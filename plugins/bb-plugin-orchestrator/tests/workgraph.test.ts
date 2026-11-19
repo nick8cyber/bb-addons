@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { beforeEach, after } from "node:test";
-import { writeFileSync } from "node:fs";
+import fs, { writeFileSync } from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { makeTempDir } from "./helpers/temp.js";
@@ -28,6 +28,9 @@ import {
   formatDesignCheckPacket,
   isTargetedCheckCommand,
   validateCheckCommand,
+  validateContractCommand,
+  commitAcceptanceContract,
+  didFilterMatchZeroTests,
   executeChecks,
 } from "../src/workgraph.js";
 import { parsePolicy } from "../src/policy.js";
@@ -2513,7 +2516,7 @@ test("§31.3 & §34.5 (ADR-0037 / Reviewer Non-blocker 5): validateCheckCommand 
   assert.ok(badScriptShell.reason?.includes("forbidden-flag"));
 });
 
-test("§34.5 (ADR-0037 / Reviewer Non-blocker 2): executeChecks prioritizes overrideCommands and ignores payload.tdd_commands on post-code checks", async () => {
+test("§34.5 (ADR-0037 / Reviewer Б1-в): executeChecks prioritizes overrideCommands and enforces acceptance contract on post-code checks", async () => {
   const executed: string[] = [];
   const fakeCmd: CmdRunner = {
     run: async (bin, args) => {
@@ -2539,22 +2542,43 @@ test("§34.5 (ADR-0037 / Reviewer Non-blocker 2): executeChecks prioritizes over
   assert.equal(executed.length, 1);
   assert.ok(executed[0].includes("tests/override.test.ts"));
 
-  // 2. Normal post-code checks does NOT use payload.tdd_commands
+  // 2. Normal post-code checks fails if acceptance test file was not created
   executed.length = 0;
-  const taskWithTdd: any = {
+  const tmpRepo = makeTempDir("bb-checks-test-");
+  const taskWithMissingTdd: any = {
     task_key: "TEST-2",
     payload: JSON.stringify({
-      tdd_commands: ["npm test tests/tdd.test.ts"],
+      tdd_commands: ["npm test tests/missing.test.ts"],
       checks_commands: ["npm test tests/real-check.test.ts"],
     }),
   };
-  await executeChecks(
-    { cmd: fakeCmd, repoRoot: "/tmp" },
-    taskWithTdd,
+  const failRes = await executeChecks(
+    { cmd: fakeCmd, repoRoot: tmpRepo },
+    taskWithMissingTdd,
     ["npm test"],
   );
-  assert.equal(executed.length, 1);
+  assert.equal(failRes.ok, false);
+  assert.equal(failRes.exitCode, 1);
+  assert.ok(
+    failRes.output?.includes(
+      'acceptance test file "tests/missing.test.ts" was not created by executor',
+    ),
+  );
+
+  // 3. Normal post-code checks executes both checks_commands and tdd_commands when test file exists
+  const testsDir = path.join(tmpRepo, "tests");
+  fs.mkdirSync(testsDir, { recursive: true });
+  fs.writeFileSync(path.join(testsDir, "missing.test.ts"), "");
+  executed.length = 0;
+  const passRes = await executeChecks(
+    { cmd: fakeCmd, repoRoot: tmpRepo },
+    taskWithMissingTdd,
+    ["npm test"],
+  );
+  assert.equal(passRes.ok, true);
+  assert.equal(executed.length, 2);
   assert.ok(executed[0].includes("tests/real-check.test.ts"));
+  assert.ok(executed[1].includes("tests/missing.test.ts"));
 });
 
 test("§34.5 (ADR-0037 / Reviewer Б1-а): runTddFailFirstVerification skips check when test file is new (does not exist on base commit)", async () => {
@@ -2652,6 +2676,263 @@ go test ./... -run TestBug
   assert.equal(res.failedAsExpected, true);
   assert.equal(res.notRun, undefined);
   assert.ok(res.output?.includes("tdd fail-first verified"));
+});
+
+test("§34.5 (ADR-0037 / Reviewer Б1-а): Mixed contract (new file + existing file) does not trigger acceptance_vacuous", async () => {
+  const tmpRepo = makeTempDir("bb-mixed-contract-");
+  const cmd = createCmd();
+  await cmd.run("git", ["init"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+
+  const fs = await import("node:fs");
+  const testsDir = path.join(tmpRepo, "tests");
+  fs.mkdirSync(testsDir, { recursive: true });
+  writeFileSync(path.join(testsDir, "sort.test.ts"), "def test_sort(): pass\n");
+  await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+  await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
+
+  const normKey = "TDD-MIXED";
+  const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+  fs.mkdirSync(accDir, { recursive: true });
+  writeFileSync(
+    path.join(accDir, `${normKey}.md`),
+    `# Contract
+## Тесты договора приёмки
+\`\`\`bash
+npm test tests/sort.test.ts
+npm test tests/new-feature.test.ts
+\`\`\`
+`,
+  );
+  await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+  await cmd.run("git", ["commit", "-m", "mixed contract"], { cwd: tmpRepo });
+  const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+  const accSha = rev.stdout.trim();
+
+  // Mock runner where existing test passes (exit 0)
+  const mockCmd: CmdRunner = {
+    run: async (bin, args, opts) => {
+      if (bin === "git") {
+        return cmd.run(bin, args, opts);
+      }
+      return { exitCode: 0, stdout: "1 passed, 1 total", stderr: "" };
+    },
+  };
+
+  const res = await runTddFailFirstVerification(
+    { cmd: mockCmd, repoRoot: tmpRepo },
+    { task_key: normKey } as any,
+    accSha,
+    ["npm test"],
+  );
+  assert.equal(res.ok, true);
+  assert.equal(res.failedAsExpected, true);
+  assert.equal(res.outcome, "skipped_new_test");
+  assert.ok(res.newTestFiles?.includes("tests/new-feature.test.ts"));
+  assert.ok(res.output?.includes("new test file(s) to be created during code phase"));
+});
+
+test("§34.5 (ADR-0037 / Reviewer Б1-а): New test case in existing file with filter matching 0 tests returns skipped_new_test", async () => {
+  const tmpRepo = makeTempDir("bb-zero-tests-");
+  const cmd = createCmd();
+  await cmd.run("git", ["init"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+
+  const fs = await import("node:fs");
+  const testsDir = path.join(tmpRepo, "tests");
+  fs.mkdirSync(testsDir, { recursive: true });
+  writeFileSync(path.join(testsDir, "sort.test.ts"), "def test_sort(): pass\n");
+  await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+  await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
+
+  const normKey = "TDD-ZERO";
+  const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+  fs.mkdirSync(accDir, { recursive: true });
+  writeFileSync(
+    path.join(accDir, `${normKey}.md`),
+    `# Contract
+## Тесты договора приёмки
+\`\`\`bash
+npm test -- tests/sort.test.ts --test-name-pattern=handles-empty
+\`\`\`
+`,
+  );
+  await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+  await cmd.run("git", ["commit", "-m", "filtered test case"], { cwd: tmpRepo });
+  const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+  const accSha = rev.stdout.trim();
+
+  // Mock runner returning 0 tests passed / no tests found
+  const mockCmd: CmdRunner = {
+    run: async (bin, args, opts) => {
+      if (bin === "git") {
+        return cmd.run(bin, args, opts);
+      }
+      return { exitCode: 0, stdout: "No tests found. 0 passed, 0 total", stderr: "" };
+    },
+  };
+
+  const res = await runTddFailFirstVerification(
+    { cmd: mockCmd, repoRoot: tmpRepo },
+    { task_key: normKey } as any,
+    accSha,
+    ["npm test"],
+  );
+  assert.equal(res.ok, true);
+  assert.equal(res.failedAsExpected, true);
+  assert.equal(res.outcome, "skipped_new_test");
+  assert.ok(res.output?.includes("0 tests matched on base commit"));
+});
+
+test("§34.5 (ADR-0037 / Reviewer Non-blockers 1, 2, 3): validateContractCommand and isTargetedCheckCommand whitelist", async () => {
+  // 1. Non-blocker 1: flag arguments not treated as target
+  assert.equal(isTargetedCheckCommand("npm test -- --test-concurrency 1"), false);
+  assert.equal(isTargetedCheckCommand("pytest -n 4"), false);
+  assert.equal(isTargetedCheckCommand("cargo test --jobs 4"), false);
+  assert.equal(isTargetedCheckCommand("pytest -p no:cacheprovider"), false);
+
+  // 2. Non-blocker 2: filter values not treated as files
+  assert.equal(isTargetedCheckCommand("pytest -k test_bug"), true);
+
+  // 3. Non-blocker 3: validateContractCommand whitelist
+  const allowedApiWrapper = validateContractCommand("cargo test --test api_wrapper");
+  assert.equal(allowedApiWrapper.valid, true);
+
+  const allowedFilter = validateContractCommand("pytest -k test_bug tests/test_sort.py -v");
+  assert.equal(allowedFilter.valid, true);
+
+  const forbiddenConfig = validateContractCommand("cargo test --config build.rustflags=-Clinker=/tmp/x foo");
+  assert.equal(forbiddenConfig.valid, false);
+  assert.ok(forbiddenConfig.reason?.includes("forbidden-flag"));
+
+  const forbiddenNodeOptions = validateContractCommand("npm test --node-options=--require=/tmp/x.js tests/a.test.js");
+  assert.equal(forbiddenNodeOptions.valid, false);
+  assert.ok(forbiddenNodeOptions.reason?.includes("forbidden-flag"));
+});
+
+test("§34.5 (ADR-0037 / Reviewer Non-blocker 4): runEnqueue updates task with acceptance_sha in store", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.insertTask({
+    taskKey: "ENQ-1",
+    projectId: "p1",
+    coordinatorThreadId: "t1",
+    level: "simple",
+    route: "simple",
+    confirmationMode: "auto",
+  });
+  store.updateTask("ENQ-1", {
+    node: "owner_gate",
+    status: "waiting_approval",
+    branch: "bb/enq-1",
+  });
+
+  const cmd: CmdRunner = {
+    run: async (bin, args) => {
+      if (args[0] === "hash-object") return { exitCode: 0, stdout: "blob123\n", stderr: "" };
+      if (args[0] === "rev-parse" && args[1] === "refs/heads/bb/enq-1") return { exitCode: 0, stdout: "parentSha123\n", stderr: "" };
+      if (args[0] === "rev-parse" && args[1]?.includes(":")) return { exitCode: 1, stdout: "", stderr: "" };
+      if (args[0] === "read-tree") return { exitCode: 0, stdout: "", stderr: "" };
+      if (args[0] === "update-index") return { exitCode: 0, stdout: "", stderr: "" };
+      if (args[0] === "write-tree") return { exitCode: 0, stdout: "tree123\n", stderr: "" };
+      if (args[0] === "commit-tree") return { exitCode: 0, stdout: "commitAccSha123\n", stderr: "" };
+      if (args[0] === "update-ref") return { exitCode: 0, stdout: "", stderr: "" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  };
+
+  const res = await runEnqueue(
+    {
+      taskKey: "ENQ-1",
+      acceptance: "## Acceptance Tests\n```bash\nnpm test tests/foo.test.ts\n```",
+    },
+    {
+      store,
+      cmd,
+      ctx: { caller: "owner", projectId: "p1" } as any,
+      workGraphMode: "strict",
+      repoRoot: "/tmp",
+      runTddCheck: async () => ({
+        ok: true,
+        failedAsExpected: true,
+        outcome: "red_confirmed",
+        output: "failed on base",
+      }),
+    },
+  );
+
+  assert.equal(res.ok, true);
+  const updated = store.getTask("ENQ-1");
+  assert.equal(updated?.acceptance_sha, "commitAccSha123");
+  assert.equal(updated?.branch, "bb/enq-1");
+  const payload = JSON.parse(updated!.payload!);
+  assert.equal(payload.tdd_outcome, "red_confirmed");
+});
+
+test("§34.5 (ADR-0037 / Reviewer Non-blocker 4 & 5): startQueuedTask with isOnlyAcceptanceCommit and avoids duplicate commit", async () => {
+  const tmpRepo = makeTempDir("bb-acc-only-");
+  const cmd = createCmd();
+  await cmd.run("git", ["init"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+
+  // Base commit on main
+  const fs = await import("node:fs");
+  writeFileSync(path.join(tmpRepo, "README.md"), "# Hello\n");
+  await cmd.run("git", ["add", "README.md"], { cwd: tmpRepo });
+  await cmd.run("git", ["commit", "-m", "init"], { cwd: tmpRepo });
+  await cmd.run("git", ["branch", "-M", "main"], { cwd: tmpRepo });
+
+  const branch = "bb/test-only-acc";
+  await cmd.run("git", ["branch", branch, "main"], { cwd: tmpRepo });
+
+  const normKey = "TEST-ONLY-ACC";
+  const content = "## Тесты договора приёмки\n```bash\nnpm test tests/new.test.ts\n```\n";
+  const accSha1 = await commitAcceptanceContract(cmd, tmpRepo, branch, normKey, content);
+
+  // Non-blocker 5: Calling commitAcceptanceContract again with identical content returns the same SHA without committing again!
+  const accSha2 = await commitAcceptanceContract(cmd, tmpRepo, branch, normKey, content);
+  assert.equal(accSha2, accSha1);
+
+  // Set up store and task where branch contains only acceptance_sha
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  store.insertTask({
+    taskKey: normKey,
+    projectId: "p1",
+    coordinatorThreadId: "t1",
+    level: "simple",
+    route: "simple",
+    confirmationMode: "auto",
+  });
+  store.updateTask(normKey, {
+    branch,
+    acceptance_sha: accSha1,
+    payload: JSON.stringify({
+      acceptance_text: content,
+    }),
+  });
+
+  // Call runRunQueue: startQueuedTask should recognize isOnlyAcceptanceCommit and advance task from start to code (not jump to review)
+  const qRes = await runRunQueue({
+    store,
+    cmd,
+    repoRoot: tmpRepo,
+    mergeBaseBranch: "main",
+    workGraphMode: "strict",
+  });
+
+  assert.equal(qRes.ok, true);
+  const taskAfter = store.getTask(normKey);
+  // Transitioned to running on code
+  assert.equal(taskAfter?.node, "code");
+  assert.equal(taskAfter?.status, "running");
+  assert.equal(taskAfter?.acceptance_sha, accSha1);
 });
 
 

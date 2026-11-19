@@ -737,7 +737,7 @@ export async function runEnqueue(
     runTddCheck?: (
       task: TaskQueueRow,
       acceptanceSha: string | null,
-    ) => Promise<{ ok: boolean; failedAsExpected: boolean; notRun?: boolean; output?: string }>;
+    ) => Promise<TddVerificationResult>;
   },
 ): Promise<{ ok: boolean; task: TaskQueueRow; reissued?: boolean }> {
   if (deps.workGraphMode === "off") {
@@ -1041,6 +1041,24 @@ export async function runEnqueue(
               return { ok: true, task: res.task! };
             }
           }
+
+          // §34.5 / Reviewer Б1-в: Record TDD verification outcome in task payload
+          existingPayload.tdd_outcome = tdd.outcome;
+          if (tdd.newTestFiles && tdd.newTestFiles.length > 0) {
+            existingPayload.tdd_new_tests = tdd.newTestFiles;
+          }
+          if (tdd.commands && tdd.commands.length > 0) {
+            existingPayload.tdd_commands = tdd.commands;
+          }
+          existingPayload.tdd_output = tdd.output;
+          const checksRun = ((existingPayload.checks_run as Record<string, unknown>) || {});
+          checksRun.tdd = {
+            outcome: tdd.outcome,
+            new_tests: tdd.newTestFiles ?? [],
+            commands: tdd.commands ?? [],
+            output: tdd.output,
+          };
+          existingPayload.checks_run = checksRun;
         }
 
         delete existingPayload.vacuous_contract;
@@ -2084,7 +2102,8 @@ export function validateCheckCommand(
     "--wrapper",
   ];
   const parts = trimmed.split(/\s+/);
-  for (const p of parts) {
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
     for (const ff of forbiddenFlags) {
       if (p === ff || p.startsWith(ff + "=")) {
         return {
@@ -2093,17 +2112,21 @@ export function validateCheckCommand(
         };
       }
     }
-    // Specially check cargo dangerous config options (wrapper, runner)
-    if (
-      (p === "--config" || p.startsWith("--config=")) &&
-      (/rustc-wrapper/i.test(trimmed) ||
-        /wrapper/i.test(trimmed) ||
-        /target\..*\.runner/i.test(trimmed))
-    ) {
-      return {
-        valid: false,
-        reason: `checks-refused: forbidden-flag (${p} is not allowed in checks)`,
-      };
+    // Specially check cargo dangerous config options (wrapper, runner, linker)
+    if (p === "--config" || p.startsWith("--config=")) {
+      const configVal = p.startsWith("--config=")
+        ? p.slice("--config=".length)
+        : (parts[i + 1] ?? "");
+      if (
+        /(?:rustc-wrapper|target\..*\.runner|target\..*\.linker|build\.rustflags)/i.test(
+          configVal,
+        )
+      ) {
+        return {
+          valid: false,
+          reason: `checks-refused: forbidden-flag (${p} is not allowed in checks)`,
+        };
+      }
     }
   }
 
@@ -2175,7 +2198,7 @@ export async function executeChecks(
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
   checksConfig?: PolicyChecksConfig,
   overrideCommands?: string[],
-): Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean }> {
+): Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean; acceptanceVerified?: boolean }> {
   let payloadObj: Record<string, unknown> = {};
   if (task.payload) {
     try {
@@ -2184,14 +2207,15 @@ export async function executeChecks(
   }
 
   let commands: string[] = [];
-  if (Array.isArray(overrideCommands) && overrideCommands.length > 0) {
-    commands = overrideCommands;
+  const isOverride = Array.isArray(overrideCommands) && overrideCommands.length > 0;
+  if (isOverride) {
+    commands = overrideCommands!;
   } else if (Array.isArray(payloadObj.checks_commands) && payloadObj.checks_commands.length > 0) {
-    commands = payloadObj.checks_commands as string[];
+    commands = [...(payloadObj.checks_commands as string[])];
   } else if (typeof payloadObj.test_command === "string") {
     commands = [payloadObj.test_command];
   } else if (Array.isArray(checksConfig?.commands) && checksConfig.commands.length > 0) {
-    commands = checksConfig.commands;
+    commands = [...checksConfig.commands];
   } else if (payloadObj.checks_fail) {
     return {
       ok: false,
@@ -2207,6 +2231,72 @@ export async function executeChecks(
     };
   } else {
     commands = ["npm test"];
+  }
+
+  // §34.5 (ADR-0037, Reviewer Б1-в): Post-code checks must also verify acceptance contract commands!
+  let contractCommands: string[] = [];
+  if (!isOverride) {
+    if (Array.isArray(payloadObj.tdd_commands) && payloadObj.tdd_commands.length > 0) {
+      contractCommands = payloadObj.tdd_commands as string[];
+    } else if (task.acceptance_sha && deps.cmd && deps.repoRoot) {
+      try {
+        const normKey = normalizeTaskKey(task.task_key).toUpperCase();
+        const showRes = await deps.cmd.run("git", [
+          "-C",
+          deps.repoRoot,
+          "show",
+          `${task.acceptance_sha}:docs/specs/acceptance/${normKey}.md`,
+        ]);
+        if (showRes.exitCode === 0 && showRes.stdout) {
+          contractCommands = extractAcceptanceCommands(showRes.stdout, allowedRunners);
+        }
+      } catch {}
+    }
+
+    // Verify that all test files referenced in contractCommands exist in repoRoot
+    if (contractCommands.length > 0 && deps.repoRoot) {
+      for (const cmdStr of contractCommands) {
+        const tokens = cmdStr.split(/\s+/).slice(1);
+        for (let i = 0; i < tokens.length; i++) {
+          const tok = tokens[i];
+          if (tok === "--") continue;
+          if (tok.startsWith("-")) {
+            const flagName = tok.split("=")[0];
+            if (!tok.includes("=") && (FLAGS_WITH_VALUES.has(flagName) || (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")))) {
+              i++;
+            }
+            continue;
+          }
+          if (/^\d+$/.test(tok) || tok === "true" || tok === "false") continue;
+          const cleanPath = tok.split("::")[0];
+          if (
+            cleanPath === "./..." ||
+            cleanPath === "..." ||
+            cleanPath === "." ||
+            cleanPath.endsWith("/...") ||
+            cleanPath.includes("*")
+          ) {
+            continue;
+          }
+          if (
+            cleanPath.includes("/") ||
+            /\.(?:[tj]sx?|py|go|rs|c|cpp|h)$/i.test(cleanPath)
+          ) {
+            const resolved = path.resolve(deps.repoRoot, cleanPath);
+            if (!fs.existsSync(resolved)) {
+              return {
+                ok: false,
+                exitCode: 1,
+                output: `checks-failed: acceptance test file "${cleanPath}" was not created by executor`,
+              };
+            }
+          }
+        }
+        if (!commands.includes(cmdStr)) {
+          commands.push(cmdStr);
+        }
+      }
+    }
   }
 
   let timeoutSeconds = 600;
@@ -2233,6 +2323,7 @@ export async function executeChecks(
     };
   }
 
+  let lastOutput = "";
   for (const cmdStr of commands) {
     const val = validateCheckCommand(cmdStr, allowedRunners);
     if (!val.valid) {
@@ -2246,6 +2337,7 @@ export async function executeChecks(
         env,
         cleanEnv: true,
       });
+      lastOutput = (res.stdout || res.stderr).trim();
       if (res.exitCode !== 0) {
         return {
           ok: false,
@@ -2258,7 +2350,7 @@ export async function executeChecks(
     }
   }
 
-  return { ok: true, exitCode: 0, output: "checks passed" };
+  return { ok: true, exitCode: 0, output: lastOutput || "checks passed", acceptanceVerified: contractCommands.length > 0 };
 }
 
 export const BARE_CHECK_RUNNERS = new Set([
@@ -2285,6 +2377,102 @@ export const TEST_FILTER_FLAGS = new Set([
   "-g",
   "--grep",
 ]);
+
+export const ALLOWED_CONTRACT_FLAGS = new Set([
+  "--",
+  "-k",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "-run",
+  "--run",
+  "--test",
+  "--filter",
+  "--testPathPattern",
+  "-g",
+  "--grep",
+  "-v",
+  "-q",
+  "--silent",
+  "--bail",
+  "-s",
+  "--nocapture",
+  "--release",
+  "--no-coverage",
+]);
+
+export const FLAGS_WITH_VALUES = new Set([
+  "-n",
+  "--maxfail",
+  "--jobs",
+  "-j",
+  "-p",
+  "-c",
+  "--config",
+  "--test-concurrency",
+  "--timeout",
+  "--target",
+  "--workers",
+  "--retries",
+  "-k",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "-run",
+  "--run",
+  "--test",
+  "--filter",
+  "--testPathPattern",
+  "-g",
+  "--grep",
+]);
+
+export function validateContractCommand(
+  cmdStr: string,
+  allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
+): { valid: boolean; binary?: string; args?: string[]; reason?: string } {
+  const baseVal = validateCheckCommand(cmdStr, allowedRunners);
+  if (!baseVal.valid) {
+    return baseVal;
+  }
+
+  const parts = cmdStr.trim().split(/\s+/);
+  for (let i = 1; i < parts.length; i++) {
+    const part = parts[i];
+    if (part === "--") continue;
+    if (part.startsWith("-")) {
+      const flagName = part.split("=")[0];
+      if (!ALLOWED_CONTRACT_FLAGS.has(flagName)) {
+        return {
+          valid: false,
+          reason: `contract-refused: forbidden-flag (${flagName} is not permitted in acceptance contract command)`,
+        };
+      }
+    }
+  }
+
+  return baseVal;
+}
+
+export function didFilterMatchZeroTests(output?: string): boolean {
+  if (!output) return false;
+  if (/no tests found/i.test(output)) return true;
+  if (/ran 0 test suites/i.test(output)) return true;
+  if (/0\s+passed,\s*0\s+total/i.test(output)) return true;
+  if (/\b0\s+tests?\s+passed\b.*\b0\s+total\b/i.test(output)) return true;
+  if (/total:\s*0/i.test(output) && /passed:\s*0/i.test(output)) return true;
+  if (/#\s*tests\s+0\b/i.test(output)) return true;
+  if (/#\s*pass\s+0\b.*#\s*fail\s+0\b/i.test(output)) return true;
+  if (/collected 0 items/i.test(output)) return true;
+  if (/no tests ran/i.test(output)) return true;
+  if (/no tests collected/i.test(output)) return true;
+  if (/running 0 tests/i.test(output)) return true;
+  if (/0 passed;\s*0 failed;\s*0 ignored/i.test(output)) return true;
+  if (/warning: no tests to run/i.test(output)) return true;
+  if (/\[no tests to run\]/i.test(output)) return true;
+  if (/\[no test files\]/i.test(output)) return true;
+  return false;
+}
 
 export function isTargetedCheckCommand(
   cmdStr: string,
@@ -2335,15 +2523,32 @@ export function isTargetedCheckCommand(
     const tok = tokens[i];
     if (tok === "--") continue;
 
-    for (const flag of TEST_FILTER_FLAGS) {
-      if (tok === flag || tok.startsWith(flag + "=")) {
+    if (tok.startsWith("-")) {
+      const flagName = tok.split("=")[0];
+      if (TEST_FILTER_FLAGS.has(flagName)) {
         hasFilter = true;
         break;
       }
+      if (!tok.includes("=") && FLAGS_WITH_VALUES.has(flagName)) {
+        i++;
+      }
+      continue;
     }
-    if (hasFilter) break;
 
-    if (!tok.startsWith("-")) {
+    if (/^\d+$/.test(tok) || tok === "true" || tok === "false") {
+      continue;
+    }
+
+    const clean = tok.split("::")[0];
+    if (
+      clean.includes("/") ||
+      clean.includes("\\") ||
+      tok.includes("::") ||
+      /\.(?:[tj]sx?|py|go|rs)$/i.test(clean) ||
+      /^(?:test_|.+_test)/i.test(clean) ||
+      clean === "./..." ||
+      clean === "..."
+    ) {
       hasPathOrTarget = true;
       break;
     }
@@ -2372,7 +2577,7 @@ export function extractAcceptanceCommands(
         for (const item of items) {
           const cmdCandidate = item.trim().replace(/^["']|["']$/g, "").trim();
           if (cmdCandidate) {
-            const val = validateCheckCommand(cmdCandidate, allowedRunners);
+            const val = validateContractCommand(cmdCandidate, allowedRunners);
             if (val.valid && isTargetedCheckCommand(cmdCandidate, allowedRunners) && !commands.includes(cmdCandidate)) {
               commands.push(cmdCandidate);
             }
@@ -2394,7 +2599,7 @@ export function extractAcceptanceCommands(
         if (trimmed.startsWith("-")) {
           const cmdCandidate = trimmed.replace(/^-\s*/, "").replace(/^["']|["']$/g, "").trim();
           if (cmdCandidate) {
-            const val = validateCheckCommand(cmdCandidate, allowedRunners);
+            const val = validateContractCommand(cmdCandidate, allowedRunners);
             if (val.valid && isTargetedCheckCommand(cmdCandidate, allowedRunners) && !commands.includes(cmdCandidate)) {
               commands.push(cmdCandidate);
             }
@@ -2437,7 +2642,7 @@ export function extractAcceptanceCommands(
       const isAllowedScriptBlock = codeBlockLang === "bash" || codeBlockLang === "sh";
       if (isAllowedScriptBlock) {
         if (trimmed && !trimmed.startsWith("#")) {
-          const val = validateCheckCommand(trimmed, allowedRunners);
+          const val = validateContractCommand(trimmed, allowedRunners);
           if (val.valid && isTargetedCheckCommand(trimmed, allowedRunners) && !commands.includes(trimmed)) {
             commands.push(trimmed);
           }
@@ -2449,18 +2654,36 @@ export function extractAcceptanceCommands(
   return commands;
 }
 
+export type TddVerificationOutcome =
+  | "red_confirmed"
+  | "skipped_new_test"
+  | "skipped_no_commands"
+  | "vacuous"
+  | "not_run";
+
+export interface TddVerificationResult {
+  ok: boolean;
+  failedAsExpected: boolean;
+  outcome?: TddVerificationOutcome;
+  notRun?: boolean;
+  output?: string;
+  newTestFiles?: string[];
+  commands?: string[];
+}
+
 export async function runTddFailFirstVerification(
   deps: { cmd?: CmdRunner; repoRoot?: string },
   task: TaskQueueRow,
   acceptanceSha: string | null,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
   checksConfig?: PolicyChecksConfig,
-): Promise<{ ok: boolean; failedAsExpected: boolean; notRun?: boolean; output?: string }> {
+): Promise<TddVerificationResult> {
   // §34.5 / Reviewer Б2: without acceptance_sha, no verification
   if (!acceptanceSha) {
     return {
       ok: true,
       failedAsExpected: true,
+      outcome: "skipped_no_commands",
       output: "tdd check skipped: no acceptance sha",
     };
   }
@@ -2475,6 +2698,7 @@ export async function runTddFailFirstVerification(
     return {
       ok: true,
       failedAsExpected: true,
+      outcome: "skipped_no_commands",
       output: "tdd check skipped by configuration",
     };
   }
@@ -2482,6 +2706,7 @@ export async function runTddFailFirstVerification(
     return {
       ok: true,
       failedAsExpected: false,
+      outcome: "vacuous",
       output:
         "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
     };
@@ -2490,6 +2715,7 @@ export async function runTddFailFirstVerification(
     return {
       ok: true,
       failedAsExpected: true,
+      outcome: "red_confirmed",
       output: "tdd fail-first verified: tests failed on base commit as expected",
     };
   }
@@ -2525,6 +2751,7 @@ export async function runTddFailFirstVerification(
     return {
       ok: true,
       failedAsExpected: true,
+      outcome: "skipped_no_commands",
       output: "tdd check skipped: no explicit acceptance test commands configured",
     };
   }
@@ -2533,6 +2760,7 @@ export async function runTddFailFirstVerification(
     return {
       ok: true,
       failedAsExpected: true,
+      outcome: "skipped_no_commands",
       output: "tdd check skipped: no cmd runner",
     };
   }
@@ -2549,6 +2777,8 @@ export async function runTddFailFirstVerification(
         ok: false,
         failedAsExpected: false,
         notRun: true,
+        outcome: "not_run",
+        commands,
         output: `mkdtemp failed: ${e?.message ?? e}`,
       };
     }
@@ -2567,6 +2797,8 @@ export async function runTddFailFirstVerification(
         ok: false,
         failedAsExpected: false,
         notRun: true,
+        outcome: "not_run",
+        commands,
         output: `git worktree add failed: ${addRes.stderr}`,
       };
     }
@@ -2576,11 +2808,20 @@ export async function runTddFailFirstVerification(
     const newTestFiles: string[] = [];
 
     for (const cmdStr of commands) {
-      const parts = cmdStr.split(/\s+/);
+      const tokens = cmdStr.split(/\s+/).slice(1);
       const fileCandidates: string[] = [];
-      for (const p of parts.slice(1)) {
-        if (p.startsWith("-") || p === "--") continue;
-        const cleanPath = p.split("::")[0];
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i];
+        if (tok === "--") continue;
+        if (tok.startsWith("-")) {
+          const flagName = tok.split("=")[0];
+          if (!tok.includes("=") && (FLAGS_WITH_VALUES.has(flagName) || (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")))) {
+            i++;
+          }
+          continue;
+        }
+        if (/^\d+$/.test(tok) || tok === "true" || tok === "false") continue;
+        const cleanPath = tok.split("::")[0];
         if (
           cleanPath === "./..." ||
           cleanPath === "..." ||
@@ -2592,9 +2833,7 @@ export async function runTddFailFirstVerification(
         }
         if (
           cleanPath.includes("/") ||
-          /\.(?:test|spec)\.[a-z0-9]+$/i.test(cleanPath) ||
-          /^(?:test_|.+_test\.)/i.test(cleanPath) ||
-          /\.[a-z0-9]{1,5}$/i.test(cleanPath)
+          /\.(?:[tj]sx?|py|go|rs|c|cpp|h)$/i.test(cleanPath)
         ) {
           fileCandidates.push(cleanPath);
         }
@@ -2626,6 +2865,9 @@ export async function runTddFailFirstVerification(
       return {
         ok: true,
         failedAsExpected: true,
+        outcome: "skipped_new_test",
+        newTestFiles,
+        commands,
         output: `tdd check skipped: new test file(s) to be created during code phase (${newTestFiles.join(", ")})`,
       };
     }
@@ -2650,21 +2892,56 @@ export async function runTddFailFirstVerification(
         ok: false,
         failedAsExpected: false,
         notRun: true,
+        outcome: "not_run",
+        commands,
         output: `tdd check not run: ${checkRes.output}`,
       };
     }
-    if (checkRes.ok && checkRes.exitCode === 0) {
+
+    const isPytestNoTests = checkRes.exitCode === 5;
+    const isZeroMatchingTests = didFilterMatchZeroTests(checkRes.output);
+
+    if (isPytestNoTests || isZeroMatchingTests) {
       return {
         ok: true,
-        failedAsExpected: false,
-        output:
-          "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+        failedAsExpected: true,
+        outcome: "skipped_new_test",
+        newTestFiles,
+        commands,
+        output: `tdd check skipped: new test case to be created during code phase (0 tests matched on base commit)`,
       };
     }
+
+    if (checkRes.exitCode !== 0) {
+      return {
+        ok: true,
+        failedAsExpected: true,
+        outcome: "red_confirmed",
+        newTestFiles,
+        commands,
+        output: `tdd fail-first verified: tests failed on base commit as expected (exitCode: ${checkRes.exitCode})`,
+      };
+    }
+
+    // If there are new test files in the contract, it CANNOT be vacuous!
+    if (newTestFiles.length > 0) {
+      return {
+        ok: true,
+        failedAsExpected: true,
+        outcome: "skipped_new_test",
+        newTestFiles,
+        commands,
+        output: `tdd check skipped: new test file(s) to be created during code phase (${newTestFiles.join(", ")})`,
+      };
+    }
+
     return {
       ok: true,
-      failedAsExpected: true,
-      output: `tdd fail-first verified: tests failed on base commit as expected (exitCode: ${checkRes.exitCode})`,
+      failedAsExpected: false,
+      outcome: "vacuous",
+      commands,
+      output:
+        "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
     };
   } finally {
     if (tmpDir) {
@@ -2794,6 +3071,19 @@ export async function commitAcceptanceContract(
   }
   const parentSha = parentRes.stdout.trim();
 
+  // §34.5 (Reviewer Non-blocker 5): If contract blob on parentSha is identical, reuse parentSha without creating duplicate commit
+  const existingBlobRes = await cmd.run(
+    "git",
+    ["rev-parse", `${parentSha}:${relPath}`],
+    { cwd: repoRoot },
+  );
+  if (
+    existingBlobRes.exitCode === 0 &&
+    existingBlobRes.stdout.trim() === blobSha
+  ) {
+    return parentSha;
+  }
+
   const tempIndex = path.join(
     repoRoot,
     `.git/index_acc_${Date.now()}_${Math.random().toString(36).slice(2)}`,
@@ -2896,11 +3186,11 @@ export interface RunQueueDeps {
   ) => Promise<{ ok: boolean; delegationId?: number; error?: string } | void>;
   runChecks?: (
     task: TaskQueueRow,
-  ) => Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean }>;
+  ) => Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean; acceptanceVerified?: boolean }>;
   runTddCheck?: (
     task: TaskQueueRow,
     acceptanceSha: string | null,
-  ) => Promise<{ ok: boolean; failedAsExpected: boolean; notRun?: boolean; output?: string }>;
+  ) => Promise<TddVerificationResult>;
   log?: { warn?: (msg: string) => void; info?: (msg: string) => void };
   requestOwnerGateInteraction?: (
     task: TaskQueueRow,
@@ -3514,6 +3804,14 @@ async function startQueuedTask(
     acceptanceSha = null;
   }
 
+  const cleanedPayload = { ...payload };
+  delete (cleanedPayload as any).queued_stalled;
+  if (resolution.action?.setPayload) {
+    Object.assign(cleanedPayload, resolution.action.setPayload);
+  }
+
+  let startReason = resolution.reason;
+
   // §34.5 (ADR-0037): TDD Fail-First Verification for fix/simple routes (both auto and manual)
   if ((task.route === "fix" || task.route === "simple") && acceptanceSha) {
     const tdd = deps.runTddCheck
@@ -3619,12 +3917,27 @@ async function startQueuedTask(
         return false;
       }
     }
-  }
 
-  const cleanedPayload = { ...payload };
-  delete (cleanedPayload as any).queued_stalled;
-  if (resolution.action?.setPayload) {
-    Object.assign(cleanedPayload, resolution.action.setPayload);
+    // §34.5 / Reviewer Б1-в: Record TDD verification outcome in task payload
+    cleanedPayload.tdd_outcome = tdd.outcome;
+    if (tdd.newTestFiles && tdd.newTestFiles.length > 0) {
+      cleanedPayload.tdd_new_tests = tdd.newTestFiles;
+    }
+    if (tdd.commands && tdd.commands.length > 0) {
+      cleanedPayload.tdd_commands = tdd.commands;
+    }
+    cleanedPayload.tdd_output = tdd.output;
+    const checksRun = ((cleanedPayload.checks_run as Record<string, unknown>) || {});
+    checksRun.tdd = {
+      outcome: tdd.outcome,
+      new_tests: tdd.newTestFiles ?? [],
+      commands: tdd.commands ?? [],
+      output: tdd.output,
+    };
+    cleanedPayload.checks_run = checksRun;
+    if (tdd.outcome === "skipped_new_test") {
+      startReason = `${resolution.reason} [tdd: skipped_new_test (${(tdd.newTestFiles ?? []).join(", ")})]`;
+    }
   }
 
   const tr = deps.store.transitionTask({
@@ -3634,7 +3947,7 @@ async function startQueuedTask(
     toNode: resolution.toNode,
     toStatus: resolution.toStatus,
     actor: "run-queue",
-    reason: resolution.reason,
+    reason: startReason,
     updates: {
       branch,
       acceptance_sha: acceptanceSha,
@@ -4745,6 +5058,11 @@ async function advanceActiveTask(
           consumed.push(latestDelegation.id);
         }
 
+        let tddOutcome: TddVerificationOutcome | undefined;
+        let tddNewTests: string[] | undefined;
+        let tddCommands: string[] | undefined;
+        let tddOutput: string | undefined;
+
         // §34.5 (ADR-0037): TDD Fail-First Verification for feature route
         if (verdict === "OK" && task.acceptance_sha) {
           const tdd = deps.runTddCheck
@@ -4848,12 +5166,32 @@ async function advanceActiveTask(
               return false;
             }
           }
+
+          tddOutcome = tdd.outcome;
+          tddNewTests = tdd.newTestFiles;
+          tddCommands = tdd.commands;
+          tddOutput = tdd.output;
+        }
+
+        const checksRun = ((payload.checks_run as Record<string, unknown>) || {});
+        if (tddOutcome) {
+          checksRun.tdd = {
+            outcome: tddOutcome,
+            new_tests: tddNewTests ?? [],
+            commands: tddCommands ?? [],
+            output: tddOutput,
+          };
         }
 
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
             ...(resolution.action?.setPayload ?? {}),
+            tdd_outcome: tddOutcome ?? payload.tdd_outcome,
+            tdd_new_tests: tddNewTests ?? payload.tdd_new_tests,
+            tdd_commands: tddCommands ?? payload.tdd_commands,
+            tdd_output: tddOutput ?? payload.tdd_output,
+            checks_run: Object.keys(checksRun).length > 0 ? checksRun : payload.checks_run,
             spec_review_verdict: null,
             spec_review_blockers: null,
             consumed_delegations: consumed,
@@ -4865,6 +5203,11 @@ async function advanceActiveTask(
           Object.assign(updates, resolution.counterUpdates);
         }
 
+        const transReason =
+          tddOutcome === "skipped_new_test"
+            ? `${resolution.reason} [tdd: skipped_new_test (${(tddNewTests ?? []).join(", ")})]`
+            : resolution.reason;
+
         const tr = deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "spec_review",
@@ -4872,7 +5215,7 @@ async function advanceActiveTask(
           toNode: resolution.toNode,
           toStatus: resolution.toStatus,
           actor: "run-queue",
-          reason: resolution.reason,
+          reason: transReason,
           updates: Object.keys(updates).length > 0 ? updates : undefined,
           timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
         }, now);
@@ -5095,10 +5438,26 @@ async function advanceActiveTask(
       });
       if (!resolution.allowed) return false;
 
+      const existingChecksRun = ((payload.checks_run as Record<string, unknown>) || {});
+      const checksRun = {
+        ...existingChecksRun,
+        ok: checkResult.ok,
+        exitCode: checkResult.exitCode,
+        output: checkResult.output,
+        acceptance_verified: checkResult.acceptanceVerified,
+        tdd: existingChecksRun.tdd ?? (payload.tdd_outcome ? {
+          outcome: payload.tdd_outcome,
+          new_tests: payload.tdd_new_tests,
+          commands: payload.tdd_commands,
+          output: payload.tdd_output,
+        } : undefined),
+      };
+
       const updates: Partial<TaskQueueRow> = {
         payload: JSON.stringify({
           ...payload,
           ...(resolution.action?.setPayload ?? {}),
+          checks_run: checksRun,
           code_done: false,
           checks_fail: false,
         }),
