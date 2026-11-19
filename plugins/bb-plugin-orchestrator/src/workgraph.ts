@@ -2929,17 +2929,19 @@ async function advanceActiveTask(
     task.status === "running" &&
     (task.node === "review" || task.node === "spec_review" || task.node === "design_check")
   ) {
-    const currentVerdict = typeof payload.review_verdict === "string"
-      ? payload.review_verdict
-      : typeof payload.spec_review_verdict === "string"
-      ? payload.spec_review_verdict
-      : typeof payload.design_check_verdict === "string"
-      ? payload.design_check_verdict
-      : null;
+    const currentVerdict =
+      task.node === "review"
+        ? (typeof payload.review_verdict === "string" ? payload.review_verdict : null)
+        : task.node === "spec_review"
+        ? (typeof payload.spec_review_verdict === "string" ? payload.spec_review_verdict : null)
+        : task.node === "design_check"
+        ? (typeof payload.design_check_verdict === "string" ? payload.design_check_verdict : null)
+        : null;
     if (currentVerdict) {
+      const verdictKey = `${task.node}:${latestDelegation?.id ?? 0}:${currentVerdict}`;
       const lastVerdict = typeof payload.last_alarm_verdict === "string" ? payload.last_alarm_verdict : null;
-      if (lastVerdict !== currentVerdict) {
-        payload.last_alarm_verdict = currentVerdict;
+      if (lastVerdict !== verdictKey) {
+        payload.last_alarm_verdict = verdictKey;
         payload.alarm_count = 0;
         const timeoutSeconds = getNodeTimeoutSeconds(deps.policy, task.node);
         const nextAlarm = now + timeoutSeconds * 1000;
@@ -2971,7 +2973,13 @@ async function advanceActiveTask(
     if (threadId && deps.getThread) {
       try {
         const th = await deps.getThread(threadId);
-        if (th && (th.status === "running" || th.status === "active")) {
+        if (
+          th &&
+          (th.status === "active" ||
+            th.status === "running" ||
+            th.status === "starting" ||
+            th.status === "pending")
+        ) {
           isThreadRunning = true;
         }
       } catch {}
@@ -3068,54 +3076,54 @@ async function advanceActiveTask(
       const maxSec = (alarmCount >= 2 || isThreadRunning) ? timeoutSeconds * 3 : timeoutSeconds * 2;
       const failReason = `node-alarm-timeout: узел ${task.node} превысил предельное время ожидания (${maxSec}с)`;
       const failEvent = getFailEventForNode(task.node, failReason);
-        if (failEvent) {
-          const resolution = resolveTransition({
-            route: task.route,
-            node: task.node,
-            status: "running",
-            event: failEvent,
-            mode: task.confirmation_mode,
-            counters: extractCounters(task),
-          });
-          if (!resolution.allowed) {
-            throw new OrchestratorError(
-              resolution.errorCode ?? "invalid-transition",
-              resolution.errorMessage ?? resolution.reason,
-            );
-          }
+      if (failEvent) {
+        const resolution = resolveTransition({
+          route: task.route,
+          node: task.node,
+          status: "running",
+          event: failEvent,
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) {
+          throw new OrchestratorError(
+            resolution.errorCode ?? "invalid-transition",
+            resolution.errorMessage ?? resolution.reason,
+          );
+        }
 
-          const consumed = Array.isArray(payload.consumed_delegations)
-            ? [...(payload.consumed_delegations as number[])]
-            : [];
-          if (latestDelegation && !consumed.includes(latestDelegation.id)) {
-            consumed.push(latestDelegation.id);
-          }
+        const consumed = Array.isArray(payload.consumed_delegations)
+          ? [...(payload.consumed_delegations as number[])]
+          : [];
+        if (latestDelegation && !consumed.includes(latestDelegation.id)) {
+          consumed.push(latestDelegation.id);
+        }
 
-          const tr = deps.store.transitionTask({
-            taskKey: task.task_key,
-            expectedNode: task.node,
-            expectedStatus: "running",
-            toNode: resolution.toNode,
-            toStatus: resolution.toStatus,
-            actor: "run-queue",
-            reason: resolution.reason,
-            updates: {
-              node_alarm_at: null,
-              payload: JSON.stringify({
-                ...payload,
-                alarm_count: 0,
-                consumed_delegations: consumed,
-              }),
-            },
-          }, now);
-          if (tr.ok) {
-            const logged = deps.store.listTransitions(task.task_key).at(-1);
-            if (logged) transitions.push(logged);
-            return true;
-          }
+        const tr = deps.store.transitionTask({
+          taskKey: task.task_key,
+          expectedNode: task.node,
+          expectedStatus: "running",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
+          actor: "run-queue",
+          reason: resolution.reason,
+          updates: {
+            node_alarm_at: null,
+            payload: JSON.stringify({
+              ...payload,
+              alarm_count: 0,
+              consumed_delegations: consumed,
+            }),
+          },
+        }, now);
+        if (tr.ok) {
+          const logged = deps.store.listTransitions(task.task_key).at(-1);
+          if (logged) transitions.push(logged);
+          return true;
         }
       }
     }
+  }
 
   if (
     latestDelegation &&

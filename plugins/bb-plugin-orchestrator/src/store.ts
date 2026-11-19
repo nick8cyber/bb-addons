@@ -4081,21 +4081,21 @@ export class DelegationStore {
         now,
       };
 
+      const isReEnteringRunning =
+        input.toStatus === "running" &&
+        (input.toNode !== existing.node ||
+          existing.status !== "running" ||
+          PASSIVE_ALARM_STATUSES.has(existing.status));
+
       if (
         input.updates?.entered_at === undefined &&
-        (input.toNode !== input.expectedNode ||
-          input.expectedStatus === "stalled" ||
-          input.expectedStatus === "blocked")
+        (input.toNode !== input.expectedNode || isReEnteringRunning)
       ) {
         setClauses.push("entered_at = :now");
       }
 
-      // §28.2 п. 5: Сброс alarm_count в payload при смене узла или выходе из stalled/blocked
-      if (
-        input.toNode !== existing.node ||
-        existing.status === "stalled" ||
-        existing.status === "blocked"
-      ) {
+      // §28.2 п. 5: Сброс alarm_count в payload при смене узла или повторном входе в running из пассивного статуса
+      if (input.toNode !== existing.node || isReEnteringRunning) {
         let payloadObj: Record<string, unknown> = {};
         const sourcePayload =
           input.updates?.payload !== undefined
@@ -4118,7 +4118,7 @@ export class DelegationStore {
       // §28.2 п. 5: Будильник узла (node_alarm_at)
       if (input.updates?.node_alarm_at === undefined) {
         if (ACTIVE_ALARM_NODES.has(input.toNode) && input.toStatus === "running") {
-          if (input.toNode !== existing.node || existing.status !== "running") {
+          if (isReEnteringRunning) {
             const timeoutSec =
               input.timeoutSeconds ??
               this.nodeTimeoutResolver?.(input.toNode) ??

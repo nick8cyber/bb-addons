@@ -818,3 +818,145 @@ test("§28.2 п. 5: design_check_verdict resets alarm and checks node does not p
   assert.equal(evPayload.task, "CHECKS-NO-PING");
   assert.equal(evPayload.taskKey, "CHECKS-NO-PING");
 });
+
+test("§28.2 п. 5: same-node resume from deferred resets alarm_count, entered_at, and arms alarm", async () => {
+  const store = createTestStore();
+  const cli = fakeCli();
+  const t0 = 1_000_000;
+
+  const del = store.insert({
+    taskKey: "SAME-RESUME-1",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "opencode",
+  });
+  store.setThreadInfo(del.id, "thr_code_exec");
+
+  store.insertTask({
+    taskKey: "SAME-RESUME-1",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  }, t0);
+
+  // 1. Enter code/running with timeout 3600s
+  store.transitionTask({
+    taskKey: "SAME-RESUME-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "code",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start-code",
+    timeoutSeconds: 3600,
+  }, t0);
+
+  // Trigger 1 at t0 + 3600s sets alarm_count = 1
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    bbCli: cli.cli,
+    now: () => t0 + 3600 * 1000,
+    policy: POLICY_WITH_NODE_POLICY,
+  });
+
+  let task = store.getTask("SAME-RESUME-1")!;
+  assert.equal(JSON.parse(task.payload!).alarm_count, 1);
+  assert.equal(task.node_alarm_at, t0 + (3600 + 7200) * 1000);
+
+  // 2. Task deferred at t0 + 4000s -> passive state: node_alarm_at = NULL
+  const tDefer = t0 + 4000 * 1000;
+  store.transitionTask({
+    taskKey: "SAME-RESUME-1",
+    expectedNode: "code",
+    expectedStatus: "running",
+    toNode: "code",
+    toStatus: "deferred",
+    actor: "owner",
+    reason: "defer",
+  }, tDefer);
+
+  task = store.getTask("SAME-RESUME-1")!;
+  assert.equal(task.status, "deferred");
+  assert.equal(task.node_alarm_at, null);
+
+  // 3. Resume from deferred at tResume = t0 + 10000s (>2× timeout later)
+  const tResume = t0 + 10000 * 1000;
+  const trResume = store.transitionTask({
+    taskKey: "SAME-RESUME-1",
+    expectedNode: "code",
+    expectedStatus: "deferred",
+    toNode: "code",
+    toStatus: "running",
+    actor: "owner",
+    reason: "resume",
+    timeoutSeconds: 7200,
+  }, tResume);
+
+  assert.ok(trResume.ok);
+  task = store.getTask("SAME-RESUME-1")!;
+  assert.equal(task.status, "running");
+  assert.equal(task.entered_at, tResume, "entered_at must be reset upon resume into running");
+  assert.equal(JSON.parse(task.payload!).alarm_count, 0, "alarm_count must be reset to 0 upon resume into running");
+  assert.equal(task.node_alarm_at, tResume + 7200 * 1000, "node_alarm_at must be re-armed from resume time");
+
+  // 4. First alarm after resume at tResume + 7200s must ping (Trigger 1), NOT stall!
+  cli.calls.length = 0;
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    bbCli: cli.cli,
+    now: () => tResume + 7200 * 1000,
+    policy: POLICY_WITH_NODE_POLICY,
+  });
+
+  task = store.getTask("SAME-RESUME-1")!;
+  assert.equal(task.status, "running", "Task must stay running on first alarm after resume");
+  assert.equal(JSON.parse(task.payload!).alarm_count, 1);
+  assert.equal(cli.calls.length, 1, "Must have pinged executor on first alarm after resume");
+  assert.ok(cli.calls[0].includes("tell"));
+
+  // 5. Test waiting_release_note -> release/running same-node resume
+  store.insertTask({
+    taskKey: "REL-RESUME-1",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+  }, t0);
+
+  store.transitionTask({
+    taskKey: "REL-RESUME-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "release",
+    toStatus: "waiting_release_note",
+    actor: "run-queue",
+    reason: "release-note-needed",
+  }, t0);
+
+  task = store.getTask("REL-RESUME-1")!;
+  assert.equal(task.node_alarm_at, null);
+
+  const tRelResume = t0 + 5000 * 1000;
+  store.transitionTask({
+    taskKey: "REL-RESUME-1",
+    expectedNode: "release",
+    expectedStatus: "waiting_release_note",
+    toNode: "release",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "release-note-provided",
+    timeoutSeconds: 3600,
+  }, tRelResume);
+
+  task = store.getTask("REL-RESUME-1")!;
+  assert.equal(task.status, "running");
+  assert.equal(task.entered_at, tRelResume);
+  assert.equal(task.node_alarm_at, tRelResume + 3600 * 1000);
+});
