@@ -183,6 +183,36 @@ export function verdictInstruction(context) {
   );
 }
 
+export function taskInstruction(context) {
+  if (!context.write) return verdictInstruction(context);
+  const { nonce, allowedPaths } = context.write;
+  return [
+    "File output contract. Your final response must be a single Markdown fence labeled json, with no other text or fences.",
+    'Return an object { "format": "web-gemini-files-v1", "nonce": "' + nonce +
+      '", "files": [...], "commitMessage": "..." }.',
+    "For each exact relative path return path, operation (create, replace, delete), and baseSha256.",
+    "Use null for create. For replace or delete, use the base SHA-256 provided by the manifest or read_file. Ask read_file if the hash has not been provided. Do not compute it yourself.",
+    "For create and replace include content as the complete JSON string, including intended line endings and final LF. For delete omit content.",
+    "A reply requesting tools must contain only tool call lines. The final file response must contain only the JSON envelope.",
+    allowedPaths ? "Allowed paths: " + JSON.stringify(allowedPaths) : "",
+  ].filter(Boolean).join("\n");
+}
+
+async function fileBaseInfo(context, path) {
+  if (!context.write || typeof path !== "string" || context.settings.mask(path) !== path) return null;
+  try {
+    const info = await context.writer.baseInfo(context.writeHead, path);
+    if (info) {
+      const bases = new Map(context.write.bases);
+      bases.set(path, info);
+      context.write.bases = [...bases];
+    }
+    return info;
+  } catch (error) {
+    return { unavailable: context.settings.mask(error.code ? "file base is unavailable" : error.message) };
+  }
+}
+
 function finalLine(text) {
   return String(text).match(/(?:^|\n)([^\n]*\S[^\n]*)(?:\r?\n[ \t\r]*)*$/)?.[1]?.replace(/\r$/, "") ?? "";
 }
@@ -397,6 +427,14 @@ export async function collectTask(context, blocks, materials, options) {
     add("Linked BB material", result.output, { name: link, at: "BB output at collection" });
   }
 
+  const fileBases = [];
+  if (context.write) {
+    for (const path of new Set([...(context.write.allowedPaths ?? []), ...context.repoFiles])) {
+      signal.throwIfAborted();
+      const info = await fileBaseInfo(context, path);
+      if (info) fileBases.push({ path, ...info });
+    }
+  }
   let reviewDiff = null;
   if (root) {
     if (!pin) {
@@ -413,7 +451,8 @@ export async function collectTask(context, blocks, materials, options) {
   } else {
     omit("Git status and diff", "working directory is not a Git worktree");
   }
-  return Object.freeze({ core: Object.freeze(core), omitted: Object.freeze(omitted.map(Object.freeze)), files: Object.freeze(materialFiles), reviewDiff });
+  return Object.freeze({ core: Object.freeze(core), omitted: Object.freeze(omitted.map(Object.freeze)),
+    files: Object.freeze(materialFiles), reviewDiff, fileBases });
 }
 
 export function packTask(context, collected, options) {
@@ -422,7 +461,7 @@ export function packTask(context, collected, options) {
   const header = [
     tools.toolSystemHeader(undefined, { pinned: Boolean(pin) }),
     pin ? "All repository tools use the pinned review tree: " + pin.sha : "",
-    verdictInstruction(context),
+    taskInstruction(context),
   ].filter(Boolean).join("\n\n");
   const tables = (delivery) => {
     let offset = 0;
@@ -439,8 +478,9 @@ export function packTask(context, collected, options) {
       version: 1,
       revision: pin?.sha ?? "working copy",
       ...(pin ? { mergeBase: pin.base } : {}),
-      permissions: "read-only",
-      expected: context.verdict ? "verdict" : "text",
+      permissions: context.write ? "write" : "read-only",
+      expected: context.write ? "files" : context.verdict ? "verdict" : "text",
+      ...(context.write ? { writeBase: context.writeHead.sha, fileBases: collected.fileBases } : {}),
       taskSha256: included[0].sha256,
       coreSha256: digest(JSON.stringify(collected.core.map(({ entry: { delivery, ...item } }) => item))),
       rangeUnits: "half-open UTF-8 byte offsets from the start of the package body or attachment",
@@ -466,7 +506,9 @@ export async function taskTool(context, collected, call, limit, signal) {
   if (bbRead) return readBbMaterial(bbRead, mask, limit, signal);
   const options = { cwd: context.root ?? context.cwd, mask, maxResultBytes: limit, rejectSensitive: true };
   if (!context.pin || !["read_file", "list_dir", "grep", "git"].includes(call.name)) {
-    return tools.executeTool(call, options);
+    const result = await tools.executeTool(call, options);
+    const base = result.ok && call.name === "read_file" ? await fileBaseInfo(context, call.args.path) : null;
+    return base ? { ...result, base } : result;
   }
   try {
     const { output, range } = await executePinned(call, context.root, context.pin, collected.reviewDiff, context.settings.maxTotalBytes, signal);
@@ -495,6 +537,7 @@ export function formatTaskToolResult(context, call, result) {
     truncated: result.truncated ?? null,
     bytes: bytes(result.output),
     sha256: digest(result.output),
+    ...(result.base ? { fileBase: result.base } : {}),
   };
   return ["=== tool: " + context.settings.mask(call.name) + " ===", JSON.stringify(manifest), result.output].join("\n");
 }

@@ -1239,6 +1239,7 @@ export async function runToolLoop({
   formatResult = (call, result) => formatToolResultBlock(call, result.output),
   maxRounds = MAX_TOOL_ROUNDS,
   isCancelled = () => false,
+  toolText = (text) => text,
 }) {
   let message = firstMessage;
   let round = 0;
@@ -1250,7 +1251,7 @@ export async function runToolLoop({
     lastRes = res;
     const raw = typeof res?.rawText === "string" && res.rawText.trim() ? res.rawText : null;
     const text = String(raw ?? res?.text ?? res ?? "");
-    const calls = parseToolCalls(text);
+    const calls = parseToolCalls(toolText(text));
     if (!calls.length) {
       return { cancelled: false, forcedFinal: false, finalText: text, rounds: round, executed, lastRes };
     }
