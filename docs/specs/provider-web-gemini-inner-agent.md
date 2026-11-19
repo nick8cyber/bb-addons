@@ -3,7 +3,7 @@ title: provider-web-gemini — внутренний агент подготов�
 status: draft
 date: 2026-11-18
 updated: 2026-11-19
-revision: 7 (r7 — уточнение ограничения `\|` по живой приёмке конверта v2 в PLUG-349)
+revision: 8 (r8 — счётчик исходов первых файловых ответов в журнале хода и класс write-env по PLUG-351)
 tags: [bb, plugins, provider-web-gemini, acp, context]
 ---
 
