@@ -141,7 +141,7 @@ function makeDelegateDeps(
   const spawnArgs: Record<string, unknown>[] = [];
   let nowVal = T0;
   const threads = {
-    spawn: async (args: Record<string, unknown>) => {
+    spawn: async (args: any) => {
       spawnArgs.push(args);
       return overrides.spawn ? overrides.spawn(args) : { id: "thr_exec" };
     },
@@ -150,7 +150,7 @@ function makeDelegateDeps(
     update: async () => ({}),
     stop: async () => ({}),
     updatePluginMetadata: async () => ({}),
-  };
+  } as unknown as DelegateDeps["threads"];
   const policyOf = () =>
     parsePolicy(overrides.policyText ?? POLICY_TEXT, overrides.presets ?? PRESETS);
   const deps: DelegateDeps = {
@@ -193,7 +193,7 @@ function makeDelegateDeps(
 const row = (
   taskKey: string,
   over: Record<string, unknown> = {},
-): Record<string, unknown> => ({
+): any => ({
   taskKey,
   projectId: "proj_main",
   coordinatorThreadId: "thr_coord",
