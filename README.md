@@ -77,6 +77,11 @@ What it handles on its own (details in the plugin README):
   conversation and the thread continues on a fresh one that starts from that
   summary (or, without one, from a read-only look at the thread's own recent
   history); failing that, it goes back to the old conversation.
+- **Parallel installs.** One pool can span several agy binaries: each account
+  binds to a named install, a per-machine `agy-installs.json` registry maps
+  names to binary paths, and an account whose install is locally unavailable
+  is skipped rather than run on a substitute binary
+  ([spec](docs/specs/provider-agy-installs.md)).
 
 Behaviour contract and decisions:
 [spec](docs/specs/provider-agy-recovery.md),
