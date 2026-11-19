@@ -4128,6 +4128,36 @@ export class DelegationStore {
       .all(normalizeTaskKey(taskKey)) as TaskTransitionRow[];
   }
 
+  insertTransition(input: {
+    taskKey: string;
+    fromNode: string;
+    toNode: string;
+    fromStatus: string;
+    toStatus: string;
+    actor: string;
+    reason: string;
+    payload?: string | null;
+    createdAt?: number;
+  }): void {
+    const key = normalizeTaskKey(input.taskKey);
+    this.db
+      .prepare(
+        `INSERT INTO task_transitions (
+          task_key, from_node, to_node, from_status, to_status, actor, reason, payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        key,
+        input.fromNode,
+        input.toNode,
+        input.fromStatus,
+        input.toStatus,
+        input.actor,
+        input.reason,
+        input.payload ?? null,
+        input.createdAt ?? Date.now(),
+      );
+  }
 }
 
 

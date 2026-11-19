@@ -2115,7 +2115,13 @@ export async function createPlugin(
       // §5.6 (r33.11): a productive call resets the idle nudge schedule.
       watchdog.markCoordinatorAction(ctx.threadId);
       try {
-        assertGraphAllowsDirectAction(store, params.taskKey, getWorkGraphMode());
+        assertGraphAllowsDirectAction(store, params.taskKey, getWorkGraphMode(), {
+          command: "delegate",
+          level: params.level,
+          route: params.route,
+          actor: "shadow:coordinator",
+          policy: policyLoad.policy,
+        });
         const res = await delegate({ ...params, threadId: ctx.threadId });
         return JSON.stringify({
           ...res,
@@ -2275,7 +2281,11 @@ export async function createPlugin(
             watchdog.markCoordinatorAction(row.coordinator_thread_id);
           }
         }
-        assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode());
+        assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode(), {
+          command: "merge",
+          actor: "shadow:coordinator",
+          policy: policyLoad.policy,
+        });
         return JSON.stringify(
           await mergeDelegation({ ...params, callerThreadId: ctx.threadId }),
         );
@@ -3010,7 +3020,13 @@ export async function createPlugin(
               t("cli.delegateUsage"),
             );
           }
-          assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode());
+          assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode(), {
+            command: "delegate",
+            level,
+            route: flag("--route"),
+            actor: "shadow:coordinator",
+            policy: policyLoad.policy,
+          });
           const attach = flags("--attach");
           const res = await delegate({
             taskKey,
@@ -3180,7 +3196,11 @@ export async function createPlugin(
               watchdog.markCoordinatorAction(row.coordinator_thread_id);
             }
           }
-          assertGraphAllowsDirectAction(store, ref, getWorkGraphMode());
+          assertGraphAllowsDirectAction(store, ref, getWorkGraphMode(), {
+            command: "merge",
+            actor: "shadow:coordinator",
+            policy: policyLoad.policy,
+          });
           if (!ctx.threadId) {
             throw new OrchestratorError(
               "no-caller-thread",
@@ -3342,7 +3362,11 @@ export async function createPlugin(
               t("cli.releaseUsageShort"),
             );
           }
-          assertGraphAllowsDirectAction(store, key, getWorkGraphMode());
+          assertGraphAllowsDirectAction(store, key, getWorkGraphMode(), {
+            command: "release",
+            actor: "shadow:coordinator",
+            policy: policyLoad.policy,
+          });
           if (flag("--kb") && flag("--no-kb")) {
             throw new OrchestratorError(
               "invalid-arguments",
