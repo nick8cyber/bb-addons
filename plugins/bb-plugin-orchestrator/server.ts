@@ -2119,7 +2119,8 @@ export async function createPlugin(
           command: "delegate",
           level: params.level,
           route: params.route,
-          actor: "agent:coordinator",
+          actor: "shadow:coordinator",
+          policy: policyLoad.policy,
         });
         const res = await delegate({ ...params, threadId: ctx.threadId });
         return JSON.stringify({
@@ -2282,7 +2283,8 @@ export async function createPlugin(
         }
         assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode(), {
           command: "merge",
-          actor: "agent:coordinator",
+          actor: "shadow:coordinator",
+          policy: policyLoad.policy,
         });
         return JSON.stringify(
           await mergeDelegation({ ...params, callerThreadId: ctx.threadId }),
@@ -3022,7 +3024,8 @@ export async function createPlugin(
             command: "delegate",
             level,
             route: flag("--route"),
-            actor: "cli:coordinator",
+            actor: "shadow:coordinator",
+            policy: policyLoad.policy,
           });
           const attach = flags("--attach");
           const res = await delegate({
@@ -3195,7 +3198,8 @@ export async function createPlugin(
           }
           assertGraphAllowsDirectAction(store, ref, getWorkGraphMode(), {
             command: "merge",
-            actor: "cli:coordinator",
+            actor: "shadow:coordinator",
+            policy: policyLoad.policy,
           });
           if (!ctx.threadId) {
             throw new OrchestratorError(
@@ -3360,7 +3364,8 @@ export async function createPlugin(
           }
           assertGraphAllowsDirectAction(store, key, getWorkGraphMode(), {
             command: "release",
-            actor: "cli:coordinator",
+            actor: "shadow:coordinator",
+            policy: policyLoad.policy,
           });
           if (flag("--kb") && flag("--no-kb")) {
             throw new OrchestratorError(

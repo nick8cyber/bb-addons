@@ -210,12 +210,13 @@ test("5в Shadow: un-enqueued manual command logs 'none' sentinels in task_trans
   assert.equal(t0.to_node, "none");
   assert.equal(t0.from_status, "none");
   assert.equal(t0.to_status, "none");
-  assert.equal(t0.actor, "cli:coordinator");
+  assert.equal(t0.actor, "shadow:coordinator");
   assert.equal(t0.reason, "task-not-enqueued");
   const payload = JSON.parse(t0.payload ?? "{}");
   assert.equal(payload.event, "manual_command");
   assert.equal(payload.command, "delegate");
   assert.equal(payload.would_reject, "graph-required");
+  assert.equal(payload.would_block?.reason, "graph-required");
 });
 
 test("5в Shadow: enqueued task manual command records would_allow / would_reject in shadow_eval", async () => {
@@ -271,6 +272,29 @@ test("5в Shadow: enqueued task manual command records would_allow / would_rejec
   payload = JSON.parse(task.payload ?? "{}");
   assert.equal(payload.shadow_eval.command, "delegate");
   assert.match(payload.shadow_eval.would_reject, /invalid_node/);
+
+  // 3. Move to node review and test custom auditor level from policy
+  store.transitionTask({
+    taskKey: "TASK-ENQ-1",
+    expectedNode: "code",
+    expectedStatus: "running",
+    toNode: "review",
+    toStatus: "running",
+    actor: "test",
+    reason: "test-advance",
+  });
+
+  await host.harness.runCli([
+    "delegate",
+    "TASK-ENQ-1",
+    "--level",
+    "review",
+    "--json",
+  ]);
+  task = store.getTask("TASK-ENQ-1")!;
+  payload = JSON.parse(task.payload ?? "{}");
+  assert.equal(payload.shadow_eval.would_allow, "delegate");
+  assert.equal(payload.shadow_eval.would_reject, undefined);
 });
 
 test("5в Shadow: run-queue logs 'вычислено, но не подключено' in shadow mode", async () => {
@@ -287,6 +311,22 @@ test("5в Shadow: run-queue logs 'вычислено, но не подключе
     "--json",
   ]);
   assert.equal(enqRes.exitCode, 0);
+
+  // 1. Queued task at start: evaluated without autoAdvance gives would_transition to code
+  const res1 = await host.harness.runCli(["run-queue", "--once", "--json"]);
+  assert.equal(res1.exitCode, 0);
+
+  let task = store.getTask("TASK-SHADOW-1")!;
+  let payload = JSON.parse(task.payload ?? "{}");
+  assert.equal(payload.shadow_eval?.note, "вычислено, но не подключено");
+  assert.deepEqual(payload.shadow_eval?.would_transition, {
+    from_node: "start",
+    to_node: "code",
+    to_status: "running",
+    event: "queue_take",
+  });
+
+  // 2. Active running task at code with completed delegation
   store.transitionTask({
     taskKey: "TASK-SHADOW-1",
     expectedNode: "start",
@@ -297,12 +337,34 @@ test("5в Shadow: run-queue logs 'вычислено, но не подключе
     reason: "test-advance",
   });
 
-  const res = await host.harness.runCli(["run-queue", "--once", "--json"]);
-  assert.equal(res.exitCode, 0);
+  const del = store.insert({
+    taskKey: "TASK-SHADOW-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_test",
+    level: "simple",
+    route: "simple-route",
+    preset: "simple-preset",
+    provider: "acp-opencode",
+  });
+  finishDelegation(store, del.id, {
+    status: "done",
+    resultSha: "shadow-code-sha-1",
+    resultCommits: 1,
+    resultDirty: 0,
+  });
 
-  const task = store.getTask("TASK-SHADOW-1")!;
-  const payload = JSON.parse(task.payload ?? "{}");
+  const res2 = await host.harness.runCli(["run-queue", "--once", "--json"]);
+  assert.equal(res2.exitCode, 0);
+
+  task = store.getTask("TASK-SHADOW-1")!;
+  payload = JSON.parse(task.payload ?? "{}");
   assert.equal(payload.shadow_eval?.note, "вычислено, но не подключено");
+  assert.deepEqual(payload.shadow_eval?.would_transition, {
+    from_node: "code",
+    to_node: "checks",
+    to_status: "running",
+    event: "code_delivered",
+  });
 });
 
 // ── 2. All 5 Levels Rehearsal ─────────────────────────────────────────────

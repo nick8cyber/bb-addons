@@ -24,6 +24,7 @@ import { normalizeTaskKey } from "./store.js";
 import { verdictDetailsInBody } from "./release.js";
 import type { PluginCliContext } from "@get-bb/plugin-sdk";
 import type { T } from "./i18n/index.js";
+import type { Policy } from "./policy.js";
 import {
   TRANSITION_TABLE,
   resolveTransition,
@@ -106,6 +107,74 @@ export interface ShadowActionParams {
   level?: string;
   route?: string;
   actor?: string;
+  policy?: Policy | null;
+}
+
+/** Resolves the effective role for a level against policy or conventions (§2.3 / §27.3). */
+export function resolveLevelRoleForWorkGraph(
+  levelName: string | undefined,
+  policy?: Policy | null,
+): "executor" | "auditor" | "architect" | "researcher" | "spec" | "unknown" {
+  if (!levelName) return "unknown";
+  if (levelName === "architect") return "architect";
+  if (levelName === "spec") return "spec";
+  if (levelName === "research") return "researcher";
+
+  if (policy) {
+    const pLevel = policy.levels[levelName];
+    if (pLevel?.role === "auditor") return "auditor";
+    if (pLevel?.role === "researcher") return "researcher";
+    if (pLevel?.role === "executor") return "executor";
+
+    if (policy.reviewByLevel) {
+      if (Object.values(policy.reviewByLevel).includes(levelName)) {
+        return "auditor";
+      }
+    }
+  }
+
+  // Fallback heuristics when policy level has no explicit role
+  if (
+    levelName === "review" ||
+    levelName.startsWith("review-") ||
+    levelName.endsWith("-review") ||
+    levelName.includes("review")
+  ) {
+    return "auditor";
+  }
+  return "executor";
+}
+
+/** Matches task node against level and policy role (§27.3 / §32). */
+export function matchesNodeLevel(
+  node: TaskNode,
+  levelName: string | undefined,
+  policy?: Policy | null,
+): boolean {
+  if (!levelName) return false;
+  const role = resolveLevelRoleForWorkGraph(levelName, policy);
+
+  switch (node) {
+    case "code":
+      return (
+        role === "executor" &&
+        levelName !== "architect" &&
+        levelName !== "spec" &&
+        levelName !== "research"
+      );
+    case "review":
+    case "spec_review":
+      return role === "auditor";
+    case "design":
+    case "design_check":
+      return levelName === "architect" || role === "architect";
+    case "spec":
+      return levelName === "spec";
+    case "research":
+      return levelName === "research" || role === "researcher";
+    default:
+      return false;
+  }
 }
 
 /** §32 (Б4): In shadow mode, mirror manual coordinator actions and log shadow_eval. */
@@ -115,93 +184,91 @@ export function recordShadowAction(
   mode: WorkGraphMode,
 ): void {
   if (mode !== "shadow") return;
-  const key = normalizeTaskKey(params.taskKey);
-  const task = store.getTask(key);
-  const actor = params.actor ?? "shadow:coordinator";
+  try {
+    const key = normalizeTaskKey(params.taskKey);
+    const task = store.getTask(key);
+    const actor = params.actor ?? "shadow:coordinator";
 
-  if (!task) {
-    // §32 (Б4): For un-enqueued tasks, log service transition with 'none' sentinels
+    if (!task) {
+      // §32 (Б4): For un-enqueued tasks, log service transition with 'none' sentinels
+      store.insertTransition({
+        taskKey: key,
+        fromNode: "none",
+        toNode: "none",
+        fromStatus: "none",
+        toStatus: "none",
+        actor: "shadow:coordinator",
+        reason: "task-not-enqueued",
+        payload: JSON.stringify({
+          event: "manual_command",
+          command: params.command,
+          would_reject: "graph-required",
+          would_block: { reason: "graph-required" },
+        }),
+      });
+      return;
+    }
+
+    // §32 (Б4): For enqueued tasks, evaluate whether the action would be allowed or rejected
+    const payload = parsePayload(task.payload);
+    let wouldAllow: string | undefined;
+    let wouldReject: string | undefined;
+
+    if (params.command === "delegate") {
+      const level = params.level ?? "";
+      if (matchesNodeLevel(task.node, level, params.policy)) {
+        wouldAllow = "delegate";
+      } else {
+        wouldReject = `invalid_node: expected ${task.node}, got delegate level ${level}`;
+      }
+    } else if (params.command === "merge") {
+      if (task.node === "code") {
+        wouldAllow = "merge";
+      } else {
+        wouldReject = `invalid_node: merge called while at node ${task.node}`;
+      }
+    } else if (params.command === "release") {
+      if (task.node === "release" && task.status === "running") {
+        wouldAllow = "release";
+      } else {
+        wouldReject = `node-not-release: release called while at ${task.node}:${task.status}`;
+      }
+    }
+
+    const shadowEval = {
+      command: params.command,
+      evaluated_at: Date.now(),
+      would_allow: wouldAllow,
+      would_reject: wouldReject,
+      would_block: wouldReject ? { reason: wouldReject } : undefined,
+      current_node: task.node,
+      current_status: task.status,
+    };
+
     store.insertTransition({
       taskKey: key,
-      fromNode: "none",
-      toNode: "none",
-      fromStatus: "none",
-      toStatus: "none",
+      fromNode: task.node,
+      toNode: task.node,
+      fromStatus: task.status,
+      toStatus: task.status,
       actor,
-      reason: "task-not-enqueued",
+      reason: `shadow-mirror:${params.command}`,
       payload: JSON.stringify({
         event: "manual_command",
         command: params.command,
-        would_reject: "graph-required",
+        shadow_eval: shadowEval,
       }),
     });
-    return;
+
+    store.updateTask(key, {
+      payload: JSON.stringify({
+        ...payload,
+        shadow_eval: shadowEval,
+      }),
+    });
+  } catch {
+    // Silent isolation: shadow mode audit must never break manual coordinator actions
   }
-
-  // §32 (Б4): For enqueued tasks, evaluate whether the action would be allowed or rejected
-  const payload = parsePayload(task.payload);
-  let wouldAllow: string | undefined;
-  let wouldReject: string | undefined;
-
-  if (params.command === "delegate") {
-    const level = params.level ?? "";
-    const nodeMatches =
-      (task.node === "code" && ["simple", "medium", "complex"].includes(level)) ||
-      (task.node === "spec" && level === "spec") ||
-      (task.node === "review" && (level === "review" || level.startsWith("review-"))) ||
-      (task.node === "design" && (level === "architect" || level === "design")) ||
-      (task.node === "design_check" && level === "architect") ||
-      (task.node === "research" && level === "research");
-
-    if (nodeMatches) {
-      wouldAllow = "delegate";
-    } else {
-      wouldReject = `invalid_node: expected ${task.node}, got delegate level ${level}`;
-    }
-  } else if (params.command === "merge") {
-    if (task.node === "code" || task.node === "release") {
-      wouldAllow = "merge";
-    } else {
-      wouldReject = `invalid_node: merge called while at node ${task.node}`;
-    }
-  } else if (params.command === "release") {
-    if (task.node === "release" && task.status === "running") {
-      wouldAllow = "release";
-    } else {
-      wouldReject = `node-not-release: release called while at ${task.node}:${task.status}`;
-    }
-  }
-
-  const shadowEval = {
-    command: params.command,
-    evaluated_at: Date.now(),
-    would_allow: wouldAllow,
-    would_reject: wouldReject,
-    current_node: task.node,
-    current_status: task.status,
-  };
-
-  store.insertTransition({
-    taskKey: key,
-    fromNode: task.node,
-    toNode: task.node,
-    fromStatus: task.status,
-    toStatus: task.status,
-    actor,
-    reason: `shadow-mirror:${params.command}`,
-    payload: JSON.stringify({
-      event: "manual_command",
-      command: params.command,
-      shadow_eval: shadowEval,
-    }),
-  });
-
-  store.updateTask(key, {
-    payload: JSON.stringify({
-      ...payload,
-      shadow_eval: shadowEval,
-    }),
-  });
 }
 
 /** §32 п.1: In strict mode, blocks direct delegate, merge, release. In shadow mode, logs mirror audit. */
@@ -209,20 +276,29 @@ export function assertGraphAllowsDirectAction(
   store: DelegationStore,
   taskKey: string,
   mode: WorkGraphMode,
-  action?: { command: "delegate" | "merge" | "release"; level?: string; route?: string; actor?: string },
+  action?: {
+    command: "delegate" | "merge" | "release";
+    level?: string;
+    route?: string;
+    actor?: string;
+    policy?: Policy | null;
+  },
 ): void {
   if (mode === "shadow") {
-    recordShadowAction(
-      store,
-      {
-        command: action?.command ?? "delegate",
-        taskKey,
-        level: action?.level,
-        route: action?.route,
-        actor: action?.actor,
-      },
-      mode,
-    );
+    try {
+      recordShadowAction(
+        store,
+        {
+          command: action?.command ?? "delegate",
+          taskKey,
+          level: action?.level,
+          route: action?.route,
+          actor: action?.actor ?? "shadow:coordinator",
+          policy: action?.policy,
+        },
+        mode,
+      );
+    } catch {}
     return;
   }
   if (mode !== "strict") return;
@@ -2180,17 +2256,163 @@ export async function runRunQueue(
 
   // §32 (Б4 / 5в): In shadow mode without autoAdvance, record simulated evaluation
   if (deps.workGraphMode === "shadow" && !shouldAdvance) {
+    // 1. Evaluate queued tasks: start -> <target_node>
+    for (const t of finalQueued) {
+      try {
+        const payload = parsePayload(t.payload);
+        const res = resolveTransition({
+          route: t.route,
+          node: "start",
+          status: "queued",
+          event: { type: "queue_take" },
+          mode: t.confirmation_mode,
+          counters: extractCounters(t),
+        });
+        const shadowEval = {
+          command: "run-queue",
+          evaluated_at: Date.now(),
+          would_transition: res.allowed
+            ? {
+                from_node: "start",
+                to_node: res.toNode,
+                to_status: res.toStatus,
+                event: "queue_take",
+              }
+            : undefined,
+          note: "вычислено, но не подключено",
+          current_node: t.node,
+          current_status: t.status,
+        };
+        deps.store.updateTask(t.task_key, {
+          payload: JSON.stringify({
+            ...payload,
+            shadow_eval: shadowEval,
+          }),
+        });
+      } catch {}
+    }
+
+    // 2. Evaluate active tasks: would advance based on completed delegations or state
     for (const t of finalActive) {
       try {
         const payload = parsePayload(t.payload);
         const delegations = deps.store.delegationsByTask(t.task_key);
         const latestDel = getActiveDelegationForTask(t, delegations);
+        let wouldTrans:
+          | { from_node: string; to_node: string; to_status: string; event: string }
+          | undefined;
+
+        if (
+          latestDel &&
+          (latestDel.status === "stalled" ||
+            latestDel.status === "failed" ||
+            latestDel.status === "quota" ||
+            latestDel.status === "cancelled")
+        ) {
+          const failEvent: TransitionEvent = {
+            type: `${t.node}_failed` as any,
+            exhausted: true,
+            reason: latestDel.status,
+          };
+          const res = resolveTransition({
+            route: t.route,
+            node: t.node,
+            status: "running",
+            event: failEvent,
+            mode: t.confirmation_mode,
+            counters: extractCounters(t),
+          });
+          if (res.allowed) {
+            wouldTrans = {
+              from_node: t.node,
+              to_node: res.toNode,
+              to_status: res.toStatus,
+              event: `${t.node}_failed`,
+            };
+          }
+        } else if (
+          latestDel?.status === "done" ||
+          payload[`${t.node}_done`] === true
+        ) {
+          let event: TransitionEvent | null = null;
+          if (t.node === "code") {
+            event = {
+              type: "code_delivered",
+              resultSha:
+                latestDel?.result_sha ??
+                (payload.result_sha as string) ??
+                "sha-code",
+              commits:
+                typeof latestDel?.result_commits === "number"
+                  ? latestDel.result_commits
+                  : typeof payload.result_commits === "number"
+                    ? payload.result_commits
+                    : 1,
+              noCode: false,
+            };
+          } else if (t.node === "spec") {
+            event = {
+              type: "spec_delivered",
+              specSha:
+                latestDel?.result_sha ??
+                (payload.spec_sha as string) ??
+                "sha-spec",
+            };
+          } else if (t.node === "design") {
+            event = {
+              type: "design_delivered",
+              acceptanceText:
+                (payload.acceptance_text as string) ?? "acceptance text",
+            };
+          } else if (t.node === "review") {
+            event = {
+              type: "review_verdict",
+              verdict: "OK",
+              blockers: 0,
+            };
+          } else if (t.node === "spec_review") {
+            event = {
+              type: "spec_review_verdict",
+              verdict: "OK",
+              blockers: 0,
+            };
+          } else if (t.node === "design_check") {
+            event = {
+              type: "design_check_verdict",
+              verdict: "OK",
+              blockers: 0,
+            };
+          } else if (t.node === "research") {
+            event = {
+              type: "research_delivered",
+              report: (payload.research_report as string) ?? "done",
+            };
+          }
+
+          if (event) {
+            const res = resolveTransition({
+              route: t.route,
+              node: t.node,
+              status: "running",
+              event,
+              mode: t.confirmation_mode,
+              counters: extractCounters(t),
+            });
+            if (res.allowed) {
+              wouldTrans = {
+                from_node: t.node,
+                to_node: res.toNode,
+                to_status: res.toStatus,
+                event: event.type,
+              };
+            }
+          }
+        }
+
         const shadowEval = {
           command: "run-queue",
           evaluated_at: Date.now(),
-          would_transition: latestDel
-            ? { node: t.node, delegationStatus: latestDel.status }
-            : undefined,
+          would_transition: wouldTrans,
           note: "вычислено, но не подключено",
           current_node: t.node,
           current_status: t.status,
