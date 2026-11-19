@@ -652,3 +652,169 @@ test("§32: Strict mode guards block direct delegate, merge, release", () => {
     (e: any) => e.code === "graph-managed" && e.message.includes("завершена (done)"),
   );
 });
+
+test("§28.2 п. 5: alarm_count resets to 0 on node transition and store resolver works", () => {
+  const store = createTestStore();
+  store.setNodeTimeoutResolver((node) => {
+    if (node === "design") return 1800;
+    if (node === "code") return 7200;
+    return 3600;
+  });
+  const t0 = 1_000_000;
+
+  store.insertTask({
+    taskKey: "RESET-ALARM-1",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+  }, t0);
+
+  // Transition to design using resolver (no explicit timeoutSeconds) -> 1800s
+  const tr1 = store.transitionTask({
+    taskKey: "RESET-ALARM-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "design",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start-design",
+  }, t0);
+  assert.ok(tr1.ok);
+  assert.equal(tr1.task?.node_alarm_at, t0 + 1800 * 1000);
+
+  // Simulate alarm Trigger 1 setting alarm_count = 1
+  store.updateTask("RESET-ALARM-1", {
+    payload: JSON.stringify({ alarm_count: 1 }),
+  });
+  let task = store.getTask("RESET-ALARM-1")!;
+  assert.equal(JSON.parse(task.payload!).alarm_count, 1);
+
+  // Transition to code (node change) -> alarm_count must reset to 0, node_alarm_at uses code timeout (7200s)
+  const t1 = t0 + 1800 * 1000;
+  const tr2 = store.transitionTask({
+    taskKey: "RESET-ALARM-1",
+    expectedNode: "design",
+    expectedStatus: "running",
+    toNode: "code",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "advance",
+  }, t1);
+  assert.ok(tr2.ok);
+  assert.equal(tr2.task?.node_alarm_at, t1 + 7200 * 1000);
+  assert.equal(JSON.parse(tr2.task!.payload!).alarm_count, 0);
+
+  // Transition to checks (non-delegation node) with alarm_count = 1
+  store.updateTask("RESET-ALARM-1", {
+    payload: JSON.stringify({ alarm_count: 1 }),
+  });
+  const t2 = t1 + 7200 * 1000;
+  const tr3 = store.transitionTask({
+    taskKey: "RESET-ALARM-1",
+    expectedNode: "code",
+    expectedStatus: "running",
+    toNode: "checks",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "advance",
+  }, t2);
+  assert.ok(tr3.ok);
+  assert.equal(JSON.parse(tr3.task!.payload!).alarm_count, 0);
+});
+
+test("§28.2 п. 5: design_check_verdict resets alarm and checks node does not ping old code thread", async () => {
+  const store = createTestStore();
+  const cli = fakeCli();
+  const t0 = 1_000_000;
+
+  store.insertTask({
+    taskKey: "DC-VERDICT-1",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+  }, t0);
+
+  store.transitionTask({
+    taskKey: "DC-VERDICT-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "design_check",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "design-check",
+    timeoutSeconds: 3600,
+  }, t0);
+
+  // 1. Advance tick with design_check_verdict recorded
+  store.updateTask("DC-VERDICT-1", {
+    payload: JSON.stringify({ design_check_verdict: "OK: approved", alarm_count: 1 }),
+  });
+
+  const t1 = t0 + 1000;
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    bbCli: cli.cli,
+    now: () => t1,
+    policy: POLICY_WITH_NODE_POLICY,
+  });
+
+  const taskAfterVerdict = store.getTask("DC-VERDICT-1")!;
+  assert.equal(taskAfterVerdict.node_alarm_at, t1 + 3600 * 1000);
+  assert.equal(JSON.parse(taskAfterVerdict.payload!).alarm_count, 0);
+
+  // 2. Checks node alarm expiry does not ping previous code thread
+  const del = store.insert({
+    taskKey: "CHECKS-NO-PING",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "opencode",
+  });
+  store.setThreadInfo(del.id, "thr_old_code");
+
+  store.insertTask({
+    taskKey: "CHECKS-NO-PING",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  }, t0);
+
+  store.transitionTask({
+    taskKey: "CHECKS-NO-PING",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "checks",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "checks",
+    timeoutSeconds: 600,
+  }, t0);
+
+  // Trigger 1 at t0 + 600s
+  cli.calls.length = 0;
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    bbCli: cli.cli,
+    now: () => t0 + 600 * 1000,
+    policy: POLICY_WITH_NODE_POLICY,
+  });
+
+  // Verify no thread tell call was made to thr_old_code
+  assert.equal(cli.calls.length, 0, "checks node must not ping old code thread");
+
+  // Verify task.alarm_triggered event has both task and taskKey
+  const events = store.listEvents("task.alarm_triggered");
+  assert.ok(events.length > 0);
+  const evPayload = JSON.parse(events[events.length - 1].payload!);
+  assert.equal(evPayload.task, "CHECKS-NO-PING");
+  assert.equal(evPayload.taskKey, "CHECKS-NO-PING");
+});

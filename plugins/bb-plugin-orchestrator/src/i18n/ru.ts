@@ -646,6 +646,7 @@ export const RU: Record<string, string> = {
   "pol.levelName": "должно быть именем уровня",
   "pol.levelNotAuditor": 'уровень "{level}" без роли "auditor"',
   "pol.isObject": "должен быть объект",
+  "pol.intGe0": "должно быть целое ≥ 0",
   "pol.intGe1": "должно быть целое ≥ 1",
   "pol.perLevelObject": "должен быть объект уровень → предел",
   "pol.capOverMax": "должно быть ≤ limits.maxActive ({max})",

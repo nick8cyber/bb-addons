@@ -2925,11 +2925,16 @@ async function advanceActiveTask(
   }
 
   // 2) Запись вердикта ревью для коммита этой задачи
-  if (task.status === "running" && (task.node === "review" || task.node === "spec_review")) {
+  if (
+    task.status === "running" &&
+    (task.node === "review" || task.node === "spec_review" || task.node === "design_check")
+  ) {
     const currentVerdict = typeof payload.review_verdict === "string"
       ? payload.review_verdict
       : typeof payload.spec_review_verdict === "string"
       ? payload.spec_review_verdict
+      : typeof payload.design_check_verdict === "string"
+      ? payload.design_check_verdict
       : null;
     if (currentVerdict) {
       const lastVerdict = typeof payload.last_alarm_verdict === "string" ? payload.last_alarm_verdict : null;
@@ -2959,109 +2964,110 @@ async function advanceActiveTask(
     const alarmCount = typeof payload.alarm_count === "number" ? payload.alarm_count : 0;
     const elapsedSeconds = Math.max(0, Math.round((now - (task.entered_at ?? now)) / 1000));
 
+    const isDelegationNode = task.node !== "checks" && task.node !== "release";
+    const threadId = isDelegationNode ? latestDelegation?.thread_id : null;
+
     let isThreadRunning = false;
-    if (latestDelegation?.thread_id) {
-      if (deps.getThread) {
-        try {
-          const th = await deps.getThread(latestDelegation.thread_id);
-          if (th && (th.status === "running" || th.status === "active")) {
-            isThreadRunning = true;
-          }
-        } catch {}
-      }
+    if (threadId && deps.getThread) {
+      try {
+        const th = await deps.getThread(threadId);
+        if (th && (th.status === "running" || th.status === "active")) {
+          isThreadRunning = true;
+        }
+      } catch {}
     }
 
-    if (isThreadRunning && elapsedSeconds < 3 * timeoutSeconds) {
-      // Исполнитель в активном выполнении хода: даём до 3× timeout_seconds
-      if (alarmCount === 0) {
-        if (latestDelegation?.thread_id && deps.bbCli) {
-          await deps.bbCli
-            .run([
-              "thread",
-              "tell",
-              latestDelegation.thread_id,
-              `Напоминание будильника: превышено расчетное время на узле ${task.node} (${timeoutSeconds}с). Заверши ход или сдай результат.`,
-            ])
-            .catch(() => {});
-        }
-        deps.store.recordTaskEvent(
-          "task.alarm_triggered",
-          {
-            task: task.task_key,
-            node: task.node,
-            elapsedSeconds,
-            alarmCount: 1,
-            threadRunning: true,
-          },
-          now,
-        );
-        payload.alarm_count = 1;
-        const nextAlarm = now + timeoutSeconds * 1000;
-        deps.store.updateTask(task.task_key, {
-          node_alarm_at: nextAlarm,
-          payload: JSON.stringify(payload),
-        });
-        task.node_alarm_at = nextAlarm;
-        task.payload = JSON.stringify(payload);
-        return true;
+    if (alarmCount === 0) {
+      // 1-е срабатывание (1x timeout): повторный пинг исполнителя узла
+      if (threadId && deps.bbCli) {
+        await deps.bbCli
+          .run([
+            "thread",
+            "tell",
+            threadId,
+            `Напоминание будильника: превышено время ожидания на узле ${task.node} (${timeoutSeconds}с). Сдай результат.`,
+          ])
+          .catch(() => {});
       }
+      deps.store.recordTaskEvent(
+        "task.alarm_triggered",
+        {
+          task: task.task_key,
+          taskKey: task.task_key,
+          node: task.node,
+          elapsedSeconds,
+          alarmCount: 1,
+          threadRunning: isThreadRunning,
+        },
+        now,
+      );
+      payload.alarm_count = 1;
+      const nextAlarm = now + timeoutSeconds * 1000;
+      deps.store.updateTask(task.task_key, {
+        node_alarm_at: nextAlarm,
+        payload: JSON.stringify(payload),
+      });
+      task.node_alarm_at = nextAlarm;
+      task.payload = JSON.stringify(payload);
+      return true;
+    } else if (alarmCount === 1 && isThreadRunning && elapsedSeconds < 3 * timeoutSeconds) {
+      // 2-е срабатывание (2x timeout), но исполнитель в активном выполнении хода: даём до 3× timeout_seconds
+      if (threadId && deps.bbCli) {
+        await deps.bbCli
+          .run([
+            "thread",
+            "tell",
+            threadId,
+            `Напоминание будильника: превышено расчетное время на узле ${task.node} (${timeoutSeconds * 2}с). Заверши ход или сдай результат.`,
+          ])
+          .catch(() => {});
+      }
+      deps.store.recordTaskEvent(
+        "task.alarm_triggered",
+        {
+          task: task.task_key,
+          taskKey: task.task_key,
+          node: task.node,
+          elapsedSeconds,
+          alarmCount: 2,
+          threadRunning: true,
+        },
+        now,
+      );
+      payload.alarm_count = 2;
+      const nextAlarm = now + timeoutSeconds * 1000;
+      deps.store.updateTask(task.task_key, {
+        node_alarm_at: nextAlarm,
+        payload: JSON.stringify(payload),
+      });
+      task.node_alarm_at = nextAlarm;
+      task.payload = JSON.stringify(payload);
+      return true;
     } else {
-      // Тред не запущен, либо running превысил 3× timeout, либо 2-е срабатывание
-      if (alarmCount === 0) {
-        // 1-е срабатывание: повторный пинг исполнителя узла
-        if (latestDelegation?.thread_id && deps.bbCli) {
-          await deps.bbCli
-            .run([
-              "thread",
-              "tell",
-              latestDelegation.thread_id,
-              `Напоминание будильника: превышено время ожидания на узле ${task.node} (${timeoutSeconds}с). Сдай результат.`,
-            ])
-            .catch(() => {});
+      // Остановка треда и перевод в stalled (предел времени превышен)
+      if (threadId) {
+        if (deps.stopThread) {
+          await deps.stopThread(threadId).catch(() => {});
+        } else if (deps.bbCli) {
+          await deps.bbCli.run(["thread", "stop", threadId]).catch(() => {});
         }
-        deps.store.recordTaskEvent(
-          "task.alarm_triggered",
-          {
-            task: task.task_key,
-            node: task.node,
-            elapsedSeconds,
-            alarmCount: 1,
-            threadRunning: false,
-          },
-          now,
-        );
-        payload.alarm_count = 1;
-        const nextAlarm = now + timeoutSeconds * 1000;
-        deps.store.updateTask(task.task_key, {
-          node_alarm_at: nextAlarm,
-          payload: JSON.stringify(payload),
-        });
-        task.node_alarm_at = nextAlarm;
-        task.payload = JSON.stringify(payload);
-        return true;
-      } else {
-        // 2-е срабатывание (2× timeout): остановка треда и перевод в stalled
-        if (latestDelegation?.thread_id) {
-          if (deps.stopThread) {
-            await deps.stopThread(latestDelegation.thread_id).catch(() => {});
-          } else if (deps.bbCli) {
-            await deps.bbCli.run(["thread", "stop", latestDelegation.thread_id]).catch(() => {});
-          }
-        }
-        deps.store.recordTaskEvent(
-          "task.alarm_triggered",
-          {
-            task: task.task_key,
-            node: task.node,
-            elapsedSeconds,
-            alarmCount: alarmCount + 1,
-            outcome: "stalled",
-          },
-          now,
-        );
+      }
+      deps.store.recordTaskEvent(
+        "task.alarm_triggered",
+        {
+          task: task.task_key,
+          taskKey: task.task_key,
+          node: task.node,
+          elapsedSeconds,
+          alarmCount: alarmCount + 1,
+          outcome: "stalled",
+        },
+        now,
+      );
 
-        const failReason = `node-alarm-timeout: узел ${task.node} превысил предельное время ожидания (${timeoutSeconds * 2}с)`;
-        const failEvent = getFailEventForNode(task.node, failReason);
+      const maxSec = (alarmCount >= 2 || isThreadRunning) ? timeoutSeconds * 3 : timeoutSeconds * 2;
+      const failReason = `node-alarm-timeout: узел ${task.node} превысил предельное время ожидания (${maxSec}с)`;
+      const failEvent = getFailEventForNode(task.node, failReason);
         if (failEvent) {
           const resolution = resolveTransition({
             route: task.route,
@@ -3110,7 +3116,6 @@ async function advanceActiveTask(
         }
       }
     }
-  }
 
   if (
     latestDelegation &&

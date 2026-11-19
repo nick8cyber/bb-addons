@@ -17,7 +17,7 @@ import {
   type StandardSchemaV1,
 } from "@get-bb/plugin-sdk";
 import { OrchestratorError, errorJson, toErrorBody } from "./src/errors.js";
-import { parsePolicy, type PolicyLoad } from "./src/policy.js";
+import { parsePolicy, getNodeTimeoutSeconds, type PolicyLoad } from "./src/policy.js";
 import {
   DelegationStore,
   JanitorStore,
@@ -772,6 +772,9 @@ export async function createPlugin(
     undefined,
     t,
   );
+  store.setNodeTimeoutResolver((node) =>
+    getNodeTimeoutSeconds(policyLoad.policy, node),
+  );
   let releaseConfig: ReleaseConfigLoad = parseReleaseConfig(
     currentSettings.release ?? "",
     t,
@@ -983,6 +986,9 @@ export async function createPlugin(
       }
     }
     policyLoad = parsePolicy(currentSettings.policy ?? "", undefined, undefined, t);
+    store.setNodeTimeoutResolver((node) =>
+      getNodeTimeoutSeconds(policyLoad.policy, node),
+    );
     releaseConfig = parseReleaseConfig(currentSettings.release ?? "", t);
     for (const w of releaseConfig.warnings) {
       bb.log.warn(`orchestrator release config: ${w.path}: ${w.message}`);
@@ -1572,6 +1578,20 @@ export async function createPlugin(
     }
     return runRunQueue({
       store,
+      policy: policyLoad.policy,
+      getThread: async (threadId) => {
+        try {
+          const t = (await bb.sdk.threads.get({ threadId })) as {
+            status?: string;
+          };
+          return { status: t.status };
+        } catch {
+          return null;
+        }
+      },
+      stopThread: async (threadId) => {
+        await bb.sdk.threads.stop({ threadId });
+      },
       workGraphMode: mode,
       maxActiveTasks: getMaxActiveTasks(),
       repoRoot,
@@ -3879,6 +3899,20 @@ abandoned: ${res.reported
         if (cmd === "run-queue") {
           const res = await runRunQueue({
             store,
+            policy: policyLoad.policy,
+            getThread: async (threadId) => {
+              try {
+                const t = (await bb.sdk.threads.get({ threadId })) as {
+                  status?: string;
+                };
+                return { status: t.status };
+              } catch {
+                return null;
+              }
+            },
+            stopThread: async (threadId) => {
+              await bb.sdk.threads.stop({ threadId });
+            },
             workGraphMode: getWorkGraphMode(),
             maxActiveTasks: getMaxActiveTasks(),
             repoRoot: ctx.cwd || process.cwd(),

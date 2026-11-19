@@ -688,7 +688,12 @@ test("§28.2 п. 3: node_policy validation catches errors", () => {
 
   // Negative max_retries
   const err5 = parsePolicy(JSON.stringify({ ...base, node_policy: { code: { max_retries: -1 } } }), presets);
-  assert.ok(err5.errors.some((e) => e.path === "node_policy.code.max_retries"));
+  assert.ok(err5.errors.some((e) => e.path === "node_policy.code.max_retries" && e.message.includes("≥ 0")));
+
+  // max_retries: 0 is allowed
+  const okRetries0 = parsePolicy(JSON.stringify({ ...base, node_policy: { code: { max_retries: 0 } } }), presets);
+  assert.equal(okRetries0.errors.length, 0);
+  assert.equal(okRetries0.policy?.node_policy?.code.max_retries, 0);
 
   // Undeclared level
   const err6 = parsePolicy(JSON.stringify({ ...base, node_policy: { code: { level: "nonexistent" } } }), presets);

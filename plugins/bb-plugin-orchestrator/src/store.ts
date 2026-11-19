@@ -894,6 +894,13 @@ export class DelegationStore {
    * (`done`/`reissued` fire as no-ops when no helper is left). */
   onDelegationFinished?: (id: number, status: DelegationStatus) => void;
 
+  /** §28.2 п. 3: Resolver для таймаута узлов по умолчанию из node_policy */
+  private nodeTimeoutResolver?: (node: string) => number;
+
+  setNodeTimeoutResolver(resolver?: (node: string) => number): void {
+    this.nodeTimeoutResolver = resolver;
+  }
+
   constructor(db: Database) {
     this.db = db;
   }
@@ -4083,11 +4090,39 @@ export class DelegationStore {
         setClauses.push("entered_at = :now");
       }
 
+      // §28.2 п. 5: Сброс alarm_count в payload при смене узла или выходе из stalled/blocked
+      if (
+        input.toNode !== existing.node ||
+        existing.status === "stalled" ||
+        existing.status === "blocked"
+      ) {
+        let payloadObj: Record<string, unknown> = {};
+        const sourcePayload =
+          input.updates?.payload !== undefined
+            ? input.updates.payload
+            : existing.payload;
+        if (sourcePayload) {
+          try {
+            payloadObj = JSON.parse(sourcePayload);
+          } catch {}
+        }
+        if (payloadObj.alarm_count !== undefined && payloadObj.alarm_count !== 0) {
+          payloadObj.alarm_count = 0;
+          if (!input.updates) {
+            input.updates = {};
+          }
+          input.updates.payload = JSON.stringify(payloadObj);
+        }
+      }
+
       // §28.2 п. 5: Будильник узла (node_alarm_at)
       if (input.updates?.node_alarm_at === undefined) {
         if (ACTIVE_ALARM_NODES.has(input.toNode) && input.toStatus === "running") {
           if (input.toNode !== existing.node || existing.status !== "running") {
-            const timeoutSec = input.timeoutSeconds ?? 3600;
+            const timeoutSec =
+              input.timeoutSeconds ??
+              this.nodeTimeoutResolver?.(input.toNode) ??
+              3600;
             setClauses.push("node_alarm_at = :auto_node_alarm_at");
             params.auto_node_alarm_at = now + timeoutSec * 1000;
           }

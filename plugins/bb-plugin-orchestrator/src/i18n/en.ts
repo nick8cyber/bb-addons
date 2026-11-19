@@ -640,6 +640,7 @@ export const EN: Record<string, string> = {
   "pol.levelName": "must be a level name",
   "pol.levelNotAuditor": 'level "{level}" does not have role "auditor"',
   "pol.isObject": "must be an object",
+  "pol.intGe0": "must be an integer ≥ 0",
   "pol.intGe1": "must be an integer ≥ 1",
   "pol.perLevelObject": "must be an object of level → cap",
   "pol.capOverMax": "must be ≤ limits.maxActive ({max})",

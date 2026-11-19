@@ -440,7 +440,7 @@ export function parsePolicy(
             !Number.isInteger(nodeCfg.max_retries) ||
             nodeCfg.max_retries < 0
           ) {
-            err(`${path}.max_retries`, t("pol.intGe1"));
+            err(`${path}.max_retries`, t("pol.intGe0"));
           } else {
             max_retries = nodeCfg.max_retries;
           }
