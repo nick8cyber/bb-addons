@@ -1,7 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
+  constants,
   copyFileSync,
   existsSync,
   fsyncSync,
@@ -426,34 +427,57 @@ export function envelopeStats(stateDir) {
   }
 }
 
+// Чтение-изменение-запись накопительного файла сериализуется межпроцессным
+// flock на соседнем envelope-stats.lock: ходы разных процессов провайдера на
+// одном stateDir иначе теряли бы чужие обновления (устаревшее чтение плюс
+// перезапись). Как и у блокировки рабочей копии, дочерний flock удерживает
+// общее с родителем описание файла — после его выхода lock остаётся нашим до
+// closeSync.
+function updateEnvelopeStats(stateDir, format, outcome, code) {
+  mkdirSync(journalPaths(stateDir).root, { recursive: true, mode: 0o700 });
+  const fd = openSync(envelopeStatsPath(stateDir) + ".lock",
+    constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  try {
+    const lock = spawnSync("flock", ["-w", "10", "3"], { stdio: ["ignore", "ignore", "ignore", fd] });
+    if (lock.error) throw lock.error;
+    if (lock.status !== 0) throw new Error("could not lock the envelope stats file");
+    const file = envelopeStatsPath(stateDir);
+    let stats = envelopeStats(stateDir);
+    if (stats === null) {
+      stats = { version: STATS_VERSION, formats: {} };
+      try {
+        renameSync(file, file + ".corrupt");
+      } catch {}
+    }
+    const slot = stats.formats[format] ??= { accepted: 0, rejected: 0, rejections: {} };
+    slot.accepted ??= 0;
+    slot.rejected ??= 0;
+    slot.rejections ??= {};
+    if (outcome === "accepted") slot.accepted += 1;
+    else {
+      slot.rejected += 1;
+      const key = code ?? "unknown";
+      slot.rejections[key] = (slot.rejections[key] ?? 0) + 1;
+    }
+    stats.updatedAt = Date.now();
+    writeJsonAtomic(file, stats);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 // Исход первого ответа фиксируется один раз на ход: turn.firstFileResponse в
 // записи журнала — защёлка, при продолжении после рестарта повторная проверка
 // того же ответа в счётчик не идёт. Запись хода сохраняется до обновления
-// накопительного файла.
+// накопительного файла, а сбой счётчика (недоступный flock, файловая ошибка)
+// ход не роняет: статистика вспомогательная, этот ответ просто выпадает из неё.
 export function recordFirstFileResponse(stateDir, sessKey, turn, { format, outcome, code = null }) {
   if (turn.firstFileResponse) return turn.firstFileResponse;
   turn.firstFileResponse = { format, outcome, code, at: Date.now() };
   saveTurn(stateDir, sessKey, turn);
-  const file = envelopeStatsPath(stateDir);
-  let stats = envelopeStats(stateDir);
-  if (stats === null) {
-    stats = { version: STATS_VERSION, formats: {} };
-    try {
-      renameSync(file, file + ".corrupt");
-    } catch {}
-  }
-  const slot = stats.formats[format] ??= { accepted: 0, rejected: 0, rejections: {} };
-  slot.accepted ??= 0;
-  slot.rejected ??= 0;
-  slot.rejections ??= {};
-  if (outcome === "accepted") slot.accepted += 1;
-  else {
-    slot.rejected += 1;
-    const key = code ?? "unknown";
-    slot.rejections[key] = (slot.rejections[key] ?? 0) + 1;
-  }
-  stats.updatedAt = Date.now();
-  writeJsonAtomic(file, stats);
+  try {
+    updateEnvelopeStats(stateDir, format, outcome, code);
+  } catch {}
   return turn.firstFileResponse;
 }
 

@@ -308,12 +308,23 @@ test("envelope stats count the first file response once per turn by reason code"
   assert.equal(turn.firstFileResponse.outcome, "rejected");
   assert.equal(turn.firstFileResponse.code, "nonce");
   assert.equal(second.firstFileResponse.outcome, "accepted");
+  // The cross-process counter update runs under a dedicated flock.
+  assert.ok(existsSync(journal.envelopeStatsPath(dir) + ".lock"));
   // A corrupt counter is quarantined and accumulation restarts.
   writeFileSync(journal.envelopeStatsPath(dir), "not json");
   const third = journal.createTurn(dir, entry, { inputSha256: sha256("third") });
   journal.recordFirstFileResponse(dir, entry.key, third, { format: "web-gemini-files-v2", outcome: "accepted" });
   assert.equal(journal.envelopeStats(dir).formats["web-gemini-files-v2"].accepted, 1);
   assert.ok(existsSync(journal.envelopeStatsPath(dir) + ".corrupt"));
+  // A failed counter update does not fail the turn: the latch stays saved.
+  const locked = journal.createTurn(dir, entry, { inputSha256: sha256("locked") });
+  chmodSync(join(dir, "inner-agent"), 0o555);
+  try {
+    journal.recordFirstFileResponse(dir, entry.key, locked, { format: "web-gemini-files-v2", outcome: "accepted" });
+  } finally {
+    chmodSync(join(dir, "inner-agent"), 0o700);
+  }
+  assert.equal(locked.firstFileResponse.outcome, "accepted");
 });
 
 test("output paths reject Git pathspec magic in every component", () => {
@@ -420,6 +431,22 @@ test("format and missing channel consume correction rounds before a verified com
     join(turnsDir, readdirSync(turnsDir)[0], "turn-0001", "record.json"), "utf8"));
   assert.equal(record.firstFileResponse.outcome, "rejected");
   assert.equal(record.firstFileResponse.code, "nonce");
+});
+
+test("an operational write failure ends the turn with write-env instead of a model repair", async (t) => {
+  const repo = repoFixture(t);
+  const app = acp(repo, ({ fileCapture }) => {
+    // Foreign worktree change between preflight and plan verification.
+    appendFileSync(process.env.DIRTY_PATH, "foreign change\n");
+    return { fileResponse: channels(output(fileCapture.nonce, [create("result.md", "done")])) };
+  }, { env: { DIRTY_PATH: join(repo.cwd, "dirty.md") } });
+  const { result: session } = await app.session();
+  const response = await app.prompt(session.sessionId, job(["result.md"]));
+  assert.match(response.error?.message ?? "", /write environment failed/);
+  // The model is not asked to repair an environment failure.
+  assert.equal(app.requests().length, 1);
+  const stats = JSON.parse(readFileSync(join(repo.state, "inner-agent", "envelope-stats.json"), "utf8"));
+  assert.deepEqual(stats.formats["web-gemini-files-v2"], { accepted: 0, rejected: 1, rejections: { "write-env": 1 } });
 });
 
 test("write refusal protects nonce, scope, symlinks, ignored files, base identity and Unicode", async (t) => {

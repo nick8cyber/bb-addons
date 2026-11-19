@@ -1935,6 +1935,14 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                       }
                       await writer.plan(context.writeHead, checked.plan, write.allowedPaths, new Map(write.bases));
                     } catch (error) {
+                      if (error.writeEnv) {
+                        // Эксплуатационный сбой среды записи: ответ модели ни при
+                        // чём и запрос исправления его не исправит — ход
+                        // завершается ошибкой, в счётчик идёт отдельный код.
+                        slog("task:write-env", { sessionId, error: String(error.message ?? error).slice(0, 300) });
+                        recordFirstResponse({ outcome: "rejected", code: "write-env" });
+                        throw new TaskTurnError("write environment failed: " + context.settings.mask(error.message));
+                      }
                       checked.repair = error.code ? "file plan could not be verified" : context.settings.mask(error.message);
                       checked.code = error.prohibited ? "prohibited-content" : error.code ? "plan-error" : "plan-verify";
                     }
