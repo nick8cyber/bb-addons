@@ -34,6 +34,7 @@ export const journalPaths = (stateDir) => ({
   root: join(stateDir, "inner-agent"),
   sessions: join(stateDir, "inner-agent", "sessions"),
   turns: join(stateDir, "inner-agent", "turns"),
+  stats: join(stateDir, "inner-agent", "envelope-stats.json"),
 });
 
 export const sessionKey = (sessionId) => digest(String(sessionId)).slice(0, 32);
@@ -406,6 +407,54 @@ export function stageFileResponse(stateDir, sessKey, turn, capture, envelope) {
 
 export function unfinishedTurns(stateDir, sessKey) {
   return listTurns(stateDir, sessKey).filter((entry) => entry.corrupt || !entry.record.outcome || entry.record.recoveryRequired);
+}
+
+/* ---------- Счётчик первых файловых ответов (PLUG-351) ---------- */
+
+// Накопительный inner-agent/envelope-stats.json: доля отказов ПЕРВОГО файлового
+// ответа веб-модели по кодам причин, набираемая на живой работе. Счётчики
+// разнесены по формату конверта, чтобы смена формата не смешивала статистику.
+const STATS_VERSION = 1;
+export const envelopeStatsPath = (stateDir) => journalPaths(stateDir).stats;
+
+export function envelopeStats(stateDir) {
+  try {
+    const stats = JSON.parse(readFileSync(envelopeStatsPath(stateDir), "utf8"));
+    return stats?.version === STATS_VERSION ? stats : null;
+  } catch {
+    return null;
+  }
+}
+
+// Исход первого ответа фиксируется один раз на ход: turn.firstFileResponse в
+// записи журнала — защёлка, при продолжении после рестарта повторная проверка
+// того же ответа в счётчик не идёт. Запись хода сохраняется до обновления
+// накопительного файла.
+export function recordFirstFileResponse(stateDir, sessKey, turn, { format, outcome, code = null }) {
+  if (turn.firstFileResponse) return turn.firstFileResponse;
+  turn.firstFileResponse = { format, outcome, code, at: Date.now() };
+  saveTurn(stateDir, sessKey, turn);
+  const file = envelopeStatsPath(stateDir);
+  let stats = envelopeStats(stateDir);
+  if (stats === null) {
+    stats = { version: STATS_VERSION, formats: {} };
+    try {
+      renameSync(file, file + ".corrupt");
+    } catch {}
+  }
+  const slot = stats.formats[format] ??= { accepted: 0, rejected: 0, rejections: {} };
+  slot.accepted ??= 0;
+  slot.rejected ??= 0;
+  slot.rejections ??= {};
+  if (outcome === "accepted") slot.accepted += 1;
+  else {
+    slot.rejected += 1;
+    const key = code ?? "unknown";
+    slot.rejections[key] = (slot.rejections[key] ?? 0) + 1;
+  }
+  stats.updatedAt = Date.now();
+  writeJsonAtomic(file, stats);
+  return turn.firstFileResponse;
 }
 
 /* ---------- Чистка журнала и защита ссылок активных ходов (§7.2) ---------- */
