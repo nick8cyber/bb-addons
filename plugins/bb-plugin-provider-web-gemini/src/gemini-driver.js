@@ -446,6 +446,7 @@ function throwIfPromptTooLarge(prompt, fieldMaxBytes = null) {
       `prompt too large: ${bytes} bytes exceeds limit ${limit} bytes (WEB_GEMINI_MAX_PROMPT_BYTES). Shrink the request and retry.`
     );
     err.code = 'WEB_GEMINI_PROMPT_TOO_LARGE';
+    err.maxPromptBytes = limit;
     throw err;
   }
 }
@@ -996,6 +997,8 @@ async function sendPrompt({
   ephemeral = false,
   file = null,
   files = null,
+  requireFullDelivery = false,
+  onSubmitted = null,
   waitForVerification = false,
   download = null,
   sessionId = null,
@@ -1046,21 +1049,36 @@ async function sendPrompt({
     await throwIfCancelled();
 
     let lastText = '';
+    let rawText = null;
     let downloadedPath = null;
     let generatedFiles = [];
+    let hasGeneratedFile = false;
     let skippedDownloads = [];
 
     // PLUG-291: пользовательские файлы прикладываются веб-вложениями до
     // вставки текста/хода — в т.ч. на хуковом пути runTurn (тесты).
     const uploadList = Array.isArray(files) ? files : (file ? [file] : []);
     const attachFn = driverHooks && driverHooks.attachFile ? driverHooks.attachFile : attachFile;
+    const upload = async () => {
+      for (const f of uploadList) {
+        await throwIfCancelled();
+        try {
+          await attachFn(page, f, { required: requireFullDelivery });
+        } catch (error) {
+          if (!requireFullDelivery) throw error;
+          const failure = new Error('mandatory attachment upload could not be confirmed');
+          failure.code = 'WEB_GEMINI_DELIVERY_FAILED';
+          throw failure;
+        }
+      }
+    };
 
     if (driverHooks?.runTurn) {
-      for (const f of uploadList) {
-        await attachFn(page, f);
-      }
+      await upload();
+      onSubmitted?.();
       const turnRes = await driverHooks.runTurn(page);
       lastText = turnRes.text || '';
+      rawText = turnRes.rawText ?? null;
       returnedConvId = turnRes.convId || convId;
       downloadedPath = turnRes.downloaded || null;
       generatedFiles = turnRes.files || [];
@@ -1103,9 +1121,7 @@ async function sendPrompt({
     }
     await throwIfCancelled();
 
-    for (const f of uploadList) {
-      await attachFn(page, f);
-    }
+    await upload();
 
     const initialCount = await waitForHistoryStabilization(page, convId, { throwIfCancelled });
 
@@ -1150,12 +1166,13 @@ async function sendPrompt({
         }
 
         typed = await safeEval(page,
-          ({ sel, want }) => {
-            const t = (((document.querySelector(sel) || {}).innerText) || '')
-              .replace(/\s+/g, ' ').trim();
+          ({ sel, want, full }) => {
+            const text = ((document.querySelector(sel) || {}).innerText) || '';
+            if (full !== null) return text.replace(/\r\n/g, '\n') === full;
+            const t = text.replace(/\s+/g, ' ').trim();
             return want === '' ? t.length > 0 : t.startsWith(want);
           },
-          { sel: textboxSelector, want: wantStart }
+          { sel: textboxSelector, want: wantStart, full: requireFullDelivery ? prompt.replace(/\r\n/g, '\n') : null }
         );
         if (!typed) typeErr = new Error('prompt text did not reach the editor');
       } catch (e) {
@@ -1163,7 +1180,12 @@ async function sendPrompt({
         await page.waitForTimeout(500);
       }
     }
-    if (!typed) throw typeErr;
+    if (!typed) {
+      if (!requireFullDelivery) throw typeErr;
+      const error = new Error('complete task text could not be confirmed in the web editor');
+      error.code = 'WEB_GEMINI_DELIVERY_FAILED';
+      throw error;
+    }
     await throwIfCancelled();
 
     const sendBtnSelector =
@@ -1207,6 +1229,7 @@ async function sendPrompt({
       }
       await page.waitForTimeout(1000);
     }
+    onSubmitted?.();
 
     lastText = '';
     let lastSrc = null;
@@ -1365,7 +1388,7 @@ async function sendPrompt({
       }
     }
 
-    if (downloadsDir) {
+    if (downloadsDir || requireFullDelivery) {
       // PLUG-291: файлы, сгенерированные в ответе, скачиваются post-turn —
       // пока DOM текущего ответа ещё жив (до ephemeral-удаления и парковки).
       const coll = await collectGeneratedFiles(page, {
@@ -1374,12 +1397,14 @@ async function sendPrompt({
         turnIndex: initialCount,
         promptPrefix,
         throwIfCancelled,
+        detectOnly: requireFullDelivery,
       }).catch((err) => {
         console.warn('[gemini] collectGeneratedFiles error:', err && err.message);
         return { files: [], skipped: [] };
       });
       generatedFiles = coll.files || [];
       skippedDownloads = coll.skipped || [];
+      hasGeneratedFile = Boolean(coll.hasGeneratedFile);
     }
 
     if (ephemeral) {
@@ -1402,11 +1427,13 @@ async function sendPrompt({
 
     resObj = new String(lastText);
     resObj.text = lastText;
+    if (typeof rawText === 'string') resObj.rawText = rawText;
     resObj.thinking = null;
     resObj.meta = {};
     resObj.convId = returnedConvId;
     resObj.downloaded = downloadedPath;
     resObj.files = generatedFiles;
+    if (hasGeneratedFile) resObj.hasGeneratedFile = true;
     resObj.skippedDownloads = skippedDownloads;
 
     return resObj;
@@ -1803,7 +1830,7 @@ async function getUploadToolsButton(page) {
   );
 }
 
-async function attachFile(page, filePath) {
+async function attachFile(page, filePath, { required = false } = {}) {
   const fs = require('fs');
   const path = require('path');
   const resolvedPath = path.resolve(filePath);
@@ -1845,6 +1872,22 @@ async function attachFile(page, filePath) {
     await fileChooser.setFiles(resolvedPath);
   }
   await page.waitForTimeout(1000);
+
+  if (required) {
+    await page.waitForFunction((name) => {
+      const composer = document.querySelector('div[contenteditable="true"][role="textbox"]');
+      const scope = composer?.closest('input-container, .input-area, form') || document;
+      const previews = scope.querySelectorAll('file-preview, mat-chip, [data-test-id*="attachment"], [class*="file-preview"]');
+      const uploaded = [...previews].some((preview) => preview.getClientRects().length && (
+        preview.innerText?.split('\n').some((line) => line.trim() === name) ||
+        [...preview.querySelectorAll('[title], [aria-label]'), preview].some((element) =>
+          element.getAttribute('title') === name || element.getAttribute('aria-label') === name)
+      ));
+      const send = document.querySelector('button[aria-label*="Send message" i], button[aria-label*="Отправить" i], button.send-button');
+      return uploaded && send && !send.disabled && send.getAttribute('aria-disabled') !== 'true';
+    }, path.basename(resolvedPath), { timeout: 15000 });
+    return;
+  }
 
   // Wait up to 15s for file preview chip to appear and send button to become enabled
   await page.waitForFunction(() => {
@@ -1951,11 +1994,76 @@ function fileNameFromDisposition(disposition) {
  * context.request и кнопки Download/Export через download-событие (клик).
  * Ссылки вне белого списка не кликаются и не выгружаются.
  */
+function findGeneratedFileCandidates(target, { detectOnly = false, tagAttr = 'argon-dl' } = {}) {
+  if (!target) return [];
+  const FILE_EXT_RE =
+    /\.(pdf|pptx?|xlsx?|docx?|csv|tsv|md|txt|zip|json|png|jpe?g|gif|svg|webp|mp3|wav|mp4|html?|ics|epub)(?:$|[?#])/i;
+  const okHost = (u) => {
+    try {
+      const base = (typeof location !== 'undefined' && location.href) ? location.href : 'http://localhost';
+      const h = new URL(u, base).hostname.toLowerCase();
+      return (
+        h === 'google.com' ||
+        h.endsWith('.google.com') ||
+        h === 'googleusercontent.com' ||
+        h.endsWith('.googleusercontent.com') ||
+        h === 'googleapis.com' ||
+        h.endsWith('.googleapis.com')
+      );
+    } catch {
+      return false;
+    }
+  };
+  const out = [];
+  const seen = new Set();
+  let seq = 0;
+  for (const a of target.querySelectorAll('a[href]')) {
+    const href = a.href || a.getAttribute('href') || '';
+    if (!href || seen.has(href)) continue;
+    if (!okHost(href)) continue;
+    const hasDl = a.hasAttribute('download');
+    if (detectOnly) {
+      const isFileCard = Boolean(a.closest?.('.file-card, .file-chip, [data-file-id], [data-mime-type], [data-attachment-id]'));
+      if (!hasDl && !isFileCard) continue;
+    } else {
+      const label = ((a.getAttribute('aria-label') || '') + ' ' + (a.innerText || '')).trim();
+      const dlText = /download|скачать|export|экспорт/i.test(label);
+      if (!hasDl && !dlText && !FILE_EXT_RE.test(href)) continue;
+    }
+    seen.add(href);
+    const tag = `${tagAttr}-${seq++}`;
+    if (a.setAttribute) a.setAttribute('data-argon-dl', tag);
+    const label = ((a.getAttribute('aria-label') || '') + ' ' + (a.innerText || '')).trim();
+    out.push({
+      kind: 'link',
+      tag,
+      href,
+      name: (a.getAttribute('download') || label || '').slice(0, 120),
+      canClick: hasDl,
+    });
+  }
+  for (const b of target.querySelectorAll('button, [role="button"], a:not([href])')) {
+    const hasDl = b.hasAttribute('download');
+    if (detectOnly) {
+      const isFileCard = Boolean(b.closest?.('.file-card, .file-chip, [data-file-id], [data-mime-type], [data-attachment-id]'));
+      if (!hasDl && !isFileCard) continue;
+    } else {
+      const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')).trim();
+      if (!/download|скачать|export|экспорт/i.test(label)) continue;
+    }
+    const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')).trim();
+    const tag = `${tagAttr}-${seq++}`;
+    if (b.setAttribute) b.setAttribute('data-argon-dl', tag);
+    out.push({ kind: 'click', tag, name: label.slice(0, 120) });
+  }
+  return out;
+}
+
 async function collectGeneratedFiles(page, opts = {}) {
   const dir = opts.dir;
   const files = [];
   const skipped = [];
-  if (!dir || !page) return { files, skipped };
+  if ((!dir && !opts.detectOnly) || !page) return { files, skipped };
   const maxCount = numEnv(['WEB_GEMINI_MAX_DOWNLOAD_COUNT', 'ARGON_MAX_DOWNLOAD_COUNT'], 5);
   const maxBytes = numEnv(['WEB_GEMINI_MAX_DOWNLOAD_BYTES', 'ARGON_MAX_DOWNLOAD_BYTES'], 50 * 1024 * 1024);
   const nonce = `n${Date.now().toString(36)}`;
@@ -1964,68 +2072,27 @@ async function collectGeneratedFiles(page, opts = {}) {
   try {
     cands = await safeEval(
       page,
-      ({ idx, promptPrefix, fnSrc, tagAttr }) => {
+      ({ idx, promptPrefix, fnSrc, candSrc, tagAttr, detectOnly }) => {
         if (!window.__argonFindTurnTarget && fnSrc) {
           window.__argonFindTurnTarget = (0, eval)('(' + fnSrc + ')');
+        }
+        if (!window.__argonFindGeneratedFileCandidates && candSrc) {
+          window.__argonFindGeneratedFileCandidates = (0, eval)('(' + candSrc + ')');
         }
         const fn = window.__argonFindTurnTarget;
         const target = fn ? fn(document, idx, promptPrefix) : null;
         if (!target) return [];
-        const FILE_EXT_RE =
-          /\.(pdf|pptx?|xlsx?|docx?|csv|tsv|md|txt|zip|json|png|jpe?g|gif|svg|webp|mp3|wav|mp4|html?|ics|epub)(?:$|[?#])/i;
-        const okHost = (u) => {
-          try {
-            const h = new URL(u, location.href).hostname.toLowerCase();
-            return (
-              h === 'google.com' ||
-              h.endsWith('.google.com') ||
-              h === 'googleusercontent.com' ||
-              h.endsWith('.googleusercontent.com') ||
-              h === 'googleapis.com' ||
-              h.endsWith('.googleapis.com')
-            );
-          } catch {
-            return false;
-          }
-        };
-        const out = [];
-        const seen = new Set();
-        let seq = 0;
-        for (const a of target.querySelectorAll('a[href]')) {
-          const href = a.href || a.getAttribute('href') || '';
-          if (!href || seen.has(href)) continue;
-          if (!okHost(href)) continue;
-          const hasDl = a.hasAttribute('download');
-          const label = ((a.getAttribute('aria-label') || '') + ' ' + (a.innerText || '')).trim();
-          const dlText = /download|скачать|export|экспорт/i.test(label);
-          if (!hasDl && !dlText && !FILE_EXT_RE.test(href)) continue;
-          seen.add(href);
-          const tag = `${tagAttr}-${seq++}`;
-          a.setAttribute('data-argon-dl', tag);
-          out.push({
-            kind: 'link',
-            tag,
-            href,
-            name: (a.getAttribute('download') || label || '').slice(0, 120),
-            canClick: hasDl,
-          });
-        }
-        for (const b of target.querySelectorAll('button, [role="button"], a:not([href])')) {
-          const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')).trim();
-          if (!/download|скачать|export|экспорт/i.test(label)) continue;
-          const tag = `${tagAttr}-${seq++}`;
-          b.setAttribute('data-argon-dl', tag);
-          out.push({ kind: 'click', tag, name: label.slice(0, 120) });
-        }
-        return out;
+        const findCands = window.__argonFindGeneratedFileCandidates;
+        return findCands ? findCands(target, { detectOnly, tagAttr }) : [];
       },
-      { idx: opts.turnIndex ?? 0, promptPrefix: opts.promptPrefix || '', fnSrc: findTurnTarget.toString(), tagAttr: nonce }
+      { idx: opts.turnIndex ?? 0, promptPrefix: opts.promptPrefix || '', fnSrc: findTurnTarget.toString(), candSrc: findGeneratedFileCandidates.toString(), tagAttr: nonce, detectOnly: Boolean(opts.detectOnly) }
     );
   } catch {
     return { files, skipped };
   }
 
   if (!Array.isArray(cands) || !cands.length) return { files, skipped };
+  if (opts.detectOnly) return { files, skipped, hasGeneratedFile: true };
 
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -2338,6 +2405,7 @@ module.exports = {
   getUploadToolsButton,
   attachFile,
   collectGeneratedFiles,
+  findGeneratedFileCandidates,
   sanitizeDownloadName,
   isAllowedDownloadHost,
   downloadUrlHost,
