@@ -1974,17 +1974,19 @@ export async function runRunQueue(
       // ── 1. Advance active running tasks ───────────────────────────────
       const activeTasks = deps.store.listActiveTasks();
       for (const task of activeTasks) {
-        const advanced = await advanceActiveTask(
-          task,
-          deps,
-          repoRoot,
-          mergeBaseBranch,
-          transitions,
-        );
-        if (advanced) {
-          progressed = true;
-          advancedCount++;
-        }
+        try {
+          const advanced = await advanceActiveTask(
+            task,
+            deps,
+            repoRoot,
+            mergeBaseBranch,
+            transitions,
+          );
+          if (advanced) {
+            progressed = true;
+            advancedCount++;
+          }
+        } catch {}
       }
 
       // ── 2. Take queued tasks ──────────────────────────────────────────
@@ -2013,18 +2015,20 @@ export async function runRunQueue(
           }
           if (!depsSatisfied) continue;
 
-          const started = await startQueuedTask(
-            t,
-            deps,
-            repoRoot,
-            mergeBaseBranch,
-            transitions,
-          );
-          if (started) {
-            progressed = true;
-            advancedCount++;
-            availableSlots--;
-          }
+          try {
+            const started = await startQueuedTask(
+              t,
+              deps,
+              repoRoot,
+              mergeBaseBranch,
+              transitions,
+            );
+            if (started) {
+              progressed = true;
+              advancedCount++;
+              availableSlots--;
+            }
+          } catch {}
         }
       }
     }
@@ -2301,11 +2305,13 @@ export async function extractReportFromDelegation(
             c.body.trim().length > 0,
         )
         .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
-      const last = comments.at(-1);
-      if (last?.body && last.body.trim()) {
-        const text = last.body.trim();
-        if (!parseVerdictDetailsFromText(text)) {
-          return text;
+      for (let i = comments.length - 1; i >= 0; i--) {
+        const body = comments[i]?.body;
+        if (body && body.trim()) {
+          const text = body.trim();
+          if (!parseVerdictDetailsFromText(text)) {
+            return text;
+          }
         }
       }
     }
@@ -2513,7 +2519,12 @@ async function advanceActiveTask(
           deps.bbCli,
         );
       }
-      if (!contractText && typeof payload.acceptance_text === "string" && payload.acceptance_text.trim()) {
+      if (
+        !latestDelegation &&
+        !contractText &&
+        typeof payload.acceptance_text === "string" &&
+        payload.acceptance_text.trim()
+      ) {
         contractText = payload.acceptance_text.trim();
       }
 
@@ -2935,6 +2946,8 @@ async function advanceActiveTask(
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
+            spec_review_verdict: null,
+            spec_review_blockers: null,
             consumed_delegations: consumed,
             nudge_count: 0,
             last_nudge_at: null,
@@ -3266,6 +3279,8 @@ async function advanceActiveTask(
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
+            review_verdict: null,
+            review_blockers: null,
             consumed_delegations: consumed,
             nudge_count: 0,
             last_nudge_at: null,
@@ -3300,10 +3315,12 @@ async function advanceActiveTask(
     case "design_check": {
       let verdict: "OK" | "CHANGES" | null = null;
       let target: "code" | "design" = "code";
+      let blockers = 0;
       if (typeof payload.design_check_verdict === "string") {
         verdict =
           payload.design_check_verdict === "CHANGES" ? "CHANGES" : "OK";
         if (payload.design_check_target === "design") target = "design";
+        blockers = Number(payload.design_check_blockers) || 0;
       } else if (latestDelegation?.status === "done") {
         const parsed = await extractVerdictFromDelegation(
           task.task_key,
@@ -3312,6 +3329,7 @@ async function advanceActiveTask(
         );
         if (parsed) {
           verdict = parsed.verdict;
+          blockers = parsed.blockers;
           if (parsed.target === "design") target = "design";
         } else {
           const lastNudge = typeof payload.last_nudge_at === "number" ? payload.last_nudge_at : 0;
@@ -3384,7 +3402,7 @@ async function advanceActiveTask(
           route: task.route,
           node: "design_check",
           status: "running",
-          event: { type: "design_check_verdict", verdict, blockers: 0, target },
+          event: { type: "design_check_verdict", verdict, blockers, target },
           mode: task.confirmation_mode,
           counters: extractCounters(task),
         });
@@ -3400,6 +3418,9 @@ async function advanceActiveTask(
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
+            design_check_verdict: null,
+            design_check_blockers: null,
+            design_check_target: null,
             consumed_delegations: consumed,
             nudge_count: 0,
             last_nudge_at: null,

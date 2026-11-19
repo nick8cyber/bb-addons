@@ -1942,3 +1942,93 @@ test("Round 4 Blocker 3: design node extracts architect report and commits accep
   assert.equal(t.status, "running");
   assert.ok(t.acceptance_sha);
 });
+
+test("Round 5 Blocker 1: design_check preserves blockers count and prevents OK when blockers > 0", async () => {
+  let threadOutput = "";
+  const customCli: BbCli = {
+    run: async (args: string[]) => {
+      const key = args.join(" ");
+      if (key.includes("tasks show")) {
+        return ok(JSON.stringify({ comments: [] }));
+      }
+      if (key.includes("thread output thr_arch_chk")) {
+        return ok(JSON.stringify({ output: threadOutput }));
+      }
+      return ok();
+    },
+  };
+
+  const host = await hostWith({ workGraph: "strict" }, customCli);
+  const store = new DelegationStore(host.bb.storage.database());
+  const now = Date.now();
+
+  // Test A: verdict OK with blockers: 2 must NOT advance to release, but route to code (round 1)
+  store.insertTask({
+    taskKey: "DC-BLOCKERS",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+  }, now);
+  store.transitionTask({
+    taskKey: "DC-BLOCKERS",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "design_check",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start",
+    now,
+  }, now);
+
+  const d1 = store.insert({
+    taskKey: "DC-BLOCKERS",
+    coordinatorThreadId: "thr_coord",
+    level: "architect",
+    route: "feature",
+    preset: "architect",
+    provider: "opencode",
+  });
+  store.setStatus(d1.id, "done");
+  host.bb.storage.database().prepare("UPDATE delegations SET thread_id = ? WHERE id = ?").run("thr_arch_chk", d1.id);
+
+  threadOutput = 'Design check finished:\n{ "verdict": "OK", "blockers": 2 }\nNeeds fix.';
+  await runRunQueue({ store, workGraphMode: "strict", bbCli: customCli });
+
+  let t = store.getTask("DC-BLOCKERS")!;
+  // Must NOT be release! Must be code due to blockers > 0
+  assert.equal(t.node, "code");
+  assert.equal(t.status, "running");
+  assert.equal(t.design_check_rounds, 1);
+
+  // Test B: verdict OK with blockers: 0 advances to release
+  store.transitionTask({
+    taskKey: "DC-BLOCKERS",
+    expectedNode: "code",
+    expectedStatus: "running",
+    toNode: "design_check",
+    toStatus: "running",
+    actor: "test",
+    reason: "back to design_check",
+    now: Date.now(),
+  }, Date.now());
+
+  const d2 = store.insert({
+    taskKey: "DC-BLOCKERS",
+    coordinatorThreadId: "thr_coord",
+    level: "architect",
+    route: "feature",
+    preset: "architect",
+    provider: "opencode",
+  });
+  store.setStatus(d2.id, "done");
+  host.bb.storage.database().prepare("UPDATE delegations SET thread_id = ? WHERE id = ?").run("thr_arch_chk", d2.id);
+
+  threadOutput = 'Design check finished:\n{ "verdict": "OK", "blockers": 0 }\nAll clean.';
+  await runRunQueue({ store, workGraphMode: "strict", bbCli: customCli });
+
+  t = store.getTask("DC-BLOCKERS")!;
+  assert.equal(t.node, "release");
+  assert.equal(t.status, "running");
+});
