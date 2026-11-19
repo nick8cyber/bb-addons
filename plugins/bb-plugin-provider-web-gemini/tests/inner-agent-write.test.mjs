@@ -10,6 +10,7 @@ import test from "node:test";
 import plugin, { resolveServerScript } from "../index.mjs";
 import envelope from "../src/file-envelope.cjs";
 import driver from "../src/gemini-driver.js";
+import * as journal from "../src/turn-journal.mjs";
 import { outputPath, resultPaths } from "../src/worktree-writer.mjs";
 
 const { sha256, verifyFileResponse } = envelope;
@@ -257,6 +258,19 @@ test("file gate compares useful UTF-8 bytes, strict fences, distinct keys and me
   assert.match(verifyFileResponse(frame(envelopeText(value).replace('"nonce":', '"no\\u006ece":"abcd","nonce":')), nonce).repair, /invalid/);
   assert.match(verifyFileResponse(channels(output(nonce, [create("x", "\ud800")])), nonce).repair, /invalid/);
   assert.match(verifyFileResponse(channels(output(nonce, [create("x", ""), create("x", "")])), nonce).repair, /duplicate/);
+  // PLUG-351: every rejection carries a stable code for the stats counter.
+  assert.equal(verifyFileResponse(attempt, nonce).code, undefined);
+  assert.equal(verifyFileResponse({ rpc: attempt.rpc }, nonce).code, "channels-unavailable");
+  assert.equal(verifyFileResponse({ ...attempt, dom: { ...attempt.dom, id: "r_other" } }, nonce).code, "channels-mismatch");
+  assert.equal(verifyFileResponse({ ...attempt, rpc: { ...attempt.rpc, invalid: "multiple" } }, nonce).code, "capture-invalid");
+  assert.equal(verifyFileResponse(attempt, "wrong").code, "nonce");
+  assert.equal(verifyFileResponse({ rpc: { ...attempt.rpc, text: "extra\n" + attempt.rpc.text } }, nonce).code, "fence");
+  assert.equal(verifyFileResponse({
+    ...attempt, dom: channels(output(nonce, [create("rich.md", "other"), ...value.files.slice(1)])).dom,
+  }, nonce).code, "channels-disagree");
+  assert.equal(verifyFileResponse(frame("stray\n" + envelopeText(value)), nonce).code, "envelope-open");
+  assert.equal(verifyFileResponse(frame(envelopeText(value).replace(/\nBBG-abcd-CLOSE$/, "")), nonce).code, "close");
+  assert.equal(verifyFileResponse(channels(output(nonce, [create("x", ""), create("x", "")])), nonce).code, "meta-entry");
   const mixed = output(nonce, [
     create("a.md", "a"), { path: "b.md", operation: "delete", baseSha256: sha256("x") }, create("c.md", "c"),
   ]);
@@ -268,9 +282,49 @@ test("file gate compares useful UTF-8 bytes, strict fences, distinct keys and me
   assert.match(verifyFileResponse({
     rpc: frame(envelopeText(piped).split("\\|").join("|")).rpc, dom: channels(piped).dom,
   }, nonce).recapture, /does not survive/);
+  assert.equal(verifyFileResponse({
+    rpc: frame(envelopeText(piped).split("\\|").join("|")).rpc, dom: channels(piped).dom,
+  }, nonce).code, "history-rewrite");
   assert.deepEqual(resultPaths(fence + "\n## Файлы результата\n" + fence + "\n" + job(["docs/a.md"])), ["docs/a.md"]);
   assert.throws(() => resultPaths("## Файлы результата\n"), /empty/);
   assert.throws(() => resultPaths(job(["a"]) + "\n## Файлы результата\n- b"), /repeated/);
+});
+
+test("envelope stats count the first file response once per turn by reason code", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "web-gemini-stats-"));
+  t.after(() => rmSync(dir, { force: true, recursive: true }));
+  const entry = journal.createSessionRecord(dir, { sessionId: "stats-session" });
+  const turn = journal.createTurn(dir, entry, { inputSha256: sha256("first") });
+  journal.recordFirstFileResponse(dir, entry.key, turn,
+    { format: "web-gemini-files-v2", outcome: "rejected", code: "nonce" });
+  // The latch in the turn record keeps a resumed re-check out of the counter.
+  journal.recordFirstFileResponse(dir, entry.key, turn,
+    { format: "web-gemini-files-v2", outcome: "accepted" });
+  const second = journal.createTurn(dir, entry, { inputSha256: sha256("second") });
+  journal.recordFirstFileResponse(dir, entry.key, second,
+    { format: "web-gemini-files-v2", outcome: "accepted" });
+  const stats = journal.envelopeStats(dir);
+  assert.deepEqual(stats.formats["web-gemini-files-v2"], { accepted: 1, rejected: 1, rejections: { nonce: 1 } });
+  assert.equal(turn.firstFileResponse.outcome, "rejected");
+  assert.equal(turn.firstFileResponse.code, "nonce");
+  assert.equal(second.firstFileResponse.outcome, "accepted");
+  // The cross-process counter update runs under a dedicated flock.
+  assert.ok(existsSync(journal.envelopeStatsPath(dir) + ".lock"));
+  // A corrupt counter is quarantined and accumulation restarts.
+  writeFileSync(journal.envelopeStatsPath(dir), "not json");
+  const third = journal.createTurn(dir, entry, { inputSha256: sha256("third") });
+  journal.recordFirstFileResponse(dir, entry.key, third, { format: "web-gemini-files-v2", outcome: "accepted" });
+  assert.equal(journal.envelopeStats(dir).formats["web-gemini-files-v2"].accepted, 1);
+  assert.ok(existsSync(journal.envelopeStatsPath(dir) + ".corrupt"));
+  // A failed counter update does not fail the turn: the latch stays saved.
+  const locked = journal.createTurn(dir, entry, { inputSha256: sha256("locked") });
+  chmodSync(join(dir, "inner-agent"), 0o555);
+  try {
+    journal.recordFirstFileResponse(dir, entry.key, locked, { format: "web-gemini-files-v2", outcome: "accepted" });
+  } finally {
+    chmodSync(join(dir, "inner-agent"), 0o700);
+  }
+  assert.equal(locked.firstFileResponse.outcome, "accepted");
 });
 
 test("output paths reject Git pathspec magic in every component", () => {
@@ -340,6 +394,8 @@ test("accept-edits records hashes, commits exact create/replace/delete bytes onc
   assert.equal(statSync(join(repo.cwd, "empty.md")).size, 0);
   assert.equal(existsSync(join(repo.cwd, "delete.md")), false);
   assert.equal(app.text(), "Branch: fixture-write\nCommit: " + sha);
+  const stats = JSON.parse(readFileSync(join(repo.state, "inner-agent", "envelope-stats.json"), "utf8"));
+  assert.deepEqual(stats.formats["web-gemini-files-v2"], { accepted: 1, rejected: 0, rejections: {} });
   assert.equal((await preopened.prompt(otherSession.sessionId, task)).result?.stopReason, "end_turn");
   assert.equal(preopened.requests().length, 0);
   assert.equal(preopened.text(), app.text());
@@ -367,6 +423,30 @@ test("format and missing channel consume correction rounds before a verified com
   assert.equal(new Set(app.requests().map(({ fileCapture }) => fileCapture.nonce)).size, 1);
   assert.equal(new Set(app.requests().map(({ fileCapture }) => fileCapture.marker)).size, 3);
   assert.equal(repo.clean(), "");
+  // PLUG-351: only the first file response is counted — the wrong nonce here.
+  const stats = JSON.parse(readFileSync(join(repo.state, "inner-agent", "envelope-stats.json"), "utf8"));
+  assert.deepEqual(stats.formats["web-gemini-files-v2"], { accepted: 0, rejected: 1, rejections: { nonce: 1 } });
+  const turnsDir = join(repo.state, "inner-agent", "turns");
+  const record = JSON.parse(readFileSync(
+    join(turnsDir, readdirSync(turnsDir)[0], "turn-0001", "record.json"), "utf8"));
+  assert.equal(record.firstFileResponse.outcome, "rejected");
+  assert.equal(record.firstFileResponse.code, "nonce");
+});
+
+test("an operational write failure ends the turn with write-env instead of a model repair", async (t) => {
+  const repo = repoFixture(t);
+  const app = acp(repo, ({ fileCapture }) => {
+    // Foreign worktree change between preflight and plan verification.
+    appendFileSync(process.env.DIRTY_PATH, "foreign change\n");
+    return { fileResponse: channels(output(fileCapture.nonce, [create("result.md", "done")])) };
+  }, { env: { DIRTY_PATH: join(repo.cwd, "dirty.md") } });
+  const { result: session } = await app.session();
+  const response = await app.prompt(session.sessionId, job(["result.md"]));
+  assert.match(response.error?.message ?? "", /write environment failed/);
+  // The model is not asked to repair an environment failure.
+  assert.equal(app.requests().length, 1);
+  const stats = JSON.parse(readFileSync(join(repo.state, "inner-agent", "envelope-stats.json"), "utf8"));
+  assert.deepEqual(stats.formats["web-gemini-files-v2"], { accepted: 0, rejected: 1, rejections: { "write-env": 1 } });
 });
 
 test("write refusal protects nonce, scope, symlinks, ignored files, base identity and Unicode", async (t) => {
@@ -405,6 +485,10 @@ test("write refusal protects nonce, scope, symlinks, ignored files, base identit
       assert.equal(repo.clean(), "");
       assert.equal(existsSync(join(repo.cwd, "elsewhere.md")), false);
       assert.equal(app.text(), "");
+      if (label === "outside") {
+        const stats = JSON.parse(readFileSync(join(repo.state, "inner-agent", "envelope-stats.json"), "utf8"));
+        assert.equal(stats.formats["web-gemini-files-v2"].rejections["plan-verify"], 1);
+      }
       if (label === "readonly") assert.equal((await app.send("session/set_mode", { sessionId: session.sessionId, modeId: "write" })).error.data.outcome, "not_started");
     });
   }

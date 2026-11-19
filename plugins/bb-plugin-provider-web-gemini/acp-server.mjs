@@ -1393,6 +1393,13 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
     }
   };
   const recordExchange = (entry) => persistJournal(() => journal.appendExchange(STATE_DIR, tj.sessKey, tj.turn, entry));
+  // PLUG-351: исход первого файлового ответа учитывается один раз на ход —
+  // конверты после запросов исправления в счётчик не входят.
+  const recordFirstResponse = (result) => {
+    if (!tj?.turn || tj.turn.firstFileResponse) return;
+    persistJournal(() => journal.recordFirstFileResponse(STATE_DIR, tj.sessKey, tj.turn,
+      { format: fileEnvelope.FORMAT, ...result }));
+  };
 
   const gen = (s.gen || 0) + 1;
   s.gen = gen;
@@ -1922,19 +1929,32 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                       const { files, commitMessage } = checked.plan;
                       if ([commitMessage, ...files.flatMap(({ path, content }) => [path, content ?? ""])]
                         .some((value) => context.settings.maskResponse(value) !== value)) {
-                        throw new Error("file response contains material prohibited for publication");
+                        const denied = new Error("file response contains material prohibited for publication");
+                        denied.prohibited = true;
+                        throw denied;
                       }
                       await writer.plan(context.writeHead, checked.plan, write.allowedPaths, new Map(write.bases));
                     } catch (error) {
+                      if (error.writeEnv) {
+                        // Эксплуатационный сбой среды записи: ответ модели ни при
+                        // чём и запрос исправления его не исправит — ход
+                        // завершается ошибкой, в счётчик идёт отдельный код.
+                        slog("task:write-env", { sessionId, error: String(error.message ?? error).slice(0, 300) });
+                        recordFirstResponse({ outcome: "rejected", code: "write-env" });
+                        throw new TaskTurnError("write environment failed: " + context.settings.mask(error.message));
+                      }
                       checked.repair = error.code ? "file plan could not be verified" : context.settings.mask(error.message);
+                      checked.code = error.prohibited ? "prohibited-content" : error.code ? "plan-error" : "plan-verify";
                     }
                     if (!checked.repair) {
+                      recordFirstResponse({ outcome: "accepted" });
                       task.signal.throwIfAborted();
                       persistJournal(() => journal.stageFileResponse(STATE_DIR, tj.sessKey, tj.turn, capture, checked.plan));
                       return { envelope: checked.plan };
                     }
                   }
                   final = { repair: checked.repair ?? checked.recapture, plan: checked.plan };
+                  recordFirstResponse({ outcome: "rejected", code: checked.code ?? "unknown" });
                 } else final = checkedAnswer(context, candidate);
                 if (final.text !== undefined) return { text: final.text };
                 if (final.denied) throw new TaskTurnError(final.denied);

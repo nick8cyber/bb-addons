@@ -13,6 +13,11 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const objectId = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const regularMode = (mode) => mode === "100644" || mode === "100755";
 const within = (root, path) => path === root || path.startsWith(root + "/");
+// Эксплуатационный сбой среды записи — занятый lock, сдвинувшаяся после
+// preflight копия или индекс, упавший git, незаданный автор. Метка writeEnv
+// отличает его от ошибки файлового плана модели (PLUG-351): веб-модель не
+// получает бесполезный запрос исправления за чужой сбой.
+const envError = (message) => Object.assign(new Error(message), { writeEnv: true });
 
 function lstat(path) {
   try { return lstatSync(path); }
@@ -116,7 +121,7 @@ function run(file, args, { cwd, fd, env, input, signal }) {
     child.once("close", (code) => {
       clearTimeout(killTimer);
       signal?.removeEventListener("abort", abort);
-      if (size > 32_000_000) reject(new Error("Git output exceeds transaction limit"));
+      if (size > 32_000_000) reject(envError("Git output exceeds transaction limit"));
       else resolve({ code, output: Buffer.concat(output) });
     });
   });
@@ -126,7 +131,7 @@ function entries(bytes, index = false) {
   return new Map(decoder.decode(bytes).split("\0").filter(Boolean).map((row) => {
     const tab = row.indexOf("\t");
     const [mode, typeOrOid, oidOrStage] = row.slice(0, tab).split(" ");
-    if (index && oidOrStage !== "0") throw new Error("unmerged Git index");
+    if (index && oidOrStage !== "0") throw envError("unmerged Git index");
     return [row.slice(tab + 1), { mode, oid: index ? typeOrOid : oidOrStage }];
   }));
 }
@@ -146,11 +151,11 @@ export class WorktreeWriter {
   constructor(root, stateDir, environment) {
     if (!environment?.managed || !environment.isWorktree || !environment.isGitRepo || !environment.branchName ||
         !root || realpathSync(root) !== realpathSync(environment.path)) {
-      throw new Error("accept-edits requires the dedicated managed BB Git worktree");
+      throw envError("accept-edits requires the dedicated managed BB Git worktree");
     }
     this.root = root;
     this.stateDir = realpathSync(stateDir);
-    if (within(root, this.stateDir)) throw new Error("provider state must be outside the worktree");
+    if (within(root, this.stateDir)) throw envError("provider state must be outside the worktree");
     this.branch = environment.branchName;
     this.ref = "refs/heads/" + this.branch;
     this.env = gitEnv();
@@ -163,7 +168,7 @@ export class WorktreeWriter {
     const { code, output } = await run("git", [...literal, "--no-pager", ...args], {
       cwd: this.root, fd: this.fd, env: { ...this.env, ...env }, input, signal,
     });
-    if (code !== 0 && !allow.includes(code)) throw new Error("git " + (args[0] === "-c" ? args[2] : args[0]) + " failed");
+    if (code !== 0 && !allow.includes(code)) throw envError("git " + (args[0] === "-c" ? args[2] : args[0]) + " failed");
     return code === 0 ? output : null;
   }
 
@@ -175,7 +180,7 @@ export class WorktreeWriter {
     const gitDir = realpathSync(await this.gitText(["rev-parse", "--absolute-git-dir"]));
     const common = realpathSync(resolve(this.root, await this.gitText(["rev-parse", "--git-common-dir"])));
     const top = realpathSync(await this.gitText(["rev-parse", "--show-toplevel"]));
-    if (gitDir === common || top !== this.root) throw new Error("accept-edits requires a linked Git worktree root");
+    if (gitDir === common || top !== this.root) throw envError("accept-edits requires a linked Git worktree root");
     const locks = join(this.stateDir, "locks");
     mkdirSync(locks, { recursive: true, mode: 0o700 });
     syncDir(this.stateDir);
@@ -188,11 +193,11 @@ export class WorktreeWriter {
       constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
     try {
       const result = await run("flock", ["-n", "3"], { fd: this.fd, signal });
-      if (result.code !== 0) throw new Error("worktree is locked by another writer");
+      if (result.code !== 0) throw envError("worktree is locked by another writer");
       signal?.throwIfAborted();
     } catch (error) {
       this.close();
-      if (error.code === "ENOENT") throw new Error("exclusive worktree locking is unavailable");
+      if (error.code === "ENOENT") throw envError("exclusive worktree locking is unavailable");
       throw error;
     }
   }
@@ -204,10 +209,10 @@ export class WorktreeWriter {
 
   async head() {
     if (await this.gitText(["symbolic-ref", "-q", "HEAD"], { allow: [1] }) !== this.ref) {
-      throw new Error("worktree HEAD does not name the trusted branch");
+      throw envError("worktree HEAD does not name the trusted branch");
     }
     const sha = await this.gitText(["rev-parse", "--verify", "HEAD^{commit}"]);
-    if (!objectId.test(sha)) throw new Error("invalid worktree HEAD");
+    if (!objectId.test(sha)) throw envError("invalid worktree HEAD");
     return { sha, branch: this.branch };
   }
 
@@ -226,10 +231,10 @@ export class WorktreeWriter {
 
   async prepare() {
     const head = await this.head();
-    if ((await this.status()).length) throw new Error("write requires a clean index and worktree");
+    if ((await this.status()).length) throw envError("write requires a clean index and worktree");
     const name = await this.gitText(["config", "--get", "user.name"], { allow: [1] });
     const email = await this.gitText(["config", "--get", "user.email"], { allow: [1] });
-    if (!name?.trim() || !email?.trim()) throw new Error("Git author name and email must be configured");
+    if (!name?.trim() || !email?.trim()) throw envError("Git author name and email must be configured");
     await this.git(["var", "GIT_AUTHOR_IDENT"]);
     return head;
   }
@@ -288,10 +293,10 @@ export class WorktreeWriter {
   }
 
   async plan(head, envelope, allowedPaths, issuedBases) {
-    if ((await this.head()).sha !== head.sha || (await this.status()).length) throw new Error("worktree changed since write preflight");
+    if ((await this.head()).sha !== head.sha || (await this.status()).length) throw envError("worktree changed since write preflight");
     const base = await this.tree(head.sha);
     const index = await this.index();
-    if (changed(base, index).length) throw new Error("index changed since write preflight");
+    if (changed(base, index).length) throw envError("index changed since write preflight");
     const flagged = new Set(decoder.decode(await this.git(["ls-files", "-v", "-z"])).split("\0")
       .filter((row) => row && !row.startsWith("H ")).map((row) => row.slice(2)));
     const files = [];
@@ -497,7 +502,7 @@ export class WorktreeWriter {
         signal.throwIfAborted();
         const work = this.working(file.path);
         if (work.hash !== file.baseSha256 || (work.stat && (work.stat.mode & 0o7777) !== file.permissions)) {
-          throw new Error("working file changed before it could be written");
+          throw envError("working file changed before it could be written");
         }
         if (file.operation === "delete") unlinkSync(work.absolute);
         else {
@@ -519,18 +524,18 @@ export class WorktreeWriter {
         saveIntent(this.intentFile, intent);
       }
       progress("commit");
-      if ((await this.head()).sha !== head.sha) throw new Error("branch changed before commit");
+      if ((await this.head()).sha !== head.sha) throw envError("branch changed before commit");
       await this.verifyTree(intent, await this.tree(head.sha), await this.index());
       this.verifyWorking(intent);
       const plannedStatus = new Set(intent.files.map((file) => file.path));
       if ((await this.status()).some((row) => row[1] !== " " || !plannedStatus.has(row.slice(3)))) {
-        throw new Error("worktree changed before commit");
+        throw envError("worktree changed before commit");
       }
       await this.git(["-c", "core.logAllRefUpdates=true", "commit", "--cleanup=verbatim", "-F", "-"], {
         input: envelope.commitMessage, signal, env: { GIT_REFLOG_ACTION: "web-gemini-" + intent.id },
       });
       const { sha } = await this.head();
-      if (!await this.ownsHead(intent, sha)) throw new Error("could not identify the transaction commit");
+      if (!await this.ownsHead(intent, sha)) throw envError("could not identify the transaction commit");
       await this.verifyCommit(intent, sha);
       signal.throwIfAborted();
       checkpoint(owner, { sha, head, files: intent.files });
