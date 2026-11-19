@@ -100,12 +100,131 @@ export function assertOwnerOnly(
   }
 }
 
-/** §32 п.1: In strict mode, blocks direct delegate, merge, release. */
+export interface ShadowActionParams {
+  command: "delegate" | "merge" | "release";
+  taskKey: string;
+  level?: string;
+  route?: string;
+  actor?: string;
+}
+
+/** §32 (Б4): In shadow mode, mirror manual coordinator actions and log shadow_eval. */
+export function recordShadowAction(
+  store: DelegationStore,
+  params: ShadowActionParams,
+  mode: WorkGraphMode,
+): void {
+  if (mode !== "shadow") return;
+  const key = normalizeTaskKey(params.taskKey);
+  const task = store.getTask(key);
+  const actor = params.actor ?? "shadow:coordinator";
+
+  if (!task) {
+    // §32 (Б4): For un-enqueued tasks, log service transition with 'none' sentinels
+    store.insertTransition({
+      taskKey: key,
+      fromNode: "none",
+      toNode: "none",
+      fromStatus: "none",
+      toStatus: "none",
+      actor,
+      reason: "task-not-enqueued",
+      payload: JSON.stringify({
+        event: "manual_command",
+        command: params.command,
+        would_reject: "graph-required",
+      }),
+    });
+    return;
+  }
+
+  // §32 (Б4): For enqueued tasks, evaluate whether the action would be allowed or rejected
+  const payload = parsePayload(task.payload);
+  let wouldAllow: string | undefined;
+  let wouldReject: string | undefined;
+
+  if (params.command === "delegate") {
+    const level = params.level ?? "";
+    const nodeMatches =
+      (task.node === "code" && ["simple", "medium", "complex"].includes(level)) ||
+      (task.node === "spec" && level === "spec") ||
+      (task.node === "review" && (level === "review" || level.startsWith("review-"))) ||
+      (task.node === "design" && (level === "architect" || level === "design")) ||
+      (task.node === "design_check" && level === "architect") ||
+      (task.node === "research" && level === "research");
+
+    if (nodeMatches) {
+      wouldAllow = "delegate";
+    } else {
+      wouldReject = `invalid_node: expected ${task.node}, got delegate level ${level}`;
+    }
+  } else if (params.command === "merge") {
+    if (task.node === "code" || task.node === "release") {
+      wouldAllow = "merge";
+    } else {
+      wouldReject = `invalid_node: merge called while at node ${task.node}`;
+    }
+  } else if (params.command === "release") {
+    if (task.node === "release" && task.status === "running") {
+      wouldAllow = "release";
+    } else {
+      wouldReject = `node-not-release: release called while at ${task.node}:${task.status}`;
+    }
+  }
+
+  const shadowEval = {
+    command: params.command,
+    evaluated_at: Date.now(),
+    would_allow: wouldAllow,
+    would_reject: wouldReject,
+    current_node: task.node,
+    current_status: task.status,
+  };
+
+  store.insertTransition({
+    taskKey: key,
+    fromNode: task.node,
+    toNode: task.node,
+    fromStatus: task.status,
+    toStatus: task.status,
+    actor,
+    reason: `shadow-mirror:${params.command}`,
+    payload: JSON.stringify({
+      event: "manual_command",
+      command: params.command,
+      shadow_eval: shadowEval,
+    }),
+  });
+
+  store.updateTask(key, {
+    payload: JSON.stringify({
+      ...payload,
+      shadow_eval: shadowEval,
+    }),
+  });
+}
+
+/** §32 п.1: In strict mode, blocks direct delegate, merge, release. In shadow mode, logs mirror audit. */
 export function assertGraphAllowsDirectAction(
   store: DelegationStore,
   taskKey: string,
   mode: WorkGraphMode,
+  action?: { command: "delegate" | "merge" | "release"; level?: string; route?: string; actor?: string },
 ): void {
+  if (mode === "shadow") {
+    recordShadowAction(
+      store,
+      {
+        command: action?.command ?? "delegate",
+        taskKey,
+        level: action?.level,
+        route: action?.route,
+        actor: action?.actor,
+      },
+      mode,
+    );
+    return;
+  }
   if (mode !== "strict") return;
   const key = normalizeTaskKey(taskKey);
   const task = store.getTask(key);
@@ -2056,6 +2175,33 @@ export async function runRunQueue(
     }
     if (depsSatisfied) {
       readyCount++;
+    }
+  }
+
+  // §32 (Б4 / 5в): In shadow mode without autoAdvance, record simulated evaluation
+  if (deps.workGraphMode === "shadow" && !shouldAdvance) {
+    for (const t of finalActive) {
+      try {
+        const payload = parsePayload(t.payload);
+        const delegations = deps.store.delegationsByTask(t.task_key);
+        const latestDel = getActiveDelegationForTask(t, delegations);
+        const shadowEval = {
+          command: "run-queue",
+          evaluated_at: Date.now(),
+          would_transition: latestDel
+            ? { node: t.node, delegationStatus: latestDel.status }
+            : undefined,
+          note: "вычислено, но не подключено",
+          current_node: t.node,
+          current_status: t.status,
+        };
+        deps.store.updateTask(t.task_key, {
+          payload: JSON.stringify({
+            ...payload,
+            shadow_eval: shadowEval,
+          }),
+        });
+      } catch {}
     }
   }
 
