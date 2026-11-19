@@ -48,7 +48,8 @@ function saveIntent(file, value) {
 export function outputPath(path) {
   if (typeof path !== "string" || !path || /^[a-z]:/i.test(path) || /[\\\x00-\x1f\x7f]/.test(path) ||
       /[\uD800-\uDFFF]/u.test(path) || path.split("/").some((name) =>
-        !name || name === "." || name === ".." || /^(?:\.git|node_modules|id_.*)$/i.test(name) || isSensitivePath(name)) ||
+        !name || name === "." || name === ".." || /^[:!^]/.test(name) ||
+        /^(?:\.git|node_modules|id_.*)$/i.test(name) || isSensitivePath(name)) ||
       isSensitivePath(path)) throw new Error("invalid or protected output path");
   return path;
 }
@@ -73,7 +74,7 @@ export function resultPaths(text) {
     } else if (inside && line.trim()) {
       const match = /^- ([^\r\n]+)$/.exec(line);
       if (!match || match[1] !== match[1].trim()) throw new Error("expected a list of exact output paths");
-      const path = outputPath(match[1]);
+      const path = outputPath(match[1].replace(/^`(.*)`$/, "$1"));
       if (paths.has(path)) throw new Error("duplicate path in result files section");
       paths.add(path);
     }
@@ -157,6 +158,7 @@ export class WorktreeWriter {
   }
 
   async git(args, { input, signal, allow = [], env = {} } = {}) {
+    // check-ignore rejects literal pathspecs. outputPath rejects magic prefixes before the check.
     const literal = args[0] === "check-ignore" ? [] : ["--literal-pathspecs"];
     const { code, output } = await run("git", [...literal, "--no-pager", ...args], {
       cwd: this.root, fd: this.fd, env: { ...this.env, ...env }, input, signal,

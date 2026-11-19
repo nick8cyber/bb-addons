@@ -2367,7 +2367,6 @@ async function runBoundPrompt(msg, session) {
   }
   const { sessionId, prompt } = msg.params;
   const task = createTaskTurn(sessionId);
-  task.mode = sessionMode(session);
   session.activeTask = task;
   let writer;
   try {
@@ -2378,6 +2377,7 @@ async function runBoundPrompt(msg, session) {
     }
     if (!thread) throw new TaskTurnError("could not verify trusted BB thread metadata");
     if (WRITE_LAUNCH && !canWrite(session)) throw new TaskTurnError(WRITE_REFUSED);
+    task.mode = sessionMode(session);
     if (!Array.isArray(prompt)) throw new TaskTurnError("prompt must be an array of blocks");
     const system = isBbSystemInstructionsBlock(prompt[0]) ? prompt[0].text : null;
     const blocks = prompt.filter((block) => block && !isBbSystemInstructionsBlock(block));

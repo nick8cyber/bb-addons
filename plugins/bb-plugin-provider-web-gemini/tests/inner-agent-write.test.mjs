@@ -10,7 +10,7 @@ import test from "node:test";
 import plugin, { resolveServerScript } from "../index.mjs";
 import envelope from "../src/file-envelope.cjs";
 import driver from "../src/gemini-driver.js";
-import { resultPaths } from "../src/worktree-writer.mjs";
+import { outputPath, resultPaths } from "../src/worktree-writer.mjs";
 
 const { sha256, verifyFileResponse } = envelope;
 const server = new URL("../acp-server.mjs", import.meta.url).href;
@@ -247,6 +247,40 @@ test("file gate compares useful UTF-8 bytes, strict fences, distinct keys and me
   assert.throws(() => resultPaths(job(["a"]) + "\n## Файлы результата\n- b"), /repeated/);
 });
 
+test("output paths reject Git pathspec magic in every component", () => {
+  for (const name of [":(icase)output.md", ":(exclude)output.md", "!output.md", "^output.md"]) {
+    for (const path of [name, "docs/" + name]) {
+      assert.throws(() => outputPath(path), /invalid or protected output path/, path);
+    }
+  }
+  assert.equal(outputPath("docs/output:notes!^.md"), "docs/output:notes!^.md");
+});
+
+test("result files accept matching inline backticks and validate the unwrapped paths", () => {
+  assert.deepEqual(resultPaths(job(["`docs/a.md`", "docs/b.md"])), ["docs/a.md", "docs/b.md"]);
+  assert.throws(() => resultPaths(job(["docs/a.md", "`docs/a.md`"])), /duplicate/);
+  assert.throws(() => resultPaths(job(["`../escape.md`"])), /invalid or protected output path/);
+});
+
+test("accept-edits prompt can write after retrying the BB thread lookup", async (t) => {
+  const repo = repoFixture(t);
+  const metadata = readFileSync(repo.bb);
+  writeFileSync(repo.bb, "#!" + process.execPath + "\nprocess.exit(1);\n");
+  const app = acp(repo, ({ fileCapture }) => fileCapture
+    ? { fileResponse: channels(output(fileCapture.nonce, [create("result.md", "recovered metadata")])) }
+    : { text: "read-only response" });
+  const { result: session } = await app.session();
+  assert.equal(session.modes.currentModeId, "read-only");
+
+  writeFileSync(repo.bb, metadata);
+  const response = await app.prompt(session.sessionId, job(["result.md"]));
+  assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response.error));
+  assert.ok(app.requests()[0].fileCapture?.nonce);
+  assert.equal(repo.git("show", "HEAD:result.md"), "recovered metadata");
+  assert.equal(repo.git("show", "-s", "--format=%P", "HEAD"), repo.head);
+  assert.equal(repo.clean(), "");
+});
+
 test("accept-edits records hashes, commits exact create/replace/delete bytes once, and replays a saved receipt", async (t) => {
   const repo = repoFixture(t, { "replace.md": "before\n", "delete.md": "remove\n" });
   const app = acp(repo, ({ prompt, fileCapture }, count) => {
@@ -263,7 +297,7 @@ test("accept-edits records hashes, commits exact create/replace/delete bytes onc
   assert.deepEqual(session.modes.availableModes.map(({ id }) => id), ["read-only", "write"]);
   const preopened = acp(repo, () => { throw new Error("a second session cannot commit the same task again"); });
   const { result: otherSession } = await preopened.session();
-  const task = job(["docs/ready.md", "empty.md", "replace.md", "delete.md"]);
+  const task = job(["`docs/ready.md`", "empty.md", "replace.md", "delete.md"]);
   const response = await app.prompt(session.sessionId, task);
   assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response.error));
   assert.equal(app.requests().length, 2);
