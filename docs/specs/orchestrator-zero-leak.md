@@ -27,7 +27,7 @@
 | **Git Object Store & History (Блокер 1)** | `git worktree` хранит ссылку на общий `.git`. Агент вызывает `git log -p --all`, `git reflog`, `git rev-list --objects`, читая удалённые секреты, конфиденциальные файлы и метаданные авторов (`git log --format="%an %ae"`). | **Snapshot Sandbox:** разворачивание чистого tar-слепка (`git archive`) в изолированный каталог с одноразовым `git init`. Физическое отсутствие родительского `.git`. |
 | **Runtime Traversal `confidentialPaths` (Блокер 2)** | `confidentialPaths` проверяется только на старте. Во время выполнения агент читает файлы секретных модулей напрямую через `read_file` или `bash`. | **Mount Masking & Archive Exclusion:** файлы `confidentialPaths` исключаются из архива слепка и принудительно перекрываются точками монтирования: файл → `--ro-bind /dev/null`, каталог → `--tmpfs`. |
 | **Синтаксический слом и Unmasking Oracle (Блокер 3)** | Кириллические скобочные маркеры `[скрыто: <тип>]` ломают парсеры JSON/YAML/URL и `git apply`. Слепая подстановка запекает секреты из prompt injection в репозиторий. | **RFC ASCII-маски и One-Way Context Unmasking:** стандартизированные идентификаторы (`host-N.bb-mask.internal`, `198.51.100.N`, `__BB_REDACTED_SECRET_NNN__`). Подстановка секретов разрешена ТОЛЬКО в неизменённых строках `' '` и удалениях `'-'`. Строгий отказ сдачи при наличии токенов в `'+'` или отчёте. |
-| **Утечки окружения хоста и DoS (Блокер 4)** | bwrap без `--clearenv` передаёт переменные окружения родителя (`BB_THREAD_ID`, ключи API). Неограниченный `bash` запускает fork-бомбу. На ядрах с запретом userns запуск падает. | **Bubblewrap Sandbox, Preflight и prlimit:** обязательный `--clearenv`, Sandbox Preflight Probe, `--unshare-net`, исключение `/etc/resolv.conf`, лимит `prlimit --nproc=64 --as=4G` внутри песочницы. |
+| **Утечки окружения хоста и DoS (Блокер 4)** | bwrap без `--clearenv` передаёт переменные окружения родителя (`BB_THREAD_ID`, ключи API). Неограниченный `bash` запускает fork-бомбу. На ядрах с запретом userns запуск падает. | **Bubblewrap Sandbox, Preflight и prlimit:** обязательный `--clearenv`, полный `--unshare-all`, боевой Sandbox Preflight Probe, `--unshare-net`, исключение `/etc/resolv.conf`, лимит `prlimit --nproc=64 --as=4294967296 --cpu=1200` (4 GiB, 20 мин CPU) внутри песочницы, валидация симлинков. |
 | **Автоматический даунгрейд приватности (Блокер 5)** | При сбое доверенных провайдеров задача молча уходит на публичные бесплатные маршруты. | **Принцип Fail-Closed:** задачи с `--privacy strict` или затрагивающие `confidentialPaths` при недоступности доверенных маршрутов блокируются (`status: blocked`), фоллбэк на public запрещён. |
 
 ---
@@ -56,9 +56,16 @@
    - Репозиторий песочницы содержит ровно одну ревизию. Команды инспекции истории безопасны.
 
 3. **Sandbox Preflight Probe и запуск в Bubblewrap:**
-   - **Preflight-проверка:** при старте плагина и перед раздачей на маршрут `trust: "public"` оркестратор проверяет работоспособность изоляции:
-     `bwrap --ro-bind /usr /usr --proc /proc --dev /dev true`
-     Если на хосте ограничены непривилегированные пользовательские пространства имён (например, `kernel.apparmor_restrict_unprivileged_userns = 1` в Ubuntu 24.04+), а бинарник `bwrap` не имеет установленного `setuid`-бита (`chmod u+s /usr/bin/bwrap`), маршрут помечается `sandbox-unavailable`. Задачи исполнителя на этом маршруте не стартуют на голом хосте, а переводятся в `blocked` (Fail-Closed).
+   - **Боевая Preflight-проверка:** при старте плагина оркестратора и перед раздачей на маршрут `trust: "public"` оркестратор проверяет работоспособность пространств имён ядра боевым набором параметров:
+     ```bash
+     bwrap --unshare-all --unshare-net --die-with-parent --ro-bind /usr /usr --proc /proc --dev /dev -- true
+     ```
+     Команда комплексно верифицирует создание User namespace (запись в `uid_map` / `gid_map`) и сетевого пространства имён (`--unshare-net`).
+     Если на хосте ограничены непривилегированные пользовательские пространства имён (например, `kernel.apparmor_restrict_unprivileged_userns = 1` в Ubuntu 24.04+) **И** бинарник `bwrap` не имеет установленного `setuid`-бита (`chmod u+s /usr/bin/bwrap`), либо нарушена сетевая изоляция (`Failed RTM_NEWADDR`):
+     - Маршрут помечается как `sandbox-unavailable`. Запись о блокировке регистрируется в таблице `route_holds` через `store.hold(routeKey, Date.now() + 86400000, "sandbox-unavailable: unprivileged userns or network namespace restricted")` в единой модели с `unavailablePatterns` / hold (§2 / `policy.ts`). Маркер хранится в БД и снимается при перезапуске плагина с повторным успешным выполнением `probeSandbox()` либо по истечении тайм-аута удержания.
+     - Ошибки вида `"bwrap: setting up uid map: Permission denied"` и `"loopback: Failed RTM_NEWADDR"` входят в состав системных `BUILTIN_UNAVAILABLE_PATTERNS`.
+     - Задачи исполнителя на этом маршруте не стартуют на голом хосте, а немедленно переводятся в `blocked` (Fail-Closed).
+   - **Запрет подмены `--unshare-all`:** использование полного флага `--unshare-all` является строгим требованием безопасности. Подмена его набором выборочных флагов (например, только `--unshare-net` и `--unshare-pid`) **категорически запрещена**: User namespace изолирует UID/GID и гарантирует свежий локальный счётчик ucounts для `prlimit --nproc=64`. Исключение флага User namespace приводит к падению с ошибкой `EAGAIN` при старте из-за фоновых процессов хоста.
    - При успешном preflight агент и его дочерние инструменты запускаются внутри изолированного окружения:
      ```bash
      bwrap \
@@ -81,22 +88,36 @@
        --setenv PATH /usr/local/bin:/usr/bin:/bin \
        --setenv BB_SANDBOX "1" \
        <точки_монтирования_confidentialPaths> \
-       -- prlimit --nproc=64 --as=4294967296 -- <команда_агента>
+       -- prlimit --nproc=64 --as=4294967296 --cpu=1200 -- <команда_агента>
      ```
-   - **Важно по лимитам ресурсов:** утилита `prlimit --nproc=64 --as=4G` накладывается **СТРОГО ВНУТРИ** песочницы на команду агента. Это исключает падение с ошибкой `EAGAIN` при старте, возникающее, если накладывать лимит снаружи на процесс `bwrap` при большом числе фоновых процессов пользователя хоста.
-   - **Подготовка mountpoint:** для путей из `confidentialPaths` оркестратор предварительно гарантирует существование целевого файла (`mkdir -p $(dirname ...) && touch ...`) или директории (`mkdir -p ...`), после чего применяет точки монтирования:
+   - **Лимиты ресурсов внутри песочницы:** утилита `prlimit --nproc=64 --as=4294967296 --cpu=1200` (4 GiB виртуальной памяти, 64 процесса, 1200 секунд CPU) накладывается **СТРОГО ВНУТРИ** песочницы на команду агента. Это исключает падение с ошибкой `EAGAIN` при старте, возникающее, если накладывать лимит снаружи на процесс `bwrap` при большом числе фоновых процессов пользователя хоста.
+   - **Подготовка mountpoint:** для путей из `confidentialPaths` оркестратор перед запуском bwrap гарантирует существование целевого файла (`mkdir -p $(dirname ...) && touch ...`) или директории (`mkdir -p ...`), после чего применяет точки монтирования:
      - если путь в репозитории — файл: `--ro-bind /dev/null /workspace/<confidentialPath>`
      - если путь в репозитории — каталог: `--tmpfs /workspace/<confidentialPath>`
    - Замечание: файл `/etc/resolv.conf` **НЕ пробрасывается**, так как сеть отключена (`--unshare-net`), а его содержимое раскрывает IP-адреса локальных DNS-серверов хоста.
 
-4. **Извлечение и применение результата:**
-   - По завершении хода оркестратор регистрирует новые untracked-файлы и снимает дифф:
+4. **Извлечение, очистка и применение результата:**
+   - По завершении хода оркестратор выполняет санитарную очистку артефактов и плейсхолдеров, регистрирует новые untracked-файлы и снимает дифф:
      ```bash
-     git -C "$SANDBOX_DIR" add -AfN
-     git -C "$SANDBOX_DIR" diff HEAD > "$SANDBOX_DIR/patch.diff"
+     # 1. Санитарная очистка артефактов сборки и кэшей, созданных агентом
+     rm -rf "$SANDBOX_DIR"/{node_modules,.venv,__pycache__,dist,build,.turbo,target,.pytest_cache,.mypy_cache,.cache}
+
+     # 2. Удаление временных плейсхолдеров confidentialPaths перед фиксацией
+     for p in "${CONFIDENTIAL_PATHS[@]}"; do
+       rm -rf "$SANDBOX_DIR/$p"
+     done
+
+     # 3. Регистрация untracked-файлов без принудительного флага -f
+     # Флаг -f исключён: он втаскивал бы игнорируемые деревья и кэши в патч.
+     # Регистрация уважает .gitignore и явно исключает confidentialPaths.
+     git -C "$SANDBOX_DIR" add -AN -- . "${EXCLUDE_CONFIDENTIAL_ARGS[@]}"
+
+     # 4. Снятие диффа с явным исключением confidentialPaths
+     git -C "$SANDBOX_DIR" diff HEAD -- . "${EXCLUDE_CONFIDENTIAL_ARGS[@]}" > "$SANDBOX_DIR/patch.diff"
      ```
-   - Флаг `-f` гарантирует регистрацию созданных агентом файлов даже в случае их попадания под шаблоны `.gitignore`.
-   - Дифф валидируется через DLP Redaction Engine (§4.2).
+   - **Исключение флага `-f`:** стандартная команда `git add -AN` уважает правила `.gitignore`. Новые исходные файлы агента (например, `src/utils/new-helper.ts`) регистрируются как intent-to-add и попадают в дифф, в то время как сборочные зависимости и кэши, попавшие под `.gitignore`, отсекаются и не загрязняют репозиторий.
+   - **Удаление плейсхолдеров и pathspec exclusion:** удаление созданных touch/mkdir заглушек `confidentialPaths` и использование pathspec `':(exclude)<path>'` гарантируют, что пути из `confidentialPaths` не попадут в `patch.diff` в виде `new file mode 100644`. Это предотвращает ошибку `git apply --check: already exists in working directory` на доверенном рабочем дереве и исключает утечку имён секретных файлов в заголовок патча.
+   - Дифф валидируется через DLP Redaction Engine (§4.2) и проходит верификацию символических ссылок (§4.3).
    - Валидированный патч применяется к рабочему дереву задачи в доверенном контуре:
      `git apply --check "$SANDBOX_DIR/patch.diff" && git apply "$SANDBOX_DIR/patch.diff"`
    - Каталог `$SANDBOX_DIR` безопасно удаляется:
@@ -168,6 +189,15 @@
    `dlp-violation: token exfiltration detected in diff addition or report body`.
    Никакого скрытого запекания реального секрета в репозиторий не допускается.
 
+### 4.3. Валидация символических ссылок (Symlink Traversal Protection)
+
+При разборе `patch.diff` (до применения к доверенному рабочему дереву) оркестратор анализирует патч на предмет создания или модификации символических ссылок (`new file mode 120000`):
+1. **Запрет абсолютных симлинков:** если целевой путь (target) симлинка начинается с `/` (например `+ /etc/passwd` или `+ /home/ubuntu/.bb/config.json`), патч немедленно отклоняется с ошибкой:
+   `symlink-violation: absolute symlink target '<target>' is prohibited`.
+2. **Запрет выхода за пределы репозитория:** если относительный путь симлинка с учётом переходов `../` выходит за пределы корня репозитория (`path.resolve(repoRoot, linkDir, target)` лежит вне `repoRoot`), патч отклоняется:
+   `symlink-violation: symlink target '<target>' escapes repository root`.
+3. **Проверка при применении:** при исполнении `git apply` контролируется реальный путь (`realpath`) целевых файлов — применение изменений поверх существующих симлинков на хосте запрещено.
+
 ---
 
 ## 5. Матрица доверия (Capability & Trust Matrix)
@@ -236,18 +266,20 @@ export interface PolicyRoute {
    - Запуск агента на публичном маршруте.
    - Проверка истории: `git log --all`, `git reflog`, `git rev-list --objects` возвращают ровно один коммит `sandbox root snapshot`.
    - Проверка ENV: вызов `env` внутри песочницы подтверждает отсутствие `BB_THREAD_ID`, `BB_SERVER_URL` и токенов провайдеров.
-2. **Тест Б2 (Физическое исключение `confidentialPaths` + `git add -AfN`):**
+2. **Тест Б2 (Физическое исключение `confidentialPaths`, отсутствие плейсхолдеров и фильтрация .gitignore):**
    - В репозитории есть `src/auth/secret.ts` (файл) и `secrets/keys/` (каталог) из `confidentialPaths`.
    - Чтение файла возвращает пустой вывод (`/dev/null`), чтение каталога — пустую директорию `tmpfs`.
-   - Создание нового файла `src/utils/new-helper.ts` агентом в песочнице: команда `git add -AfN && git diff HEAD` включает новый файл в `patch.diff` без потерь.
+   - Создание нового файла `src/utils/new-helper.ts` (untracked, не в `.gitignore`): команда `git add -AN && git diff HEAD` включает новый файл в `patch.diff` без потерь.
+   - Создание временных файлов в игнорируемых каталогах (например, `node_modules/pkg/index.js` или `test.log` при `*.log` в `.gitignore`): благодаря исключению флага `-f` и предварительной санитарной очистке артефакты НЕ попадают в `patch.diff`, предотвращая загрязнение доверенного дерева.
+   - Плейсхолдеры mountpoint `confidentialPaths` удаляются до `git add`: в `patch.diff` отсутствуют записи для `src/auth/secret.ts`, а `git apply --check` на доверенном дереве завершается успешно без ошибки `already exists in working directory`.
 3. **Тест Б3 (Защита от Unmasking Oracle):**
    - Агент возвращает unified diff, где в добавленной строке `'+'` находится токен `__BB_REDACTED_SECRET_001__`.
    - Оркестратор бракует сдачу с ошибкой `dlp-violation`. Секрет не запекается в репозиторий.
    - Агент возвращает удаление строки с секретом (строка `'-'`): анмаскинг в удаляемой строке проходит успешно, `git apply` накладывается без ошибок.
 4. **Тест Б4 (Изоляция Bubblewrap, Preflight и Prlimit):**
-   - Sandbox Preflight Probe запускается при старте. Если unprivileged userns заблокированы ядром, публичный маршрут исполнителя получает статус `sandbox-unavailable`.
+   - Боевой Sandbox Preflight Probe (`bwrap --unshare-all --unshare-net --die-with-parent --ro-bind /usr /usr --proc /proc --dev /dev -- true`) запускается при старте. Если unprivileged userns заблокированы ядром И отсутствует setuid-бит на bwrap, публичный маршрут исполнителя получает статус `sandbox-unavailable` с регистрацией в `route_holds`.
    - При активной песочнице агент вызывает `curl https://google.com` или пытается прочитать `/etc/shadow`.
-   - Результат: отказ сети `Network is unreachable`, отказ доступа к файлам хоста. Внутренний лимит `prlimit --nproc=64` защищает от fork-бомбы.
+   - Результат: отказ сети `Network is unreachable`, отказ доступа к файлам хоста. Внутренний лимит `prlimit --nproc=64 --as=4294967296 --cpu=1200` защищает от fork-бомбы и исчерпания памяти/CPU.
 5. **Тест Б5 (Fail-Closed):**
    - Задача с `--privacy strict`. Провайдер `swe2` (trusted-cloud) отключен или исчерпал лимиты.
    - Попытка перехода задачи с `--privacy strict` на публичный маршрут при отключенном swe2.
