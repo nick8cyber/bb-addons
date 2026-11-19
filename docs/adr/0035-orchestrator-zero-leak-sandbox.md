@@ -112,7 +112,7 @@ export interface Policy {
 | `public` | OpenCode free, веб-Gemini (Argon/Carbon), публичные пулы | Строгий DLP, RFC ASCII-маскирование, физическое исключение `confidentialPaths` | Строгий bwrap, `--unshare-all`, Snapshot Sandbox без `.git` |
 
 **Исполнение ролей на публичных маршрутах:**
-- Для всех ролей (`executor`, `auditor`, `researcher`, `architect`): исполнение строго в Snapshot Sandbox на базе bubblewrap с сетевым карантином (`--unshare-all`) при успешном Sandbox Preflight Probe, либо через внутренний агент плагина провайдера ([ADR-0034](0034-provider-web-gemini-inner-agent.md)). Режим «маршрут без инструментов» (`tools: false`) и сборка текстового пакета материалов первого сообщения оркестратором полностью удалены (ADR-0036, PLUG-316). Внешние веб-модели без нативных инструментов используют внутренний агент контекста провайдера или Snapshot Sandbox.
+- Для всех ролей (`executor`, `auditor`, `researcher`, `architect`): на `public` исполнение всегда строго в Snapshot Sandbox на базе bubblewrap с сетевым карантином (`--unshare-all`) при успешном Sandbox Preflight Probe; для моделей без нативных инструментов файловую работу в изолированном снимке выполняет внутренний агент провайдера ([ADR-0034](0034-provider-web-gemini-inner-agent.md)). Режим «маршрут без инструментов» (`tools: false`) и сборка текстового пакета материалов первого сообщения оркестратором полностью удалены (ADR-0036, PLUG-316).
 
 **Принцип Fail-Closed:**
 Если задача помечена флагом приватности `--privacy strict` либо затрагивает файлы из перечня `confidentialPaths`, а все маршруты уровней `trusted-local` и `trusted-cloud` недоступны (исчерпана квота, rate limit, сбой сети):
