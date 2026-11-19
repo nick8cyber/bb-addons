@@ -60,6 +60,7 @@ const POLICY_TEXT = JSON.stringify({
       autoFallback: true,
     },
     research: { role: "researcher", chain: ["research-argon"], autoFallback: true },
+    architect: { role: "architect", chain: ["arch-route"], autoFallback: true },
     simple: { chain: ["simple"] },
   },
   routes: {
@@ -78,10 +79,15 @@ const POLICY_TEXT = JSON.stringify({
       maxActive: 1,
       quotaGroup: "argon",
     },
+    "arch-route": {
+      preset: "a-arch",
+      provider: "claude-code",
+      tools: false,
+    },
     simple: { preset: "simple", provider: "acp-opencode" },
   },
 });
-const PRESETS = new Set(["a-r", "o-r", "r-a", "simple"]);
+const PRESETS = new Set(["a-r", "o-r", "r-a", "simple", "a-arch"]);
 
 // ── §20.1 policy validation ───────────────────────────────────────────
 
@@ -115,13 +121,15 @@ test("§20.1: tools:false in release-audit is a policy error", () => {
   assert.ok(load.errors.some((e) => e.path === "routes.a.tools"));
 });
 
-test("§20.1/§21.3: tools:false is valid on auditor and researcher levels", () => {
+test("§20.1/§21.3/§30.1: tools:false is valid on auditor, researcher, and architect levels", () => {
   const load = parsePolicy(POLICY_TEXT, PRESETS);
   assert.equal(load.errors.length, 0, JSON.stringify(load.errors));
   assert.ok(load.policy);
   assert.equal(levelRole(load.policy, "review"), "auditor");
   assert.equal(levelRole(load.policy, "research"), "researcher");
+  assert.equal(levelRole(load.policy, "architect"), "architect");
   assert.equal(roleForLevel("research", load.policy), "researcher");
+  assert.equal(roleForLevel("architect", load.policy), "architect");
 });
 
 test("§20.1: tools must be a boolean", () => {
@@ -851,6 +859,24 @@ test("§21.1: the role window offers researcher; labels and the ≤2500-char tex
   }
   assert.deepEqual(ROLES.researcher.tools, []);
   assert.equal(ROLES.researcher.delegates, false);
+});
+
+test("§30.1: the role window offers architect; labels and the ≤2500-char texts exist", () => {
+  assert.ok((WINDOW_ROLE_IDS as readonly string[]).includes("architect"));
+  const ru = createT("ru");
+  const en = createT("en");
+  assert.equal(ru("app.roleArchitect"), "Архитектор");
+  assert.equal(en("app.roleArchitect"), "Architect");
+  for (const t of [T_RU, createT("en")]) {
+    const text = roleInstructions("architect", { t });
+    assert.ok(text.length > 0 && text.length <= ROLE_INSTRUCTIONS_MAX);
+    assert.match(text, /архитектор|architect/i);
+    assert.match(text, /design/i);
+    assert.match(text, /design_check/i);
+    assert.match(text, /договор приёмки|acceptance contract/i);
+  }
+  assert.deepEqual(ROLES.architect.tools, []);
+  assert.equal(ROLES.architect.delegates, false);
 });
 
 test("§21.2: the orchestrator role text tells the coordinator to delegate research first", () => {

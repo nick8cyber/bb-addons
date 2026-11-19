@@ -59,7 +59,8 @@ export type RoleId =
   | "auditor"
   | "release-auditor"
   | "researcher"
-  | "helper";
+  | "helper"
+  | "architect";
 
 export const ROLE_IDS: readonly RoleId[] = [
   "orchestrator",
@@ -68,6 +69,7 @@ export const ROLE_IDS: readonly RoleId[] = [
   "release-auditor",
   "researcher",
   "helper",
+  "architect",
 ];
 
 /** §13.1 rev 20: `release-auditor` is never offered in the new-chat
@@ -89,6 +91,8 @@ export const WINDOW_ROLE_IDS = [
   // §21.1 (r33): researcher is a real window pick — a chat that only
   // searches the internet without touching the project.
   "researcher",
+  // §30.1 (r34): architect designs and validates architecture & contracts.
+  "architect",
 ] as const;
 
 export const DEFAULT_ROLE: RoleId = "orchestrator";
@@ -117,6 +121,7 @@ const ROLE_BODY_KEYS: Record<RoleId, string> = {
   "release-auditor": "role.body.releaseAuditor",
   researcher: "role.body.researcher",
   helper: "role.body.helper",
+  architect: "role.body.architect",
 };
 
 const ROLE_MANDATORY_KEYS: Partial<Record<RoleId, string>> = {
@@ -345,6 +350,15 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
     tools: [],
     skills: [],
   },
+  // §30.1 (r34): architects design upfront and validate at the end —
+  // no code modification tools, no delegation tools, no helpers.
+  architect: {
+    id: "architect",
+    delegates: false,
+    instructions: roleInstructions("architect"),
+    tools: [],
+    skills: [],
+  },
 };
 
 export const isRoleId = (value: unknown): value is RoleId =>
@@ -369,7 +383,9 @@ export const roleForLevel = (
         // reviewByLevel entry decides this, the level's role does.
         levelRole(policy, level) === "researcher"
         ? "researcher"
-        : "executor";
+        : levelRole(policy, level) === "architect"
+          ? "architect"
+          : "executor";
 
 /** §19.1: helper spawns carry `helper#<id> · <title>` from birth. */
 const HELPER_TITLE_RE = /^helper#(\d+) · /;

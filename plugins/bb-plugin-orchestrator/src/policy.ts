@@ -41,7 +41,7 @@ export interface PolicyRoute {
 
 /** §2.3: what a level's delegation does — executes, only checks, or
  * researches (§21). */
-export type LevelRole = "auditor" | "executor" | "researcher";
+export type LevelRole = "auditor" | "executor" | "researcher" | "architect";
 
 export interface PolicyLevel {
   description?: string;
@@ -319,13 +319,14 @@ export function parsePolicy(
       if (value.autoFallback !== undefined && typeof value.autoFallback !== "boolean") {
         err(`${path}.autoFallback`, t("pol.isBool"));
       }
-      // §2.3: the level's role — `auditor` (review), `executor`, or
-      // `researcher` (§21).
+      // §2.3/§30: the level's role — `auditor` (review), `executor`,
+      // `researcher` (§21), or `architect` (§30).
       if (
         value.role !== undefined &&
         value.role !== "auditor" &&
         value.role !== "executor" &&
-        value.role !== "researcher"
+        value.role !== "researcher" &&
+        value.role !== "architect"
       ) {
         err(`${path}.role`, t("pol.roleEnum"));
       }
@@ -352,7 +353,8 @@ export function parsePolicy(
           : {}),
         ...(value.role === "auditor" ||
         value.role === "executor" ||
-        value.role === "researcher"
+        value.role === "researcher" ||
+        value.role === "architect"
           ? { role: value.role }
           : {}),
         chain,
@@ -615,9 +617,9 @@ export function parsePolicy(
     }
   }
 
-  // §20.1/§21.3 (r33): a `tools: false` route may stand only in levels
-  // whose role is `auditor` or `researcher` — never in `release-audit`
-  // or an executor level.
+  // §20.1/§21.3/§30.1: a `tools: false` route may stand only in levels
+  // whose role is `auditor`, `researcher`, or `architect` — never in
+  // `release-audit` or an executor level.
   for (const [levelName, level] of Object.entries(levels)) {
     const role =
       level.role ?? (levelName === "review" ? "auditor" : "executor");
@@ -626,7 +628,7 @@ export function parsePolicy(
       if (!route || route.tools !== false) continue;
       if (
         levelName === "release-audit" ||
-        (role !== "auditor" && role !== "researcher")
+        (role !== "auditor" && role !== "researcher" && role !== "architect")
       ) {
         err(
           `routes.${routeName}.tools`,
@@ -778,7 +780,10 @@ export function levelRole(
 ): LevelRole {
   const role = policy?.levels[levelName]?.role;
   if (role) return role;
-  return levelName === "review" ? "auditor" : "executor";
+  if (levelName === "review") return "auditor";
+  if (levelName === "research") return "researcher";
+  if (levelName === "architect") return "architect";
+  return "executor";
 }
 
 /**

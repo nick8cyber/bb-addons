@@ -163,7 +163,7 @@ export const rpcContract = defineRpcContract({
   setPendingRole: {
     input: z.object({
       projectId: z.string().nullable(),
-      role: z.enum(["none", "orchestrator", "executor", "auditor", "researcher"]),
+      role: z.enum(["none", "orchestrator", "executor", "auditor", "researcher", "architect"]),
     }),
     output: z.object({ ok: z.literal(true) }),
   },
@@ -171,7 +171,7 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().nullable() }),
     output: z.object({
       role: z
-        .enum(["none", "orchestrator", "executor", "auditor", "researcher"])
+        .enum(["none", "orchestrator", "executor", "auditor", "researcher", "architect"])
         .nullable(),
     }),
   },
@@ -808,7 +808,7 @@ export async function createPlugin(
       reviewLevel: reviewLevelName(policyLoad.policy),
     };
     const extra =
-      id === "release-auditor" || id === "helper" || id === "researcher"
+      id === "release-auditor" || id === "helper" || id === "researcher" || id === "architect"
         ? undefined
         : roleTextsLoad.texts[id];
     const text = roleInstructions(id, { extra, ...opts, t });

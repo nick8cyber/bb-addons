@@ -155,7 +155,7 @@ const POLICY_TEXT = JSON.stringify({
   },
 });
 
-async function createRehearsalHost(
+export async function createRehearsalHost(
   settings: Record<string, string | boolean> = {},
   cli: BbCli = fakeCli().cli,
   cmdRunner: CmdRunner = fakeCmd().cmd,

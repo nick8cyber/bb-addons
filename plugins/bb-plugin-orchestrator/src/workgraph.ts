@@ -130,6 +130,7 @@ export function resolveLevelRoleForWorkGraph(
 
   if (policy) {
     const pLevel = policy.levels[levelName];
+    if (pLevel?.role === "architect") return "architect";
     if (pLevel?.role === "auditor") return "auditor";
     if (pLevel?.role === "researcher") return "researcher";
     if (pLevel?.role === "executor") return "executor";
@@ -1288,6 +1289,16 @@ export async function runReject(
 
   if (task.node === "owner_gate") {
     assertOwnerOnly(deps.ctx);
+    let gateStage: "pre_code" | "pre_release" | undefined;
+    try {
+      if (task.payload) {
+        const p = JSON.parse(task.payload);
+        if (p.gate_stage === "pre_code" || p.gate_stage === "pre_release") {
+          gateStage = p.gate_stage;
+        }
+      }
+    } catch {}
+
     const tgt = target as TaskNode | undefined;
     const resolution = resolveTransition({
       route: task.route,
@@ -1296,6 +1307,7 @@ export async function runReject(
       event: { type: "owner_reject", isOwner: true, target: tgt, reason: reason! },
       mode: task.confirmation_mode,
       counters: extractCounters(task),
+      gateStage,
     });
 
     if (!resolution.allowed) {
@@ -1404,6 +1416,10 @@ export async function runResume(
     reopen?: boolean;
     cmd?: CmdRunner;
     repoRoot?: string;
+    dispatchNode?: (
+      task: TaskQueueRow,
+      node: TaskNode,
+    ) => Promise<{ ok: boolean; delegationId?: number; error?: string } | void>;
   },
 ): Promise<{ ok: boolean; task: TaskQueueRow }> {
   if (deps.workGraphMode === "off") {
@@ -1510,6 +1526,9 @@ export async function runResume(
           `не удалось возобновить задачу ${key}: конфликт CAS`,
         );
       }
+      if (res.task && resolution.action?.dispatchNode && deps.dispatchNode) {
+        await deps.dispatchNode(res.task, resolution.action.dispatchNode);
+      }
       return { ok: true, task: res.task! };
     }
 
@@ -1540,6 +1559,9 @@ export async function runResume(
         "transition-failed",
         `не удалось возобновить задачу ${key}: конфликт CAS`,
       );
+    }
+    if (res.task && resolution.action?.dispatchNode && deps.dispatchNode) {
+      await deps.dispatchNode(res.task, resolution.action.dispatchNode);
     }
     return { ok: true, task: res.task! };
   }
@@ -1618,6 +1640,9 @@ export async function runResume(
         `не удалось возобновить задачу ${key}: конфликт CAS`,
       );
     }
+    if (res.task && resolution.action?.dispatchNode && deps.dispatchNode) {
+      await deps.dispatchNode(res.task, resolution.action.dispatchNode);
+    }
     return { ok: true, task: res.task! };
   }
 
@@ -1668,6 +1693,9 @@ export async function runResume(
         `не удалось возобновить задачу ${key}: конфликт CAS`,
       );
     }
+    if (res.task && resolution.action?.dispatchNode && deps.dispatchNode) {
+      await deps.dispatchNode(res.task, resolution.action.dispatchNode);
+    }
     return { ok: true, task: res.task! };
   }
 
@@ -1704,6 +1732,16 @@ export async function runApprove(
     );
   }
 
+  let gateStage: "pre_code" | "pre_release" | undefined;
+  try {
+    if (task.payload) {
+      const p = JSON.parse(task.payload);
+      if (p.gate_stage === "pre_code" || p.gate_stage === "pre_release") {
+        gateStage = p.gate_stage;
+      }
+    }
+  } catch {}
+
   const resolution = resolveTransition({
     route: task.route,
     node: task.node,
@@ -1711,6 +1749,7 @@ export async function runApprove(
     event: { type: "owner_approve", isOwner: isOwnerCalling(deps.ctx), comment },
     mode: task.confirmation_mode,
     counters: extractCounters(task),
+    gateStage,
   });
 
   if (!resolution.allowed) {
@@ -2661,6 +2700,14 @@ async function startQueuedTask(
     updates: {
       branch,
       acceptance_sha: acceptanceSha,
+      ...(resolution.action?.setPayload
+        ? {
+            payload: JSON.stringify({
+              ...payload,
+              ...resolution.action.setPayload,
+            }),
+          }
+        : {}),
     },
     timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
   }, now);
@@ -3328,6 +3375,7 @@ async function advanceActiveTask(
             acceptance_sha: accSha,
             payload: JSON.stringify({
               ...payload,
+              ...(resolution.action?.setPayload ?? {}),
               design_done: false,
               acceptance_text: contractText,
               consumed_delegations: consumed,
@@ -3587,6 +3635,7 @@ async function advanceActiveTask(
           spec_sha: specSha,
           payload: JSON.stringify({
             ...payload,
+            ...(resolution.action?.setPayload ?? {}),
             spec_done: false,
             consumed_delegations: consumed,
             nudge_count: 0,
@@ -3742,6 +3791,7 @@ async function advanceActiveTask(
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
+            ...(resolution.action?.setPayload ?? {}),
             spec_review_verdict: null,
             spec_review_blockers: null,
             consumed_delegations: consumed,
@@ -3908,6 +3958,7 @@ async function advanceActiveTask(
           result_sha: resultSha,
           payload: JSON.stringify({
             ...payload,
+            ...(resolution.action?.setPayload ?? {}),
             code_done: false,
             result_commits: null,
             acceptance_tampered: false,
@@ -3966,6 +4017,7 @@ async function advanceActiveTask(
       const updates: Partial<TaskQueueRow> = {
         payload: JSON.stringify({
           ...payload,
+          ...(resolution.action?.setPayload ?? {}),
           code_done: false,
           checks_fail: false,
         }),
@@ -4118,6 +4170,7 @@ async function advanceActiveTask(
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
+            ...(resolution.action?.setPayload ?? {}),
             review_verdict: null,
             review_blockers: null,
             consumed_delegations: consumed,
@@ -4228,7 +4281,7 @@ async function advanceActiveTask(
                   "thread",
                   "tell",
                   latestDelegation.thread_id,
-                  'Заверши вердиктом: закончи строкой JSON {"verdict":"OK"|"CHANGES","blockers":<n>}',
+                  'Заверши вердиктом: закончи строкой JSON {"verdict":"OK"|"CHANGES","blockers":<n>,"target":"code"|"design"}',
                 ])
                 .catch(() => {});
             }
@@ -4278,6 +4331,7 @@ async function advanceActiveTask(
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
+            ...(resolution.action?.setPayload ?? {}),
             design_check_verdict: null,
             design_check_blockers: null,
             design_check_target: null,

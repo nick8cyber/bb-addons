@@ -209,7 +209,7 @@ export async function wrapPromptWithPacket(args: {
   /** `auditor` — JSON verdict required, diff of the checked work,
    * `packet-empty` applies; `researcher` — internet search allowed,
    * diff only with an explicit `--from`, never `packet-empty` (§21.3). */
-  role: "auditor" | "researcher";
+  role: "auditor" | "researcher" | "architect";
   /** The prompt being wrapped — the task part of the spawn seed. */
   prompt: string;
   /** §20.2 п.4 packet order — header → task → stat → files → diff →
@@ -415,7 +415,11 @@ export async function wrapPromptWithPacket(args: {
     maskedFiles.reduce((n, m) => n + m.count, 0) +
     maskedDiff.reduce((n, m) => n + m.count, 0);
   const header = t(
-    args.role === "researcher" ? "pkt.headerResearch" : "pkt.headerAudit",
+    args.role === "researcher"
+      ? "pkt.headerResearch"
+      : args.role === "architect"
+        ? "pkt.headerArchitect"
+        : "pkt.headerAudit",
     {
       masked: count > 0 ? t("pkt.masked", { n: count }) : "",
     },

@@ -699,3 +699,24 @@ test("§28.2 п. 3: node_policy validation catches errors", () => {
   const err6 = parsePolicy(JSON.stringify({ ...base, node_policy: { code: { level: "nonexistent" } } }), presets);
   assert.ok(err6.errors.some((e) => e.path === "node_policy.code.level"));
 });
+
+test("§30.1: policy supports role 'architect' and level 'spec'", () => {
+  const pol = JSON.stringify({
+    version: 1,
+    levels: {
+      architect: { role: "architect", chain: ["r-arch"] },
+      spec: { chain: ["r-spec"] },
+      custom_arch: { role: "architect", chain: ["r-arch"] },
+    },
+    routes: {
+      "r-arch": { preset: "p-arch", provider: "claude-code", tools: false },
+      "r-spec": { preset: "p-spec", provider: "acp-devin" },
+    },
+  });
+  const pr = new Set(["p-arch", "p-spec"]);
+  const load = parsePolicy(pol, pr);
+  assert.equal(load.errors.length, 0);
+  assert.equal(levelRole(load.policy, "architect"), "architect");
+  assert.equal(levelRole(load.policy, "custom_arch"), "architect");
+  assert.equal(levelRole(load.policy, "spec"), "executor");
+});

@@ -436,7 +436,8 @@ function resolveRoute(
     if (
       route.tools === false &&
       levelRole(policy, input.level ?? name) !== "auditor" &&
-      levelRole(policy, input.level ?? name) !== "researcher"
+      levelRole(policy, input.level ?? name) !== "researcher" &&
+      levelRole(policy, input.level ?? name) !== "architect"
     ) {
       throw new OrchestratorError(
         "preset-not-allowed",
@@ -666,7 +667,9 @@ export async function runHelper(
             role:
               levelRole(load.policy, route.level) === "researcher"
                 ? "researcher"
-                : "auditor",
+                : levelRole(load.policy, route.level) === "architect"
+                  ? "architect"
+                  : "auditor",
             prompt,
             spec: EMPTY_SPEC,
             continueFrom: null,
@@ -756,7 +759,9 @@ export async function runHelper(
       const helperRole =
         levelRole(load.policy, route.level) === "researcher"
           ? "researcher"
-          : "helper";
+          : levelRole(load.policy, route.level) === "architect"
+            ? "architect"
+            : "helper";
       deps.store.setThreadRole(threadId, helperRole, "delegate");
       deps.store.setHelperTurnStarted(row.id, deps.now?.() ?? Date.now());
       deps.store.setHelperStatusIf(row.id, "dispatching", "running");

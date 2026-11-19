@@ -766,7 +766,7 @@ interface DispatchOpts {
   from?: string;
   /** §20.2 (r33): the effective tool-less role for this row — set by
    * `dispatchToRoute` for the packet wrap inside the dispatch paths. */
-  toolless?: "auditor" | "researcher";
+  toolless?: "auditor" | "researcher" | "architect";
   /** §20.2: the «маршрут занят» gate — evaluated INSIDE the dispatch
    * path after the packet is built, so attach refusals and packet
    * skips land before the row ever parks. "queued" while the wait
@@ -834,7 +834,7 @@ export async function dispatchToRoute(
   const toolless =
     policyRoute?.tools === false ||
     (row.route.startsWith("preset:") &&
-      (role === "auditor" || role === "researcher") &&
+      (role === "auditor" || role === "researcher" || role === "architect") &&
       Object.values(policy?.routes ?? {}).some(
         (r) =>
           r.tools === false &&
@@ -842,13 +842,13 @@ export async function dispatchToRoute(
             (PRESET_ALIASES[row.preset] !== undefined &&
               r.preset === PRESET_ALIASES[row.preset])),
       ));
-  if (toolless && role !== "auditor" && role !== "researcher") {
+  if (toolless && role !== "auditor" && role !== "researcher" && role !== "architect") {
     await refuseDispatch(
       row,
       opts,
       deps,
       `preset-not-allowed: route "${row.route}" is a tool-less route ` +
-        `outside auditor/researcher levels`,
+        `outside auditor/researcher/architect levels`,
       "preset-not-allowed",
     );
   }
@@ -1017,10 +1017,10 @@ export async function dispatchToRoute(
       .filter(Boolean)
       .join("\n\n") || undefined;
   const instructions = mergeDispatchInstructions(
-    role === "researcher" ? undefined : deps.gitInstructions?.(),
+    role === "researcher" || role === "architect" ? undefined : deps.gitInstructions?.(),
     extra,
     row.continue_from && role !== "researcher"
-      ? role === "auditor"
+      ? role === "auditor" || role === "architect"
         ? reviewRoundLine(
             row.continue_from,
             resultRef?.branch,
@@ -1039,7 +1039,7 @@ export async function dispatchToRoute(
   );
   const innerOpts: DispatchOpts = {
     ...opts,
-    toolless: toolless ? (role as "auditor" | "researcher") : undefined,
+    toolless: toolless ? (role as "auditor" | "researcher" | "architect") : undefined,
     busyGate,
   };
   // §4 r30: the plugin spawns the executor itself — the parent,
