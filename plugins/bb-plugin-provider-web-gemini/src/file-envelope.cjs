@@ -1,12 +1,17 @@
 const { createHash } = require("node:crypto");
 
-const FORMAT = "web-gemini-files-v1";
+const FORMAT = "web-gemini-files-v2";
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const unicode = (value) => typeof value === "string" && !/[\uD800-\uDFFF]/u.test(value);
 const hasCoauthor = (value) => /^[ \t]*co-authored-by[ \t]*:/im.test(value);
 const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const hasKeys = (value, keys) => object(value) && Object.keys(value).length === keys.length &&
   keys.every((key) => Object.hasOwn(value, key));
+
+// Rewrites observed in the saved hNvQHb history channel: the DOM channel keeps
+// what the model emitted, history delivers the replacement. A channel match
+// under a known rewrite names the literal cause the repair request must quote.
+const HISTORY_REWRITES = [["\\|", "|"]];
 
 function uniqueKeys(json) {
   // JSON.parse has already validated the grammar. Ignore punctuation in strings
@@ -26,66 +31,135 @@ function uniqueKeys(json) {
   return true;
 }
 
-function decode(json, nonce) {
-  if (!unicode(json)) throw new Error("file response contains invalid Unicode");
+function metaFields(json, nonce) {
   let parsed;
   try { parsed = JSON.parse(json); }
   catch (error) {
     const position = /\bposition (\d+)/.exec(error.message)?.[1];
-    throw new Error("file response contains invalid JSON" + (position ? " near character " + position : ""));
+    throw new Error("file response META is not one valid JSON line" + (position ? " near character " + position : ""));
   }
   if (!hasKeys(parsed, ["format", "nonce", "files", "commitMessage"]) || parsed.format !== FORMAT ||
       !Array.isArray(parsed.files) || !parsed.files.length || !unicode(parsed.commitMessage) ||
       !parsed.commitMessage.trim() || parsed.commitMessage.includes("\0") ||
       hasCoauthor(parsed.commitMessage) || !uniqueKeys(json)) {
-    throw new Error("invalid file envelope fields or commit message");
+    throw new Error("invalid file envelope META fields or commit message");
   }
   if (parsed.nonce !== nonce) throw new Error("file response has the wrong nonce");
   const paths = new Set();
   const files = parsed.files.map((file) => {
-    const operation = file?.operation;
-    const keys = ["path", "operation", "baseSha256"];
-    if (operation !== "delete") keys.push("content");
-    if (!hasKeys(file, keys) || !unicode(file.path) || !file.path || paths.has(file.path) ||
-        !["create", "replace", "delete"].includes(operation) ||
-        (operation === "create" ? file.baseSha256 !== null :
-          typeof file.baseSha256 !== "string" || !/^[0-9a-f]{64}$/.test(file.baseSha256)) ||
-        (operation !== "delete" && (!unicode(file.content) || file.content.includes("\0")))) {
-      throw new Error("invalid file entry or duplicate path");
+    if (!hasKeys(file, ["path", "operation", "baseSha256"]) || !unicode(file.path) || !file.path ||
+        paths.has(file.path) || !["create", "replace", "delete"].includes(file.operation) ||
+        (file.operation === "create" ? file.baseSha256 !== null :
+          typeof file.baseSha256 !== "string" || !/^[0-9a-f]{64}$/.test(file.baseSha256))) {
+      throw new Error("invalid file entry or duplicate path in META");
     }
     paths.add(file.path);
-    return { ...file, sha256: operation === "delete" ? null : sha256(Buffer.from(file.content, "utf8")) };
+    return { path: file.path, operation: file.operation, baseSha256: file.baseSha256 };
   });
   return { files, commitMessage: parsed.commitMessage };
+}
+
+// The interior lines of the single code fence: BBG-<nonce>-ENVELOPE, one META
+// line, FILE-NN blocks in files order (delete entries have none), BBG-<nonce>-CLOSE.
+function decode(interior, nonce) {
+  if (!unicode(interior)) throw new Error("file response contains invalid Unicode");
+  const lines = interior.split("\n");
+  const open = /^BBG-(.*)-ENVELOPE\r?$/.exec(lines[0] ?? "");
+  if (!open) throw new Error("file response is missing the BBG-<nonce>-ENVELOPE line");
+  const { files, commitMessage } = metaFields(lines[1] ?? "", nonce);
+  if (open[1] !== nonce) throw new Error("file response markers carry the wrong nonce");
+  const mark = "BBG-" + nonce + "-";
+  // The line break after a framing marker may carry a CR from the outer
+  // framing; a CR at the end of a content line belongs to the file bytes.
+  const marker = (line, suffix) => line === mark + suffix || line === mark + suffix + "\r";
+  let pos = 2;
+  for (const [index, file] of files.entries()) {
+    if (file.operation === "delete") { file.sha256 = null; continue; }
+    const nn = String(index + 1).padStart(2, "0");
+    if (!marker(lines[pos], "FILE-" + nn + "-BEGIN")) {
+      throw new Error("file response is missing the " + mark + "FILE-" + nn + "-BEGIN line");
+    }
+    pos += 1;
+    const start = pos;
+    while (pos < lines.length && !lines[pos].startsWith(mark)) pos += 1;
+    if (!marker(lines[pos], "FILE-" + nn + "-END")) {
+      throw new Error("file block " + nn + " ends with a wrong or missing END marker");
+    }
+    const content = lines.slice(start, pos).join("\n");
+    pos += 1;
+    if (!unicode(content) || content.includes("\0")) throw new Error("file block " + nn + " content is invalid");
+    file.content = content;
+    file.sha256 = sha256(Buffer.from(content, "utf8"));
+  }
+  if (!marker(lines[pos], "CLOSE")) {
+    throw new Error("file response is missing the " + mark + "CLOSE line");
+  }
+  if (pos + 1 !== lines.length) throw new Error("file response has lines after the " + mark + "CLOSE line");
+  return { files, commitMessage };
+}
+
+// The RPC history channel carries the full message text: exactly one outer
+// fence, no surrounding text, and no same-character fence inside that is not
+// strictly shorter than the outer one.
+function fenceInterior(text) {
+  const open = /^\s*([\x60]{3,}|~{3,})[^\r\n]*\r?\n/.exec(text);
+  const rest = open && text.slice(open[0].length);
+  const marker = open?.[1][0] === "\x60" ? "\\x60" : "~";
+  const close = open && new RegExp("\n {0,3}(?:" + marker + "){" + open[1].length + ",}[ \t\r]*\n?\\s*$")
+    .exec("\n" + rest);
+  if (!close) throw new Error("expected exactly one Markdown fence and no surrounding text");
+  const interior = rest.slice(0, Math.max(0, close.index - 1));
+  const inner = new RegExp("^ {0,3}(?:" + marker + "){" + open[1].length + ",}", "m");
+  if (inner.test(interior)) {
+    throw new Error("expected exactly one Markdown fence and no surrounding text; " +
+      "an inner fence of the same character must be strictly shorter than the outer fence");
+  }
+  return interior;
+}
+
+function rewriteCause(rpcInterior, domInterior) {
+  for (const [from, to] of HISTORY_REWRITES) {
+    if (rpcInterior === domInterior.split(from).join(to)) {
+      return "the `" + from + "` sequence does not survive the saved-history channel; " +
+        "rewrite the affected line without it";
+    }
+  }
+  return null;
 }
 
 function verifyFileResponse(capture, nonce) {
   const { rpc, dom } = capture ?? {};
   if (rpc?.invalid || dom?.invalid) return { repair: rpc?.invalid || dom.invalid };
   if (rpc?.id && dom?.id && rpc.id !== dom.id) return { recapture: "file response channels identify different messages" };
+  let rpcInterior = null;
   try {
-    let left;
-    if (rpc?.id && typeof rpc.text === "string") {
-      const match = /^\s*([\x60]{3,}|~{3,})json[ \t]*\r?\n([\s\S]*?)\r?\n\1[ \t]*\s*$/.exec(rpc.text);
-      if (!match || /^ {0,3}(?:[\x60]{3,}|~{3,})/m.test(match[2])) {
-        throw new Error("expected exactly one json fence and no surrounding text");
-      }
-      left = decode(match[2], nonce);
-    }
-    const right = dom?.id && typeof dom.text === "string" ? decode(dom.text, nonce) : null;
-    if (!left || !right) return { recapture: "one or both file response channels are unavailable" };
-    const rightFiles = new Map(right.files.map((file) => [file.path, file]));
-    if (left.commitMessage !== right.commitMessage || left.files.length !== right.files.length ||
-        left.files.some((file) => {
-          const other = rightFiles.get(file.path);
-          return !other || file.operation !== other.operation || file.baseSha256 !== other.baseSha256 || file.sha256 !== other.sha256;
-        })) {
-      return { recapture: "file response channels disagree on content or plan metadata" };
-    }
-    return { plan: left };
+    if (rpc?.id && typeof rpc.text === "string") rpcInterior = fenceInterior(rpc.text);
   } catch (error) {
     return { repair: error.message };
   }
+  const domInterior = dom?.id && typeof dom.text === "string" ? dom.text.replace(/\r?\n$/, "") : null;
+  if (rpcInterior === null || domInterior === null) {
+    return { recapture: "one or both file response channels are unavailable" };
+  }
+  const sides = [rpcInterior, domInterior].map((interior) => {
+    try { return { plan: decode(interior, nonce) }; }
+    catch (error) { return { error: error.message }; }
+  });
+  if (!sides[0].plan || !sides[1].plan) {
+    if (sides[0].plan !== sides[1].plan) {
+      const cause = rewriteCause(rpcInterior, domInterior);
+      if (cause) return { repair: cause };
+    }
+    return { repair: sides[0].error ?? sides[1].error };
+  }
+  const metaKey = ({ files, commitMessage }) => JSON.stringify({ files: files.map(
+    ({ path, operation, baseSha256 }) => [path, operation, baseSha256]), commitMessage });
+  const [left, right] = sides.map(({ plan }) => plan);
+  if (metaKey(left) !== metaKey(right) || left.files.some((file, index) => file.sha256 !== right.files[index].sha256)) {
+    const cause = rewriteCause(rpcInterior, domInterior);
+    return { recapture: "file response channels disagree on content or plan metadata" + (cause ? ": " + cause : "") };
+  }
+  return { plan: left };
 }
 
 // Keep tool tags quoted inside file content out of the read-tool loop.
