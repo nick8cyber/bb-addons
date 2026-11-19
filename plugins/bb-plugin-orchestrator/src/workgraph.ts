@@ -910,15 +910,34 @@ export async function runEnqueue(
           }
         }
 
+        const resolution = resolveTransition({
+          route: existing.route,
+          node: "owner_gate",
+          status: existing.status,
+          event: {
+            type: "owner_enqueue_acceptance",
+            isOwner: true,
+            acceptanceText,
+          },
+          mode: existing.confirmation_mode,
+          counters: extractCounters(existing),
+        });
+        if (!resolution.allowed) {
+          throw new OrchestratorError(
+            resolution.errorCode ?? "transition-failed",
+            resolution.errorMessage ?? resolution.reason,
+          );
+        }
+
         const res = deps.store.transitionTask(
           {
             taskKey,
             expectedNode: "owner_gate",
             expectedStatus: existing.status,
-            toNode: "owner_gate",
-            toStatus: "waiting_approval",
+            toNode: resolution.toNode,
+            toStatus: resolution.toStatus,
             actor: "owner",
-            reason: "update-acceptance",
+            reason: resolution.reason,
             updates: {
               payload: JSON.stringify(existingPayload),
               acceptance_sha: accSha,
@@ -2514,14 +2533,23 @@ async function startQueuedTask(
         }
         const branchRes = await deps.cmd.run("git", ["branch", branch, baseRef], { cwd: repoRoot });
         if (branchRes.exitCode !== 0) {
+          const reason = `git-failed: не удалось создать ветку ${branch}: ${branchRes.stderr.trim()}`;
+          const failTr = resolveTransition({
+            route: task.route,
+            node: "start",
+            status: "queued",
+            event: { type: "git_failure", reason },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
           deps.store.transitionTask({
             taskKey: task.task_key,
             expectedNode: "start",
             expectedStatus: "queued",
-            toNode: "start",
-            toStatus: "stalled",
+            toNode: failTr.toNode,
+            toStatus: failTr.toStatus,
             actor: "run-queue",
-            reason: `git-failed: не удалось создать ветку ${branch}: ${branchRes.stderr.trim()}`,
+            reason: failTr.reason,
           });
           return false;
         }
@@ -2546,14 +2574,23 @@ async function startQueuedTask(
   if (resolution.action?.commitAcceptance) {
     if (payload.acceptance_text && branch) {
       if (!deps.cmd) {
+        const reason = "git-failed: missing cmd runner for acceptance commit";
+        const failTr = resolveTransition({
+          route: task.route,
+          node: "start",
+          status: "queued",
+          event: { type: "git_failure", reason },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
         deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "start",
           expectedStatus: "queued",
-          toNode: "start",
-          toStatus: "stalled",
+          toNode: failTr.toNode,
+          toStatus: failTr.toStatus,
           actor: "run-queue",
-          reason: "git-failed: missing cmd runner for acceptance commit",
+          reason: failTr.reason,
         });
         return false;
       }
@@ -2566,14 +2603,23 @@ async function startQueuedTask(
           String(payload.acceptance_text),
         );
       } catch (e: any) {
+        const reason = `git-failed: ${e?.message ?? e}`;
+        const failTr = resolveTransition({
+          route: task.route,
+          node: "start",
+          status: "queued",
+          event: { type: "git_failure", reason },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
         deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "start",
           expectedStatus: "queued",
-          toNode: "start",
-          toStatus: "stalled",
+          toNode: failTr.toNode,
+          toStatus: failTr.toStatus,
           actor: "run-queue",
-          reason: `git-failed: ${e?.message ?? e}`,
+          reason: failTr.reason,
         });
         return false;
       }
@@ -2910,14 +2956,23 @@ async function advanceActiveTask(
         let accSha = task.acceptance_sha || null;
         if (task.branch) {
           if (!deps.cmd) {
+            const reason = "git-failed: missing cmd runner for acceptance commit";
+            const failTr = resolveTransition({
+              route: task.route,
+              node: "design",
+              status: "running",
+              event: { type: "git_failure", reason },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "design",
               expectedStatus: "running",
-              toNode: "design",
-              toStatus: "stalled",
+              toNode: failTr.toNode,
+              toStatus: failTr.toStatus,
               actor: "run-queue",
-              reason: "git-failed: missing cmd runner for acceptance commit",
+              reason: failTr.reason,
             });
             return false;
           }
@@ -2930,14 +2985,23 @@ async function advanceActiveTask(
               contractText,
             );
           } catch (e: any) {
+            const reason = `git-failed: ${e?.message ?? e}`;
+            const failTr = resolveTransition({
+              route: task.route,
+              node: "design",
+              status: "running",
+              event: { type: "git_failure", reason },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "design",
               expectedStatus: "running",
-              toNode: "design",
-              toStatus: "stalled",
+              toNode: failTr.toNode,
+              toStatus: failTr.toStatus,
               actor: "run-queue",
-              reason: `git-failed: ${e?.message ?? e}`,
+              reason: failTr.reason,
             });
             return false;
           }
@@ -2988,14 +3052,28 @@ async function advanceActiveTask(
         }
 
         if (nudgeCount >= 3) {
+          const reason = `design-no-report: exhausted ${nudgeCount} nudges without acceptance contract`;
+          const tr = resolveTransition({
+            route: task.route,
+            node: "design",
+            status: "running",
+            event: {
+              type: "design_question_or_no_report",
+              exhausted: true,
+              nudgeCount,
+              reason,
+            },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
           deps.store.transitionTask({
             taskKey: task.task_key,
             expectedNode: "design",
             expectedStatus: "running",
-            toNode: "design",
-            toStatus: "stalled",
+            toNode: tr.toNode,
+            toStatus: tr.toStatus,
             actor: "run-queue",
-            reason: `design-no-report: exhausted ${nudgeCount} nudges without acceptance contract`,
+            reason: tr.reason,
           });
           return false;
         }
@@ -3061,14 +3139,28 @@ async function advanceActiveTask(
           }
 
           if (nudgeCount >= 3) {
+            const reason = `spec-no-report: exhausted ${nudgeCount} nudges without commit`;
+            const tr = resolveTransition({
+              route: task.route,
+              node: "spec",
+              status: "running",
+              event: {
+                type: "spec_question_or_no_report",
+                exhausted: true,
+                nudgeCount,
+                reason,
+              },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "spec",
               expectedStatus: "running",
-              toNode: "spec",
-              toStatus: "stalled",
+              toNode: tr.toNode,
+              toStatus: tr.toStatus,
               actor: "run-queue",
-              reason: `spec-no-report: exhausted ${nudgeCount} nudges without commit`,
+              reason: tr.reason,
             });
             return false;
           }
@@ -3237,14 +3329,28 @@ async function advanceActiveTask(
           }
 
           if (nudgeCount >= 3) {
+            const reason = `no-verdict: exhausted ${nudgeCount} spec_review nudges`;
+            const tr = resolveTransition({
+              route: task.route,
+              node: "spec_review",
+              status: "running",
+              event: {
+                type: "spec_review_question_or_no_verdict",
+                exhausted: true,
+                nudgeCount,
+                reason,
+              },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "spec_review",
               expectedStatus: "running",
-              toNode: "spec_review",
-              toStatus: "stalled",
+              toNode: tr.toNode,
+              toStatus: tr.toStatus,
               actor: "run-queue",
-              reason: `no-verdict: exhausted ${nudgeCount} spec_review nudges`,
+              reason: tr.reason,
             });
             return false;
           }
@@ -3364,14 +3470,28 @@ async function advanceActiveTask(
           }
 
           if (nudgeCount >= 3) {
+            const reason = `code-no-commits: exhausted ${nudgeCount} nudges without commits`;
+            const tr = resolveTransition({
+              route: task.route,
+              node: "code",
+              status: "running",
+              event: {
+                type: "code_question_or_no_report",
+                exhausted: true,
+                nudgeCount,
+                reason,
+              },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "code",
               expectedStatus: "running",
-              toNode: "code",
-              toStatus: "stalled",
+              toNode: tr.toNode,
+              toStatus: tr.toStatus,
               actor: "run-queue",
-              reason: `code-no-commits: exhausted ${nudgeCount} nudges without commits`,
+              reason: tr.reason,
             });
             return false;
           }
@@ -3570,14 +3690,28 @@ async function advanceActiveTask(
           }
 
           if (nudgeCount >= 3) {
+            const reason = `no-verdict: exhausted ${nudgeCount} review nudges`;
+            const tr = resolveTransition({
+              route: task.route,
+              node: "review",
+              status: "running",
+              event: {
+                type: "review_question_or_no_verdict",
+                exhausted: true,
+                nudgeCount,
+                reason,
+              },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "review",
               expectedStatus: "running",
-              toNode: "review",
-              toStatus: "stalled",
+              toNode: tr.toNode,
+              toStatus: tr.toStatus,
               actor: "run-queue",
-              reason: `no-verdict: exhausted ${nudgeCount} review nudges`,
+              reason: tr.reason,
             });
             return false;
           }
@@ -3709,14 +3843,28 @@ async function advanceActiveTask(
           }
 
           if (nudgeCount >= 3) {
+            const reason = `no-verdict: exhausted ${nudgeCount} design_check nudges`;
+            const tr = resolveTransition({
+              route: task.route,
+              node: "design_check",
+              status: "running",
+              event: {
+                type: "design_check_question_or_no_verdict",
+                exhausted: true,
+                nudgeCount,
+                reason,
+              },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "design_check",
               expectedStatus: "running",
-              toNode: "design_check",
-              toStatus: "stalled",
+              toNode: tr.toNode,
+              toStatus: tr.toStatus,
               actor: "run-queue",
-              reason: `no-verdict: exhausted ${nudgeCount} design_check nudges`,
+              reason: tr.reason,
             });
             return false;
           }
