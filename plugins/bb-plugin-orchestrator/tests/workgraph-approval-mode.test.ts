@@ -625,7 +625,7 @@ test("§29.2: owner gate reject at pre_release can route to code, spec, or desig
   assert.equal(rejDesign.task.status, "running");
 });
 
-test("§29.2: owner defer moves task to deferred and resume restores status", async () => {
+test("§29.2: owner defer moves task to deferred and resume restores status with interaction_id reset", async () => {
   const store = createStore();
   store.insertTask({
     taskKey: "PLUG-160",
@@ -648,10 +648,14 @@ test("§29.2: owner defer moves task to deferred and resume restores status", as
     reason: "ready for review",
     updates: {
       payload: JSON.stringify({ gate_stage: "pre_code" }),
+      interaction_id: "interact_old_card_123",
     },
   });
 
-  // Owner defers task
+  // Verify interaction_id is present initially
+  assert.equal(store.getTask("PLUG-160")?.interaction_id, "interact_old_card_123");
+
+  // Owner defers task -> interaction_id is reset to null!
   const deferred = await runDefer("PLUG-160", "wait for client feedback", {
     store,
     ctx: {},
@@ -661,8 +665,9 @@ test("§29.2: owner defer moves task to deferred and resume restores status", as
   assert.equal(deferred.task.node, "owner_gate");
   assert.equal(deferred.task.deferred_by, "owner");
   assert.equal(deferred.task.deferred_reason, "wait for client feedback");
+  assert.equal(deferred.task.interaction_id, null);
 
-  // Owner resumes task from deferred
+  // Owner resumes task from deferred -> interaction_id is null and waiting_approval restored
   const resumed = await runResume("PLUG-160", undefined, {
     store,
     ctx: {},
@@ -670,5 +675,23 @@ test("§29.2: owner defer moves task to deferred and resume restores status", as
   });
   assert.equal(resumed.task.status, "waiting_approval");
   assert.equal(resumed.task.node, "owner_gate");
+  assert.equal(resumed.task.interaction_id, null);
+
+  // Run run-queue: verifies interaction is re-requested and advancedCount is 0 (card request doesn't inflate advancedCount)
+  let requested = false;
+  const resQueue = await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    autoAdvance: true,
+    maxActiveTasks: 1,
+    repoRoot: "/tmp",
+    requestOwnerGateInteraction: async (task, stage) => {
+      requested = true;
+      return "interact_fresh_456";
+    },
+  });
+  assert.equal(requested, true);
+  assert.equal(resQueue.advancedCount, 0); // Not counted as task advance!
+  assert.equal(store.getTask("PLUG-160")?.interaction_id, "interact_fresh_456");
 });
 

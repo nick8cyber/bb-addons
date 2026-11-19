@@ -4096,10 +4096,23 @@ export class DelegationStore {
 
       // §28.2 п. 5: Сброс alarm_count в payload при смене узла или повторном входе в running;
       // фиксация/бэкфилл node_entered_at для стабильного якоря активного делегирования; сброс interaction_id
-      if (input.toNode !== existing.node) {
+      const isLeavingWaitingApproval =
+        existing.status === "waiting_approval" &&
+        input.toStatus !== "waiting_approval";
+      const isEnteringWaitingApproval =
+        existing.status !== "waiting_approval" &&
+        input.toStatus === "waiting_approval";
+      if (
+        input.toNode !== existing.node ||
+        isLeavingWaitingApproval ||
+        isEnteringWaitingApproval
+      ) {
         if (!input.updates || input.updates.interaction_id === undefined) {
           setClauses.push("interaction_id = NULL");
         }
+      }
+
+      if (input.toNode !== existing.node) {
         let payloadObj: Record<string, unknown> = {};
         const sourcePayload =
           input.updates?.payload !== undefined

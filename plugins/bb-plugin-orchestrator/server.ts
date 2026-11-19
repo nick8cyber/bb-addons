@@ -1745,6 +1745,10 @@ export async function createPlugin(
             current.status === "waiting_approval" &&
             current.interaction_id === interactionId
           ) {
+            const reason =
+              result.outcome === "cancelled"
+                ? `gate-timeout: card cancelled (${result.reason})`
+                : "gate-submitted: card completed";
             store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "owner_gate",
@@ -1752,7 +1756,7 @@ export async function createPlugin(
               toNode: "owner_gate",
               toStatus: "waiting_approval",
               actor: "orchestrator",
-              reason: `gate-timeout: card ${result.outcome}${result.outcome === "cancelled" ? ` (${result.reason})` : ""}`,
+              reason,
               updates: { interaction_id: null },
             });
           }
@@ -2316,6 +2320,9 @@ export async function createPlugin(
       return { mode: getApprovalMode() };
     },
     async setProjectApprovalMode(input) {
+      if (process.env.BB_THREAD_ID) {
+        throw new OrchestratorError("permission-denied", "owner-only");
+      }
       const modeVal = input.mode ?? "";
       await settings.experimental_set({ approvalMode: modeVal || null });
       currentSettings.approvalMode = modeVal;
@@ -2339,6 +2346,9 @@ export async function createPlugin(
       return { taskKey: key, mode };
     },
     async setTaskConfirmationMode(input) {
+      if (process.env.BB_THREAD_ID) {
+        throw new OrchestratorError("permission-denied", "owner-only");
+      }
       let key = input.taskKey ? normalizeTaskKey(input.taskKey) : undefined;
       if (!key && input.threadId) {
         const del = store.byThreadId(input.threadId);
@@ -2370,6 +2380,7 @@ export async function createPlugin(
               store,
               ctx: {},
               workGraphMode: getWorkGraphMode(),
+              now,
             });
           } catch (e) {
             bb.log.warn(`orchestrator: auto-approve on switch to auto failed: ${describeError(e)}`);
@@ -2379,6 +2390,9 @@ export async function createPlugin(
       return { ok: true as const };
     },
     async ownerApprove(input) {
+      if (process.env.BB_THREAD_ID) {
+        throw new OrchestratorError("permission-denied", "owner-only");
+      }
       const res = await runApprove(input.taskKey, input.comment, {
         store,
         ctx: {},
@@ -2393,6 +2407,9 @@ export async function createPlugin(
       };
     },
     async ownerReject(input) {
+      if (process.env.BB_THREAD_ID) {
+        throw new OrchestratorError("permission-denied", "owner-only");
+      }
       const res = await runReject(input.taskKey, input.target, input.reason, {
         store,
         ctx: {},
@@ -2407,6 +2424,9 @@ export async function createPlugin(
       };
     },
     async ownerDefer(input) {
+      if (process.env.BB_THREAD_ID) {
+        throw new OrchestratorError("permission-denied", "owner-only");
+      }
       const res = await runDefer(input.taskKey, input.reason, {
         store,
         ctx: {},
@@ -2420,6 +2440,9 @@ export async function createPlugin(
       };
     },
     async ownerResume(input) {
+      if (process.env.BB_THREAD_ID) {
+        throw new OrchestratorError("permission-denied", "owner-only");
+      }
       const res = await runResume(input.taskKey, input.target, {
         store,
         ctx: {},
@@ -2434,6 +2457,9 @@ export async function createPlugin(
       };
     },
     async ownerDequeue(input) {
+      if (process.env.BB_THREAD_ID) {
+        throw new OrchestratorError("permission-denied", "owner-only");
+      }
       const res = await runDequeue(input.taskKey, input.reason, {
         store,
         cmd: cmdRunner,

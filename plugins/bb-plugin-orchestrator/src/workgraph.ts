@@ -1254,6 +1254,7 @@ export async function runDefer(
         deferred_by: "owner",
         deferred_reason: reason,
         payload: JSON.stringify(existingPayload),
+        interaction_id: null,
       },
     },
     now,
@@ -1350,7 +1351,10 @@ export async function runReject(
     } catch {}
     delete rejectPayload.previous_status;
 
-    const updates: Partial<TaskQueueRow> = { payload: JSON.stringify(rejectPayload) };
+    const updates: Partial<TaskQueueRow> = {
+      payload: JSON.stringify(rejectPayload),
+      interaction_id: null,
+    };
     if (resolution.toStatus === "deferred") {
       updates.deferred_by = "owner";
       updates.deferred_reason = reason ?? "rejected at owner_gate";
@@ -1707,6 +1711,7 @@ export async function runResume(
           deferred_by: null,
           deferred_reason: null,
           payload: JSON.stringify(parsedPayload),
+          interaction_id: null,
         },
       },
       now,
@@ -2311,8 +2316,6 @@ export async function runRunQueue(
                   },
                   deps.now ? deps.now() : Date.now(),
                 );
-                progressed = true;
-                advancedCount++;
               }
             } catch {}
           }
