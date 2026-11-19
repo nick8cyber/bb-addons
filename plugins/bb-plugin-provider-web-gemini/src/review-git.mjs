@@ -310,15 +310,15 @@ export async function executePinned(call, root, pin, diff, maxBytes, signal) {
   if (sub === "show" && pinned(range)) {
     let targetFiles = files;
     if (!targetFiles.length || targetFiles.includes(".")) {
-      const treeFiles = (await git(root, ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", sha], { maxBytes, signal })) ?? "";
-      targetFiles = treeFiles.split("\0").filter(Boolean);
+      const treeFiles = (await git(root, ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-m", "-z", sha], { maxBytes, signal })) ?? "";
+      targetFiles = [...new Set(treeFiles.split("\0").filter(Boolean))];
     }
     const allowed = [];
     for (const file of targetFiles) {
       if (sensitive(file) || LOCK.test(file) || GENERATED.test(file)) continue;
       allowed.push(file);
     }
-    const showArgs = ["show", ...DIFF_OPTIONS];
+    const showArgs = ["show", "--format=%H %s", ...DIFF_OPTIONS];
     if (opts.includes("--stat")) showArgs.push("--stat");
     else showArgs.push("-U10");
     showArgs.push(sha);

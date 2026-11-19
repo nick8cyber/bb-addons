@@ -602,8 +602,14 @@ test("audit fixes: response ISO/RFC/CVE tokens pass, git show on multi-commit br
 
   const repo = setup(t);
 
-  // 1. Blocker 1: Standard technical tokens (ISO-8601, RFC-3339, HTTP-2, ES-2022, CVE-2024-1234) and task keys in response
+  // 1. Blocker 1: Outbound task-key masking matches orchestrator parity (masking ES-12),
+  // while response does not trigger repair on technical tokens (ISO-8601, CVE, ES-2022) or task keys.
   const settings = loadSettings(repo.tmp, projectId);
+  assert.equal(settings.mask("ES-12 fix"), "[скрыто: task-key] fix", "outgoing task key must be masked");
+  assert.equal(settings.mask("CSS-4 style"), "[скрыто: task-key] style", "outgoing task key must be masked");
+  assert.equal(settings.mask("ISO-8601 standard"), "[скрыто: task-key] standard", "outgoing ISO token must be masked as task-key");
+  assert.equal(settings.mask("SHA-256 hash"), "SHA-256 hash", "standard hash token must not be masked");
+
   const context = { settings, verdict: null };
   const resp = { text: "Verified dates in ISO-8601 and RFC-3339; fixed CVE-2024-1234 on HTTP-2 and ES-2022. Related to PLUG-327." };
   const checked = checkedAnswer(context, resp);
@@ -611,6 +617,7 @@ test("audit fixes: response ISO/RFC/CVE tokens pass, git show on multi-commit br
   assert.ok(checked.text.includes("ISO-8601"));
 
   // 2. Finding 2: Multi-commit branch review — git show shows only the commit's changes
+  // and does not leak author name/email.
   repo.git("switch", "-c", "multi-commit", repo.base);
   repo.write("docs/c1.txt", "commit 1 content\n");
   repo.git("add", ".");
@@ -627,16 +634,20 @@ test("audit fixes: response ISO/RFC/CVE tokens pass, git show on multi-commit br
   const showRes = await executePinned({ name: "git", args: { args: `show ${c2}` } }, repo.repo, pin2, diff2, 1_000_000);
   assert.ok(showRes.output.includes("docs/c2.txt"), "git show output must include commit 2 file");
   assert.ok(!showRes.output.includes("docs/c1.txt"), "git show output must NOT include commit 1 file");
+  assert.ok(!showRes.output.includes("Author:"), "git show output must NOT include Author: header");
+  assert.ok(!showRes.output.includes("fixture@example.com"), "git show output must NOT leak author email");
 
   // 3. Finding 3: grep with regex alternation a|b
   const grepRes = await executePinned({ name: "grep", args: { pattern: "commit 1|commit 2" } }, repo.repo, pin2, diff2, 1_000_000);
   assert.ok(grepRes.output.includes("commit 1") || grepRes.output.includes("commit 2"), "grep with alternation must match lines");
 
-  // 4. Finding 4: User description containing ## Attachments does not break tracker attachment parsing
+  // 4. Finding 4: User description containing ## Attachments and ## Recent comments does not break tracker attachment parsing
   const taskTextWithUserAttachments = [
     "# EX-99 · Task with user attachments",
     "## Description",
     "User problem description.",
+    "## Recent comments",
+    "User quoting previous comments",
     "## Attachments",
     "- custom note bullet",
     "- another note",
@@ -658,12 +669,67 @@ test("audit fixes: response ISO/RFC/CVE tokens pass, git show on multi-commit br
   });
   assert.deepEqual(prep.attachments, [{ name: "real-file.txt", id: "01M7RK0JBY8VJ7VK4Z2DJQKE09" }]);
 
-  // 5. Finding 5: detectOnly does not treat links with text 'download' as generated files
-  const mockPageNoDownload = {
+  // 5. Finding 5: findGeneratedFileCandidates predicate and collectGeneratedFiles
+  const { findGeneratedFileCandidates } = await import("../src/gemini-driver.js");
+  const makeMockTarget = (elements) => ({
+    querySelectorAll(selector) {
+      if (selector === 'a[href]') return elements.filter((el) => el.tagName === 'a' && el.href);
+      if (selector === 'button, [role="button"], a:not([href])') {
+        return elements.filter((el) => el.tagName === 'button' || el.role === 'button' || (el.tagName === 'a' && !el.href));
+      }
+      return [];
+    },
+  });
+  const makeMockEl = ({ tagName = 'a', href = '', attributes = {}, classes = [], text = '', parentClasses = [] }) => {
+    const attrs = new Map(Object.entries(attributes));
+    if (href) attrs.set('href', href);
+    return {
+      tagName,
+      href,
+      innerText: text,
+      getAttribute(name) { return attrs.get(name) || ''; },
+      hasAttribute(name) { return attrs.has(name); },
+      setAttribute(name, val) { attrs.set(name, val); },
+      closest(selector) {
+        const classList = [...classes, ...parentClasses];
+        const selectors = selector.split(',').map((s) => s.trim().replace(/^\./, ''));
+        return selectors.some((sel) => classList.includes(sel)) ? { tagName: 'div' } : null;
+      },
+    };
+  };
+
+  // Case 1: link with text 'download' without attribute is NOT a file
+  const elDownloadText = makeMockEl({ tagName: 'a', href: 'https://google.com/export/report', text: 'download report' });
+  const cands1 = findGeneratedFileCandidates(makeMockTarget([elDownloadText]), { detectOnly: true });
+  assert.equal(cands1.length, 0, "link with text 'download' without download attribute or file card is not a candidate");
+
+  // Case 2: a[download] IS a file
+  const elDownloadAttr = makeMockEl({ tagName: 'a', href: 'https://google.com/export/report.pdf', attributes: { download: 'report.pdf' }, text: 'view' });
+  const cands2 = findGeneratedFileCandidates(makeMockTarget([elDownloadAttr]), { detectOnly: true });
+  assert.equal(cands2.length, 1, "link with download attribute is a candidate");
+
+  // Case 3: source link inside mat-card is NOT a file
+  const elSourceCard = makeMockEl({ tagName: 'a', href: 'https://google.com/source', parentClasses: ['mat-card', 'source-card'], text: 'source link' });
+  const cands3 = findGeneratedFileCandidates(makeMockTarget([elSourceCard]), { detectOnly: true });
+  assert.equal(cands3.length, 0, "source link in mat-card is not a candidate");
+
+  // Case 4: link inside .file-card IS a file
+  const elFileCard = makeMockEl({ tagName: 'a', href: 'https://google.com/doc', parentClasses: ['file-card'], text: 'card file' });
+  const cands4 = findGeneratedFileCandidates(makeMockTarget([elFileCard]), { detectOnly: true });
+  assert.equal(cands4.length, 1, "link inside .file-card is a candidate");
+
+  // Integration with collectGeneratedFiles:
+  const mockPageNoCandidates = {
     evaluate: async () => [],
   };
-  const coll = await collectGeneratedFiles(mockPageNoDownload, { detectOnly: true });
-  assert.equal(coll.hasGeneratedFile, undefined);
+  const collNo = await collectGeneratedFiles(mockPageNoCandidates, { detectOnly: true });
+  assert.equal(collNo.hasGeneratedFile, undefined);
+
+  const mockPageWithCandidates = {
+    evaluate: async () => [{ kind: 'link', href: 'https://google.com/doc.pdf', tag: 'tag-1' }],
+  };
+  const collYes = await collectGeneratedFiles(mockPageWithCandidates, { detectOnly: true });
+  assert.equal(collYes.hasGeneratedFile, true);
 
   // 6. Finding 6: slog writes task:pinned-sha, task:package, task:stage, and task:outcome
   const app = fixture(t, repo, () => ({ text: "Report\n{\"verdict\":\"OK\",\"blockers\":0}" }));

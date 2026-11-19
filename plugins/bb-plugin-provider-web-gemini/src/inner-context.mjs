@@ -151,16 +151,23 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
   const root = await repoRoot(cwd, signal);
   const pin = await pinReview(root, refs, thread.environment ?? {}, signal);
   const verdict = parseVerdict(text, system, pin);
-  const recentIndex = text.search(/^## Recent comments[ \t]*$/m);
-  const textBeforeRecent = recentIndex !== -1 ? text.slice(0, recentIndex) : text;
-  const attachments = section(textBeforeRecent, /^## Attachments[ \t]*$/, { last: true })
-    .filter((line) => line.startsWith("- ")).map((line) => {
-      const match = TRACKER_ATTACHMENT.exec(line);
-      if (!match) throw new Error("malformed tracker attachment entry");
-      return { name: match[1], id: match[2] };
-    });
+  const pairMatches = [...text.matchAll(/(?:^|\n)## Attachments[ \t]*\r?\n([\s\S]*?)(?=\r?\n## Recent comments[ \t]*(?:\r?\n|$))/g)];
+  const attachmentRows = pairMatches.length
+    ? pairMatches.at(-1)[1].split(/\r?\n/)
+    : section(text, /^## Attachments[ \t]*$/, { last: true });
+  const attachments = [];
+  const attachmentOmissions = [];
+  for (const line of attachmentRows) {
+    if (!line.startsWith("- ")) continue;
+    const match = TRACKER_ATTACHMENT.exec(line);
+    if (!match) {
+      attachmentOmissions.push({ line, reason: "malformed tracker attachment entry" });
+      continue;
+    }
+    attachments.push({ name: match[1], id: match[2] });
+  }
   const key = /^# ([A-Z][A-Z0-9]{1,9}-\d+) · /m.exec(text)?.[1];
-  return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, key, thread: thread.thread };
+  return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions, key, thread: thread.thread };
 }
 
 export function verdictInstruction(context) {
@@ -336,6 +343,11 @@ export async function collectTask(context, blocks, options) {
     const result = validateUploads(externalBlocks);
     if (result.error) throw new Error("mandatory ACP attachment is inaccessible or exceeds upload limits");
     for (const file of result.files) upload(basename(file), await readTextFile(file, maxUploadBytes, signal), "ACP attachment", "ACP input");
+  }
+  if (context.attachmentOmissions?.length) {
+    for (const item of context.attachmentOmissions) {
+      omit("Tracker attachment: " + item.line, item.reason);
+    }
   }
   if (context.attachments.length) {
     if (materialFiles.length + new Set(context.attachments.map((item) => item.id)).size > maxUploadCount) {

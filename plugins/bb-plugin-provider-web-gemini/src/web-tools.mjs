@@ -65,16 +65,13 @@ const THREAD_ID_IN_TEXT_RE = new RegExp(`${THR}[a-z0-9]{6,}(?:#msg=(\\d+))?`, "g
 export const TASK_KEY_RE = /^[A-Z][A-Z0-9]{1,9}-\d+$/;
 const TASK_KEY_IN_TEXT_RE = /\b[A-Z][A-Z0-9]{1,9}-\d+\b/g;
 
-/** Общие ложноположительные ключей задач (тот же список, что в leak-scan). */
+/** Общие ложноположительные ключей задач (зеркало plugins/bb-plugin-orchestrator/hooks/leak-scan.ts). */
 const TASK_KEY_ALLOW = new Set([
   "UTF-8", "UTF-16", "UTF-32", "ISO-8859", "SHA-1", "SHA-256", "SHA-384",
   "SHA-512", "MD-5", "DES-3", "AES-128", "AES-192", "AES-256",
-  "ISO-8601", "RFC-3339", "HTTP-2", "HTTP-3", "ES-2022", "ES-2023", "ES-2024", "ES-2025",
 ]);
 export const isTaskKeyToken = (token) =>
-  TASK_KEY_RE.test(token) &&
-  !TASK_KEY_ALLOW.has(token) &&
-  !/^(?:ISO|RFC|HTTP|ES|CVE|IEEE|POSIX|TLS|SSL|ECMA|HTML|CSS|W3C|BASE|GZIP|BZIP|XZ|LZ4|ZSTD)-\d+$/i.test(token);
+  TASK_KEY_RE.test(token) && !TASK_KEY_ALLOW.has(token);
 
 /* ---------- §6: маскировка (правила сканера утечек, категории 1–4) ----------
  * Формат подстановки — `[скрыто: <тип>]` по спеке. Сами регулярки зеркалят
