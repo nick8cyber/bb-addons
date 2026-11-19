@@ -1,7 +1,7 @@
 // plugins/bb-plugin-orchestrator/src/transition-matrix.ts
 // Pure Transition Matrix & Engine for bb-plugin-orchestrator
 // Spec: docs/specs/orchestrator.md §28.1 (Revision 34.2)
-// Exactly 80 rules matching §28.1 matrix rows 1..80.
+// Exactly 82 rules matching §28.1 matrix rows 1..82.
 
 import { OrchestratorError } from "./errors.js";
 
@@ -379,7 +379,7 @@ function matchesEventType(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// §28.1 TRANSITION TABLE AS PURE DATA (80 rules matching spec §28.1 matrix)
+// §28.1 TRANSITION TABLE AS PURE DATA (82 rules matching spec §28.1 matrix)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const TRANSITION_TABLE: readonly TransitionRule[] = [
@@ -2900,7 +2900,7 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
     node: "spec_review",
     status: "running",
     eventType: "acceptance_vacuous",
-    description: "договор приёмки тривиален / без падающих тестов (TDD Fail-First) -> возврат архитектору на design / blocked при >=3",
+    description: "договор приёмки тривиален / без падающих тестов -> design running / blocked при >=3",
     resolve(input) {
       if (input.event.type !== "acceptance_vacuous") return null;
       const nextRounds = input.counters.design_check_rounds + 1;
@@ -2911,7 +2911,8 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
           toStatus: "blocked",
           reason: "blocked: acceptance-contract-vacuous ceiling 3 rounds reached",
           ruleId: "rule-81-acceptance-vacuous-feature",
-          counters: { ...input.counters, design_check_rounds: nextRounds },
+          counterUpdates: { design_check_rounds: nextRounds },
+          action: { escalateArchitect: true },
         };
       }
       return {
@@ -2920,7 +2921,8 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
         toStatus: "running",
         reason: "acceptance-contract-vacuous: договор приёмки не содержит падающих тестов; возврат архитектору на design",
         ruleId: "rule-81-acceptance-vacuous-feature",
-        counters: { ...input.counters, design_check_rounds: nextRounds },
+        counterUpdates: { design_check_rounds: nextRounds },
+        action: { retryDispatch: true, dispatchNode: "design" },
       };
     },
   },
@@ -2931,7 +2933,7 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
     rowNumber: 82,
     route: ["fix", "simple"],
     node: ["start", "owner_gate"],
-    status: ["queued", "waiting_approval"],
+    status: ["queued", "running", "waiting_approval"],
     eventType: "acceptance_vacuous",
     description: "договор приёмки на fix/simple уже полностью зелёный -> owner_gate waiting_approval / blocked при >=3",
     resolve(input) {
@@ -2944,7 +2946,7 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
           toStatus: "blocked",
           reason: "blocked: acceptance-contract-vacuous ceiling 3 attempts reached on fix/simple",
           ruleId: "rule-82-acceptance-vacuous-fix-simple",
-          counters: { ...input.counters, check_attempts: nextAttempts },
+          counterUpdates: { check_attempts: nextAttempts },
         };
       }
       return {
@@ -2953,7 +2955,13 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
         toStatus: "waiting_approval",
         reason: "acceptance-contract-vacuous: договор приёмки уже полностью проходит на базовом коммите; ожидание владельца",
         ruleId: "rule-82-acceptance-vacuous-fix-simple",
-        counters: { ...input.counters, check_attempts: nextAttempts },
+        counterUpdates: { check_attempts: nextAttempts },
+        action: {
+          setPayload: {
+            gate_stage: "pre_code",
+            vacuous_contract: true,
+          },
+        },
       };
     },
   },

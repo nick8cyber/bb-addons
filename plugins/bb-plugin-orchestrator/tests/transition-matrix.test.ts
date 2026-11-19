@@ -1209,7 +1209,8 @@ test("Row 81 & 82: acceptance_vacuous -> design / owner_gate", () => {
   assert.equal(res81.toNode, "design");
   assert.equal(res81.toStatus, "running");
   assert.equal(res81.ruleId, "rule-81-acceptance-vacuous-feature");
-  assert.equal(res81.counters?.design_check_rounds, 1);
+  assert.equal(res81.counterUpdates?.design_check_rounds, 1);
+  assert.equal(res81.action?.dispatchNode, "design");
 
   // Row 81: feature ceiling -> blocked
   const res81b = resolveTransition({
@@ -1223,6 +1224,8 @@ test("Row 81 & 82: acceptance_vacuous -> design / owner_gate", () => {
   assert.equal(res81b.allowed, true);
   assert.equal(res81b.toNode, "spec_review");
   assert.equal(res81b.toStatus, "blocked");
+  assert.equal(res81b.counterUpdates?.design_check_rounds, 3);
+  assert.equal(res81b.action?.escalateArchitect, true);
 
   // Row 82: fix | start | acceptance_vacuous -> owner_gate waiting_approval
   const res82 = resolveTransition({
@@ -1237,7 +1240,11 @@ test("Row 81 & 82: acceptance_vacuous -> design / owner_gate", () => {
   assert.equal(res82.toNode, "owner_gate");
   assert.equal(res82.toStatus, "waiting_approval");
   assert.equal(res82.ruleId, "rule-82-acceptance-vacuous-fix-simple");
-  assert.equal(res82.counters?.check_attempts, 1);
+  assert.equal(res82.counterUpdates?.check_attempts, 1);
+  assert.deepEqual(res82.action?.setPayload, {
+    gate_stage: "pre_code",
+    vacuous_contract: true,
+  });
 
   // Row 82: simple ceiling -> blocked
   const res82b = resolveTransition({
@@ -1251,6 +1258,7 @@ test("Row 81 & 82: acceptance_vacuous -> design / owner_gate", () => {
   assert.equal(res82b.allowed, true);
   assert.equal(res82b.toNode, "start");
   assert.equal(res82b.toStatus, "blocked");
+  assert.equal(res82b.counterUpdates?.check_attempts, 3);
 
   // Row 82 from owner_gate node: fix | owner_gate | acceptance_vacuous -> owner_gate waiting_approval
   const res82og = resolveTransition({
@@ -1265,7 +1273,26 @@ test("Row 81 & 82: acceptance_vacuous -> design / owner_gate", () => {
   assert.equal(res82og.toNode, "owner_gate");
   assert.equal(res82og.toStatus, "waiting_approval");
   assert.equal(res82og.ruleId, "rule-82-acceptance-vacuous-fix-simple");
-  assert.equal(res82og.counters?.check_attempts, 1);
+  assert.equal(res82og.counterUpdates?.check_attempts, 1);
+  assert.deepEqual(res82og.action?.setPayload, {
+    gate_stage: "pre_code",
+    vacuous_contract: true,
+  });
+
+  // Row 82 from start node with running status
+  const res82running = resolveTransition({
+    route: "simple",
+    node: "start",
+    status: "running",
+    event: { type: "acceptance_vacuous" },
+    mode: "auto",
+    counters: defaultCounters(),
+  });
+  assert.equal(res82running.allowed, true);
+  assert.equal(res82running.toNode, "owner_gate");
+  assert.equal(res82running.toStatus, "waiting_approval");
+  assert.equal(res82running.ruleId, "rule-82-acceptance-vacuous-fix-simple");
+  assert.equal(res82running.counterUpdates?.check_attempts, 1);
 });
 
 test("Coverage: all 82 rules in TRANSITION_TABLE are exercised and verified", () => {
