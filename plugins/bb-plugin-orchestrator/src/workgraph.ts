@@ -1004,6 +1004,8 @@ export async function runEnqueue(
               delete (existingPayload as any).queued_stalled_alarm_at;
               const updates: Partial<TaskQueueRow> = {
                 acceptance_sha: accSha,
+                deferred_by: null,
+                deferred_reason: null,
                 payload: JSON.stringify({
                   ...existingPayload,
                   ...(vacuousTr.action?.setPayload ?? {}),
@@ -2065,15 +2067,31 @@ export function validateCheckCommand(
     }
   }
 
-  // §31.3: Forbidden flags: -exec, --import, -o, --pdb, --run-command
-  const forbiddenFlags = ["-exec", "--import", "-o", "--pdb", "--run-command"];
+  // §31.3: Forbidden flags: -exec, --import, -o, --pdb, --run-command, --script-shell, etc.
+  const forbiddenFlags = [
+    "-exec",
+    "--import",
+    "-o",
+    "--pdb",
+    "--run-command",
+    "--script-shell",
+    "--shell",
+    "--config",
+    "-c",
+    "--toolchain",
+    "--wrapper",
+    "-Z",
+    "-C",
+  ];
   const parts = trimmed.split(/\s+/);
   for (const p of parts) {
-    if (forbiddenFlags.includes(p)) {
-      return {
-        valid: false,
-        reason: `checks-refused: forbidden-flag (${p} is not allowed in checks)`,
-      };
+    for (const ff of forbiddenFlags) {
+      if (p === ff || p.startsWith(ff + "=")) {
+        return {
+          valid: false,
+          reason: `checks-refused: forbidden-flag (${p} is not allowed in checks)`,
+        };
+      }
     }
   }
 
@@ -2153,7 +2171,9 @@ export async function executeChecks(
   }
 
   let commands: string[] = [];
-  if (Array.isArray(payloadObj.checks_commands)) {
+  if (Array.isArray(payloadObj.tdd_commands) && payloadObj.tdd_commands.length > 0) {
+    commands = payloadObj.tdd_commands as string[];
+  } else if (Array.isArray(payloadObj.checks_commands)) {
     commands = payloadObj.checks_commands as string[];
   } else if (typeof payloadObj.test_command === "string") {
     commands = [payloadObj.test_command];
@@ -2228,17 +2248,70 @@ export async function executeChecks(
   return { ok: true, exitCode: 0, output: "checks passed" };
 }
 
+export const BARE_CHECK_RUNNERS = new Set([
+  "npm test",
+  "npm run test",
+  "npm run test:*",
+  "npm run lint",
+  "pytest",
+  "cargo test",
+  "go test",
+  "go test ./...",
+]);
+
 export function extractAcceptanceCommands(
   markdownText: string,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
 ): string[] {
   const commands: string[] = [];
+
+  // 1. Check YAML frontmatter for tdd_commands / acceptance_commands
+  const frontmatterMatch = markdownText.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (frontmatterMatch) {
+    const fm = frontmatterMatch[1];
+    const lines = fm.split("\n");
+    let inTdd = false;
+    for (const l of lines) {
+      const trimmed = l.trim();
+      if (/^(?:tdd_commands|acceptance_commands):/.test(trimmed)) {
+        inTdd = true;
+        continue;
+      }
+      if (inTdd) {
+        if (/^[a-zA-Z0-9_]+:/.test(trimmed)) {
+          inTdd = false;
+          continue;
+        }
+        if (trimmed.startsWith("-")) {
+          const cmdCandidate = trimmed.replace(/^-\s*/, "").replace(/^["']|["']$/g, "").trim();
+          if (cmdCandidate) {
+            const val = validateCheckCommand(cmdCandidate, allowedRunners);
+            if (val.valid && !BARE_CHECK_RUNNERS.has(cmdCandidate) && !commands.includes(cmdCandidate)) {
+              commands.push(cmdCandidate);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Check dedicated sections or fenced code blocks labeled with acceptance-tests / tdd
   const lines = markdownText.split("\n");
+  let inDedicatedSection = false;
   let inCodeBlock = false;
   let codeBlockLang = "";
 
   for (const line of lines) {
     const trimmed = line.trim();
+
+    // Check heading for dedicated section
+    if (/^##+\s+(?:тест[ыа]\s+договора|acceptance\s+tests?|команд[ыа]\s+верификации|verification\s+commands?)/i.test(trimmed)) {
+      inDedicatedSection = true;
+      continue;
+    } else if (/^##+\s+/.test(trimmed) && inDedicatedSection) {
+      inDedicatedSection = false;
+    }
+
     if (trimmed.startsWith("```")) {
       if (inCodeBlock) {
         inCodeBlock = false;
@@ -2251,28 +2324,23 @@ export function extractAcceptanceCommands(
     }
 
     if (inCodeBlock) {
-      if (
+      const isExplicitTddBlock =
+        codeBlockLang === "acceptance-tests" ||
+        codeBlockLang === "acceptance" ||
+        codeBlockLang === "tdd";
+      const isAllowedScriptBlock =
         codeBlockLang === "bash" ||
         codeBlockLang === "sh" ||
         codeBlockLang === "shell" ||
-        codeBlockLang === ""
-      ) {
+        codeBlockLang === "";
+
+      if (isExplicitTddBlock || (inDedicatedSection && isAllowedScriptBlock)) {
         if (trimmed && !trimmed.startsWith("#")) {
           const val = validateCheckCommand(trimmed, allowedRunners);
-          if (val.valid && !commands.includes(trimmed)) {
+          if (val.valid && !BARE_CHECK_RUNNERS.has(trimmed) && !commands.includes(trimmed)) {
             commands.push(trimmed);
           }
         }
-      }
-      continue;
-    }
-
-    const backtickMatches = line.matchAll(/`([^`]+)`/g);
-    for (const match of backtickMatches) {
-      const candidate = match[1].trim();
-      const val = validateCheckCommand(candidate, allowedRunners);
-      if (val.valid && !commands.includes(candidate)) {
-        commands.push(candidate);
       }
     }
   }
@@ -2325,17 +2393,13 @@ export async function runTddFailFirstVerification(
     };
   }
 
+  // 1. Explicit commands from payload (prioritize tdd_commands)
   let commands: string[] | undefined =
-    (Array.isArray(payloadObj.tdd_commands)
+    Array.isArray(payloadObj.tdd_commands) && payloadObj.tdd_commands.length > 0
       ? (payloadObj.tdd_commands as string[])
-      : undefined) ??
-    (Array.isArray(payloadObj.checks_commands)
-      ? (payloadObj.checks_commands as string[])
-      : undefined) ??
-    (typeof payloadObj.test_command === "string"
-      ? [payloadObj.test_command]
-      : undefined);
+      : undefined;
 
+  // 2. Extract from acceptance contract markdown on acceptanceSha
   if (!commands && deps.cmd && deps.repoRoot) {
     try {
       const normKey = normalizeTaskKey(task.task_key).toUpperCase();
@@ -2354,13 +2418,13 @@ export async function runTddFailFirstVerification(
     } catch {}
   }
 
-  // §34.5 / Reviewer Б1: if contract has no executable test items, skip check.
-  // Never run entire project checksConfig.commands on base code!
+  // §34.5 / Reviewer Б1: if contract has no explicit test items in dedicated block, skip check.
+  // Never run bare runners or entire project test suite on base code!
   if (!commands || commands.length === 0) {
     return {
       ok: true,
       failedAsExpected: true,
-      output: "tdd check skipped: no executable test items found in acceptance contract",
+      output: "tdd check skipped: no explicit acceptance test commands configured",
     };
   }
 
@@ -2375,9 +2439,19 @@ export async function runTddFailFirstVerification(
   // §34.5 (ADR-0037): Run checks in an isolated worktree at acceptanceSha
   let tmpDir: string | null = null;
   try {
-    tmpDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), `bb-tdd-${task.task_key}-`),
-    );
+    try {
+      tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), `bb-tdd-${task.task_key}-`),
+      );
+    } catch (e: any) {
+      return {
+        ok: false,
+        failedAsExpected: false,
+        notRun: true,
+        output: `mkdtemp failed: ${e?.message ?? e}`,
+      };
+    }
+
     const addRes = await deps.cmd.run("git", [
       "-C",
       deps.repoRoot,
@@ -2394,6 +2468,29 @@ export async function runTddFailFirstVerification(
         notRun: true,
         output: `git worktree add failed: ${addRes.stderr}`,
       };
+    }
+
+    // Check if test files referenced in commands physically exist on acceptance_sha
+    for (const cmdStr of commands) {
+      const parts = cmdStr.split(/\s+/);
+      for (const p of parts.slice(1)) {
+        if (
+          !p.startsWith("-") &&
+          (p.includes("/") ||
+            /\.(?:test|spec)\.[a-z0-9]+$/i.test(p) ||
+            /^(?:test_|.+_test\.)/i.test(p))
+        ) {
+          const resolvedPath = path.resolve(tmpDir, p);
+          if (!fs.existsSync(resolvedPath)) {
+            return {
+              ok: false,
+              failedAsExpected: false,
+              notRun: true,
+              output: `checks-refused: test-file-not-found (${p} does not exist on acceptance_sha)`,
+            };
+          }
+        }
+      }
     }
 
     const nmRepo = path.join(deps.repoRoot, "node_modules");
@@ -3300,6 +3397,10 @@ async function startQueuedTask(
             toStatus: failTr.toStatus,
             actor: "machine:checks",
             reason: failTr.reason,
+            updates: {
+              branch,
+              acceptance_sha: acceptanceSha,
+            },
             now,
           },
           now,

