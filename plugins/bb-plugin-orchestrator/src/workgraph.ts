@@ -12,6 +12,7 @@ import type { BbCli } from "./bb-cli.js";
 import type {
   ConfirmationMode,
   DelegationStore,
+  DelegationRow,
   TaskLevel,
   TaskNode,
   TaskQueueRow,
@@ -20,6 +21,7 @@ import type {
   TaskTransitionRow,
 } from "./store.js";
 import { normalizeTaskKey } from "./store.js";
+import { verdictDetailsInBody } from "./release.js";
 import type { PluginCliContext } from "@get-bb/plugin-sdk";
 import type { T } from "./i18n/index.js";
 import {
@@ -2107,7 +2109,7 @@ async function startQueuedTask(
             route: task.route,
             node: "start",
             status: "queued",
-            event: { type: "queue_take", branchExistsWithCommits: true },
+            event: { type: "queue_take", branchExistsWithCommits: true, branch },
             mode: task.confirmation_mode,
             counters: extractCounters(task),
           });
@@ -2138,7 +2140,19 @@ async function startQueuedTask(
         if (revTarget.exitCode !== 0) {
           baseRef = mergeBaseBranch;
         }
-        await deps.cmd.run("git", ["branch", branch, baseRef], { cwd: repoRoot });
+        const branchRes = await deps.cmd.run("git", ["branch", branch, baseRef], { cwd: repoRoot });
+        if (branchRes.exitCode !== 0) {
+          deps.store.transitionTask({
+            taskKey: task.task_key,
+            expectedNode: "start",
+            expectedStatus: "queued",
+            toNode: "start",
+            toStatus: "stalled",
+            actor: "run-queue",
+            reason: `git-failed: не удалось создать ветку ${branch}: ${branchRes.stderr.trim()}`,
+          });
+          return false;
+        }
       }
     }
   }
@@ -2222,6 +2236,79 @@ async function startQueuedTask(
   return false;
 }
 
+function getActiveDelegationForTask(
+  task: TaskQueueRow,
+  delegations: DelegationRow[],
+): DelegationRow | undefined {
+  if (delegations.length === 0) return undefined;
+  // delegationsByTask returns ORDER BY id DESC (newest first).
+  const latest = delegations[0];
+  // If the latest delegation was created before the task entered the current node,
+  // it belongs to an earlier node/attempt and must not be used.
+  if (task.entered_at > 0 && latest.created_at < task.entered_at - 50) {
+    return undefined;
+  }
+  return latest;
+}
+
+async function extractVerdictFromDelegation(
+  taskKey: string,
+  delegation: DelegationRow,
+  bbCli?: BbCli,
+): Promise<{ verdict: "OK" | "CHANGES"; blockers: number; target?: "code" | "design" } | null> {
+  if (!bbCli) return null;
+  try {
+    const showRes = await bbCli.run(["tasks", "show", taskKey, "--json"]);
+    if (showRes.exitCode === 0 && showRes.stdout) {
+      const show = JSON.parse(showRes.stdout) as {
+        comments?: {
+          kind?: string;
+          threadId?: string | null;
+          body?: string;
+          createdAt?: string;
+        }[];
+      };
+      const comments = (show.comments ?? [])
+        .filter((c) => !delegation.thread_id || c.threadId === delegation.thread_id)
+        .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
+      const last = comments.at(-1);
+      if (last?.body) {
+        const d = verdictDetailsInBody(last.body);
+        if (d) {
+          let target: "code" | "design" | undefined;
+          if (last.body.includes('"target":"design"') || last.body.includes("'target':'design'")) {
+            target = "design";
+          }
+          return { verdict: d.verdict, blockers: d.blockers ?? 0, target };
+        }
+      }
+    }
+  } catch {}
+
+  if (delegation.thread_id) {
+    try {
+      const threadRes = await bbCli.run(["thread", "show", delegation.thread_id, "--json"]);
+      if (threadRes.exitCode === 0 && threadRes.stdout) {
+        const th = JSON.parse(threadRes.stdout) as {
+          messages?: { body?: string }[];
+        };
+        const messages = th.messages ?? [];
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const body = messages[i]?.body;
+          if (body) {
+            const d = verdictDetailsInBody(body);
+            if (d) {
+              return { verdict: d.verdict, blockers: d.blockers ?? 0 };
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
 async function advanceActiveTask(
   task: TaskQueueRow,
   deps: RunQueueDeps,
@@ -2232,13 +2319,13 @@ async function advanceActiveTask(
   const normKey = normalizeTaskKey(task.task_key);
   const payload = parsePayload(task.payload);
   const delegations = deps.store.delegationsByTask(task.task_key);
-  const latestDelegation = delegations.at(-1);
+  const latestDelegation = getActiveDelegationForTask(task, delegations);
 
   if (
     latestDelegation &&
     (latestDelegation.status === "stalled" || latestDelegation.status === "failed")
   ) {
-    let failEvent: TransitionEvent;
+    let failEvent: TransitionEvent | null = null;
     switch (task.node) {
       case "design":
         failEvent = { type: "design_failed", exhausted: true, reason: latestDelegation.status };
@@ -2262,9 +2349,11 @@ async function advanceActiveTask(
         failEvent = { type: "research_failed", exhausted: true, reason: latestDelegation.status };
         break;
       default:
-        failEvent = { type: "design_failed", exhausted: true, reason: latestDelegation.status };
+        failEvent = null;
         break;
     }
+    if (!failEvent) return false;
+
     const resolution = resolveTransition({
       route: task.route,
       node: task.node,
@@ -2273,6 +2362,11 @@ async function advanceActiveTask(
       mode: task.confirmation_mode,
       counters: extractCounters(task),
     });
+    if (!resolution.allowed) return false;
+    if (resolution.toNode === task.node && resolution.toStatus === task.status) {
+      return false;
+    }
+
     const tr = deps.store.transitionTask({
       taskKey: task.task_key,
       expectedNode: task.node,
@@ -2373,7 +2467,34 @@ async function advanceActiveTask(
         const specSha =
           latestDelegation?.result_sha ||
           (payload.spec_sha as string) ||
-          `sha-spec-${normKey.toLowerCase()}`;
+          (payload.spec_done ? `sha-spec-${normKey.toLowerCase()}` : null);
+
+        if (!specSha) {
+          const resolution = resolveTransition({
+            route: task.route,
+            node: "spec",
+            status: "running",
+            event: { type: "spec_question_or_no_report" },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+          if (!resolution.allowed) return false;
+          const tr = deps.store.transitionTask({
+            taskKey: task.task_key,
+            expectedNode: "spec",
+            expectedStatus: "running",
+            toNode: resolution.toNode,
+            toStatus: resolution.toStatus,
+            actor: "run-queue",
+            reason: resolution.reason,
+            updates: resolution.counterUpdates ? resolution.counterUpdates : undefined,
+          });
+          if (tr.ok) {
+            const logged = deps.store.listTransitions(task.task_key).at(-1);
+            if (logged) transitions.push(logged);
+          }
+          return false;
+        }
 
         let tampered = false;
         if (task.route === "feature" && task.acceptance_sha) {
@@ -2389,11 +2510,18 @@ async function advanceActiveTask(
         let filesOutsideDocs = false;
         if (deps.cmd && specSha && !specSha.startsWith("sha-")) {
           try {
-            const diffRes = await deps.cmd.run(
+            let diffRes = await deps.cmd.run(
               "git",
-              ["diff", "--name-only", `${specSha}~1`, specSha],
+              ["diff", "--name-only", `${mergeBaseBranch}...${specSha}`],
               { cwd: repoRoot },
             );
+            if (diffRes.exitCode !== 0) {
+              diffRes = await deps.cmd.run(
+                "git",
+                ["diff", "--name-only", `${specSha}~1`, specSha],
+                { cwd: repoRoot },
+              );
+            }
             if (diffRes.exitCode === 0) {
               const files = diffRes.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
               filesOutsideDocs = files.some(
@@ -2454,7 +2582,25 @@ async function advanceActiveTask(
         verdict = payload.spec_review_verdict === "CHANGES" ? "CHANGES" : "OK";
         blockers = Number(payload.spec_review_blockers) || 0;
       } else if (latestDelegation?.status === "done") {
-        verdict = "OK";
+        const parsed = await extractVerdictFromDelegation(
+          task.task_key,
+          latestDelegation,
+          deps.bbCli,
+        );
+        if (parsed) {
+          verdict = parsed.verdict;
+          blockers = parsed.blockers;
+        } else {
+          const resolution = resolveTransition({
+            route: task.route,
+            node: "spec_review",
+            status: "running",
+            event: { type: "spec_review_question_or_no_verdict" },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+          return false;
+        }
       }
 
       if (verdict) {
@@ -2500,7 +2646,34 @@ async function advanceActiveTask(
         const resultSha =
           latestDelegation?.result_sha ||
           (payload.result_sha as string) ||
-          `sha-code-${normKey.toLowerCase()}`;
+          (payload.code_done ? `sha-code-${normKey.toLowerCase()}` : null);
+
+        if (!resultSha) {
+          const resolution = resolveTransition({
+            route: task.route,
+            node: "code",
+            status: "running",
+            event: { type: "code_question_or_no_report" },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+          if (!resolution.allowed) return false;
+          const tr = deps.store.transitionTask({
+            taskKey: task.task_key,
+            expectedNode: "code",
+            expectedStatus: "running",
+            toNode: resolution.toNode,
+            toStatus: resolution.toStatus,
+            actor: "run-queue",
+            reason: resolution.reason,
+          });
+          if (tr.ok) {
+            const logged = deps.store.listTransitions(task.task_key).at(-1);
+            if (logged) transitions.push(logged);
+          }
+          return false;
+        }
+
         const commits =
           latestDelegation?.result_commits ??
           (typeof payload.result_commits === "number"
@@ -2625,7 +2798,25 @@ async function advanceActiveTask(
         verdict = payload.review_verdict === "CHANGES" ? "CHANGES" : "OK";
         blockers = Number(payload.review_blockers) || 0;
       } else if (latestDelegation?.status === "done") {
-        verdict = "OK";
+        const parsed = await extractVerdictFromDelegation(
+          task.task_key,
+          latestDelegation,
+          deps.bbCli,
+        );
+        if (parsed) {
+          verdict = parsed.verdict;
+          blockers = parsed.blockers;
+        } else {
+          const resolution = resolveTransition({
+            route: task.route,
+            node: "review",
+            status: "running",
+            event: { type: "review_question_or_no_verdict" },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+          return false;
+        }
       }
 
       if (verdict) {
@@ -2674,7 +2865,25 @@ async function advanceActiveTask(
           payload.design_check_verdict === "CHANGES" ? "CHANGES" : "OK";
         if (payload.design_check_target === "design") target = "design";
       } else if (latestDelegation?.status === "done") {
-        verdict = "OK";
+        const parsed = await extractVerdictFromDelegation(
+          task.task_key,
+          latestDelegation,
+          deps.bbCli,
+        );
+        if (parsed) {
+          verdict = parsed.verdict;
+          if (parsed.target === "design") target = "design";
+        } else {
+          const resolution = resolveTransition({
+            route: task.route,
+            node: "design_check",
+            status: "running",
+            event: { type: "design_check_question_or_no_verdict" },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+          return false;
+        }
       }
 
       if (verdict) {
@@ -2858,6 +3067,17 @@ async function advanceActiveTask(
         });
         if (!resolution.allowed) return false;
 
+        const researchReport =
+          (payload.research_report as string) ||
+          latestDelegation?.result_sha ||
+          "done";
+        const updates: Partial<TaskQueueRow> = {
+          payload: JSON.stringify({
+            ...payload,
+            research_report: researchReport,
+          }),
+        };
+
         const tr = deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "research",
@@ -2866,6 +3086,7 @@ async function advanceActiveTask(
           toStatus: resolution.toStatus,
           actor: "run-queue",
           reason: resolution.reason,
+          updates,
         });
         if (tr.ok) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);

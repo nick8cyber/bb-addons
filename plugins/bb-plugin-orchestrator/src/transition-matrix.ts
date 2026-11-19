@@ -43,6 +43,7 @@ export type TransitionEvent =
   | {
       type: "queue_take";
       branchExistsWithCommits?: boolean;
+      branch?: string;
       acceptanceText?: string | null;
     }
   | {
@@ -446,8 +447,9 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
         allowed: true,
         toNode: "start",
         toStatus: "stalled",
-        reason:
-          "stalled: branch-exists: ветка уже существует и содержит коммиты; проверь состояние ветки или выполни dequeue",
+        reason: input.event.branch
+          ? `stalled: branch-exists: ветка ${input.event.branch} уже существует и содержит коммиты; проверь состояние ветки или выполни dequeue`
+          : "stalled: branch-exists: ветка уже существует и содержит коммиты; проверь состояние ветки или выполни dequeue",
         ruleId: "rule-05-start-branch-exists-with-commits",
       };
     },

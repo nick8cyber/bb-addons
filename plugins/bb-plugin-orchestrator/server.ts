@@ -1556,14 +1556,19 @@ export async function createPlugin(
       bb.log.warn(`orchestrator release pump: ${describeError(e)}`),
     );
 
-  const pumpRunQueue = () => {
+  const pumpRunQueue = async () => {
     const mode = getWorkGraphMode();
-    if (mode === "off") return Promise.resolve();
+    if (mode === "off") return;
+    let repoRoot = process.cwd();
+    try {
+      const wt = await resolveWorktreeContext(undefined, undefined, process.cwd()).catch(() => null);
+      if (wt?.repoRoot) repoRoot = wt.repoRoot;
+    } catch {}
     return runRunQueue({
       store,
       workGraphMode: mode,
       maxActiveTasks: getMaxActiveTasks(),
-      repoRoot: process.cwd(),
+      repoRoot,
       cmd,
       bbCli,
       t,
