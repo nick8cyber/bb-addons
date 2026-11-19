@@ -151,7 +151,7 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
   const root = await repoRoot(cwd, signal);
   const pin = await pinReview(root, refs, thread.environment ?? {}, signal);
   const verdict = parseVerdict(text, system, pin);
-  const pairMatches = [...text.matchAll(/(?:^|\n)## Attachments[ \t]*\r?\n([\s\S]*?)(?=\r?\n## Recent comments[ \t]*(?:\r?\n|$))/g)];
+  const pairMatches = [...text.matchAll(/(?:^|\n)## Attachments[ \t]*\r?\n((?:(?!##[ \t])[^\n]*\r?\n)*?)(?=## Recent comments[ \t]*(?:\r?\n|$))/g)];
   const attachmentRows = pairMatches.length
     ? pairMatches.at(-1)[1].split(/\r?\n/)
     : section(text, /^## Attachments[ \t]*$/, { last: true });
