@@ -11,7 +11,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 
 Плагин `bb-plugin-provider-web-gemini` (ранее `bb-plugin-provider-argon`) регистрирует в BB ACP-провайдера `acp-web-gemini` («Gemini (Web)», с сохранением совместимости для `acp-argon`) поверх веб-интерфейса `gemini.google.com` без API-ключей. Транспорт работает по JSON-RPC 2.0 (протокол ACP) через `acp-server.mjs` и управляет изолированными headless-профилями Chrome по Chrome DevTools Protocol (`playwright` или `playwright-core`).
 
-Архитектурное решение и отвергнутые альтернативы зафиксированы в [ADR 0027](../adr/0027-provider-argon-acp.md). Связанные разделы спеки оркестратора (роли без инструментов `auditor` и `researcher` на `acp-web-gemini`) — [orchestrator.md §§20–21](orchestrator.md).
+Архитектурное решение и отвергнутые альтернативы зафиксированы в [ADR 0027](../adr/0027-provider-argon-acp.md). Связанные разделы спеки оркестратора (унифицированные роли с инструментами и абстрактные контракты возможностей) — [orchestrator.md §§12, 20–21](orchestrator.md).
 
 ---
 

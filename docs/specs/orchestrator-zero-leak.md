@@ -266,8 +266,7 @@ export interface PolicyRoute {
    - Полный строгий DLP-фильтр (RFC ASCII-маскирование хостов, IP, токенов).
    - Физическое исключение `confidentialPaths`.
    - Исполнение:
-     - для роли `auditor` (§20.1) и роли `researcher` (§21 п.3): режим `tools: false` с передачей отфильтрованного пакета DLP Redaction Engine;
-     - для роли `executor`: исполнение строго в Snapshot Sandbox на базе Bubblewrap с сетевым карантином (`--unshare-all`) при успешном Sandbox Preflight Probe.
+     - для всех ролей (`executor`, `auditor`, `researcher`, `architect`): исполнение строго в Snapshot Sandbox на базе Bubblewrap с сетевым карантином (`--unshare-all`) при успешном Sandbox Preflight Probe. Режим «маршрут без инструментов» (`tools: false`) и сборка пакета материалов первого сообщения оркестратором полностью удалены (ADR-0036, PLUG-316). Внешние веб-модели без нативных инструментов используют внутренний агент плагина провайдера (ADR-0034) или запускаются в Snapshot Sandbox.
 
 ### 5.2. Правило Fail-Closed
 
