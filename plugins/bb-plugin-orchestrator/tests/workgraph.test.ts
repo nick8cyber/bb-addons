@@ -1737,3 +1737,208 @@ test("Round 3 Blocker 5: resume from stalled does not immediately re-stall on ne
   t = store.getTask("RESUME-STALL")!;
   assert.equal(t.status, "running", "Task should remain running after resume, not re-stall");
 });
+
+test("Round 4 Blocker 1: review done without verdict receives nudge, and late verdict response advances task", async () => {
+  let threadOutput = "";
+  const customCli: BbCli = {
+    run: async (args: string[]) => {
+      const key = args.join(" ");
+      if (key.includes("tasks show")) {
+        return ok(JSON.stringify({ comments: [] }));
+      }
+      if (key.includes("thread output thr_rev_late")) {
+        return ok(JSON.stringify({ output: threadOutput }));
+      }
+      return ok();
+    },
+  };
+
+  const host = await hostWith({ workGraph: "strict" }, customCli);
+  const store = new DelegationStore(host.bb.storage.database());
+  const now = Date.now();
+
+  store.insertTask({
+    taskKey: "LATE-VERD",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  }, now);
+  store.transitionTask({
+    taskKey: "LATE-VERD",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "review",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start",
+    now,
+  }, now);
+
+  const d = store.insert({
+    taskKey: "LATE-VERD",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review",
+    preset: "review",
+    provider: "opencode",
+  });
+  store.setStatus(d.id, "done");
+  host.bb.storage.database().prepare("UPDATE delegations SET thread_id = ? WHERE id = ?").run("thr_rev_late", d.id);
+
+  // Tick 1: reviewer finished without verdict -> nudge transition, stays in review
+  await runRunQueue({ store, workGraphMode: "strict", bbCli: customCli });
+  let t = store.getTask("LATE-VERD")!;
+  assert.equal(t.node, "review");
+  assert.equal(t.status, "running");
+
+  // Reviewer now replies with verdict OK
+  threadOutput = 'Completed review successfully:\n{ "verdict": "OK", "blockers": 0 }\nAll tests pass.';
+
+  // Tick 2: runRunQueue must read late verdict and advance task to release
+  await runRunQueue({ store, workGraphMode: "strict", bbCli: customCli });
+  t = store.getTask("LATE-VERD")!;
+  assert.equal(t.node, "release");
+  assert.equal(t.status, "running");
+});
+
+test("Round 4 Blocker 2: failEvent triggers for quota and cancelled delegations", async () => {
+  const host = await hostWith({ workGraph: "strict" });
+  const store = new DelegationStore(host.bb.storage.database());
+  const now = Date.now();
+
+  // Test A: Quota delegation
+  store.insertTask({
+    taskKey: "QUOTA-TASK",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  }, now);
+  store.transitionTask({
+    taskKey: "QUOTA-TASK",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "code",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start",
+    now,
+  }, now);
+  const dQuota = store.insert({
+    taskKey: "QUOTA-TASK",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "opencode",
+  });
+  store.setStatus(dQuota.id, "quota");
+
+  await runRunQueue({ store, workGraphMode: "strict" });
+  const tQuota = store.getTask("QUOTA-TASK")!;
+  assert.equal(tQuota.status, "stalled");
+
+  // Test B: Cancelled delegation
+  store.insertTask({
+    taskKey: "CANCEL-TASK",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  }, now);
+  store.transitionTask({
+    taskKey: "CANCEL-TASK",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "code",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start",
+    now,
+  }, now);
+  const dCancel = store.insert({
+    taskKey: "CANCEL-TASK",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "opencode",
+  });
+  store.setStatus(dCancel.id, "cancelled");
+
+  await runRunQueue({ store, workGraphMode: "strict" });
+  const tCancel = store.getTask("CANCEL-TASK")!;
+  assert.equal(tCancel.status, "stalled");
+});
+
+test("Round 4 Blocker 3: design node extracts architect report and commits acceptance contract; missing report nudges", async () => {
+  let architectReport = "";
+  const customCli: BbCli = {
+    run: async (args: string[]) => {
+      const key = args.join(" ");
+      if (key.includes("tasks show")) {
+        return ok(JSON.stringify({ comments: [] }));
+      }
+      if (key.includes("thread output thr_arch_1")) {
+        return ok(JSON.stringify({ output: architectReport }));
+      }
+      return ok();
+    },
+  };
+
+  const { cmd } = fakeCmd();
+  const host = await hostWith({ workGraph: "strict" }, customCli, cmd);
+  const store = new DelegationStore(host.bb.storage.database());
+  const now = Date.now();
+
+  store.insertTask({
+    taskKey: "ARCH-REPORT",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+    branch: "bb/ARCH-REPORT-feature",
+  }, now);
+  store.transitionTask({
+    taskKey: "ARCH-REPORT",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "design",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start",
+    now,
+  }, now);
+
+  const d = store.insert({
+    taskKey: "ARCH-REPORT",
+    coordinatorThreadId: "thr_coord",
+    level: "architect",
+    route: "feature",
+    preset: "architect",
+    provider: "opencode",
+  });
+  store.setStatus(d.id, "done");
+  host.bb.storage.database().prepare("UPDATE delegations SET thread_id = ? WHERE id = ?").run("thr_arch_1", d.id);
+
+  // Case A: done without report -> triggers design_question_or_no_report
+  await runRunQueue({ store, workGraphMode: "strict", bbCli: customCli, cmd });
+  let t = store.getTask("ARCH-REPORT")!;
+  assert.equal(t.node, "design");
+  assert.equal(t.status, "running");
+  const tr = store.listTransitions("ARCH-REPORT").at(-1)!;
+  assert.match(tr.reason, /question without report/);
+
+  // Case B: architect delivers report
+  architectReport = "# Acceptance Contract\n\n1. Project must build\n2. Tests must pass\n";
+  await runRunQueue({ store, workGraphMode: "strict", bbCli: customCli, cmd });
+  t = store.getTask("ARCH-REPORT")!;
+  assert.equal(t.node, "spec");
+  assert.equal(t.status, "running");
+  assert.ok(t.acceptance_sha);
+});

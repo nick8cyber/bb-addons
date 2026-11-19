@@ -2273,6 +2273,68 @@ export function parseVerdictDetailsFromText(body: string): {
   return result;
 }
 
+export async function extractReportFromDelegation(
+  taskKey: string,
+  delegation: DelegationRow,
+  bbCli?: BbCli,
+): Promise<string | null> {
+  if (!bbCli || !delegation.thread_id) return null;
+
+  // 1. Check task comments from this delegation thread
+  try {
+    const showRes = await bbCli.run(["tasks", "show", taskKey, "--json"]);
+    if (showRes.exitCode === 0 && showRes.stdout) {
+      const show = JSON.parse(showRes.stdout) as {
+        comments?: {
+          kind?: string;
+          threadId?: string | null;
+          body?: string;
+          createdAt?: string;
+        }[];
+      };
+      const comments = (show.comments ?? [])
+        .filter(
+          (c) =>
+            c.kind === "agent" &&
+            c.threadId === delegation.thread_id &&
+            typeof c.body === "string" &&
+            c.body.trim().length > 0,
+        )
+        .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
+      const last = comments.at(-1);
+      if (last?.body && last.body.trim()) {
+        const text = last.body.trim();
+        if (!parseVerdictDetailsFromText(text)) {
+          return text;
+        }
+      }
+    }
+  } catch {}
+
+  // 2. Fallback to thread output
+  try {
+    const threadRes = await bbCli.run([
+      "thread",
+      "output",
+      delegation.thread_id,
+      "--json",
+    ]);
+    if (threadRes.exitCode === 0 && threadRes.stdout) {
+      const th = JSON.parse(threadRes.stdout) as {
+        output?: string | null;
+      };
+      if (th.output && th.output.trim()) {
+        const text = th.output.trim();
+        if (!parseVerdictDetailsFromText(text)) {
+          return text;
+        }
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
 function getActiveDelegationForTask(
   task: TaskQueueRow,
   delegations: DelegationRow[],
@@ -2364,7 +2426,10 @@ async function advanceActiveTask(
 
   if (
     latestDelegation &&
-    (latestDelegation.status === "stalled" || latestDelegation.status === "failed")
+    (latestDelegation.status === "stalled" ||
+      latestDelegation.status === "failed" ||
+      latestDelegation.status === "quota" ||
+      latestDelegation.status === "cancelled")
   ) {
     let failEvent: TransitionEvent | null = null;
     switch (task.node) {
@@ -2441,9 +2506,17 @@ async function advanceActiveTask(
   switch (task.node) {
     case "design": {
       let contractText: string | null = null;
-      if (typeof payload.acceptance_text === "string" && payload.acceptance_text.trim()) {
-        contractText = payload.acceptance_text;
+      if (latestDelegation?.status === "done") {
+        contractText = await extractReportFromDelegation(
+          task.task_key,
+          latestDelegation,
+          deps.bbCli,
+        );
       }
+      if (!contractText && typeof payload.acceptance_text === "string" && payload.acceptance_text.trim()) {
+        contractText = payload.acceptance_text.trim();
+      }
+
       if (contractText && (latestDelegation?.status === "done" || payload.design_done === true)) {
         const resolution = resolveTransition({
           route: task.route,
@@ -2491,6 +2564,13 @@ async function advanceActiveTask(
           }
         }
 
+        const consumed = Array.isArray(payload.consumed_delegations)
+          ? [...(payload.consumed_delegations as number[])]
+          : [];
+        if (latestDelegation && !consumed.includes(latestDelegation.id)) {
+          consumed.push(latestDelegation.id);
+        }
+
         const tr = deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "design",
@@ -2501,7 +2581,14 @@ async function advanceActiveTask(
           reason: resolution.reason,
           updates: {
             acceptance_sha: accSha,
-            payload: JSON.stringify({ ...payload, design_done: false }),
+            payload: JSON.stringify({
+              ...payload,
+              design_done: false,
+              acceptance_text: contractText,
+              consumed_delegations: consumed,
+              nudge_count: 0,
+              last_nudge_at: null,
+            }),
           },
         });
         if (tr.ok && tr.task) {
@@ -2512,6 +2599,68 @@ async function advanceActiveTask(
           }
           return true;
         }
+      } else if (latestDelegation?.status === "done" && !contractText) {
+        const lastNudge = typeof payload.last_nudge_at === "number" ? payload.last_nudge_at : 0;
+        const nudgeCount = typeof payload.nudge_count === "number" ? payload.nudge_count : 0;
+        const now = Date.now();
+
+        if (nudgeCount > 0 && now - lastNudge < 60_000) {
+          return false;
+        }
+
+        if (nudgeCount >= 3) {
+          deps.store.transitionTask({
+            taskKey: task.task_key,
+            expectedNode: "design",
+            expectedStatus: "running",
+            toNode: "design",
+            toStatus: "stalled",
+            actor: "run-queue",
+            reason: `design-no-report: exhausted ${nudgeCount} nudges without acceptance contract`,
+          });
+          return false;
+        }
+
+        const resolution = resolveTransition({
+          route: task.route,
+          node: "design",
+          status: "running",
+          event: { type: "design_question_or_no_report" },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) return false;
+        if (latestDelegation?.thread_id && deps.bbCli) {
+          await deps.bbCli
+            .run([
+              "thread",
+              "tell",
+              latestDelegation.thread_id,
+              "Сдай архитектурное решение и текст договора приёмки для docs/specs/acceptance/<KEY>.md",
+            ])
+            .catch(() => {});
+        }
+        const tr = deps.store.transitionTask({
+          taskKey: task.task_key,
+          expectedNode: "design",
+          expectedStatus: "running",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
+          actor: "run-queue",
+          reason: resolution.reason,
+          updates: {
+            payload: JSON.stringify({
+              ...payload,
+              nudge_count: nudgeCount + 1,
+              last_nudge_at: now,
+            }),
+          },
+        });
+        if (tr.ok) {
+          const logged = deps.store.listTransitions(task.task_key).at(-1);
+          if (logged) transitions.push(logged);
+        }
+        return false;
       }
       return false;
     }
@@ -2520,10 +2669,31 @@ async function advanceActiveTask(
       if (latestDelegation?.status === "done" || payload.spec_done === true) {
         const specSha =
           latestDelegation?.result_sha ||
-          (payload.spec_sha as string) ||
-          (payload.spec_done ? `sha-spec-${normKey.toLowerCase()}` : null);
+          (typeof payload.spec_sha === "string" ? payload.spec_sha : null) ||
+          (!latestDelegation && payload.spec_done ? `sha-spec-${normKey.toLowerCase()}` : null);
 
         if (!specSha) {
+          const lastNudge = typeof payload.last_nudge_at === "number" ? payload.last_nudge_at : 0;
+          const nudgeCount = typeof payload.nudge_count === "number" ? payload.nudge_count : 0;
+          const now = Date.now();
+
+          if (nudgeCount > 0 && now - lastNudge < 60_000) {
+            return false;
+          }
+
+          if (nudgeCount >= 3) {
+            deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "spec",
+              expectedStatus: "running",
+              toNode: "spec",
+              toStatus: "stalled",
+              actor: "run-queue",
+              reason: `spec-no-report: exhausted ${nudgeCount} nudges without commit`,
+            });
+            return false;
+          }
+
           const resolution = resolveTransition({
             route: task.route,
             node: "spec",
@@ -2533,6 +2703,26 @@ async function advanceActiveTask(
             counters: extractCounters(task),
           });
           if (!resolution.allowed) return false;
+          if (latestDelegation?.thread_id && deps.bbCli) {
+            await deps.bbCli
+              .run([
+                "thread",
+                "tell",
+                latestDelegation.thread_id,
+                "Заверши сдачей коммита документации в docs/ в ветку задачи.",
+              ])
+              .catch(() => {});
+          }
+          const updates: Partial<TaskQueueRow> = {
+            payload: JSON.stringify({
+              ...payload,
+              nudge_count: nudgeCount + 1,
+              last_nudge_at: now,
+            }),
+          };
+          if (resolution.counterUpdates) {
+            Object.assign(updates, resolution.counterUpdates);
+          }
           const tr = deps.store.transitionTask({
             taskKey: task.task_key,
             expectedNode: "spec",
@@ -2541,7 +2731,7 @@ async function advanceActiveTask(
             toStatus: resolution.toStatus,
             actor: "run-queue",
             reason: resolution.reason,
-            updates: resolution.counterUpdates ? resolution.counterUpdates : undefined,
+            updates,
           });
           if (tr.ok) {
             const logged = deps.store.listTransitions(task.task_key).at(-1);
@@ -2600,8 +2790,22 @@ async function advanceActiveTask(
         });
         if (!resolution.allowed) return false;
 
+        const consumed = Array.isArray(payload.consumed_delegations)
+          ? [...(payload.consumed_delegations as number[])]
+          : [];
+        if (latestDelegation && !consumed.includes(latestDelegation.id)) {
+          consumed.push(latestDelegation.id);
+        }
+
         const updates: Partial<TaskQueueRow> = {
           spec_sha: specSha,
+          payload: JSON.stringify({
+            ...payload,
+            spec_done: false,
+            consumed_delegations: consumed,
+            nudge_count: 0,
+            last_nudge_at: null,
+          }),
         };
         if (resolution.counterUpdates) {
           Object.assign(updates, resolution.counterUpdates);
@@ -2636,12 +2840,6 @@ async function advanceActiveTask(
         verdict = payload.spec_review_verdict === "CHANGES" ? "CHANGES" : "OK";
         blockers = Number(payload.spec_review_blockers) || 0;
       } else if (latestDelegation?.status === "done") {
-        const nudged = Array.isArray(payload.nudged_delegations)
-          ? (payload.nudged_delegations as number[])
-          : [];
-        if (nudged.includes(latestDelegation.id)) {
-          return false;
-        }
         const parsed = await extractVerdictFromDelegation(
           task.task_key,
           latestDelegation,
@@ -2651,6 +2849,27 @@ async function advanceActiveTask(
           verdict = parsed.verdict;
           blockers = parsed.blockers;
         } else {
+          const lastNudge = typeof payload.last_nudge_at === "number" ? payload.last_nudge_at : 0;
+          const nudgeCount = typeof payload.nudge_count === "number" ? payload.nudge_count : 0;
+          const now = Date.now();
+
+          if (nudgeCount > 0 && now - lastNudge < 60_000) {
+            return false;
+          }
+
+          if (nudgeCount >= 3) {
+            deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "spec_review",
+              expectedStatus: "running",
+              toNode: "spec_review",
+              toStatus: "stalled",
+              actor: "run-queue",
+              reason: `no-verdict: exhausted ${nudgeCount} spec_review nudges`,
+            });
+            return false;
+          }
+
           const resolution = resolveTransition({
             route: task.route,
             node: "spec_review",
@@ -2660,7 +2879,7 @@ async function advanceActiveTask(
             counters: extractCounters(task),
           });
           if (resolution.allowed) {
-            if (latestDelegation.thread_id && deps.bbCli) {
+            if (latestDelegation?.thread_id && deps.bbCli) {
               await deps.bbCli
                 .run([
                   "thread",
@@ -2681,8 +2900,8 @@ async function advanceActiveTask(
               updates: {
                 payload: JSON.stringify({
                   ...payload,
-                  nudged_delegations: [...nudged, latestDelegation.id],
-                  last_nudge_at: Date.now(),
+                  nudge_count: nudgeCount + 1,
+                  last_nudge_at: now,
                 }),
               },
             });
@@ -2706,7 +2925,21 @@ async function advanceActiveTask(
         });
         if (!resolution.allowed) return false;
 
-        const updates: Partial<TaskQueueRow> = {};
+        const consumed = Array.isArray(payload.consumed_delegations)
+          ? [...(payload.consumed_delegations as number[])]
+          : [];
+        if (latestDelegation && !consumed.includes(latestDelegation.id)) {
+          consumed.push(latestDelegation.id);
+        }
+
+        const updates: Partial<TaskQueueRow> = {
+          payload: JSON.stringify({
+            ...payload,
+            consumed_delegations: consumed,
+            nudge_count: 0,
+            last_nudge_at: null,
+          }),
+        };
         if (resolution.counterUpdates) {
           Object.assign(updates, resolution.counterUpdates);
         }
@@ -2737,16 +2970,31 @@ async function advanceActiveTask(
       if (latestDelegation?.status === "done" || payload.code_done === true) {
         const resultSha =
           latestDelegation?.result_sha ||
-          (payload.result_sha as string) ||
-          (payload.code_done ? `sha-code-${normKey.toLowerCase()}` : null);
+          (typeof payload.result_sha === "string" ? payload.result_sha : null) ||
+          (!latestDelegation && payload.code_done ? `sha-code-${normKey.toLowerCase()}` : null);
 
         if (!resultSha) {
-          const nudged = Array.isArray(payload.nudged_delegations)
-            ? (payload.nudged_delegations as number[])
-            : [];
-          if (latestDelegation && nudged.includes(latestDelegation.id)) {
+          const lastNudge = typeof payload.last_nudge_at === "number" ? payload.last_nudge_at : 0;
+          const nudgeCount = typeof payload.nudge_count === "number" ? payload.nudge_count : 0;
+          const now = Date.now();
+
+          if (nudgeCount > 0 && now - lastNudge < 60_000) {
             return false;
           }
+
+          if (nudgeCount >= 3) {
+            deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "code",
+              expectedStatus: "running",
+              toNode: "code",
+              toStatus: "stalled",
+              actor: "run-queue",
+              reason: `code-no-commits: exhausted ${nudgeCount} nudges without commits`,
+            });
+            return false;
+          }
+
           const resolution = resolveTransition({
             route: task.route,
             node: "code",
@@ -2777,10 +3025,8 @@ async function advanceActiveTask(
             updates: {
               payload: JSON.stringify({
                 ...payload,
-                nudged_delegations: latestDelegation
-                  ? [...nudged, latestDelegation.id]
-                  : nudged,
-                last_nudge_at: Date.now(),
+                nudge_count: nudgeCount + 1,
+                last_nudge_at: now,
               }),
             },
           });
@@ -2821,6 +3067,13 @@ async function advanceActiveTask(
         });
         if (!resolution.allowed) return false;
 
+        const consumed = Array.isArray(payload.consumed_delegations)
+          ? [...(payload.consumed_delegations as number[])]
+          : [];
+        if (latestDelegation && !consumed.includes(latestDelegation.id)) {
+          consumed.push(latestDelegation.id);
+        }
+
         const updates: Partial<TaskQueueRow> = {
           result_sha: resultSha,
           payload: JSON.stringify({
@@ -2828,6 +3081,9 @@ async function advanceActiveTask(
             code_done: false,
             result_commits: null,
             acceptance_tampered: false,
+            consumed_delegations: consumed,
+            nudge_count: 0,
+            last_nudge_at: null,
           }),
         };
         if (resolution.counterUpdates) {
@@ -2915,12 +3171,6 @@ async function advanceActiveTask(
         verdict = payload.review_verdict === "CHANGES" ? "CHANGES" : "OK";
         blockers = Number(payload.review_blockers) || 0;
       } else if (latestDelegation?.status === "done") {
-        const nudged = Array.isArray(payload.nudged_delegations)
-          ? (payload.nudged_delegations as number[])
-          : [];
-        if (nudged.includes(latestDelegation.id)) {
-          return false;
-        }
         const parsed = await extractVerdictFromDelegation(
           task.task_key,
           latestDelegation,
@@ -2930,6 +3180,27 @@ async function advanceActiveTask(
           verdict = parsed.verdict;
           blockers = parsed.blockers;
         } else {
+          const lastNudge = typeof payload.last_nudge_at === "number" ? payload.last_nudge_at : 0;
+          const nudgeCount = typeof payload.nudge_count === "number" ? payload.nudge_count : 0;
+          const now = Date.now();
+
+          if (nudgeCount > 0 && now - lastNudge < 60_000) {
+            return false;
+          }
+
+          if (nudgeCount >= 3) {
+            deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "review",
+              expectedStatus: "running",
+              toNode: "review",
+              toStatus: "stalled",
+              actor: "run-queue",
+              reason: `no-verdict: exhausted ${nudgeCount} review nudges`,
+            });
+            return false;
+          }
+
           const resolution = resolveTransition({
             route: task.route,
             node: "review",
@@ -2939,7 +3210,7 @@ async function advanceActiveTask(
             counters: extractCounters(task),
           });
           if (resolution.allowed) {
-            if (latestDelegation.thread_id && deps.bbCli) {
+            if (latestDelegation?.thread_id && deps.bbCli) {
               await deps.bbCli
                 .run([
                   "thread",
@@ -2960,8 +3231,8 @@ async function advanceActiveTask(
               updates: {
                 payload: JSON.stringify({
                   ...payload,
-                  nudged_delegations: [...nudged, latestDelegation.id],
-                  last_nudge_at: Date.now(),
+                  nudge_count: nudgeCount + 1,
+                  last_nudge_at: now,
                 }),
               },
             });
@@ -2985,7 +3256,21 @@ async function advanceActiveTask(
         });
         if (!resolution.allowed) return false;
 
-        const updates: Partial<TaskQueueRow> = {};
+        const consumed = Array.isArray(payload.consumed_delegations)
+          ? [...(payload.consumed_delegations as number[])]
+          : [];
+        if (latestDelegation && !consumed.includes(latestDelegation.id)) {
+          consumed.push(latestDelegation.id);
+        }
+
+        const updates: Partial<TaskQueueRow> = {
+          payload: JSON.stringify({
+            ...payload,
+            consumed_delegations: consumed,
+            nudge_count: 0,
+            last_nudge_at: null,
+          }),
+        };
         if (resolution.counterUpdates) {
           Object.assign(updates, resolution.counterUpdates);
         }
@@ -3020,12 +3305,6 @@ async function advanceActiveTask(
           payload.design_check_verdict === "CHANGES" ? "CHANGES" : "OK";
         if (payload.design_check_target === "design") target = "design";
       } else if (latestDelegation?.status === "done") {
-        const nudged = Array.isArray(payload.nudged_delegations)
-          ? (payload.nudged_delegations as number[])
-          : [];
-        if (nudged.includes(latestDelegation.id)) {
-          return false;
-        }
         const parsed = await extractVerdictFromDelegation(
           task.task_key,
           latestDelegation,
@@ -3035,6 +3314,27 @@ async function advanceActiveTask(
           verdict = parsed.verdict;
           if (parsed.target === "design") target = "design";
         } else {
+          const lastNudge = typeof payload.last_nudge_at === "number" ? payload.last_nudge_at : 0;
+          const nudgeCount = typeof payload.nudge_count === "number" ? payload.nudge_count : 0;
+          const now = Date.now();
+
+          if (nudgeCount > 0 && now - lastNudge < 60_000) {
+            return false;
+          }
+
+          if (nudgeCount >= 3) {
+            deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "design_check",
+              expectedStatus: "running",
+              toNode: "design_check",
+              toStatus: "stalled",
+              actor: "run-queue",
+              reason: `no-verdict: exhausted ${nudgeCount} design_check nudges`,
+            });
+            return false;
+          }
+
           const resolution = resolveTransition({
             route: task.route,
             node: "design_check",
@@ -3044,7 +3344,7 @@ async function advanceActiveTask(
             counters: extractCounters(task),
           });
           if (resolution.allowed) {
-            if (latestDelegation.thread_id && deps.bbCli) {
+            if (latestDelegation?.thread_id && deps.bbCli) {
               await deps.bbCli
                 .run([
                   "thread",
@@ -3065,8 +3365,8 @@ async function advanceActiveTask(
               updates: {
                 payload: JSON.stringify({
                   ...payload,
-                  nudged_delegations: [...nudged, latestDelegation.id],
-                  last_nudge_at: Date.now(),
+                  nudge_count: nudgeCount + 1,
+                  last_nudge_at: now,
                 }),
               },
             });
@@ -3090,7 +3390,21 @@ async function advanceActiveTask(
         });
         if (!resolution.allowed) return false;
 
-        const updates: Partial<TaskQueueRow> = {};
+        const consumed = Array.isArray(payload.consumed_delegations)
+          ? [...(payload.consumed_delegations as number[])]
+          : [];
+        if (latestDelegation && !consumed.includes(latestDelegation.id)) {
+          consumed.push(latestDelegation.id);
+        }
+
+        const updates: Partial<TaskQueueRow> = {
+          payload: JSON.stringify({
+            ...payload,
+            consumed_delegations: consumed,
+            nudge_count: 0,
+            last_nudge_at: null,
+          }),
+        };
         if (resolution.counterUpdates) {
           Object.assign(updates, resolution.counterUpdates);
         }
@@ -3250,24 +3564,40 @@ async function advanceActiveTask(
         latestDelegation?.status === "done" ||
         payload.research_done === true
       ) {
+        const report =
+          (latestDelegation
+            ? await extractReportFromDelegation(
+                task.task_key,
+                latestDelegation,
+                deps.bbCli,
+              )
+            : null) ||
+          (typeof payload.research_report === "string"
+            ? payload.research_report
+            : "done");
+
         const resolution = resolveTransition({
           route: task.route,
           node: "research",
           status: "running",
-          event: { type: "research_delivered", report: "done" },
+          event: { type: "research_delivered", report },
           mode: task.confirmation_mode,
           counters: extractCounters(task),
         });
         if (!resolution.allowed) return false;
 
-        const researchReport =
-          (payload.research_report as string) ||
-          latestDelegation?.result_sha ||
-          "done";
+        const consumed = Array.isArray(payload.consumed_delegations)
+          ? [...(payload.consumed_delegations as number[])]
+          : [];
+        if (latestDelegation && !consumed.includes(latestDelegation.id)) {
+          consumed.push(latestDelegation.id);
+        }
+
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
-            research_report: researchReport,
+            research_report: report,
+            consumed_delegations: consumed,
           }),
         };
 

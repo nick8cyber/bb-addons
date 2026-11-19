@@ -9,7 +9,7 @@
 import { z } from "zod";
 import { join as joinPath } from "node:path";
 import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import {
   defineRpcContract,
   type BbPluginApi,
@@ -1561,7 +1561,7 @@ export async function createPlugin(
     const mode = getWorkGraphMode();
     if (mode === "off") return;
     let repoRoot = cachedPumpRepoRoot ?? process.cwd();
-    if (!cachedPumpRepoRoot) {
+    if (!cachedPumpRepoRoot || !existsSync(cachedPumpRepoRoot)) {
       try {
         const wt = await resolveWorktreeContext(undefined, undefined, process.cwd()).catch(() => null);
         if (wt?.repoRoot) {
