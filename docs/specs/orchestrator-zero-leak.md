@@ -91,7 +91,7 @@
        -- prlimit --nproc=64 --as=4294967296 --cpu=1200 -- <команда_агента>
      ```
    - **Лимиты ресурсов внутри песочницы:** утилита `prlimit --nproc=64 --as=4294967296 --cpu=1200` (4 GiB виртуальной памяти, 64 процесса, 1200 секунд CPU) накладывается **СТРОГО ВНУТРИ** песочницы на команду агента. Это исключает падение с ошибкой `EAGAIN` при старте, возникающее, если накладывать лимит снаружи на процесс `bwrap` при большом числе фоновых процессов пользователя хоста.
-   - **Подготовка mountpoint:** для путей из `confidentialPaths` оркестратор перед запуском bwrap гарантирует существование целевого файла (`mkdir -p $(dirname ...) && touch ...`) или директории (`mkdir -p ...`), сохраняя список фактически созданных временных плейсхолдеров в виде абсолютных путей внутри каталога песочницы в массиве `CREATED_PLACEHOLDERS` (`CREATED_PLACEHOLDERS+=("$SANDBOX_DIR/$targetPath")`):
+   - **Подготовка mountpoint:** для путей из `confidentialPaths` оркестратор предварительно раскрывает glob-шаблоны по списку файлов базового коммита (`git ls-files <base-sha> -- <glob>`) и каталогов верхнего уровня. Для каждого разрешённого пути перед запуском bwrap гарантируется существование целевого файла (`mkdir -p $(dirname ...) && touch ...`) или директории (`mkdir -p ...`), сохраняя список фактически созданных временных плейсхолдеров в виде абсолютных путей внутри каталога песочницы в массиве `CREATED_PLACEHOLDERS` (`CREATED_PLACEHOLDERS+=("$SANDBOX_DIR/$targetPath")`):
      - если путь в репозитории — файл: `--ro-bind /dev/null /workspace/<confidentialPath>`
      - если путь в репозитории — каталог: `--tmpfs /workspace/<confidentialPath>`
    - Замечание: файл `/etc/resolv.conf` **НЕ пробрасывается**, так как сеть отключена (`--unshare-all`), а его содержимое раскрывает IP-адреса локальных DNS-серверов хоста.
@@ -111,13 +111,19 @@
        rm -rf "$placeholder"
      done
 
-     # 3. Формирование массива pathspec-исключений для confidentialPaths и стандартных артефактов
+     # 3. Инициализация и формирование массива pathspec-исключений для confidentialPaths и артефактов
+     CONFIDENTIAL_PATHS=("${POLICY_CONFIDENTIAL_PATHS[@]}")
      EXCLUDE_CONFIDENTIAL_ARGS=()
      for p in "${CONFIDENTIAL_PATHS[@]}"; do
        EXCLUDE_CONFIDENTIAL_ARGS+=(":(exclude)$p")
      done
-     # Защита от случайного раздутия патча артефактами в проектах с неполным .gitignore
-     EXCLUDE_CONFIDENTIAL_ARGS+=(":(exclude)node_modules" ":(exclude).venv" ":(exclude)__pycache__" ":(exclude)*.pyc")
+     # Защита от раздутия патча артефактами в корне и вложенных пакетах монорепозитория
+     EXCLUDE_CONFIDENTIAL_ARGS+=(
+       ":(exclude)node_modules" ":(exclude)*/node_modules"
+       ":(exclude).venv" ":(exclude)*/.venv"
+       ":(exclude)__pycache__" ":(exclude)*/__pycache__"
+       ":(exclude)*.pyc"
+     )
 
      # 4. Регистрация untracked-файлов без принудительного флага -f
      # Флаг -f исключён: он втаскивал бы игнорируемые деревья и кэши в патч.
@@ -284,7 +290,7 @@ export interface PolicyRoute {
    - Чтение файла возвращает пустой вывод (`/dev/null`), чтение каталога — пустую директорию `tmpfs`.
    - В процессе работы агент создаёт:
      - новый файл `src/utils/new-helper.ts` (untracked, не в `.gitignore`);
-     - временные сборочные файлы в `node_modules/pkg/index.js` и `test.log` (подпадают под `.gitignore`).
+     - временные сборочные файлы в корне и пакетах: `node_modules/pkg/index.js`, `packages/sub/node_modules/dep/index.js` и `test.log` (подпадают под `.gitignore` либо pathspec-исключения).
    - После `git clean -fdX` и удаления сохранённых плейсхолдеров `CREATED_PLACEHOLDERS`:
      1) закоммиченный `dist/bundle.js` остаётся нетронутым и НЕ попадает в дифф как `deleted`;
      2) сборочный мусор (`node_modules/`, `test.log`) удаляется и НЕ попадает в `patch.diff`;
