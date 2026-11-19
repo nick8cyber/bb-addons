@@ -34,7 +34,6 @@ import {
   maskSecrets,
   parseAddedLines,
   personalEmailHits,
-  PERSONAL_EMAIL_RE,
   scanAddedLinesCore,
   secretValues,
   type AddedLine,
@@ -96,87 +95,6 @@ export type IdentityResolution =
 
 export const EMPTY_TREE_SHA =
   "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
-
-
-/**
- * §20.2 (r33): mask every built-in scanner hit INSIDE arbitrary text —
- * the material packet a `tools: false` route sends to an external web
- * provider. Each match becomes `mask(rule)` («[скрыто: <тип>]» by the
- * caller); the count feeds the packet header's «скрыто N фрагментов».
- * `threadIds` honors the project's §16.6 switch: on, tracker keys and
- * `thr_…` are contract (not masked); off, they are findings too.
- */
-export function maskLeakText(
-  text: string,
-  opts: {
-    hostname?: string | undefined;
-    threadIds?: boolean;
-    allowedEmails?: readonly string[];
-    /** §4 `leaks.allow`: paths where category 3–4 mentions are the
-     * project's norm — applied when `file` names this text's source. */
-    allow?: readonly string[];
-    /** The file this text belongs to (an `--attach` path or a diff
-     * hunk's `b/` name) — `allow` relaxes categories 3–4 inside it. */
-    file?: string;
-    mask?: (rule: string) => string;
-  } = {},
-): { text: string; count: number } {
-  const mask = opts.mask ?? ((rule: string) => `[скрыто: ${rule}]`);
-  let count = 0;
-  let out = text;
-  const sub = (
-    re: RegExp,
-    rule: string,
-    keep?: (m: string) => boolean,
-  ) => {
-    out = out.replace(re, (m) => {
-      if (keep && keep(m)) return m;
-      count++;
-      return mask(rule);
-    });
-  };
-  const SECRET_MASK_RES: { rule: string; re: RegExp }[] = [
-    {
-      rule: "private-key",
-      re: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?=-----END|$)/g,
-    },
-    { rule: "vless-uri", re: /vless:\/\/\S+/g },
-    {
-      rule: "github-token",
-      re: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{10,}/g,
-    },
-    {
-      rule: "api-key",
-      re: /\bsk-[A-Za-z0-9_-]{12,}\b|\bxox[baprs]-[A-Za-z0-9-]{8,}|\bAKIA[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_-]{20,}\b|\bya29\.[0-9A-Za-z_-]{10,}/g,
-    },
-    { rule: "vpn-private-key", re: /PrivateKey\s*=\s*\S+/g },
-  ];
-  for (const { rule, re } of SECRET_MASK_RES) sub(re, rule);
-  sub(new RegExp(PERSONAL_EMAIL_RE.source, "gi"), "personal-email", (m) =>
-    personalEmailHits(m, opts.allowedEmails ?? []).length === 0,
-  );
-  // §4: `allow` relaxes categories 3–4 only — secrets and personal
-  // emails (1–2) are masked everywhere, always.
-  const relaxed =
-    opts.file !== undefined && isAllowed(opts.file, opts.allow ?? []);
-  if (!relaxed) {
-    for (const { rule, re, exempt } of MACHINE_RULES) {
-      sub(new RegExp(re.source, "g"), `machine-${rule}`, (m) =>
-        exempt ? exempt.test(m) : false,
-      );
-    }
-    if (opts.hostname && opts.hostname.length > 2) {
-      sub(hostRe(opts.hostname), "machine-hostname");
-    }
-    for (const { rule, re } of bbIdRules(opts.threadIds ?? true)) {
-      sub(new RegExp(re.source, "gi"), `bb-${rule}`, (m) =>
-        rule === "task-key" ? !isTaskKeyToken(m) : false,
-      );
-    }
-  }
-  return { text: out, count };
-}
 
 // ── Category 2: author identity ────────────────────────────────────────
 

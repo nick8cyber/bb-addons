@@ -188,14 +188,22 @@ export function verdictInstruction(context) {
 export function taskInstruction(context) {
   if (!context.write) return verdictInstruction(context);
   const { nonce, allowedPaths } = context.write;
+  const mark = "BBG-" + nonce;
   return [
-    "File output contract. Your final response must be a single Markdown fence labeled json, with no other text or fences.",
-    'Return an object { "format": "web-gemini-files-v1", "nonce": "' + nonce +
-      '", "files": [...], "commitMessage": "..." }.',
-    "For each exact relative path return path, operation (create, replace, delete), and baseSha256.",
-    "Use null for create. For replace or delete, use the base SHA-256 provided by the manifest or read_file. Ask read_file if the hash has not been provided. Do not compute it yourself.",
-    "For create and replace include content as the complete JSON string, including intended line endings and final LF. For delete omit content.",
-    "A reply requesting tools must contain only tool call lines. The final file response must contain only the JSON envelope.",
+    "File output contract. Your final response must be a single Markdown fence with no other text or fences.",
+    "The outer fence must be strictly longer than any fence of the same character inside file content; otherwise use tildes.",
+    "Inside the fence, each on its own line: " + mark + "-ENVELOPE, the META line, the file blocks, " + mark + "-CLOSE.",
+    'META is one JSON line: {"format":"web-gemini-files-v2","nonce":"' + nonce +
+      '","commitMessage":"...","files":[{"path":"...","operation":"...","baseSha256":"..."}]}. META contains no file content.',
+    "Each files entry: path (exact relative path), operation (create, replace, delete), baseSha256. " +
+      "Use null for create. For replace or delete, use the base SHA-256 provided by the manifest or read_file. " +
+      "Ask read_file if the hash has not been provided. Do not compute it yourself.",
+    "After META, for every create or replace entry in files order: " + mark + "-FILE-NN-BEGIN, " +
+      "the complete raw file content, " + mark + "-FILE-NN-END. NN is the two-digit index of the entry in files " +
+      "plus one; delete entries keep their number but have no FILE block.",
+    "Content between the marker lines is verbatim: no escaping, no trimming; keep line endings and the final LF. " +
+      "Never emit a line starting with " + mark + "- inside file content. No other lines before ENVELOPE or after CLOSE.",
+    "A reply requesting tools must contain only tool call lines. The final file response must contain only the envelope fence.",
     allowedPaths ? "Allowed paths: " + JSON.stringify(allowedPaths) : "",
   ].filter(Boolean).join("\n");
 }
@@ -223,7 +231,8 @@ export function checkedAnswer(context, response) {
   const page = String(response?.text ?? response ?? "");
   const raw = typeof response?.rawText === "string" && response.rawText.trim() ? response.rawText : null;
   const source = raw ?? page;
-  const isFileEnvelope = (text) => /"format"\s*:\s*"web-gemini-files-v1"/.test(text);
+  const isFileEnvelope = (text) => /"format"\s*:\s*"web-gemini-files-v\d+"/.test(text) ||
+    /^BBG-\S+-ENVELOPE[ \t\r]*$/m.test(text);
   if (isFileEnvelope(source) || isFileEnvelope(page) || response?.files?.length || response?.hasGeneratedFile) {
     return { denied: "file output requires a write-enabled preset and a dedicated worktree; full grants read-only access" };
   }

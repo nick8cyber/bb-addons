@@ -247,18 +247,18 @@ test("CLI delegate end-to-end through the fake host", async () => {
   assert.deepEqual(updates, []);
 });
 
-test("PLUG-294: CLI delegate on tool-less route with --from forwards stepsDeps and succeeds", async () => {
+test("PLUG-294: CLI delegate with --from forwards stepsDeps and succeeds", async () => {
   const { cli } = fakeCli((args) => {
     const key = args.join(" ");
     if (key.startsWith("tasks preset list")) {
-      return ok(JSON.stringify({ presets: [{ name: "argon-preset", id: "p_argon" }] }));
+      return ok(JSON.stringify({ presets: [{ name: "preset-1", id: "p_1" }] }));
     }
     if (key.startsWith("tasks preset show")) {
       return ok(
         JSON.stringify({
           preset: {
-            providerId: "acp-argon",
-            modelId: "argon-1",
+            providerId: "prov-x",
+            modelId: "m-1",
             reasoningLevel: "medium",
             permissionMode: "auto",
             environmentKind: "project-default",
@@ -290,9 +290,9 @@ test("PLUG-294: CLI delegate on tool-less route with --from forwards stepsDeps a
       policy: JSON.stringify({
         version: 1,
         limits: { maxActive: 5 },
-        levels: { review: { chain: ["argon"], role: "auditor" } },
+        levels: { review: { chain: ["r1"], role: "auditor" } },
         routes: {
-          argon: { preset: "argon-preset", provider: "acp-argon", tools: false },
+          r1: { preset: "preset-1", provider: "prov-x" },
         },
       }),
     },
@@ -320,7 +320,7 @@ test("PLUG-294: CLI delegate on tool-less route with --from forwards stepsDeps a
     gitCmd,
   );
   const res = await host.harness.runCli(
-    ["delegate", "PLUG-1", "--level", "review", "--route", "argon", "--from", "sha123", "--json"],
+    ["delegate", "PLUG-1", "--level", "review", "--route", "r1", "--from", "sha123", "--json"],
     { threadId: "thr_coord" },
   );
   assert.equal(res.exitCode, 0, res.stderr || res.stdout);
@@ -332,10 +332,12 @@ test("PLUG-294: CLI delegate on tool-less route with --from forwards stepsDeps a
   };
   assert.equal(body.ok, true);
   assert.equal(body.threadId, "thr_exec");
-  assert.equal(body.route, "argon");
+  assert.equal(body.route, "r1");
   assert.equal(spawnCalls.length, 1);
-  assert.match(spawnCalls[0]!.prompt ?? "", /МАТЕРИАЛ ДЛЯ ПРОВЕРКИ/);
-  assert.ok(spawnCalls[0]!.prompt?.includes("DIFF_OUTPUT"));
+  // §20.1 (r34.4): the seed prompt is the ordinary agent contract — no
+  // material packet, no inlined diff bytes.
+  assert.doesNotMatch(spawnCalls[0]!.prompt ?? "", /МАТЕРИАЛ ДЛЯ ПРОВЕРКИ/);
+  assert.ok(!spawnCalls[0]!.prompt?.includes("DIFF_OUTPUT"));
 });
 
 test("policy validate rejects an invalid policy with a path", async () => {

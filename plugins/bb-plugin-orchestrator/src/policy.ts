@@ -11,6 +11,10 @@ import { OrchestratorError } from "./errors.js";
 import { RU } from "./i18n/ru.js";
 import { T_RU, type T } from "./i18n/index.js";
 
+/** §20.1 п.5: the queue wait when the route sets no
+ * `routeBusyWaitSeconds`. */
+export const DEFAULT_ROUTE_BUSY_WAIT_SECONDS = 1200;
+
 export interface PolicyRoute {
   preset: string;
   provider: string;
@@ -23,18 +27,11 @@ export interface PolicyRoute {
   startSeconds?: number;
   /** §16.5: response silence this long → one coordinator message (default 1800). */
   idleSeconds?: number;
-  /** §20.1 (r33): `false` — the provider has no repo tools (a web
-   * session); the plugin ships the whole material packet in the first
-   * prompt. Only on auditor/researcher level routes, never
-   * `release-audit` (§20.1, §21.3). */
-  tools?: boolean;
-  /** §20.2: parallel dispatches cap for this route (a web provider has
-   * one tab); the excess stays `dispatching` in the `queued_at` queue.
-   * Counted per quota group (§21.4). */
+  /** §20.1 п.5 (r34.4): parallel dispatches cap for this route; the
+   * excess stays `dispatching` in the `queued_at` queue. Counted per
+   * quota group. */
   maxActive?: number;
-  /** §20.2: byte cap for the material packet prompt (default 150 000). */
-  maxPromptBytes?: number;
-  /** §20.2: how long a queued dispatch waits for a busy route before
+  /** §20.1 п.5: how long a queued dispatch waits for a busy route before
    * the next chain route is tried (default 1200). */
   routeBusyWaitSeconds?: number;
 }
@@ -72,6 +69,13 @@ export interface Policy {
   reviewByLevel?: Record<string, string>;
   /** §28.2 п. 3: per-node timeout, retry limits, and level assignment. */
   node_policy?: PolicyNodePolicy;
+  /** §20.3 (r34.4): alias → canonical name dictionaries. A direct
+   * config match always wins over an alias lookup; chains resolve to
+   * the terminal name; cycles are rejected at validation
+   * (`policy-error: alias-cycle`). */
+  routeAliases?: Record<string, string>;
+  presetAliases?: Record<string, string>;
+  quotaGroupAliases?: Record<string, string>;
   levels: Record<string, PolicyLevel>;
   routes: Record<string, PolicyRoute>;
 }
@@ -253,14 +257,18 @@ export function parsePolicy(
           routeIdle = v;
         }
       }
-      // §20.1/§20.2 (r33): `tools` — a provider without repo tools;
-      // `maxActive` — a busy-route queue; `maxPromptBytes` and
-      // `routeBusyWaitSeconds` — packet cap and queue wait.
-      if (value.tools !== undefined && typeof value.tools !== "boolean") {
-        err(`${path}.tools`, t("pol.isBool"));
+      // §20.2 (r34.4): `tools`, `maxPromptBytes`, `splitPackets` are
+      // removed fields — a policy carrying them still loads (no
+      // breaking change) but registers a deprecation warning; the
+      // route itself is always treated as a tools-capable one.
+      if (value.tools !== undefined) {
+        warn(`${path}.tools`, t("pol.toolsDeprecated"));
+      }
+      if (value.maxPromptBytes !== undefined || value.splitPackets !== undefined) {
+        warn(`${path}.packetFields`, t("pol.packetFieldsDeprecated"));
       }
       const numField = (
-        key: "maxActive" | "maxPromptBytes" | "routeBusyWaitSeconds",
+        key: "maxActive" | "routeBusyWaitSeconds",
       ): number | undefined => {
         const v = value[key];
         if (v === undefined) return undefined;
@@ -271,7 +279,6 @@ export function parsePolicy(
         return v;
       };
       const routeMaxActive = numField("maxActive");
-      const routeMaxPrompt = numField("maxPromptBytes");
       const routeBusyWait = numField("routeBusyWaitSeconds");
       if (isNonEmptyString(value.preset) && isNonEmptyString(value.provider)) {
         routes[name] = {
@@ -287,12 +294,8 @@ export function parsePolicy(
             : {}),
           ...(routeStart !== undefined ? { startSeconds: routeStart } : {}),
           ...(routeIdle !== undefined ? { idleSeconds: routeIdle } : {}),
-          ...(value.tools === false ? { tools: false } : {}),
           ...(routeMaxActive !== undefined
             ? { maxActive: routeMaxActive }
-            : {}),
-          ...(routeMaxPrompt !== undefined
-            ? { maxPromptBytes: routeMaxPrompt }
             : {}),
           ...(routeBusyWait !== undefined
             ? { routeBusyWaitSeconds: routeBusyWait }
@@ -301,6 +304,39 @@ export function parsePolicy(
       }
     }
   }
+
+  // §20.3 (r34.4): the alias dictionaries — `Record<alias, canonical>`,
+  // exact case, chains resolve to the terminal name; a cycle is a
+  // blocking `policy-error: alias-cycle`. Parsed before the levels:
+  // `routeAliases` applies to the chain-reference validation below.
+  const aliasesOf = (
+    key: "routeAliases" | "presetAliases" | "quotaGroupAliases",
+  ): Record<string, string> | undefined => {
+    const v = raw[key];
+    if (v === undefined) return undefined;
+    if (!isRecord(v)) {
+      err(key, t("pol.aliasObject"));
+      return undefined;
+    }
+    const out: Record<string, string> = {};
+    for (const [k, val] of Object.entries(v)) {
+      if (!isNonEmptyString(k) || !isNonEmptyString(val)) {
+        err(`${key}.${k || "?"}`, t("pol.aliasString"));
+        continue;
+      }
+      out[k] = val;
+    }
+    for (const k of Object.keys(out)) {
+      const chain = aliasChain(k, out);
+      if (chain.cycle) {
+        err(`${key}.${k}`, t("pol.aliasCycle", { chain: chain.names.join(" -> ") }));
+      }
+    }
+    return out;
+  };
+  const routeAliases = aliasesOf("routeAliases");
+  const presetAliases = aliasesOf("presetAliases");
+  const quotaGroupAliases = aliasesOf("quotaGroupAliases");
 
   // Levels + rule 2 (chain references).
   const levels: Record<string, PolicyLevel> = {};
@@ -340,7 +376,12 @@ export function parsePolicy(
         } else {
           chain = value.chain.map((r) => (r as string).trim());
           chain.forEach((routeName, i) => {
-            if (!routesRaw || !(routeName in routesRaw)) {
+            // §20.3 п.3: `routeAliases` applies here too — a chain entry
+            // is declared when any hop of its alias chain names a route.
+            const declared = routeNameChain(routeName, routeAliases).some(
+              (n) => routesRaw !== undefined && n in routesRaw,
+            );
+            if (!declared) {
               err(
                 `${path}.chain[${i}]`, t("pol.routeUndeclared", { route: routeName }));
             }
@@ -606,34 +647,16 @@ export function parsePolicy(
       const role = level.role ?? (levelName === "review" ? "auditor" : "executor");
       if (role !== "executor") continue;
       for (const routeName of level.chain) {
-        const route = findRoute(routes, routeName);
-        if (!route) continue;
+        const resolvedName = routeNameChain(routeName, routeAliases).find(
+          (n) => routes[n] !== undefined,
+        );
+        if (resolvedName === undefined) continue;
+        const route = routes[resolvedName]!;
         const detail = presetDetails.get(route.preset);
         if (detail && detail.environmentKind !== "new-worktree") {
           warn(
-            `routes.${routeName}.preset`, t("pol.presetNoWorktree", { preset: route.preset, kind: detail.environmentKind ?? "—", level: levelName }));
+            `routes.${resolvedName}.preset`, t("pol.presetNoWorktree", { preset: route.preset, kind: detail.environmentKind ?? "—", level: levelName }));
         }
-      }
-    }
-  }
-
-  // §20.1/§21.3/§30.1: a `tools: false` route may stand only in levels
-  // whose role is `auditor`, `researcher`, or `architect` — never in
-  // `release-audit` or an executor level.
-  for (const [levelName, level] of Object.entries(levels)) {
-    const role =
-      level.role ?? (levelName === "review" ? "auditor" : "executor");
-    for (const routeName of level.chain) {
-      const route = findRoute(routes, routeName);
-      if (!route || route.tools !== false) continue;
-      if (
-        levelName === "release-audit" ||
-        (role !== "auditor" && role !== "researcher" && role !== "architect")
-      ) {
-        err(
-          `routes.${routeName}.tools`,
-          t("pol.toolsForbidden", { level: levelName }),
-        );
       }
     }
   }
@@ -653,6 +676,15 @@ export function parsePolicy(
       ...(node_policy && Object.keys(node_policy).length > 0
         ? { node_policy }
         : {}),
+      ...(routeAliases && Object.keys(routeAliases).length > 0
+        ? { routeAliases }
+        : {}),
+      ...(presetAliases && Object.keys(presetAliases).length > 0
+        ? { presetAliases }
+        : {}),
+      ...(quotaGroupAliases && Object.keys(quotaGroupAliases).length > 0
+        ? { quotaGroupAliases }
+        : {}),
       levels,
       routes,
     },
@@ -662,110 +694,137 @@ export function parsePolicy(
   };
 }
 
-/** Canonical preset name: transforms legacy argon preset names to web-gemini. */
-export function canonicalPresetName(name: string | undefined): string {
-  if (!name) return "";
-  if (name === "argon-review") return "web-gemini-review";
-  if (name === "argon-research") return "web-gemini-research";
-  return name;
-}
+/* ── §20.3 (r34.4): generic alias machinery — the policy carries the
+ * dictionaries (`routeAliases`/`presetAliases`/`quotaGroupAliases`);
+ * no provider names are hardcoded. */
 
-export const PRESET_ALIASES: Record<string, string> = {
-  "argon-review": "web-gemini-review",
-  "argon-research": "web-gemini-research",
-  "web-gemini-review": "argon-review",
-  "web-gemini-research": "argon-research",
-};
-
-/** Canonical route name: transforms legacy argon route names to web-gemini. */
-export function canonicalRouteName(name: string | undefined): string {
-  if (!name) return "";
-  if (name === "review-argon") return "review-web-gemini";
-  if (name === "research-argon") return "research-web-gemini";
-  if (name === "argon-review") return "web-gemini-review";
-  if (name === "argon-research") return "web-gemini-research";
-  return name;
-}
-
-/** Canonical quota group: "argon" and "web-gemini" share the same slot counter. */
-export function canonicalQuotaGroup(g: string): string {
-  if (
-    g === "argon" ||
-    g === "web-gemini" ||
-    g === "review-argon" ||
-    g === "review-web-gemini" ||
-    g === "research-argon" ||
-    g === "research-web-gemini" ||
-    g === "argon-review" ||
-    g === "web-gemini-review" ||
-    g === "argon-research" ||
-    g === "web-gemini-research"
-  ) {
-    return "web-gemini";
+/**
+ * Walk the alias chain from `name`: returns every hop in order
+ * (`name`, `aliases[name]`, …). `cycle` marks a walk that re-entered a
+ * name — validation rejects those with `alias-cycle`; at runtime the
+ * walk just stops at the repeat.
+ */
+function aliasChain(
+  name: string,
+  aliases: Record<string, string> | undefined,
+): { names: string[]; cycle: boolean } {
+  const names = [name];
+  const seen = new Set(names);
+  let cur = name;
+  while (aliases && aliases[cur] !== undefined) {
+    cur = aliases[cur]!;
+    if (seen.has(cur)) return { names: [...names, cur], cycle: true };
+    seen.add(cur);
+    names.push(cur);
   }
-  if (g.startsWith("preset:")) {
-    const p = g.slice("preset:".length);
-    return `preset:${canonicalPresetName(p)}`;
-  }
-  return g;
+  return { names, cycle: false };
 }
 
-/** Route aliases for backward compatibility between argon and web-gemini naming. */
-export const ROUTE_ALIASES: Record<string, string> = {
-  "review-argon": "review-web-gemini",
-  "research-argon": "research-web-gemini",
-  "review-web-gemini": "review-argon",
-  "research-web-gemini": "research-argon",
-  "argon-review": "web-gemini-review",
-  "argon-research": "web-gemini-research",
-  "web-gemini-review": "argon-review",
-  "web-gemini-research": "argon-research",
-};
+/** §20.3: every name in `name`'s alias chain, itself first. */
+export function routeNameChain(
+  name: string,
+  aliases: Record<string, string> | undefined,
+): string[] {
+  return aliasChain(name, aliases).names;
+}
 
-/** Resolves a route from a policy or routes map by direct name or alias. */
+/** Canonical preset name: the terminal of the `presetAliases` chain. */
+export function canonicalPresetName(
+  name: string | undefined,
+  policy?: Policy | null,
+): string {
+  if (!name) return "";
+  const chain = aliasChain(name, policy?.presetAliases).names;
+  return chain[chain.length - 1]!;
+}
+
+/** Canonical route name: the terminal of the `routeAliases` chain. */
+export function canonicalRouteName(
+  name: string | undefined,
+  policy?: Policy | null,
+): string {
+  if (!name) return "";
+  const chain = aliasChain(name, policy?.routeAliases).names;
+  return chain[chain.length - 1]!;
+}
+
+/** Canonical quota group: `quotaGroupAliases` first, then
+ * `presetAliases` inside a `preset:` group. */
+export function canonicalQuotaGroup(
+  g: string,
+  policy?: Policy | null,
+): string {
+  const chain = aliasChain(g, policy?.quotaGroupAliases).names;
+  const resolved = chain[chain.length - 1]!;
+  if (resolved.startsWith("preset:")) {
+    const p = resolved.slice("preset:".length);
+    return `preset:${canonicalPresetName(p, policy)}`;
+  }
+  return resolved;
+}
+
+/** §20.3: two preset names are the same preset when their canonical
+ * forms match (or they are literally equal). */
+export function samePreset(
+  policy: Policy | null | undefined,
+  a: string | undefined,
+  b: string | undefined,
+): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return canonicalPresetName(a, policy) === canonicalPresetName(b, policy);
+}
+
+/** Resolves a route from a policy or routes map by direct name or
+ * alias chain (the direct match wins — §20.3 п.3). */
 export function findRoute(
   policyOrRoutes: Policy | Record<string, PolicyRoute> | null | undefined,
   name: string | undefined,
 ): PolicyRoute | undefined {
   if (!policyOrRoutes || !name) return undefined;
-  const routes: Record<string, PolicyRoute> =
-    "version" in policyOrRoutes && policyOrRoutes.version === 1
-      ? (policyOrRoutes as Policy).routes
-      : (policyOrRoutes as Record<string, PolicyRoute>);
-  const canon = canonicalRouteName(name);
-  if (routes[canon]) return routes[canon];
-  if (routes[name]) return routes[name];
-  const alias = ROUTE_ALIASES[name];
-  if (alias && routes[alias]) return routes[alias];
+  const isPolicy =
+    "version" in policyOrRoutes && policyOrRoutes.version === 1;
+  const routes: Record<string, PolicyRoute> = isPolicy
+    ? (policyOrRoutes as Policy).routes
+    : (policyOrRoutes as Record<string, PolicyRoute>);
+  const aliases = isPolicy
+    ? (policyOrRoutes as Policy).routeAliases
+    : undefined;
+  for (const n of routeNameChain(name, aliases)) {
+    if (routes[n]) return routes[n];
+  }
   return undefined;
 }
 
 /**
- * Resolves a route by name from policy.routes, checking canonical name,
- * exact name, and ROUTE_ALIASES. Returns the resolved route name and route object.
+ * Resolves a route by name from policy.routes — a direct match first,
+ * then each `routeAliases` hop. Returns the resolved route name and
+ * route object.
  */
 export function resolvePolicyRoute(
   policy: Policy | null | undefined,
   name: string | undefined,
 ): { name: string; route: PolicyRoute } | undefined {
   if (!policy || !name) return undefined;
-  const canon = canonicalRouteName(name);
-  if (policy.routes[canon]) {
-    return { name: canon, route: policy.routes[canon] };
-  }
-  if (policy.routes[name]) {
-    return { name, route: policy.routes[name] };
-  }
-  const alias = ROUTE_ALIASES[name];
-  if (alias && policy.routes[alias]) {
-    return { name: alias, route: policy.routes[alias] };
+  for (const n of routeNameChain(name, policy.routeAliases)) {
+    if (policy.routes[n]) {
+      return { name: n, route: policy.routes[n] };
+    }
   }
   return undefined;
 }
 
-/** Quota group a route belongs to: its `quotaGroup`, or itself. */
-export function quotaGroupOf(route: PolicyRoute, name: string): string {
-  return canonicalQuotaGroup(route.quotaGroup ?? canonicalRouteName(name));
+/** Quota group a route belongs to: its `quotaGroup`, or itself —
+ * canonicalized through the policy's alias dictionaries. */
+export function quotaGroupOf(
+  route: PolicyRoute,
+  name: string,
+  policy?: Policy | null,
+): string {
+  return canonicalQuotaGroup(
+    route.quotaGroup ?? canonicalRouteName(name, policy),
+    policy,
+  );
 }
 
 /**
@@ -799,19 +858,36 @@ export function quotaGroupsForOneOff(
   oneOff: { route: string; provider: string; modelId?: string | null },
   presetModels: ReadonlyMap<string, string | null | undefined>,
 ): string[] {
-  const canon = canonicalQuotaGroup(oneOff.route);
-  const groups = new Set<string>([canon]);
+  const canon = canonicalQuotaGroup(oneOff.route, policy);
+  const groups = new Set<string>([canon, oneOff.route]);
+  // A route_holds row may carry ANY spelling of the group — every name
+  // (alias or canonical) that canonicalizes to `canon` joins the set.
+  const aliases = policy?.quotaGroupAliases;
+  if (aliases) {
+    for (const name of [...Object.keys(aliases), ...Object.values(aliases)]) {
+      if (canonicalQuotaGroup(name, policy) === canon) groups.add(name);
+    }
+  }
   if (canon.startsWith("preset:")) {
     const p = canon.slice("preset:".length);
-    const alias = PRESET_ALIASES[p];
-    if (alias) groups.add(`preset:${alias}`);
+    const pAliases = policy?.presetAliases;
+    const names = new Set([p]);
+    if (pAliases) {
+      for (const name of [
+        ...Object.keys(pAliases),
+        ...Object.values(pAliases),
+      ]) {
+        if (canonicalPresetName(name, policy) === p) names.add(name);
+      }
+    }
+    for (const n of names) groups.add(`preset:${n}`);
   }
   const want = baseModelId(oneOff.modelId);
   if (!policy || !want) return [...groups];
   for (const [name, route] of Object.entries(policy.routes)) {
     if (route.provider !== oneOff.provider) continue;
     if (baseModelId(presetModels.get(route.preset)) !== want) continue;
-    groups.add(quotaGroupOf(route, name));
+    groups.add(quotaGroupOf(route, name, policy));
   }
   return [...groups];
 }
@@ -855,26 +931,23 @@ export function pickRoute(
   }
   const unavailable = opts.unavailableRoutes ?? new Set<string>();
   const held = opts.heldGroups ?? new Set<string>();
-  const canonHeld = new Set([...held].map((h) => canonicalQuotaGroup(h)));
+  const canonHeld = new Set(
+    [...held].map((h) => canonicalQuotaGroup(h, policy)),
+  );
   const usable = (name: string) => {
     const resolved = resolvePolicyRoute(policy, name);
     const route = resolved?.route;
     if (!route) return false;
-    const resolvedName = resolved.name;
-    const alias = ROUTE_ALIASES[name];
-    const canon = canonicalRouteName(name);
-    const qg = quotaGroupOf(route, resolvedName);
+    const names = new Set([
+      ...routeNameChain(name, policy.routeAliases),
+      resolved.name,
+    ]);
+    const qg = quotaGroupOf(route, resolved.name, policy);
     // Holds sit on quota groups (§5.2) and on route names (§5.3
     // `unavailable`) — a route is unusable when either is on hold.
     return (
-      !unavailable.has(name) &&
-      (!alias || !unavailable.has(alias)) &&
-      (!canon || !unavailable.has(canon)) &&
-      (!resolvedName || !unavailable.has(resolvedName)) &&
-      !held.has(name) &&
-      (!alias || !held.has(alias)) &&
-      (!canon || !held.has(canon)) &&
-      (!resolvedName || !held.has(resolvedName)) &&
+      ![...names].some((n) => unavailable.has(n)) &&
+      ![...names].some((n) => held.has(n)) &&
       !held.has(qg) &&
       !canonHeld.has(qg)
     );

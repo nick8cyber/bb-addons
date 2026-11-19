@@ -189,26 +189,12 @@ export const RU: Record<string, string> = {
   "del.baseSkip.project-list": "bb project list не прочитался",
   "del.baseSkip.no-local-path":
     "у проекта нет источника local_path на целевой машине",
-  // §20.3 (r33): a tool-less route may not be hand-picked outside
-  // auditor/researcher levels.
-  "del.presetNotAllowed":
-    "пресет/маршрут «{preset}» не имеет инструментов и не может быть выбран на уровне «{level}» (preset-not-allowed)",
-  // §20.2 (r33): route-level capacity — queued, then the chain moves on.
+  // §20.1 п.5 (r34.4): route-level capacity — queued, then the chain
+  // moves on.
   "del.routeBusy": "{route} занят — в очереди, итог придёт строкой",
   "del.routeBusyExhausted":
     "маршрут «{route}» оставался занят дольше лимита ожидания — управление передано следующему маршруту",
   "del.routeSkipped": "пропущен {route}: {reason}",
-  // §20.2 (r33): the material packet's header — a tool-less provider
-  // must not ask for files; gaps go to «Не проверено»/«Не найдено».
-  "pkt.headerAudit":
-    "=== МАТЕРИАЛ ДЛЯ ПРОВЕРКИ ===\nУ тебя нет инструментов и доступа к файлам проекта — весь материал ниже, в этом же сообщении. Не проси файлы и не жди их; всё, чего не хватает для проверки, перечисли в разделе «Не проверено». Последней строкой ответа дай JSON-вердикт.{masked}",
-  "pkt.headerResearch":
-    "=== МАТЕРИАЛ ДЛЯ ИССЛЕДОВАНИЯ ===\nУ тебя нет инструментов и доступа к файлам проекта, но поиск в интернете разрешён и ожидается. Материал ниже — в этом же сообщении; не проси файлы. Чего не нашёл — перечисли в разделе «Не найдено».{masked}",
-  "pkt.headerArchitect":
-    "=== МАТЕРИАЛ ДЛЯ АРХИТЕКТУРЫ ===\nУ тебя нет инструментов изменения кода и файлов проекта. Материал ниже — в этом же сообщении. Сдай текстом архитектурное решение и договор приёмки (узел design) либо вердикт строкой JSON (узел design_check).{masked}",
-  "pkt.masked": " Фрагментов скрыто: {n} ([скрыто: тип]).",
-  // §20.3 (r33): a tool-less route never resumes — the route failed.
-  "wd.toollessRoute": "маршрут без инструментов не продолжается",
 
   // ── release.ts ──────────────────────────────────────────────────────
   "rel.gitFailed": "git {cmd} failed (exit {code}): {out}",
@@ -634,9 +620,16 @@ export const RU: Record<string, string> = {
   "pol.isString": "должна быть строка",
   "pol.isBool": "должен быть boolean",
   "pol.roleEnum": 'должно быть "auditor", "researcher", "architect" или "executor"',
-  // §20.1/§30.1: `tools: false` — только уровни auditor/researcher/architect.
-  "pol.toolsForbidden":
-    'tools:false разрешён только в уровнях с ролью auditor/researcher/architect, а не в "{level}"',
+  // §20.2 (r34.4): устаревшие поля маршрута — предупреждения, не ошибки.
+  "pol.toolsDeprecated":
+    "route-tools-deprecated: поле tools устарело и удалено в r34.4 " +
+    "(PLUG-316) — маршрут выполняется как стандартный агент с инструментами",
+  "pol.packetFieldsDeprecated":
+    "route-packet-fields-deprecated: maxPromptBytes/splitPackets " +
+    "устарели и удалены в r34.4 (PLUG-316)",
+  "pol.aliasObject": "должен быть объект алиас → каноническое имя",
+  "pol.aliasString": "алиас и цель должны быть непустыми строками",
+  "pol.aliasCycle": "цикл алиасов: {chain}",
   "pol.chainReq": "нужен непустой массив имён маршрутов",
   "pol.routeNameStr": "имя маршрута должно быть непустой строкой",
   "pol.routeUndeclared": 'маршрут "{route}" не объявлен в routes',
@@ -749,7 +742,7 @@ export const RU: Record<string, string> = {
   "tool.delFresh":
     "Начать заход без продолжения прошлого итога (§6 --fresh)",
   "tool.delAttach":
-    "Пути файлов из репозитория — маршруту без инструментов уйдёт их текст (§20.2)",
+    "Пути файлов из репозитория — списком в инструкции задачи (§20.1 п.4)",
   "tool.status":
     "Список делегирований и счётчики этого координатора " +
     "(активные против лимитов политики).",

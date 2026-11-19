@@ -2288,8 +2288,9 @@ function fileRepairInstruction(context, candidate, plan) {
     typeof channel?.text === "string" ? Buffer.byteLength(channel.text) + " bytes" : "unavailable");
   const files = plan?.files.map(({ path, operation, baseSha256 }) => ({ path, operation, baseSha256 }));
   const summary = context.settings.mask(JSON.stringify({ history: channels[0], dom: channels[1], ...(files ? { files } : {}) }));
-  return "Return the entire file envelope. In JSON strings escape line breaks, tabs, quotation marks and backslashes. " +
-    "Previous response summary " + summary + "\n";
+  return "Return the entire file envelope: the BBG-<nonce>-ENVELOPE line, the one-line META JSON, raw file content " +
+    "between the FILE-NN-BEGIN and FILE-NN-END marker lines without escaping, and BBG-<nonce>-CLOSE, all inside a " +
+    "single Markdown fence. Previous response summary " + summary + "\n";
 }
 
 async function planTaskTurn({ session, sessionId, blocks, text, prepare, task }) {

@@ -333,11 +333,11 @@ export const MIGRATIONS: readonly string[] = [
     SELECT thread_id, role, decided_at, source FROM thread_roles;
   DROP TABLE thread_roles;
   ALTER TABLE thread_roles_owner RENAME TO thread_roles`,
-  // §20.2 (r33): a busy `maxActive` route parks the delegation
+  // §20.1 п.5 (r34.4): a busy `maxActive` route parks the delegation
   // `dispatching` with `queued_at` set — the watchdog retries in
   // `queued_at` order until `routeBusyWaitSeconds` runs out. `attach`
-  // holds the dispatch's packet spec as JSON
-  // (`{"paths":[…],"from":…}`) so a reissue rebuilds the same packet.
+  // holds the dispatch's attach spec as JSON
+  // (`{"paths":[…],"from":…}`) so a reissue lists the same paths.
   `ALTER TABLE delegations ADD COLUMN queued_at INTEGER`,
   `ALTER TABLE delegations ADD COLUMN attach TEXT`,
   // §24.2 (r33.5): staged executor results per plugin — the release
@@ -564,12 +564,12 @@ export interface DelegationRow {
    * делегирование — оживший тред повторяет delegation.done, но не
    * review.verdict). */
   verdict_event_at: number | null;
-  /** §20.2 (r33): parked behind a busy `maxActive` route — the watchdog
+  /** §20.1 п.5: parked behind a busy `maxActive` route — the watchdog
    * retries in `queued_at` order; null when not queued. */
   queued_at: number | null;
-  /** §20.2 (r33): the dispatch's packet spec JSON
-   * (`{"paths":string[],"from":string|null}`) — `--attach` files and the
-   * explicit `--from` ref, inherited by reissues. */
+  /** §20.1 п.4: the dispatch's attach spec JSON
+   * (`{"paths":string[],"from":string|null}`) — `--attach` file paths
+   * and the explicit `--from` ref, inherited by reissues. */
   attach: string | null;
   /** §5.6 (r34.1): immutable timestamp of the terminal transition
    * (done/failed/stalled/quota/cancelled); NULL on revive to `running`.
@@ -920,7 +920,7 @@ export class DelegationStore {
     explicitRoute?: boolean;
     /** §4.1 r28: «задача без кода» (`delegate --no-code`). */
     noCode?: boolean;
-    /** §20.2 (r33): the packet spec JSON — `{"paths","from"}`. */
+    /** §20.1 п.4: the attach spec JSON — `{"paths","from"}`. */
     attach?: string | null;
     /** Test helper: explicit creation timestamp */
     now?: number;
@@ -1112,7 +1112,7 @@ export class DelegationStore {
   }
 
   /**
-   * §20.2 (r33): park/unpark a `dispatching` row behind a busy
+   * §20.1 п.5 (r34.4): park/unpark a `dispatching` row behind a busy
    * `maxActive` route — `queued_at` keeps the first-come order across
    * retries (a re-check does not re-stamp).
    */
@@ -1125,7 +1125,7 @@ export class DelegationStore {
   }
 
   /**
-   * §20.2 (r33): a skipped or timed-out tool-less route hands the SAME
+   * §20.1 п.5 (r34.4): a skipped or timed-out route hands the SAME
    * dispatching row to the next chain route — only while the row is
    * still `dispatching` with no thread (the route is not yet burned).
    * `explicit_route` drops with the caller's pick: the new route is
@@ -1687,8 +1687,8 @@ export class DelegationStore {
           // §4.1 r28: a reissue is the same dispatch — the «без кода»
           // mark inherits with the round fields.
           row.no_code,
-          // §20.2: the packet spec survives the reissue — the tool-less
-          // route's material is rebuilt from the same spec.
+          // §20.1 п.4: the attach spec survives the reissue — the same
+          // path list goes into the reissued seed prompt.
           row.attach,
           now,
           now,
@@ -2364,25 +2364,6 @@ export class DelegationStore {
       .run(threadId, Date.now(), id);
   }
 
-  /**
-   * §21.4 (r33 ревью 2): a packet skip inside a tool-less helper moves
-   * the SAME dispatching row to the next chain route — helpers never
-   * queue; the row's preset/route must match where it actually spawns
-   * (the shared `quotaGroup` busy count reads them).
-   */
-  updateHelperRoute(
-    id: number,
-    next: { route: string; preset: string },
-  ): boolean {
-    const info = this.db
-      .prepare(
-        `UPDATE helpers SET route = ?, preset = ?, updated_at = ?
-         WHERE id = ? AND status = 'dispatching' AND thread_id IS NULL`,
-      )
-      .run(next.route, next.preset, Date.now(), id);
-    return info.changes > 0;
-  }
-
   setHelperStatus(id: number, status: HelperStatus): void {
     this.db
       .prepare(`UPDATE helpers SET status = ?, updated_at = ? WHERE id = ?`)
@@ -2415,7 +2396,7 @@ export class DelegationStore {
       .run(Date.now(), id);
   }
 
-  /** §19.1 (Argon): a running helper's silence clock follows its last
+  /** §19.1: a running helper's silence clock follows its last
    * journal event — a direct write, not `COALESCE`: a stale spawn-time
    * stamp would mark a busy helper stalled. */
   setHelperTurnStarted(id: number, at: number): void {

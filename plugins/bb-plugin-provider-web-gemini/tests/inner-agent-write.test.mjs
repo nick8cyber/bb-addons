@@ -16,13 +16,26 @@ const { sha256, verifyFileResponse } = envelope;
 const server = new URL("../acp-server.mjs", import.meta.url).href;
 const thread = "t" + "hr_fixture335";
 const fence = "\x60".repeat(3);
+const outerFence = "\x60".repeat(4);
 const create = (path, content) => ({ path, operation: "create", baseSha256: null, content });
-const output = (nonce, files) => ({ format: "web-gemini-files-v1", nonce, files, commitMessage: "Write the requested files" });
-const frame = (json, id = "r_123") => ({
-  rpc: { id, text: fence + "json\n" + json + "\n" + fence },
-  dom: { id, text: json + "\n" },
+const output = (nonce, files) => ({ nonce, files });
+const envelopeText = ({ nonce, files }) => {
+  const meta = JSON.stringify({ format: "web-gemini-files-v2", nonce, commitMessage: "Write the requested files",
+    files: files.map(({ content, ...entry }) => entry) });
+  const lines = ["BBG-" + nonce + "-ENVELOPE", meta];
+  for (const [index, file] of files.entries()) {
+    if (file.operation === "delete") continue;
+    const marker = "BBG-" + nonce + "-FILE-" + String(index + 1).padStart(2, "0");
+    lines.push(marker + "-BEGIN", file.content, marker + "-END");
+  }
+  lines.push("BBG-" + nonce + "-CLOSE");
+  return lines.join("\n");
+};
+const frame = (body, id = "r_123") => ({
+  rpc: { id, text: outerFence + "text\n" + body + "\n" + outerFence },
+  dom: { id, text: body + "\n" },
 });
-const channels = (value) => frame(JSON.stringify(value, null, 2));
+const channels = (value) => frame(envelopeText(value));
 const rich = "# Café 🧪\r\n**Bold** [link](https://example.org)\r\n" +
   fence + "js\r\nconst x = 1;\r\n" + fence + '\r\n<tool name="git" args="status"/>';
 
@@ -88,7 +101,9 @@ function acp(repo, model, { mode = "write", owner = true, env = {} } = {}) {
     "import { startServer } from " + JSON.stringify(server) + ";",
     "const create = " + create.toString() + ";",
     "const output = " + output.toString() + ";",
+    "const envelopeText = " + envelopeText.toString() + ";",
     "const fence = " + JSON.stringify(fence) + ";",
+    "const outerFence = " + JSON.stringify(outerFence) + ";",
     "const frame = " + frame.toString() + ";",
     "const channels = " + channels.toString() + ";",
     "const rich = " + JSON.stringify(rich) + ";",
@@ -192,7 +207,7 @@ test("RPC history selects the matching conversation, query and selected candidat
   ), "abcd", "marker").invalid, /multiple/);
 });
 
-test("driver recaptures both channels once on disagreement or absence and skips recapture for malformed JSON", async () => {
+test("driver recaptures both channels once on disagreement or absence and skips recapture for a malformed envelope", async () => {
   const nonce = "fixture";
   const paired = channels(output(nonce, [create("result.md", "same bytes")]));
   const other = channels(output(nonce, [create("result.md", "other bytes")]));
@@ -228,20 +243,31 @@ test("file gate compares useful UTF-8 bytes, strict fences, distinct keys and me
   const nonce = "abcd";
   const value = output(nonce, [create("rich.md", rich), create("empty.md", ""), create("plain.md", "no final LF")]);
   const attempt = channels(value);
-  const compact = JSON.stringify({ ...value, files: [...value.files].reverse() });
-  const verified = verifyFileResponse({ ...attempt, dom: { ...attempt.dom, text: compact + "\r\n" } }, nonce);
+  const verified = verifyFileResponse({ ...attempt, dom: { ...attempt.dom, text: envelopeText(value) + "\r\n" } }, nonce);
   assert.deepEqual(verified.plan.files.map(({ sha256: hash }) => hash), [sha256(rich), sha256(""), sha256("no final LF")]);
   assert.match(verifyFileResponse({ rpc: attempt.rpc }, nonce).recapture, /unavailable/);
   assert.match(verifyFileResponse({ ...attempt, dom: { ...attempt.dom, id: "r_other" } }, nonce).recapture, /different messages/);
   assert.match(verifyFileResponse({
     ...attempt, dom: channels({ ...value, files: [create("rich.md", rich.replaceAll("\r\n", "\n")), ...value.files.slice(1)] }).dom,
   }, nonce).recapture, /disagree/);
+  assert.match(verifyFileResponse({ ...attempt, dom: channels(output(nonce, [...value.files].reverse())).dom }, nonce).recapture, /disagree/);
   assert.match(verifyFileResponse(attempt, "wrong").repair, /nonce/);
-  assert.match(verifyFileResponse({ rpc: { ...attempt.rpc, text: "extra\n" + attempt.rpc.text } }, nonce).repair, /one json fence/);
-  assert.match(verifyFileResponse({ ...attempt, rpc: { ...attempt.rpc, text: attempt.rpc.text + "\n" + attempt.rpc.text } }, nonce).repair, /one json fence/);
-  assert.match(verifyFileResponse(frame(JSON.stringify(value).replace('"nonce":', '"no\\u006ece":"abcd","nonce":')), nonce).repair, /invalid/);
+  assert.match(verifyFileResponse({ rpc: { ...attempt.rpc, text: "extra\n" + attempt.rpc.text } }, nonce).repair, /one Markdown fence/);
+  assert.match(verifyFileResponse({ ...attempt, rpc: { ...attempt.rpc, text: attempt.rpc.text + "\n" + attempt.rpc.text } }, nonce).repair, /one Markdown fence/);
+  assert.match(verifyFileResponse(frame(envelopeText(value).replace('"nonce":', '"no\\u006ece":"abcd","nonce":')), nonce).repair, /invalid/);
   assert.match(verifyFileResponse(channels(output(nonce, [create("x", "\ud800")])), nonce).repair, /invalid/);
   assert.match(verifyFileResponse(channels(output(nonce, [create("x", ""), create("x", "")])), nonce).repair, /duplicate/);
+  const mixed = output(nonce, [
+    create("a.md", "a"), { path: "b.md", operation: "delete", baseSha256: sha256("x") }, create("c.md", "c"),
+  ]);
+  assert.deepEqual(verifyFileResponse(channels(mixed), nonce).plan.files.map((file) => file.path), ["a.md", "b.md", "c.md"]);
+  assert.match(verifyFileResponse(frame(envelopeText(value).replace(/\nBBG-abcd-CLOSE$/, "")), nonce).repair, /CLOSE/);
+  assert.match(verifyFileResponse(frame("stray\n" + envelopeText(value)), nonce).repair, /ENVELOPE/);
+  // The saved-history channel rewrites \| to | while the DOM keeps the model bytes.
+  const piped = output(nonce, [create("t.md", "| a \\| b |\n")]);
+  assert.match(verifyFileResponse({
+    rpc: frame(envelopeText(piped).split("\\|").join("|")).rpc, dom: channels(piped).dom,
+  }, nonce).recapture, /does not survive/);
   assert.deepEqual(resultPaths(fence + "\n## Файлы результата\n" + fence + "\n" + job(["docs/a.md"])), ["docs/a.md"]);
   assert.throws(() => resultPaths("## Файлы результата\n"), /empty/);
   assert.throws(() => resultPaths(job(["a"]) + "\n## Файлы результата\n- b"), /repeated/);
@@ -367,7 +393,7 @@ test("write refusal protects nonce, scope, symlinks, ignored files, base identit
         : label === "symlink" ? create("link/new.md", "new")
         : label === "ignored" ? create("ignored.md", "new")
         : { path: "a.md", operation: "replace", baseSha256: sha256(label === "nfd" ? "e\u0301\n" : "wrong"), content: "new" };
-      const app = acp(repo, "({ fileCapture }) => ({ text: fence + 'json\\n{\"format\":\"web-gemini-files-v1\"}\\n' + fence, " +
+      const app = acp(repo, "({ fileCapture }) => ({ text: fence + 'text\\nBBG-' + (fileCapture?.nonce ?? 'x') + '-ENVELOPE\\n' + fence, " +
         "fileResponse: channels(output(fileCapture?.nonce, [" + JSON.stringify(reply) + "])) })", {
         mode: label === "readonly" ? "read-only" : "write", owner: label !== "anonymous",
       });

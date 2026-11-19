@@ -1164,34 +1164,36 @@ test("§2.3 --preset: held group of a same-provider+model route refuses it", asy
   );
 });
 
-test("§2.3 --preset: a legacy-spelled held group (review-argon) refuses a web-gemini one-off", async () => {
-  // A route_holds row written before the rename keeps the old spelling;
-  // the one-off's canonical groups must match it through
-  // canonicalQuotaGroup, not just raw names.
+test("§2.3 --preset: a legacy-spelled held group refuses an aliased one-off", async () => {
+  // A route_holds row written under the old group name keeps the old
+  // spelling; the one-off's canonical groups must match it through
+  // `quotaGroupAliases` → canonicalQuotaGroup, not just raw names.
   const policy = JSON.parse(POLICY_TEXT);
-  policy.routes["review-web-gemini"] = {
-    preset: "web-gemini-review",
-    provider: "acp-web-gemini",
+  policy.quotaGroupAliases = { "tab-old": "tab-b" };
+  policy.routes["review-b"] = {
+    preset: "preset-b",
+    provider: "prov-x",
+    quotaGroup: "tab-b",
   };
   const { deps } = makeDeps({
     policyText: JSON.stringify(policy),
-    held: [["review-argon", Date.now() + 60_000]],
+    held: [["tab-old", Date.now() + 60_000]],
     cli: (args) => {
       const key = args.join(" ");
       if (key.startsWith("tasks preset show"))
         return ok(
           JSON.stringify({
-            preset: { providerId: "acp-web-gemini", modelId: "m1" },
+            preset: { providerId: "prov-x", modelId: "m1" },
           }),
         );
       if (key.startsWith("tasks preset list"))
         return ok(
           JSON.stringify({
             presets: [
-              { name: "one-off", providerId: "acp-web-gemini", modelId: "m1" },
+              { name: "one-off", providerId: "prov-x", modelId: "m1" },
               {
-                name: "web-gemini-review",
-                providerId: "acp-web-gemini",
+                name: "preset-b",
+                providerId: "prov-x",
                 modelId: "m1",
               },
             ],

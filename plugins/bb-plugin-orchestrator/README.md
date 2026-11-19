@@ -48,9 +48,9 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   target host, no `local_path` source on it, an unreadable
   `bb project list`, no cmd runner) the check skips, the spawn keeps
   the preset's base, and the delegate response names the reason:
-  "base not checked: <reason>". `--attach <path>` (repeatable, §20.2) hands the
-  dispatch extra files: verbatim in the material packet on a
-  `tools: false` route, as a path list on a tool route.
+  "base not checked: <reason>". `--attach <path>` (repeatable, §20.1 п.4) hands the
+  dispatch extra files as a path list in the seed prompt and task
+  instructions — the agent opens them in its own working copy.
 - **Coordinator gating**: the `orchestrator_*` tools and the routing rule
   reach only threads whose role may delegate (`delegates`, §13);
   `delegate` re-checks the caller at call time (`not-a-coordinator`).
@@ -325,48 +325,38 @@ operations (`list`, `search`, `read`, `write`, `append`, `sync`, `status`) insid
 - RBAC: full access for `orchestrator` and `executor`; other roles are not granted the tool; if explicitly attached, their access is restricted to read-only (`list`, `search`, `read`, `status`), and mutating operations are rejected with `permission-denied`.
 - Release integration: Step 1 verifies a clean repository (`requireCleanOnRelease`); Step 7 auto-records UTC release notes into `<kb.path>/releases/<YYYY-MM-DD>-<KEY>.md` with idempotency.
 
-## Tool-less routes: the auditor packet and the researcher (§20–§21)
+## Uniform tools contract: busy-route queue, policy aliases and the researcher (§20–§21)
 
-A route may declare `tools: false` (default `true`) — valid only on
-levels whose role is `auditor` or `researcher`; anywhere else
-(including `release-audit`) it is a policy error. A tool-less provider
-sees no repository and no plugin tools, so the plugin packs the
-material into its first prompt:
+r34.4 removed the `tools: false` route kind and the auditor packet
+module: every route dispatches an ordinary agent with tools — task,
+working copy, base and head links — and how a provider without native
+tools receives material is that provider plugin's own concern. A
+policy that still carries `tools`, `maxPromptBytes` or `splitPackets`
+loads with a deprecation warning, never an error (§20.2).
 
-- **Auditor packet**: a header (no tools, the final-JSON verdict is
-  required), the task text, then the checked work as `diff --stat` +
-  a `-U10` diff of the link commit against the merge-base with the
-  project target branch (`--from <sha>` overrides the link). Lockfiles,
-  `dist/` and `node_modules/` never enter the diff; binary content is
-  excluded. `--attach` files are read from the link commit via
-  `git show` — never from the worktree — and a missing/secret/binary
-  path refuses the dispatch (`attach-missing`, `attach-secret`,
-  `attach-binary`). The packet passes through the release leak masker
-  before it leaves; over `maxPromptBytes` (route field, default
-  150000) or nothing to show (`packet-empty`/`packet-too-large`) the
-  route is skipped to the next chain route. Tool routes get `--attach`
-  as a path list only.
-- **Busy route**: a tool-less route with `maxActive` (counted over its
-  `quotaGroup`) parks the row `dispatching` under `queued_at` instead
-  of falling to a paid route at once; the watchdog retries in
-  `queued_at` order and after `routeBusyWaitSeconds` (default 1200)
-  the dispatch advances to the next chain route. The queue counts
-  inside `limits.maxActive`.
-- **No-nudge outcomes**: a tool-less turn that ends without the
-  verdict, an interruption, or an errored turn fails the route at
-  once — no reminder, no resume; `autoFallback` reissues on the next
-  route. A tool-less preset on any other level (helpers included) is
-  `preset-not-allowed`.
+- **`--attach`** (§20.1 п.4): repeatable; on every route the paths go
+  into the seed prompt and task instructions as a list — the agent
+  opens them in its own working copy; the orchestrator never inlines
+  file bytes into the first prompt.
+- **Busy route** (§20.1 п.5): any route with `maxActive` (counted over
+  its `quotaGroup`) parks the row `dispatching` under `queued_at`
+  instead of falling to the next chain route at once; the watchdog
+  retries in `queued_at` order (FIFO) and after `routeBusyWaitSeconds`
+  (default 1200) the dispatch advances to the next chain route, or
+  fails `route-busy-timeout` when no alternative remains. The queue
+  counts inside `limits.maxActive`.
+- **Policy aliases** (§20.3): `routeAliases`, `presetAliases` and
+  `quotaGroupAliases` translate route, preset and quota-group names —
+  no provider names are hardcoded. A direct config match wins over an
+  alias lookup, chains resolve to the terminal name, a cycle is a
+  blocking `alias-cycle` error.
 - **Researcher** (§21): the `research` level role and a window pick —
   internet research that spends no coordinator tokens: cite sources
   for material claims, separate facts from conclusions, say what was
   not found; no code edits, no subagents, no plugin tools, no handoff.
-  A research packet says file tools are unavailable but internet
-  search is allowed, carries the task and attachments, includes a
-  diff only with explicit `--from`, never fails `packet-empty` for a
-  missing diff, and asks no verdict — `reviewByLevel` does not apply.
   `delegate --level research` and `helper --level research` dispatch
-  researchers; `role set` cannot name `researcher`.
+  researchers like any route; `reviewByLevel` does not apply; `role
+  set` cannot name `researcher`.
 
 ## Setup
 

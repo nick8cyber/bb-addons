@@ -16,8 +16,6 @@
 import { OrchestratorError } from "./errors.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
-  PRESET_ALIASES,
-  ROUTE_ALIASES,
   canonicalQuotaGroup,
   canonicalRouteName,
   findRoute,
@@ -25,6 +23,7 @@ import {
   levelRole,
   quotaGroupOf,
   quotaGroupsForOneOff,
+  routeNameChain,
   type PolicyLoad,
   type PolicyRoute,
 } from "./policy.js";
@@ -638,7 +637,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     const quotaGroups = async (): Promise<string[]> => {
       if (cachedGroups) return cachedGroups;
       if (route) {
-        cachedGroups = [quotaGroupOf(route, row.route)];
+        cachedGroups = [quotaGroupOf(route, row.route, load.policy)];
       } else if (row.route.startsWith("preset:")) {
         const models = await presetModelMap(deps.bbCli);
         cachedGroups = quotaGroupsForOneOff(
@@ -651,7 +650,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           models,
         );
       } else {
-        cachedGroups = [canonicalQuotaGroup(row.route)];
+        cachedGroups = [canonicalQuotaGroup(row.route, load.policy)];
       }
       return cachedGroups;
     };
@@ -661,19 +660,6 @@ export function createWatchdog(deps: WatchdogDeps) {
       level: load.policy?.levels[row.level],
       route,
       quotaGroups,
-      // §20.3 (r33): the route the row stands on runs without repo
-      // tools — a `preset:` one-off takes the flag off the policy route
-      // sharing its preset.
-      toolless:
-        route?.tools === false ||
-        (row.route.startsWith("preset:") &&
-          Object.values(load.policy?.routes ?? {}).some(
-            (r) =>
-              r.tools === false &&
-              (r.preset === row.preset ||
-                (PRESET_ALIASES[row.preset] !== undefined &&
-                  r.preset === PRESET_ALIASES[row.preset])),
-          )),
       patterns: [...BUILTIN_QUOTA_PATTERNS, ...(route?.quotaPatterns ?? [])],
       unavailablePatterns: [
         ...BUILTIN_UNAVAILABLE_PATTERNS,
@@ -946,12 +932,14 @@ export function createWatchdog(deps: WatchdogDeps) {
       // NULL`). An explicit --route/--preset delegation restarts from the
       // chain's beginning and skips every route this task already ran on.
       const held = store.heldGroups(now());
-      const canonHeld = new Set([...held].map((h) => canonicalQuotaGroup(h)));
+      const canonHeld = new Set(
+        [...held].map((h) => canonicalQuotaGroup(h, info.policy)),
+      );
       const unavailable = new Set(info.load.unavailableRoutes);
       const matchRoute = (a: string, b: string) =>
         a === b ||
-        canonicalRouteName(a) === canonicalRouteName(b) ||
-        ROUTE_ALIASES[a] === b;
+        canonicalRouteName(a, info.policy) ===
+          canonicalRouteName(b, info.policy);
       const idx = info.level.chain.findIndex((c) => matchRoute(c, row.route));
       const restart = idx === -1 || row.explicit_route !== 0;
       const candidates = restart
@@ -968,26 +956,20 @@ export function createWatchdog(deps: WatchdogDeps) {
       const used = restart
         ? store.chainUsedRoutes(row)
         : store.chainUsedRoutes(row, { reissuesOnly: true });
+      const namesOf = (name: string) =>
+        routeNameChain(name, info.policy?.routeAliases);
       const isUsed = (name: string) =>
-        used.has(name) ||
-        (ROUTE_ALIASES[name] !== undefined && used.has(ROUTE_ALIASES[name])) ||
-        used.has(canonicalRouteName(name));
+        namesOf(name).some((n) => used.has(n));
       const isUnavailable = (name: string) =>
-        unavailable.has(name) ||
-        (ROUTE_ALIASES[name] !== undefined && unavailable.has(ROUTE_ALIASES[name])) ||
-        unavailable.has(canonicalRouteName(name));
+        namesOf(name).some((n) => unavailable.has(n));
       for (const name of candidates) {
         const r = findRoute(info.policy, name);
         if (!r || isUsed(name) || isUnavailable(name)) continue;
-        const alias = ROUTE_ALIASES[name];
-        const canon = canonicalRouteName(name);
-        const qg = quotaGroupOf(r, name);
+        const qg = quotaGroupOf(r, name, info.policy);
         // §5.2 holds sit on quota groups, §5.3 `unavailable` on route
         // names — a candidate is out when either is held.
         if (
-          held.has(name) ||
-          (alias && held.has(alias)) ||
-          held.has(canon) ||
+          namesOf(name).some((n) => held.has(n)) ||
           held.has(qg) ||
           canonHeld.has(qg)
         ) {
@@ -1147,13 +1129,6 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (!fresh || fresh.status !== "running") return true;
     if (hasSetupError(fresh, "interrupted-resume-sent")) {
       await toStalled(fresh, t("wd.interruptedAgain", { reason }));
-      return true;
-    }
-    // §20.3 (r33): a tool-less route never continues after an
-    // interruption — the route is marked failed at once and the chain
-    // advances.
-    if ((await routeInfo(fresh)).toolless) {
-      await toStalled(fresh, t("wd.toollessRoute"));
       return true;
     }
     // §5.3 rev 15: the interrupt time opens the window for the NEW turn —
@@ -1602,12 +1577,6 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
     if (isUnavailable(fresh, text, info.unavailablePatterns)) {
       await toUnavailable(fresh, `errored: ${text.slice(0, 200)}`);
-      return;
-    }
-    // §20.3 (r33): a tool-less route never resumes after an error —
-    // the route is marked failed and the chain advances.
-    if (info.toolless) {
-      await toFailed(fresh, t("wd.toollessRoute"));
       return;
     }
     if (hasSetupError(fresh, "errored-resume-sent")) {
@@ -2700,15 +2669,6 @@ export function createWatchdog(deps: WatchdogDeps) {
         if (verdictCheck.state === "wait") return;
         if (verdictCheck.state === "missing") {
           const cur = store.get(row.id) ?? row;
-          // §20.3 (r33): a tool-less auditor gets no reminder — a
-          // missing verdict fails the route and the chain advances.
-          if (
-            r31Role === "auditor" &&
-            (await routeInfo(cur)).toolless
-          ) {
-            await toStalled(cur, t("wd.noVerdictReason"));
-            return;
-          }
           if (cur.verdict_nudged_at == null) {
             const tip = await journalTipSeq(row);
             if (tip == null) return; // журнал не прочитан — wait
@@ -3982,11 +3942,11 @@ export function createWatchdog(deps: WatchdogDeps) {
     // §7 retry limit: an exhausted reissue stays `dispatching` for the
     // coordinator to resolve by hand — retries stop entirely.
     if (hasSetupError(row, "retry-exhausted")) return;
-    // §20.2 (r33): a row parked `dispatching` under `queued_at` waits on
-    // a busy tool-less route — every pass retries the dispatch: a freed
-    // slot runs it, an expired `routeBusyWaitSeconds` moves to the next
-    // chain route. This precedes the post-dispatch grace — the queue is
-    // a live wait, not a lost dispatch.
+    // §20.1 п.5 (r34.4): a row parked `dispatching` under `queued_at`
+    // waits on a busy `maxActive` route — every pass retries the
+    // dispatch: a freed slot runs it, an expired `routeBusyWaitSeconds`
+    // moves to the next chain route. This precedes the post-dispatch
+    // grace — the queue is a live wait, not a lost dispatch.
     if (row.queued_at != null && !row.thread_id) {
       try {
         const res = await deps.dispatch(store.get(row.id) ?? row, {
