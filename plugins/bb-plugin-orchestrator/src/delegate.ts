@@ -1012,15 +1012,13 @@ export async function dispatchToRoute(
     !toolless && spec.paths.length
       ? t("instr.attachList", { list: spec.paths.join(", ") })
       : undefined;
+  const extra =
+    [opts.instructions?.trim(), attachLine?.trim()]
+      .filter(Boolean)
+      .join("\n\n") || undefined;
   const instructions = mergeDispatchInstructions(
     role === "researcher" ? undefined : deps.gitInstructions?.(),
-    mergeDispatchInstructions(
-      opts.instructions,
-      attachLine,
-      undefined,
-      false,
-      t,
-    ),
+    extra,
     row.continue_from && role !== "researcher"
       ? role === "auditor"
         ? reviewRoundLine(
