@@ -95,7 +95,7 @@ test("1. Syntax and hygiene checks across plugin files", () => {
   function getFiles(dir) {
     const res = [];
     for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (ent.name === "node_modules" || ent.name === ".git") continue;
+      if (ent.name === "node_modules" || ent.name === ".git" || ent.name === "dist") continue;
       const full = path.join(dir, ent.name);
       if (ent.isDirectory()) {
         res.push(...getFiles(full));
@@ -3221,7 +3221,7 @@ test("19. PLUG-291: uploads/downloads — collectUploadFiles, pruneDir, spill ho
   const spMatch = driverSrc.match(/async function sendPrompt\(\{[\s\S]*?\}\) \{([\s\S]*?)\nasync function \w+/);
   assert.ok(spMatch, "sendPrompt body must be found");
   const spBody = spMatch[1];
-  const iAttach = spBody.indexOf("await attachFn(page, f)");
+  const iAttach = spBody.indexOf("await upload();", spBody.indexOf("const textboxSelector"));
   const iStabilize = spBody.indexOf("waitForHistoryStabilization(page, convId");
   const iInsert = spBody.indexOf("execCommand('insertText'");
   assert.ok(iAttach > 0 && iStabilize > iAttach && iInsert > iAttach, "attach must precede text insert");
