@@ -4,9 +4,13 @@ import { DelegationStore } from "../src/store.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
 import type { CmdRunner } from "../src/cmd.js";
 import type { Policy } from "../src/policy.js";
+import { resolveTransition } from "../src/transition-matrix.js";
 import {
   runRunQueue,
   runResume,
+  runEnqueue,
+  commitAcceptanceContract,
+  checkAcceptanceTampered,
   resolveLevelRoleForWorkGraph,
   matchesNodeLevel,
 } from "../src/workgraph.js";
@@ -430,4 +434,163 @@ test("runResume invokes dispatchNode when resolving action", async () => {
   assert.equal(dispatched.length, 1);
   assert.equal(dispatched[0]!.taskKey, "ARCH-5");
   assert.equal(dispatched[0]!.node, "code");
+});
+
+test("§31.5: enqueue --acceptance rejected with acceptance-contract-immutable on feature or pre_release", async () => {
+  const host = await createRehearsalHost({ workGraph: "strict" });
+  const store = new DelegationStore(host.bb.storage.database());
+  const { cmd } = fakeCmd();
+
+  // 1. Feature route is immutable
+  store.insertTask({
+    taskKey: "ARCH-IMM-1",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    priority: 10,
+    confirmationMode: "manual",
+  });
+  store.transitionTask({
+    taskKey: "ARCH-IMM-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "owner_gate",
+    toStatus: "waiting_approval",
+    actor: "test",
+    reason: "test",
+  });
+
+  await assert.rejects(
+    async () => {
+      await runEnqueue(
+        { taskKey: "ARCH-IMM-1", acceptance: "updated contract" },
+        { store, ctx: {} as any, workGraphMode: "strict", cmd, repoRoot: "/tmp/fake-repo", mergeBaseBranch: "main" },
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "acceptance-contract-immutable");
+      return true;
+    },
+  );
+
+  // 2. Fix route at owner_gate pre_release is immutable
+  store.insertTask({
+    taskKey: "ARCH-IMM-2",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "fix",
+    level: "simple",
+    priority: 10,
+    confirmationMode: "manual",
+  });
+  store.transitionTask({
+    taskKey: "ARCH-IMM-2",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "owner_gate",
+    toStatus: "waiting_approval",
+    actor: "test",
+    reason: "test",
+  });
+  store.updateTask("ARCH-IMM-2", {
+    payload: JSON.stringify({ gate_stage: "pre_release" }),
+  });
+
+  await assert.rejects(
+    async () => {
+      await runEnqueue(
+        { taskKey: "ARCH-IMM-2", acceptance: "updated contract" },
+        { store, ctx: {} as any, workGraphMode: "strict", cmd, repoRoot: "/tmp/fake-repo", mergeBaseBranch: "main" },
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "acceptance-contract-immutable");
+      return true;
+    },
+  );
+
+  // 3. Fix route at owner_gate pre_code IS mutable (owner update allowed)
+  store.updateTask("ARCH-IMM-2", {
+    payload: JSON.stringify({ gate_stage: "pre_code" }),
+    branch: "bb/ARCH-IMM-2",
+  });
+  const res = await runEnqueue(
+    { taskKey: "ARCH-IMM-2", acceptance: "owner updated contract" },
+    { store, ctx: {} as any, workGraphMode: "strict", cmd, repoRoot: "/tmp/fake-repo", mergeBaseBranch: "main" },
+  );
+  assert.equal(res.ok, true);
+
+  // 4. Rule-29 transition matrix test for pre_release
+  const tr = resolveTransition({
+    route: "fix",
+    node: "owner_gate",
+    status: "waiting_approval",
+    event: { type: "owner_enqueue_acceptance", isOwner: true, acceptanceText: "new text" },
+    mode: "manual",
+    counters: {
+      spec_attempts: 0,
+      spec_review_rounds: 0,
+      code_attempts: 0,
+      check_attempts: 0,
+      code_review_rounds: 0,
+      design_check_rounds: 0,
+      release_attempts: 0,
+    },
+    gateStage: "pre_release",
+  });
+  assert.equal(tr.allowed, false);
+  assert.equal(tr.errorCode, "acceptance-contract-immutable");
+});
+
+test("§31.4 / §31.5 non-blockers: checkAcceptanceTampered fail-closed and read-tree failure check", async () => {
+  const host = await createRehearsalHost({ workGraph: "strict" });
+  const store = new DelegationStore(host.bb.storage.database());
+
+  // checkAcceptanceTampered fails closed on git diff error
+  const failDiffCmd = {
+    run: async (c: string, a: string[]) => {
+      if (c === "git" && a[0] === "diff") {
+        return { exitCode: 128, stdout: "", stderr: "fatal: bad object" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  };
+  const taskRow = {
+    task_key: "ARCH-TAM-1",
+    acceptance_sha: "acc-sha-123",
+    payload: JSON.stringify({}),
+  } as any;
+  const isTampered = await checkAcceptanceTampered(
+    { cmd: failDiffCmd as any, repoRoot: "/tmp/fake-repo" },
+    taskRow,
+    "res-sha-456",
+  );
+  assert.equal(isTampered, true);
+
+  // commitAcceptanceContract checks read-tree exitCode
+  const failReadTreeCmd = {
+    run: async (c: string, a: string[]) => {
+      if (c === "git" && a[0] === "hash-object") {
+        return { exitCode: 0, stdout: "blob-123", stderr: "" };
+      }
+      if (c === "git" && a[0] === "rev-parse") {
+        return { exitCode: 0, stdout: "parent-123", stderr: "" };
+      }
+      if (c === "git" && a[0] === "read-tree") {
+        return { exitCode: 1, stdout: "", stderr: "read-tree failed" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  };
+  await assert.rejects(
+    async () => {
+      await commitAcceptanceContract(failReadTreeCmd as any, "/tmp/fake-repo", "branch-1", "ARCH-TAM-1", "text");
+    },
+    (err: any) => {
+      assert.equal(err.code, "git-failed");
+      assert.match(err.message, /read-tree failed/);
+      return true;
+    },
+  );
 });

@@ -1307,6 +1307,18 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
           ruleId: "rule-29-fix-simple-owner-gate-update-acceptance",
         };
       }
+      if (input.gateStage === "pre_release") {
+        return {
+          allowed: false,
+          errorCode: "acceptance-contract-immutable",
+          errorMessage:
+            "acceptance-contract-immutable: договор приёмки неизменяем на этапе pre_release",
+          toNode: "owner_gate",
+          toStatus: input.status,
+          reason: "acceptance-contract-immutable: gate_stage is pre_release",
+          ruleId: "rule-29-fix-simple-owner-gate-update-acceptance",
+        };
+      }
       return {
         allowed: true,
         toNode: "owner_gate",
@@ -1466,7 +1478,7 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
           toNode: "code",
           toStatus: "blocked",
           reason:
-            "code-refused: acceptance-tampered: изменение договора приёмки запрещено (попытка " +
+            "acceptance-contract-tampered: изменение договора приёмки запрещено (попытка " +
             attempts +
             " >= 3) -> blocked",
           ruleId: "rule-34-code-acceptance-tampered",
@@ -1479,7 +1491,7 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
         toNode: "code",
         toStatus: "running",
         reason:
-          "code-refused: acceptance-tampered: договор приёмки изменён (попытка " +
+          "acceptance-contract-tampered: договор приёмки изменён (попытка " +
           attempts +
           " < 3) -> retry",
         ruleId: "rule-34-code-acceptance-tampered",

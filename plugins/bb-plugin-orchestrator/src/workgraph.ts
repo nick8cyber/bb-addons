@@ -887,17 +887,32 @@ export async function runEnqueue(
   const existing = deps.store.getTask(taskKey);
   if (existing) {
     if (existing.status !== "done" && existing.status !== "cancelled") {
+      let existingPayload: Record<string, unknown> = {};
+      try {
+        if (existing.payload) existingPayload = JSON.parse(existing.payload);
+      } catch {}
+      const gateStage = existingPayload.gate_stage;
+
+      // §31.5: for feature route OR at owner_gate pre_release, acceptance contract is immutable
+      if (acceptanceText) {
+        if (existing.route === "feature" || gateStage === "pre_release") {
+          throw new OrchestratorError(
+            "acceptance-contract-immutable",
+            existing.route === "feature"
+              ? "для маршрута feature договор формируется и изменяется исключительно архитектором на узле design через reject --target design"
+              : "договор приёмки неизменяем на этапе pre_release",
+          );
+        }
+      }
+
       // Check exception for owner updating acceptance at owner_gate (§31.5, §32 п.2)
       if (
         (existing.route === "fix" || existing.route === "simple") &&
         existing.node === "owner_gate" &&
         (existing.status === "waiting_approval" || existing.status === "deferred") &&
+        gateStage !== "pre_release" &&
         acceptanceText
       ) {
-        let existingPayload: Record<string, unknown> = {};
-        try {
-          if (existing.payload) existingPayload = JSON.parse(existing.payload);
-        } catch {}
         existingPayload.acceptance_text = acceptanceText;
         delete existingPayload.previous_status;
 
@@ -930,6 +945,10 @@ export async function runEnqueue(
           },
           mode: existing.confirmation_mode,
           counters: extractCounters(existing),
+          gateStage:
+            gateStage === "pre_code" || gateStage === "pre_release"
+              ? gateStage
+              : undefined,
         });
         if (!resolution.allowed) {
           throw new OrchestratorError(
@@ -2039,7 +2058,11 @@ export async function checkAcceptanceTampered(
       ],
       { cwd: deps.repoRoot },
     );
-    if (res.exitCode === 0 && res.stdout.trim().length > 0) {
+    if (res.exitCode !== 0) {
+      // §31.4: git diff failure must not fail-open (tampered = true)
+      return true;
+    }
+    if (res.stdout.trim().length > 0) {
       return true;
     }
   }
@@ -2087,10 +2110,16 @@ export async function commitAcceptanceContract(
   );
   try {
     const env = { ...process.env, GIT_INDEX_FILE: tempIndex };
-    await cmd.run("git", ["read-tree", `${parentSha}^{tree}`], {
+    const readTreeRes = await cmd.run("git", ["read-tree", `${parentSha}^{tree}`], {
       cwd: repoRoot,
       env,
     });
+    if (readTreeRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `git read-tree failed: ${readTreeRes.stderr || readTreeRes.stdout}`,
+      );
+    }
     const updateRes = await cmd.run(
       "git",
       ["update-index", "--add", "--cacheinfo", "100644", blobSha, relPath],
@@ -3450,7 +3479,7 @@ async function advanceActiveTask(
               "thread",
               "tell",
               latestDelegation.thread_id,
-              "Сдай архитектурное решение и текст договора приёмки для docs/specs/acceptance/<KEY>.md",
+              `Сдай архитектурное решение и текст договора приёмки для docs/specs/acceptance/${task.task_key}.md`,
             ])
             .catch(() => {});
         }
