@@ -362,10 +362,10 @@ node scripts/import-accounts.mjs --rebind --label <label> --install <имя>
    {
      "installs": {
        "main": {
-         "bin": "/home/user/.local/bin/agy"
+         "bin": "/home/example/.local/bin/agy"
        },
        "secondary": {
-         "bin": "/home/user/.local/opt/agy-secondary/bin/agy"
+         "bin": "/home/example/.local/opt/agy-secondary/bin/agy"
        }
      },
      "default": "main"
