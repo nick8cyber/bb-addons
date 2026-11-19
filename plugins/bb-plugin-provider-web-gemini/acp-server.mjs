@@ -10,7 +10,10 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import * as webTools from "./src/web-tools.mjs";
+import { checkedAnswer, collectTask, formatTaskToolResult, packTask, prepareTask, taskThread, taskTool, verdictInstruction } from "./src/inner-context.mjs";
 import {
   existsSync,
   mkdirSync,
@@ -34,6 +37,8 @@ const require = createRequire(join(HERE, "package.json"));
 console.log = console.error;
 
 const FAKE = process.env.WEB_GEMINI_FAKE === "1" || process.env.ARGON_FAKE === "1";
+const BB_THREAD_ARG = process.argv.find((arg) => arg.startsWith("--bb-thread-id="));
+const SESSION_ACCESS = process.argv.find((arg) => arg.startsWith("--session-access="))?.split("=")[1];
 const HEADLESS = process.env.WEB_GEMINI_HEADLESS || process.env.ARGON_HEADLESS || process.env.GEMINI_HEADLESS || null;
 
 function resolveDefaultStateDir() {
@@ -856,6 +861,13 @@ function getDriver() {
   return driver;
 }
 
+async function fakeTaskReply({ onSubmitted, convId, signal }) {
+  onSubmitted?.();
+  const wait = Number(process.env.WEB_GEMINI_FAKE_DELAY_MS || process.env.ARGON_FAKE_DELAY_MS) || 0;
+  if (wait > 0) await delay(wait, null, { signal });
+  return { convId: convId ?? "fake-task", text: 'FAKE_WEB_GEMINI_TASK\n{"verdict":"OK","blockers":0}' };
+}
+
 const out = (v) => process.stdout.write(`${JSON.stringify(v)}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -1057,8 +1069,8 @@ export function configOptionsFor(s, backends = BACKENDS, state = null) {
 }
 
 const modes = {
-  availableModes: [{ id: "default", name: "Default" }],
-  currentModeId: "default",
+  availableModes: [{ id: "read-only", name: "Read only" }],
+  currentModeId: "read-only",
 };
 
 /* ---------- global prompt queue ---------- */
@@ -1067,6 +1079,96 @@ function enqueue(fn) {
   const run = queue.then(fn, fn);
   queue = run.then(() => {}, () => {});
   return run;
+}
+
+class TaskTurnError extends Error {}
+// BB's host projector can coalesce updates within 500 ms of opening or
+// updating the same item and drop a coalesced update when the item closes.
+const BB_PROGRESS_WINDOW_MS = 600;
+
+function turnError(id, outcome, reason, stage = "preflight") {
+  out({ jsonrpc: "2.0", id, error: {
+    code: -32000, message: "[web-gemini:" + outcome + "] " + reason, data: { outcome, reason, stage },
+  } });
+}
+
+function createTaskTurn(sessionId) {
+  const controller = new AbortController();
+  const started = Date.now();
+  const deadline = started + SEND_DEADLINE_MS;
+  const toolCallId = "gemini-turn-" + randomUUID();
+  const update = (fields) => out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { toolCallId, ...fields } } });
+  let stage = "preflight";
+  let interval;
+  let closed = false;
+  let lastUpdateAt = started;
+  let sentOutsideOpenWindow = false;
+  let wake;
+  const aborted = new Promise((resolve) => { wake = resolve; });
+  const stop = (reason) => {
+    if (closed || controller.signal.aborted) return;
+    controller.abort(reason);
+    wake({ cancelled: true });
+  };
+  const timer = setTimeout(() => stop("deadline exceeded"), SEND_DEADLINE_MS);
+  timer.unref();
+  const progress = (status, message) => {
+    if (status === "in_progress") {
+      lastUpdateAt = Date.now();
+      sentOutsideOpenWindow ||= lastUpdateAt - started >= BB_PROGRESS_WINDOW_MS;
+    }
+    update({
+      sessionUpdate: "tool_call_update", status, content: [{ type: "content", content: {
+        type: "text", text: message ?? (stage + " · " + Math.floor((Date.now() - started) / 1000) + "s"),
+      } }],
+    });
+  };
+  update({ sessionUpdate: "tool_call", title: "Gemini task", kind: "other", status: "in_progress" });
+  progress("in_progress");
+  const turn = {
+    get stage() { return stage; },
+    deadline, signal: controller.signal, aborted, stop, ownedFiles: [],
+    ping(next) {
+      if (closed || controller.signal.aborted) return;
+      stage = next;
+      progress("in_progress");
+    },
+    heartbeat(ms) {
+      clearInterval(interval);
+      interval = setInterval(() => turn.ping(stage), ms);
+      interval.unref();
+    },
+    async finish(outcome, reason = "") {
+      if (closed) return;
+      closed = true;
+      clearInterval(interval);
+      clearTimeout(timer);
+      const result = "[web-gemini:" + outcome + "]" + (reason ? " " + reason : "");
+      if (outcome === "failed" && controller.signal.reason === "cancelled") {
+        progress("in_progress", result);
+        await sleep(BB_PROGRESS_WINDOW_MS);
+        progress("in_progress", result);
+      } else if (outcome === "passed" && !sentOutsideOpenWindow) {
+        await sleep(Math.max(0, Math.min(lastUpdateAt + BB_PROGRESS_WINDOW_MS, deadline) - Date.now()));
+        progress("in_progress");
+      }
+      progress(outcome === "passed" ? "completed" : "failed", result);
+      for (const file of turn.ownedFiles) {
+        try { unlinkSync(file); } catch {}
+      }
+    },
+  };
+  turn.heartbeat(15_000);
+  return turn;
+}
+
+function cancelSession(sessionId) {
+  const s = sessions.get(sessionId);
+  if (!s) return;
+  s.cancelled = true;
+  s.activeTask?.stop("cancelled");
+  s._cancelRes?.();
+  if (sessions.get(activePromptSessionId) === s) activeAbort?.abort();
 }
 
 /* ---------- auth probe on error path ---------- */
@@ -1209,6 +1311,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
   sessions.set(sessionId, s);
   const upd = (update) =>
     out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
+  const { task, context } = attachments;
 
   const gen = (s.gen || 0) + 1;
   s.gen = gen;
@@ -1248,14 +1351,17 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
     // and used to surface as model-unavailable — fail fast BEFORE any
     // lease/park, but inside try so the client gets a -32000, not a dead
     // server (throw above try → void runPrompt() → unhandled rejection).
-    const earlyTooLarge = promptTooLargeError(text);
+    const earlyTooLarge = task ? null : promptTooLargeError(text);
     if (earlyTooLarge) throw earlyTooLarge;
     slog("prompt:enqueue", { sessionId, chars: text.length, model: s.model });
-    const result = await enqueue(async () => {
-      if (s.cancelled) return { cancelled: true };
+    task?.ping("queue");
+    let inQueue = true;
+    const queued = enqueue(async () => {
+      inQueue = false;
+      if (s.cancelled || task?.signal.aborted) return { cancelled: true };
       slog("prompt:dequeue", { sessionId });
 
-      if (FAKE) {
+      if (FAKE && !task) {
         const bound = await bindBackend(s, sessionId);
         if (bound.error) throw new Error(bound.error);
         const backend = bound.backend || BACKENDS[0];
@@ -1300,8 +1406,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       }
 
       const maxAttempts = Math.min(BACKENDS.length, 3);
-      const waitDeadline = Date.now() + 130_000;
-      const turnDeadline = Date.now() + SEND_DEADLINE_MS;
+      const turnDeadline = task?.deadline ?? Date.now() + SEND_DEADLINE_MS;
+      const waitDeadline = Math.min(Date.now() + 130_000, turnDeadline);
       let attempts = 0;
       let lastErr = null;
       let streamedAny = false;
@@ -1309,9 +1415,29 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       // §5 web-gemini-tools: первое сообщение нового разговора несёт
       // системную шапку инструментов и упакованные материалы (дифф, файлы,
       // треды, задачи). У существующего разговора (s.convId) текст идёт как есть.
-      const packed = s.convId
-        ? { message: text }
-        : webTools.packFirstMessage({
+      let collected;
+      let packed;
+      let messageLimit = webTools.effectiveMessageBytes();
+      let packageOptions;
+      if (task) {
+        task.ping("collect");
+        try {
+          packageOptions = {
+            signal: task.signal, maxUploadBytes: argonMaxUploadBytes(), maxUploadCount: argonMaxUploadCount(),
+            validateUploads: (blocks) => collectUploadFiles(blocks, s), spillDir: UPLOADS_DIR, ownedFiles: task.ownedFiles,
+            limit: messageLimit,
+          };
+          collected = await collectTask(context, attachments.blocks, packageOptions);
+          packed = packTask(context, collected, packageOptions);
+        } catch (error) {
+          if (task.signal.aborted) return { cancelled: true };
+          const reason = error.code ? "could not read or stage mandatory task materials" : error.message;
+          throw new TaskTurnError(context.settings.mask(reason));
+        }
+      } else {
+        packed = s.convId
+          ? { message: text }
+          : webTools.packFirstMessage({
             text,
             cwd: s.cwd,
             embeddedResources: attachments.embeddedResources ?? [],
@@ -1320,32 +1446,36 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             spillDir: UPLOADS_DIR,
             spillId: sessionId,
           });
+      }
       // Spill-пакет идёт сверх WEB_GEMINI_MAX_UPLOAD_COUNT и без проверки
       // WEB_GEMINI_MAX_UPLOAD_BYTES: это наш сгенерированный .md с материалами
       // задачи, его доставка обязательна; лимиты выше — про пользовательские
       // пути на валидации collectUploadFiles.
       if (packed.spilledFile) uploadFiles.push(packed.spilledFile);
 
+      let remainingContext = task ? context.settings.maxTotalBytes : Infinity;
       while (true) {
-        if (s.cancelled) return { cancelled: true };
+        if (s.cancelled || task?.signal.aborted) return { cancelled: true };
         const bound = await bindBackend(s, sessionId);
         if (bound.error) {
           slog("bind:error", { sessionId, error: bound.error });
           throw new Error(bound.error);
         }
         if (bound.busyUntil) {
-          if (s.cancelled) return { cancelled: true };
+          task?.ping("queue");
+          if (s.cancelled || task?.signal.aborted) return { cancelled: true };
           if (Date.now() >= waitDeadline) {
             throw new Error(`account "${bound.account || "picked"}" is busy until ${new Date(bound.busyUntil).toISOString()}`);
           }
           slog("bind:busy", { sessionId, account: bound.account, busyUntil: new Date(bound.busyUntil).toISOString() });
           const wakeAt = Math.min(Date.now() + Math.max(bound.busyUntil - Date.now() + 500, 3000), Date.now() + 15_000);
-          while (!s.cancelled && Date.now() < wakeAt) await sleep(500);
+          while (!s.cancelled && !task?.signal.aborted && Date.now() < wakeAt) await sleep(500);
           continue;
         }
-        if (s.cancelled) {
+        if (s.cancelled || task?.signal.aborted || Date.now() >= turnDeadline) {
           if (bound.backend) await releaseLease(bound.backend.id);
-          return { cancelled: true };
+          if (s.cancelled || task?.signal.aborted) return { cancelled: true };
+          throw new TaskTurnError("deadline exceeded");
         }
 
         const backend = bound.backend;
@@ -1368,14 +1498,40 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         const mappedThinking = normalizeThinking(s.thinking);
         const attempt = (async () => {
           try {
-            const driverMod = getDriver();
+            const sendWebPrompt = task && FAKE ? fakeTaskReply : getDriver().sendPrompt;
             // PLUG-291: пользовательские файлы идут веб-вложениями первой
             // отправкой попытки (перед вставкой текста, без insertText);
             // при ротации на новый чат файлы прикладываются заново.
-            let filesPending = uploadFiles.length ? uploadFiles.slice() : null;
+            let filesPending = task ? [...packed.files] : uploadFiles.length ? uploadFiles.slice() : null;
+            let delivered = false;
+            const toolLimit = Math.min(webTools.MAX_TOOL_RESULT_BYTES, webTools.effectiveMessageBytes());
+            const contract = task ? verdictInstruction(context) : "";
             // §3 Tool Loop: все раунды — в том же convId на том же бэкенде,
             // лиз удерживается до конца хода.
-            const sendOnce = async (message) => {
+            const sendOnce = async (message, canRepack = true) => {
+              const originalMessage = message;
+              let outboundBytes = 0;
+              if (task) {
+                if (task.signal.aborted) throw Object.assign(new Error("prompt cancelled"), { code: "ARGON_CANCELLED" });
+                if (delivered && !s.convId) throw new TaskTurnError("web conversation identity is missing for the follow-up");
+                outboundBytes = delivered ? Buffer.byteLength(message) : packed.totalBytes;
+                if (delivered && Buffer.byteLength(message) > messageLimit) {
+                  if (outboundBytes > remainingContext) throw new TaskTurnError("tool follow-up exceeds remaining context budget");
+                  let spill;
+                  try {
+                    spill = webTools.writeSpillPackage(UPLOADS_DIR, randomUUID(), message);
+                  } catch {
+                    throw new TaskTurnError("could not stage complete tool results");
+                  }
+                  task.ownedFiles.push(spill.pkgPath);
+                  filesPending = [spill.pkgPath];
+                  message = "Read the complete tool results and instructions in " + spill.pkgName + ".";
+                  outboundBytes += Buffer.byteLength(message);
+                }
+                remainingContext -= outboundBytes;
+                if (remainingContext < 0) throw new TaskTurnError("outgoing task context exceeds byte budget");
+                task.ping("delivery");
+              }
               // PLUG-281/§4.1: каждый уходящий в Gemini текст (первое
               // упакованное сообщение, блоки результатов инструментов,
               // принудительный финал) проверяется до отправки — это ошибка
@@ -1390,7 +1546,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 chars: message.length,
                 convId: s.convId || null,
               });
-              const res = await driverMod.sendPrompt({
+              const request = {
                 prompt: message,
                 model: s.model,
                 thinking: mappedThinking,
@@ -1404,13 +1560,15 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 signal: abortCtrl.signal,
                 files: filesPending,
                 sessionId,
-                downloadsDir: DOWNLOADS_DIR,
-                shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || s.activeGen !== gen,
+                downloadsDir: task ? null : DOWNLOADS_DIR,
+                requireFullDelivery: Boolean(task),
+                onSubmitted: task ? () => task.ping("generation") : null,
+                shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted || s.activeGen !== gen,
                 backend: backend,
                 accountId: backend.id,
                 tier: backend.tier,
                 stateDir: STATE_DIR,
-                onChunk: (c) => {
+                onChunk: task ? null : (c) => {
                   if (c && !s.cancelled && s.activeGen === gen) {
                     streamedAny = true;
                     upd({
@@ -1419,29 +1577,52 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                     });
                   }
                 },
-              });
+              };
+              let res;
+              try {
+                res = await sendWebPrompt(request);
+              } catch (error) {
+                if (!task || !canRepack || error.code !== "WEB_GEMINI_PROMPT_TOO_LARGE" ||
+                    !Number.isSafeInteger(error.maxPromptBytes) || error.maxPromptBytes <= 0 ||
+                    error.maxPromptBytes >= messageLimit) throw error;
+                // The driver reports maxlength before uploading anything.
+                remainingContext += outboundBytes;
+                messageLimit = error.maxPromptBytes;
+                if (!delivered) {
+                  try {
+                    packed = packTask(context, collected, { ...packageOptions, limit: messageLimit });
+                  } catch {
+                    throw new TaskTurnError("mandatory task context could not be delivered within the web textbox limit");
+                  }
+                }
+                filesPending = delivered ? null : [...packed.files];
+                return sendOnce(delivered ? originalMessage : packed.message, false);
+              }
               filesPending = null;
+              if (task) delivered = true;
               if (res && res.convId) {
                 s.convId = res.convId;
               }
-              emitGenerated(res);
+              if (!task) emitGenerated(res);
               slog("driver:done", { sessionId, convId: s.convId || null, streamedAny });
               return res;
             };
             let toolSeq = 0;
             const loop = await webTools.runToolLoop({
-              firstMessage: s.convId ? text : packed.message,
+              firstMessage: task ? packed.message : s.convId ? text : packed.message,
               send: sendOnce,
-              execute: (call) => webTools.executeTool(call, { cwd: s.cwd }),
+              execute: (call) => task ? taskTool(context, collected, call, toolLimit, task.signal) : webTools.executeTool(call, { cwd: s.cwd }),
+              onToolRound: task ? () => task.ping("request_more") : null,
+              ...(task ? { formatResult: (call, result) => formatTaskToolResult(context, call, result) } : {}),
               onToolStart: (call) => {
-                const toolCallId = `argtool-${++toolSeq}`;
+                const toolCallId = task ? "gemini-read-" + randomUUID() : "argtool-" + (++toolSeq);
                 upd({
                   sessionUpdate: "tool_call",
                   toolCallId,
-                  title: webTools.toolTitle(call),
+                  title: task ? context.settings.mask(webTools.toolTitle(call)) : webTools.toolTitle(call),
                   kind: webTools.toolKind(call.name),
                   status: "in_progress",
-                  rawInput: { name: call.name, args: call.args },
+                  ...(task ? {} : { rawInput: { name: call.name, args: call.args } }),
                 });
                 return toolCallId;
               },
@@ -1459,12 +1640,25 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 });
               },
               maxRounds: webTools.MAX_TOOL_ROUNDS,
-              isCancelled: () => s.cancelled || abortCtrl.signal.aborted,
+              isCancelled: () => s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted,
             });
             if (loop.cancelled) {
               const e = new Error("prompt cancelled by user");
               e.code = "ARGON_CANCELLED";
               throw e;
+            }
+            if (task) {
+              let candidate = loop.lastRes;
+              for (let repair = 0; ; repair++) {
+                task.ping("verify");
+                const final = checkedAnswer(context, candidate);
+                if (final.text !== undefined) return { text: final.text };
+                if (final.denied) throw new TaskTurnError(final.denied);
+                if (repair >= context.settings.maxRepairRounds) throw new TaskTurnError(final.repair);
+                task.ping("request_more");
+                candidate = await sendOnce("Correct the previous reply. " + final.repair +
+                  ". Return the complete publishable final answer without tool calls or file envelopes.\n" + contract);
+              }
             }
             // PLUG-291: текстовая строка-указатель на скачанные файлы —
             // resource_link-чанки уже отправлены выше, здесь видимая
@@ -1495,9 +1689,10 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           throw new Error(`turn exceeded ${SEND_DEADLINE_MS / 60000}min deadline`);
         }
 
+        let deadlineTimer;
         const deadlineP = new Promise((res) => {
-          const t = setTimeout(() => res("deadline"), remaining);
-          t.unref?.();
+          deadlineTimer = setTimeout(() => res("deadline"), remaining);
+          deadlineTimer.unref?.();
         });
 
         const outcome = await Promise.race([
@@ -1507,6 +1702,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           }),
           deadlineP,
         ]);
+        clearTimeout(deadlineTimer);
         s._cancelRes = null;
 
         if (outcome === "cancelled") {
@@ -1544,7 +1740,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           slog("driver:error", {
             sessionId,
             account: backend.id,
-            error: err && err.message ? String(err.message).slice(0, 300) : String(err),
+            error: task ? "task request failed" : (err?.message ? String(err.message).slice(0, 300) : String(err)),
             code: err && err.code,
           });
           if (err && (err.code === "WEB_GEMINI_CANCELLED" || err.code === "ARGON_CANCELLED")) {
@@ -1557,17 +1753,18 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           }
           // PLUG-281: oversized prompt is the caller's error, not the
           // account's — release the lease, never probe/rotate/cool down.
-          if (err && (err.code === "WEB_GEMINI_PROMPT_TOO_LARGE" || err.code === "ARGON_PROMPT_TOO_LARGE")) {
+          if (err instanceof TaskTurnError || (err && ["WEB_GEMINI_PROMPT_TOO_LARGE", "ARGON_PROMPT_TOO_LARGE", "WEB_GEMINI_DELIVERY_FAILED"].includes(err.code))) {
             await releaseLease(backend.id);
             activeBackendId = null;
             activeAbort = null;
             activeAttempt = null;
             activePromptSessionId = null;
+            if (task && !(err instanceof TaskTurnError)) throw new TaskTurnError("mandatory task context could not be delivered to the web model");
             throw err;
           }
-          const hint = await probeAuthHint(backend);
+          const hint = await (task ? Promise.race([probeAuthHint(backend), task.aborted.then(() => null)]) : probeAuthHint(backend));
           const cls = classifyFailure(err, hint);
-          const cooled = await settleBackend(backend.id, sessionId, cls.untilMs, hint || err.message, cls.parkedReason, cls.lockedModel);
+          const cooled = await settleBackend(backend.id, sessionId, cls.untilMs, task ? "task request failed" : hint || err.message, cls.parkedReason, cls.lockedModel);
           activeBackendId = null;
           activeAbort = null;
           activeAttempt = null;
@@ -1591,14 +1788,25 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       }
       throw lastErr;
     });
+    const result = task
+      ? await Promise.race([queued, task.aborted.then((value) => inQueue ? value : queued)])
+      : await queued;
 
     if (!isExiting) {
       const isCancelled = Boolean(result && (result.cancelled || result.stopReason === "cancelled"));
+      if (task) {
+        if (task.signal.reason === "deadline exceeded") throw new TaskTurnError("deadline exceeded");
+        if (isCancelled || task.signal.aborted) await task.finish("failed", "cancelled");
+        else {
+          await task.finish("passed");
+          upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: result.text } });
+        }
+      }
       out({
         jsonrpc: "2.0",
         id,
         result: {
-          stopReason: isCancelled ? "cancelled" : "end_turn",
+          stopReason: isCancelled || task?.signal.aborted ? "cancelled" : "end_turn",
           ...(turnFiles.length
             ? {
                 attachments: turnFiles.map((f) => ({
@@ -1617,7 +1825,12 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
     if (s.activeGen === gen) s.activeGen = null;
     if (!isExiting) {
       // PLUG-281: caller-side refusal — report verbatim, no driver framing.
-      if (err && (err.code === "WEB_GEMINI_PROMPT_TOO_LARGE" || err.code === "ARGON_PROMPT_TOO_LARGE")) {
+      if (task) {
+        const reason = task.signal.reason === "deadline exceeded" ? "deadline exceeded" :
+          err instanceof TaskTurnError ? err.message : "web model request failed at " + task.stage;
+        await task.finish("failed", reason);
+        turnError(id, "failed", reason, task.stage);
+      } else if (err && (err.code === "WEB_GEMINI_PROMPT_TOO_LARGE" || err.code === "ARGON_PROMPT_TOO_LARGE")) {
         out({ jsonrpc: "2.0", id, error: { code: -32000, message: err.message } });
       } else {
         const hint = FAKE ? null : (err.authHint ?? (s.backend ? await probeAuthHint(s.backend) : null));
@@ -1625,6 +1838,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         out({ jsonrpc: "2.0", id, error: { code: -32000, message: msg } });
       }
     }
+  } finally {
+    if (task && s.activeTask === task) s.activeTask = null;
   }
 }
 
@@ -1656,18 +1871,63 @@ process.on("SIGTERM", () => { void cleanShutdown(); });
 process.on("SIGINT", () => { void cleanShutdown(); });
 
 /* ---------- JSON-RPC request dispatcher ---------- */
+async function sendSession(id, sessionId, session) {
+  if (BB_THREAD_ARG) {
+    session.thread = await taskThread(BB_THREAD_ARG.slice("--bb-thread-id=".length)).catch(() => null);
+  }
+  out({
+    jsonrpc: "2.0",
+    id,
+    result: {
+      sessionId,
+      models: {
+        availableModels: MODELS.map((m) => ({ modelId: m.value, name: m.name })),
+        currentModelId: session.model,
+      },
+      configOptions: configOptionsFor(session, BACKENDS, loadState()),
+      modes,
+    },
+  });
+}
+
+async function runBoundPrompt(msg, session) {
+  if (session.activeTask) {
+    turnError(msg.id, "not_started", "session already has an active task turn");
+    return;
+  }
+  const { sessionId, prompt } = msg.params;
+  const task = createTaskTurn(sessionId);
+  session.activeTask = task;
+  try {
+    task.signal.throwIfAborted();
+    const thread = session.thread;
+    if (!thread) throw new TaskTurnError("could not verify trusted BB thread metadata");
+    if (SESSION_ACCESS && SESSION_ACCESS !== "read-only") throw new TaskTurnError("full grants read-only access");
+    if (!Array.isArray(prompt)) throw new TaskTurnError("prompt must be an array of blocks");
+    const system = isBbSystemInstructionsBlock(prompt[0]) ? prompt[0].text : null;
+    const blocks = prompt.filter((block) => block && !isBbSystemInstructionsBlock(block));
+    const text = blocks.filter((block) => block.type === "text").map((block) => String(block.text ?? "")).join("\n");
+    const context = await prepareTask({
+      text, system, session, thread, stateDir: STATE_DIR, signal: task.signal,
+      onSettings: (settings) => task.heartbeat(settings.progressIntervalMs),
+    });
+    if (Date.now() >= task.deadline) task.stop("deadline exceeded");
+    task.signal.throwIfAborted();
+    await runPrompt(msg.id, sessionId, text, { task, context, blocks });
+  } catch (error) {
+    const reason = task.signal.reason ?? (error.code ? "invalid task input or working directory" : error.message);
+    await task.finish("not_started", reason);
+    turnError(msg.id, "not_started", reason);
+  } finally {
+    if (session.activeTask === task) session.activeTask = null;
+  }
+}
+
 export function dispatch(msg) {
   const p = msg.params ?? {};
   if (msg.id === undefined || msg.id === null) {
     if (msg.method === "session/cancel") {
-      const s = sessions.get(p.sessionId);
-      if (s) {
-        s.cancelled = true;
-        s._cancelRes?.();
-        if (activePromptSessionId === s.id && activeAbort) {
-          activeAbort.abort();
-        }
-      }
+      cancelSession(p.sessionId);
     }
     return;
   }
@@ -1705,19 +1965,7 @@ export function dispatch(msg) {
       };
       sessions.set(sessionId, s);
       sessions.set(`argon-${uniq}`, s);
-      out({
-        jsonrpc: "2.0",
-        id: msg.id,
-        result: {
-          sessionId,
-          models: {
-            availableModels: MODELS.map((m) => ({ modelId: m.value, name: m.name })),
-            currentModelId: s.model,
-          },
-          configOptions: configOptionsFor(s, BACKENDS, loadState()),
-          modes,
-        },
-      });
+      void sendSession(msg.id, sessionId, s);
       return;
     }
 
@@ -1740,24 +1988,15 @@ export function dispatch(msg) {
           sessions.set(`argon-${sessionId.slice("web-gemini-".length)}`, s);
         }
       }
-      out({
-        jsonrpc: "2.0",
-        id: msg.id,
-        result: {
-          sessionId,
-          models: {
-            availableModels: MODELS.map((m) => ({ modelId: m.value, name: m.name })),
-            currentModelId: s.model,
-          },
-          configOptions: configOptionsFor(s, BACKENDS, loadState()),
-          modes,
-        },
-      });
+      void sendSession(msg.id, sessionId, s);
       return;
     }
 
     case "session/set_mode":
-      out({ jsonrpc: "2.0", id: msg.id, result: {} });
+      if (!sessions.has(p.sessionId)) turnError(msg.id, "not_started", "unknown session");
+      else if (p.modeId !== "read-only") {
+        turnError(msg.id, "not_started", "full grants read-only access; a write-enabled preset and dedicated worktree are required for file output");
+      } else out({ jsonrpc: "2.0", id: msg.id, result: {} });
       return;
 
     case "session/set_config_option": {
@@ -1833,92 +2072,93 @@ export function dispatch(msg) {
     case "session/prompt": {
       const sess = sessions.get(p.sessionId);
       if (!sess) {
-        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown session "${p.sessionId}"` } });
+        if (BB_THREAD_ARG) turnError(msg.id, "not_started", "unknown session");
+        else out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown session "${p.sessionId}"` } });
         return;
       }
-      if (!Array.isArray(p.prompt)) {
-        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "prompt must be an array of blocks" } });
-        return;
-      }
-      // PLUG-285: блоки с агентским контекстом bb (<system_instructions>…)
-      // отбрасываются целиком, до склейки — до драйвера доходит только
-      // текст пользователя. Ресурсы и не-text блоки не затрагиваются.
-      let text = p.prompt
-        .filter((b) => b && b.type === "text" && !isBbSystemInstructionsBlock(b))
-        .map((b) => String(b.text ?? ""))
-        .join("\n");
-      if (!text.trim()) {
-        out({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
-        return;
-      }
-      // PLUG-281 / PLUG-303 (r22, §2.2 п.2): гард размера промпта и перелив текста в файл.
-      // При превышении лимита исходный текст атомарно переливается в uploads/pkg-<sessionId>-prompt-<ts>.md
-      // и уходит веб-вложением сверх лимитов пользовательских файлов, а текст заменяется на указатель.
-      // При ошибке записи файла возвращается прежний JSON-RPC -32000.
-      const extraUploadFiles = [];
-      const tooLarge = promptTooLargeError(text);
-      if (tooLarge) {
-        try {
-          const { pkgName, pkgPath } = webTools.writeSpillPackage(
-            UPLOADS_DIR,
-            `${p.sessionId}-prompt`,
-            text,
-          );
-          extraUploadFiles.push(pkgPath);
-          text = `[Задача передана файлом-вложением «${pkgName}» — изучи его целиком и выполни.]`;
-          slog("prompt:spill-prompt", { sessionId: p.sessionId, pkgName, bytes: Buffer.byteLength(text, "utf8") });
-        } catch (err) {
-          slog("prompt:spill-error", { sessionId: p.sessionId, error: err?.message });
-          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: tooLarge.message } });
-          return;
-        }
-      }
-      // §5 + PLUG-291: приложенные ресурсы ACP (embeddedContext) —
-      // встроенные текстовые ресурсы идут во вложения первого сообщения.
-      // resource_link обрабатывается только как file:// (collectUploadFiles
-      // ниже) — URL и не-файловые ссылки в материалы не вкладываются.
-      const embeddedResources = p.prompt.filter(
-        (b) => b && b.type === "resource" && b.resource && typeof b.resource.text === "string",
-      );
-      // PLUG-291: локальные файлы-вложения (file://, image/localFile path)
-      // валидируются синхронно по корням сессии и лимитам — ошибка идёт
-      // JSON-RPC error, валидные пути уходят драйверу веб-вложениями.
-      const upload = collectUploadFiles(p.prompt, sess);
-      if (upload.error) {
-        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: upload.error } });
-        return;
-      }
-      void runPrompt(msg.id, p.sessionId, text, {
-        embeddedResources,
-        uploadFiles: [...upload.files, ...extraUploadFiles],
-      });
+      if (BB_THREAD_ARG && (!sess.thread || sess.thread.thread.originPluginId)) void runBoundPrompt(msg, sess);
+      else if (SESSION_ACCESS && SESSION_ACCESS !== "read-only") turnError(msg.id, "not_started", "full grants read-only access");
+      else dispatchPrompt(msg, sess);
       return;
     }
 
-    case "session/cancel": {
-      const s = sessions.get(p.sessionId);
-      if (s) {
-        s.cancelled = true;
-        s._cancelRes?.();
-        if (activePromptSessionId === s.id && activeAbort) {
-          activeAbort.abort();
-        }
-      }
+    case "session/cancel":
+      cancelSession(p.sessionId);
       out({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "cancelled" } });
       return;
-    }
 
     case "authenticate":
       out({ jsonrpc: "2.0", id: msg.id, result: {} });
       return;
 
     default:
-      out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `unknown ${msg.method}` } });
+      out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown " + msg.method } });
   }
 }
 
+function dispatchPrompt(msg, sess) {
+  const p = msg.params;
+  if (!Array.isArray(p.prompt)) {
+    out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "prompt must be an array of blocks" } });
+    return;
+  }
+  // PLUG-285: блоки с агентским контекстом bb (<system_instructions>…)
+  // отбрасываются целиком, до склейки — до драйвера доходит только
+  // текст пользователя. Ресурсы и не-text блоки не затрагиваются.
+  let text = p.prompt
+    .filter((b) => b && b.type === "text" && !isBbSystemInstructionsBlock(b))
+    .map((b) => String(b.text ?? ""))
+    .join("\n");
+  if (!text.trim()) {
+    out({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    return;
+  }
+  // PLUG-281 / PLUG-303 (r22, §2.2 п.2): гард размера промпта и перелив текста в файл.
+  // При превышении лимита исходный текст атомарно переливается в uploads/pkg-<sessionId>-prompt-<ts>.md
+  // и уходит веб-вложением сверх лимитов пользовательских файлов, а текст заменяется на указатель.
+  // При ошибке записи файла возвращается прежний JSON-RPC -32000.
+  const extraUploadFiles = [];
+  const tooLarge = promptTooLargeError(text);
+  if (tooLarge) {
+    try {
+      const { pkgName, pkgPath } = webTools.writeSpillPackage(
+        UPLOADS_DIR,
+        `${p.sessionId}-prompt`,
+        text,
+      );
+      extraUploadFiles.push(pkgPath);
+      text = `[Задача передана файлом-вложением «${pkgName}» — изучи его целиком и выполни.]`;
+      slog("prompt:spill-prompt", { sessionId: p.sessionId, pkgName, bytes: Buffer.byteLength(text, "utf8") });
+    } catch (err) {
+      slog("prompt:spill-error", { sessionId: p.sessionId, error: err?.message });
+      out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: tooLarge.message } });
+      return;
+    }
+  }
+  // §5 + PLUG-291: приложенные ресурсы ACP (embeddedContext) —
+  // встроенные текстовые ресурсы идут во вложения первого сообщения.
+  // resource_link обрабатывается только как file:// (collectUploadFiles
+  // ниже) — URL и не-файловые ссылки в материалы не вкладываются.
+  const embeddedResources = p.prompt.filter(
+    (b) => b && b.type === "resource" && b.resource && typeof b.resource.text === "string",
+  );
+  // PLUG-291: локальные файлы-вложения (file://, image/localFile path)
+  // валидируются синхронно по корням сессии и лимитам — ошибка идёт
+  // JSON-RPC error, валидные пути уходят драйверу веб-вложениями.
+  const upload = collectUploadFiles(p.prompt, sess);
+  if (upload.error) {
+    out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: upload.error } });
+    return;
+  }
+  void runPrompt(msg.id, p.sessionId, text, {
+    embeddedResources,
+    uploadFiles: [...upload.files, ...extraUploadFiles],
+  });
+}
+
 /* ---------- CLI entrypoint ---------- */
-export function startServer() {
+export function startServer({ webDriver } = {}) {
+  if (webDriver) driver = webDriver;
   reapOrphanAcpServers();
   // PLUG-291: чистка каталогов веб-вложений при старте (TTL 24ч, ≤20 файлов).
   pruneDir(UPLOADS_DIR);
