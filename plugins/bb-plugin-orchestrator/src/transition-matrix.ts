@@ -1,7 +1,7 @@
 // plugins/bb-plugin-orchestrator/src/transition-matrix.ts
 // Pure Transition Matrix & Engine for bb-plugin-orchestrator
 // Spec: docs/specs/orchestrator.md §28.1 (Revision 34.2)
-// Exactly 80 rules matching §28.1 matrix rows 1..80.
+// Exactly 82 rules matching §28.1 matrix rows 1..82.
 
 import { OrchestratorError } from "./errors.js";
 
@@ -261,6 +261,10 @@ export type TransitionEvent =
       exhausted?: boolean;
       nudgeCount?: number;
       reason?: string;
+    }
+  | {
+      type: "acceptance_vacuous";
+      reason?: string;
     };
 
 export interface TransitionInput {
@@ -375,7 +379,7 @@ function matchesEventType(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// §28.1 TRANSITION TABLE AS PURE DATA (80 rules matching spec §28.1 matrix)
+// §28.1 TRANSITION TABLE AS PURE DATA (82 rules matching spec §28.1 matrix)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const TRANSITION_TABLE: readonly TransitionRule[] = [
@@ -2884,6 +2888,80 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
         reason: "question without report: stay in research, nudge",
         ruleId: "rule-80-research-question",
         action: { nudgeThread: true },
+      };
+    },
+  },
+
+  // ── Row 81: feature | spec_review | acceptance_vacuous -> design running / blocked
+  {
+    id: "rule-81-acceptance-vacuous-feature",
+    rowNumber: 81,
+    route: "feature",
+    node: "spec_review",
+    status: "running",
+    eventType: "acceptance_vacuous",
+    description: "договор приёмки тривиален / без падающих тестов -> design running / blocked при >=3",
+    resolve(input) {
+      if (input.event.type !== "acceptance_vacuous") return null;
+      const nextRounds = input.counters.design_check_rounds + 1;
+      if (nextRounds >= 3) {
+        return {
+          allowed: true,
+          toNode: "spec_review",
+          toStatus: "blocked",
+          reason: "blocked: acceptance-contract-vacuous ceiling 3 rounds reached",
+          ruleId: "rule-81-acceptance-vacuous-feature",
+          counterUpdates: { design_check_rounds: nextRounds },
+          action: { escalateArchitect: true },
+        };
+      }
+      return {
+        allowed: true,
+        toNode: "design",
+        toStatus: "running",
+        reason: "acceptance-contract-vacuous: договор приёмки не содержит падающих тестов; возврат архитектору на design",
+        ruleId: "rule-81-acceptance-vacuous-feature",
+        counterUpdates: { design_check_rounds: nextRounds },
+        action: { retryDispatch: true, dispatchNode: "design" },
+      };
+    },
+  },
+
+  // ── Row 82: fix/simple | start, owner_gate | acceptance_vacuous -> owner_gate waiting_approval / blocked
+  {
+    id: "rule-82-acceptance-vacuous-fix-simple",
+    rowNumber: 82,
+    route: ["fix", "simple"],
+    node: ["start", "owner_gate"],
+    status: ["queued", "running", "waiting_approval", "deferred"],
+    eventType: "acceptance_vacuous",
+    description: "договор приёмки на fix/simple уже полностью зелёный -> owner_gate waiting_approval / blocked при >=3",
+    resolve(input) {
+      if (input.event.type !== "acceptance_vacuous") return null;
+      const nextAttempts = input.counters.check_attempts + 1;
+      if (nextAttempts >= 3) {
+        return {
+          allowed: true,
+          toNode: input.node,
+          toStatus: "blocked",
+          reason: "blocked: acceptance-contract-vacuous ceiling 3 attempts reached on fix/simple",
+          ruleId: "rule-82-acceptance-vacuous-fix-simple",
+          counterUpdates: { check_attempts: nextAttempts },
+        };
+      }
+      return {
+        allowed: true,
+        toNode: "owner_gate",
+        toStatus: "waiting_approval",
+        reason: "acceptance-contract-vacuous: договор приёмки уже полностью проходит на базовом коммите; ожидание владельца",
+        ruleId: "rule-82-acceptance-vacuous-fix-simple",
+        counterUpdates: { check_attempts: nextAttempts },
+        action: {
+          setPayload: {
+            gate_stage: "pre_code",
+            vacuous_contract: true,
+          },
+        },
       };
     },
   },

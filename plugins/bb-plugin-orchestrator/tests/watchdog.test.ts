@@ -6245,25 +6245,26 @@ test("PLUG-298: reissue matches chain index and used routes across aliases", asy
     levels: {
       review: {
         role: "auditor",
-        chain: ["review-web-gemini", "simple-alt"],
+        chain: ["review-new", "simple-alt"],
         autoFallback: true,
       },
     },
     routes: {
-      "review-web-gemini": {
+      "review-new": {
         preset: "simple",
-        provider: "acp-web-gemini",
-        quotaGroup: "web-gemini",
+        provider: "prov-x",
+        quotaGroup: "tab",
       },
       "simple-alt": {
         preset: "simple-alt",
         provider: "agy",
       },
     },
+    routeAliases: { "review-old": "review-new" },
   });
   const h = makeHarness({ policyText: customPolicy });
-  // Row ran on legacy name "review-argon"
-  const row = h.insertActive({ threadId: "thr_e1", level: "review", route: "review-argon" });
+  // Row ran on legacy name "review-old" — an alias of "review-new".
+  const row = h.insertActive({ threadId: "thr_e1", level: "review", route: "review-old" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
   h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
   await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
@@ -6273,7 +6274,7 @@ test("PLUG-298: reissue matches chain index and used routes across aliases", asy
   assert.equal(h.store.get(row.id)!.status, "reissued");
   const active = h.store.listActive();
   assert.equal(active.length, 1);
-  // Reissued to next candidate in chain: "simple-alt", not restarting at review-web-gemini
+  // Reissued to next candidate in chain: "simple-alt", not restarting at review-new
   assert.equal(active[0]!.route, "simple-alt");
 });
 

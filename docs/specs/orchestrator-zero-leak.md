@@ -1,7 +1,7 @@
 # Изоляция данных и исполнение в песочнице (Zero-Leak Sandbox)
 
 > [!IMPORTANT] Нормативный статус
-> Документ развивает требования [ADR-0035](../adr/0035-orchestrator-zero-leak-sandbox.md), устраняет 5 критических блокеров независимого аудита безопасности (`audit-zero-leak-argon.md`) и регламентирует безопасное подключение публичных и бесплатных моделей (OpenCode free, веб-Gemini/Argon) в оркестратор.
+> Документ развивает требования [ADR-0035](../adr/0035-orchestrator-zero-leak-sandbox.md), устраняет 5 критических блокеров независимого аудита безопасности (тред `thr_dsjymhnts5`) и регламентирует безопасное подключение публичных и бесплатных моделей (OpenCode free, веб-Gemini/Argon) в оркестратор.
 
 ---
 
@@ -148,7 +148,7 @@
 
 ### 4.1. Стандартизированный синтаксис масок (RFC ASCII)
 
-Маскирование секретов по §20.2 п.5 заменяется единым движком со стандартизированными ASCII-псевдонимами. Замены выполняются детерминированно с ведением локальной таблицы соответствий задачи (`DLP_MAP`):
+Маскирование секретов (ранее в r33) заменяется единым движком со стандартизированными ASCII-псевдонимами. Замены выполняются детерминированно с ведением локальной таблицы соответствий задачи (`DLP_MAP`):
 
 | Тип данных | Формат ASCII-замены | Источник сущностей | Обратимость (Unmasking) |
 |---|---|---|---|
@@ -238,10 +238,14 @@ export interface PolicyRoute {
   firstResponseSeconds?: number;
   startSeconds?: number;
   idleSeconds?: number;
-  tools?: boolean;
   maxActive?: number;
-  maxPromptBytes?: number;
   routeBusyWaitSeconds?: number;
+
+  // --- Устаревшие поля (deprecated-input по §20.2, игнорируются) ---
+  /** deprecated-input: устарело в r34.4 (PLUG-316), принимается валидатором с policy-warning по §20.2, игнорируется */
+  tools?: boolean;
+  /** deprecated-input: устарело в r34.4 (PLUG-316), принимается валидатором с policy-warning по §20.2, игнорируется */
+  maxPromptBytes?: number;
 
   // --- Новые поля ревизии 34.3 (Zero-Leak Sandbox) ---
   /** Уровень доверия маршрута (по умолчанию: 'trusted-cloud') */
@@ -266,8 +270,7 @@ export interface PolicyRoute {
    - Полный строгий DLP-фильтр (RFC ASCII-маскирование хостов, IP, токенов).
    - Физическое исключение `confidentialPaths`.
    - Исполнение:
-     - для роли `auditor` (§20.1) и роли `researcher` (§21 п.3): режим `tools: false` с передачей отфильтрованного пакета DLP Redaction Engine;
-     - для роли `executor`: исполнение строго в Snapshot Sandbox на базе Bubblewrap с сетевым карантином (`--unshare-all`) при успешном Sandbox Preflight Probe.
+     - для всех ролей (`executor`, `auditor`, `researcher`, `architect`): исполнение строго в Snapshot Sandbox на базе Bubblewrap с сетевым карантином (`--unshare-all`) при успешном Sandbox Preflight Probe. Для моделей без нативных инструментов файловую работу в изолированном снимке выполняет внутренний агент плагина провайдера ([ADR-0034](../adr/0034-provider-web-gemini-inner-agent.md)). Режим «маршрут без инструментов» (`tools: false`) и сборка пакета материалов первого сообщения оркестратором полностью удалены (ADR-0036, PLUG-316).
 
 ### 5.2. Правило Fail-Closed
 

@@ -42,6 +42,7 @@ export interface JanitorConfig {
   protectedBranches: string[];
   deleteBranches: boolean;
   scope: JanitorScope;
+  serviceWorktreeTimeoutMs: number;
 }
 
 export interface JanitorConfigLoad {
@@ -112,6 +113,7 @@ export function parseJanitorConfig(
     "protectedBranches",
     "deleteBranches",
     "scope",
+    "serviceWorktreeTimeout",
   ]);
   for (const key of Object.keys(raw)) {
     if (!KNOWN_KEYS.has(key)) {
@@ -209,6 +211,16 @@ export function parseJanitorConfig(
     }
   }
 
+  let serviceWorktreeTimeoutMs = 2 * 3_600_000;
+  if (raw.serviceWorktreeTimeout !== undefined) {
+    const ms = parseDurationMs(raw.serviceWorktreeTimeout);
+    if (ms === undefined || ms < MIN_AFTER_MERGE_MS) {
+      err("serviceWorktreeTimeout", "must be <n>m|h|d, at least 15m");
+    } else {
+      serviceWorktreeTimeoutMs = ms;
+    }
+  }
+
   if (errors.length > 0) return { config: null, errors };
   return {
     config: {
@@ -221,6 +233,7 @@ export function parseJanitorConfig(
       protectedBranches,
       deleteBranches,
       scope,
+      serviceWorktreeTimeoutMs,
     },
     errors,
   };

@@ -4,7 +4,8 @@
  * queue CLI commands (enqueue, dequeue, defer, reject, resume, approve,
  * release-note, run-queue) and owner-only guards.
  */
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import fs, { existsSync, readFileSync, unlinkSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { OrchestratorError } from "./errors.js";
 import type { CmdRunner } from "./cmd.js";
@@ -32,6 +33,7 @@ import {
   getNodeTimeoutSeconds,
   getNodeMaxRetries,
   type Policy,
+  type PolicyChecksConfig,
 } from "./policy.js";
 import {
   TRANSITION_TABLE,
@@ -721,15 +723,21 @@ export async function runEnqueue(
   input: EnqueueCommandInput,
   deps: {
     store: DelegationStore;
-    cmd: CmdRunner;
+    cmd?: CmdRunner;
     bbCli?: BbCli;
     ctx: PluginCliContext;
     workGraphMode: WorkGraphMode;
-    repoRoot: string;
-    mergeBaseBranch: string;
+    repoRoot?: string;
+    mergeBaseBranch?: string;
     now?: () => number;
     hasChecksCommands?: boolean;
     approvalMode?: "auto" | "manual" | null;
+    policy?: Policy;
+    log?: { warn?: (msg: string) => void };
+    runTddCheck?: (
+      task: TaskQueueRow,
+      acceptanceSha: string | null,
+    ) => Promise<TddVerificationResult>;
   },
 ): Promise<{ ok: boolean; task: TaskQueueRow; reissued?: boolean }> {
   if (deps.workGraphMode === "off") {
@@ -840,6 +848,26 @@ export async function runEnqueue(
     );
   }
 
+  // §34.7 (ADR-0037): Canonical approvalMode name; confirmation_mode is deprecated
+  if ((input as any).confirmation_mode !== undefined) {
+    if (deps.log?.warn) {
+      deps.log.warn(
+        "[orchestrator] confirmation-mode-deprecated: use approvalMode (--mode) instead",
+      );
+    } else {
+      console.warn(
+        "[orchestrator] confirmation-mode-deprecated: use approvalMode (--mode) instead",
+      );
+    }
+    if (
+      !input.mode &&
+      ((input as any).confirmation_mode === "auto" ||
+        (input as any).confirmation_mode === "manual")
+    ) {
+      input.mode = (input as any).confirmation_mode;
+    }
+  }
+
   // §29.3: Confirmation mode resolution
   // 1) Explicit flag --mode auto|manual passed by human (owner)
   // 2) If orchestrator.approvalMode project setting is set (non-null 'auto' | 'manual'), apply to all tasks
@@ -910,7 +938,7 @@ export async function runEnqueue(
         }
       }
 
-      // Check exception for owner updating acceptance at owner_gate (§31.5, §32 п.2)
+      // Check exception for owner updating acceptance at owner_gate (§31.5, §32 п.2, §34.5)
       if (
         (existing.route === "fix" || existing.route === "simple") &&
         existing.node === "owner_gate" &&
@@ -931,6 +959,10 @@ export async function runEnqueue(
               taskKey,
               acceptanceText,
             );
+            deps.store.updateTask(taskKey, {
+              acceptance_sha: accSha,
+              branch: existing.branch,
+            });
           } catch (e: any) {
             throw new OrchestratorError(
               "git-failed",
@@ -938,6 +970,98 @@ export async function runEnqueue(
             );
           }
         }
+
+        // §34.5 (ADR-0037): TDD fail-first verification on owner_gate upon enqueue --acceptance
+        if (accSha) {
+          const tdd = deps.runTddCheck
+            ? await deps.runTddCheck(existing, accSha)
+            : await runTddFailFirstVerification(
+                { cmd: deps.cmd, repoRoot },
+                { ...existing, acceptance_sha: accSha, payload: JSON.stringify(existingPayload) },
+                accSha,
+                DEFAULT_ALLOWED_RUNNERS,
+                deps.policy?.checks,
+              );
+
+          if (tdd.notRun) {
+            throw new OrchestratorError(
+              "tdd-check-not-run",
+              `проверка договора не смогла запуститься: ${tdd.output}`,
+            );
+          }
+
+          if (!tdd.failedAsExpected) {
+            const vacuousTr = resolveTransition({
+              route: existing.route,
+              node: "owner_gate",
+              status: existing.status,
+              event: {
+                type: "acceptance_vacuous",
+                reason:
+                  "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+              },
+              mode: existing.confirmation_mode,
+              counters: extractCounters(existing),
+            });
+            if (vacuousTr.allowed) {
+              delete (existingPayload as any).queued_stalled;
+              delete (existingPayload as any).queued_stalled_alarm_at;
+              const updates: Partial<TaskQueueRow> = {
+                acceptance_sha: accSha,
+                deferred_by: null,
+                deferred_reason: null,
+                payload: JSON.stringify({
+                  ...existingPayload,
+                  ...(vacuousTr.action?.setPayload ?? {}),
+                }),
+              };
+              if (vacuousTr.counterUpdates) {
+                Object.assign(updates, vacuousTr.counterUpdates);
+              }
+              const res = deps.store.transitionTask(
+                {
+                  taskKey,
+                  expectedNode: "owner_gate",
+                  expectedStatus: existing.status,
+                  toNode: vacuousTr.toNode,
+                  toStatus: vacuousTr.toStatus,
+                  actor: "machine:checks",
+                  reason: vacuousTr.reason,
+                  updates,
+                  now,
+                },
+                now,
+              );
+              if (!res.ok) {
+                throw new OrchestratorError(
+                  "transition-failed",
+                  "не удалось обновить договор приёмки",
+                );
+              }
+              return { ok: true, task: res.task! };
+            }
+          }
+
+          // §34.5 / Reviewer Б1-в: Record TDD verification outcome in task payload
+          existingPayload.tdd_outcome = tdd.outcome;
+          if (tdd.newTestFiles && tdd.newTestFiles.length > 0) {
+            existingPayload.tdd_new_tests = tdd.newTestFiles;
+          }
+          if (tdd.commands && tdd.commands.length > 0) {
+            existingPayload.tdd_commands = tdd.commands;
+          }
+          existingPayload.tdd_output = tdd.output;
+          const checksRun = ((existingPayload.checks_run as Record<string, unknown>) || {});
+          checksRun.tdd = {
+            outcome: tdd.outcome,
+            new_tests: tdd.newTestFiles ?? [],
+            commands: tdd.commands ?? [],
+            output: tdd.output,
+          };
+          existingPayload.checks_run = checksRun;
+        }
+
+        delete existingPayload.vacuous_contract;
 
         const resolution = resolveTransition({
           route: existing.route,
@@ -1043,15 +1167,17 @@ export async function runEnqueue(
           if (typeof p.pr_number === "number") prNumber = p.pr_number;
         } catch {}
       }
-      await checkAndPrepareTaskBranch(
-        deps.cmd,
-        deps.repoRoot,
-        branch,
-        taskKey,
-        deps.mergeBaseBranch,
-        Boolean(input.forceResetBranch),
-        prNumber,
-      );
+      if (deps.cmd) {
+        await checkAndPrepareTaskBranch(
+          deps.cmd,
+          deps.repoRoot ?? process.cwd(),
+          branch,
+          taskKey,
+          deps.mergeBaseBranch ?? "main",
+          Boolean(input.forceResetBranch),
+          prNumber,
+        );
+      }
     }
   }
 
@@ -1060,6 +1186,10 @@ export async function runEnqueue(
     : null;
 
   const payload = acceptanceText ? JSON.stringify({ acceptance_text: acceptanceText }) : null;
+
+  const queueStallMinutes =
+    deps.policy?.timing?.queueStallMinutes ?? 30;
+  const initialNodeAlarmAt = now + queueStallMinutes * 60_000;
 
   if (existing) {
     // Reissue / reset
@@ -1078,6 +1208,8 @@ export async function runEnqueue(
       },
       now,
     );
+    deps.store.updateTask(taskKey, { node_alarm_at: initialNodeAlarmAt });
+    task.node_alarm_at = initialNodeAlarmAt;
     return { ok: true, task, reissued: true };
   }
 
@@ -1099,6 +1231,8 @@ export async function runEnqueue(
     },
     now,
   );
+  deps.store.updateTask(taskKey, { node_alarm_at: initialNodeAlarmAt });
+  task.node_alarm_at = initialNodeAlarmAt;
   return { ok: true, task };
 }
 
@@ -1762,14 +1896,23 @@ export async function runApprove(
   }
 
   let gateStage: "pre_code" | "pre_release" | undefined;
+  let payloadObj: Record<string, unknown> = {};
   try {
     if (task.payload) {
-      const p = JSON.parse(task.payload);
-      if (p.gate_stage === "pre_code" || p.gate_stage === "pre_release") {
-        gateStage = p.gate_stage;
+      payloadObj = JSON.parse(task.payload);
+      if (payloadObj.gate_stage === "pre_code" || payloadObj.gate_stage === "pre_release") {
+        gateStage = payloadObj.gate_stage as "pre_code" | "pre_release";
       }
     }
   } catch {}
+
+  // §34.5 (ADR-0037): Reject approval if acceptance contract is vacuous
+  if (gateStage === "pre_code" && payloadObj.vacuous_contract) {
+    throw new OrchestratorError(
+      "acceptance-contract-vacuous",
+      "договор приёмки уже полностью проходит на неизменённом коде (acceptance-contract-vacuous); обновите договор через enqueue --acceptance перед одобрением",
+    );
+  }
 
   const resolution = resolveTransition({
     route: task.route,
@@ -1902,6 +2045,220 @@ export const DEFAULT_ALLOWED_RUNNERS: readonly string[] = [
   "go test ./...",
 ];
 
+export const BARE_CHECK_RUNNERS = new Set([
+  "npm test",
+  "npm run test",
+  "npm run test:*",
+  "npm run lint",
+  "pytest",
+  "cargo test",
+  "go test",
+  "go test ./...",
+]);
+
+export const TEST_FILTER_FLAGS = new Set([
+  "-k",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "-run",
+  "--run",
+  "--test",
+  "--filter",
+  "--testPathPattern",
+  "-g",
+  "--grep",
+]);
+
+export const ALLOWED_CONTRACT_FLAGS = new Set([
+  "--",
+  "-k",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "-run",
+  "--run",
+  "--test",
+  "--filter",
+  "--testPathPattern",
+  "-g",
+  "--grep",
+  "-v",
+  "-q",
+  "--silent",
+  "--bail",
+  "-s",
+  "--nocapture",
+  "--release",
+  "--no-coverage",
+]);
+
+export const FLAGS_WITH_VALUES = new Set([
+  "-n",
+  "--maxfail",
+  "--jobs",
+  "-j",
+  "-p",
+  "-c",
+  "-o",
+  "--config",
+  "--test-concurrency",
+  "--timeout",
+  "--target",
+  "--workers",
+  "--retries",
+  "-k",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "-run",
+  "--run",
+  "--test",
+  "--filter",
+  "--testPathPattern",
+  "-g",
+  "--grep",
+  "--tb",
+  "--features",
+  "--package",
+  "--bin",
+  "--example",
+  "--bench",
+  "--profile",
+  "--override-ini",
+]);
+
+export function splitRunnerPrefix(parts: string[]): {
+  binary: string;
+  prefixArgs: string[];
+  restArgs: string[];
+} {
+  if (parts.length === 0) {
+    return { binary: "", prefixArgs: [], restArgs: [] };
+  }
+
+  // npm commands: npm test, npm run test, npm run test:*
+  if (parts[0] === "npm") {
+    const ddIdx = parts.indexOf("--");
+    if (ddIdx !== -1) {
+      return {
+        binary: "npm",
+        prefixArgs: parts.slice(1, ddIdx + 1),
+        restArgs: parts.slice(ddIdx + 1),
+      };
+    }
+    if (parts[1] === "run") {
+      return {
+        binary: "npm",
+        prefixArgs: parts.slice(1, 3),
+        restArgs: parts.slice(3),
+      };
+    }
+    if (parts[1] === "test") {
+      return {
+        binary: "npm",
+        prefixArgs: ["test"],
+        restArgs: parts.slice(2),
+      };
+    }
+  }
+
+  // cargo test
+  if (parts[0] === "cargo" && parts[1] === "test") {
+    return {
+      binary: "cargo",
+      prefixArgs: ["test"],
+      restArgs: parts.slice(2),
+    };
+  }
+
+  // go test
+  if (parts[0] === "go" && parts[1] === "test") {
+    return {
+      binary: "go",
+      prefixArgs: ["test"],
+      restArgs: parts.slice(2),
+    };
+  }
+
+  // node --test
+  if (parts[0] === "node" && parts[1] === "--test") {
+    return {
+      binary: "node",
+      prefixArgs: ["--test"],
+      restArgs: parts.slice(2),
+    };
+  }
+
+  // python / python3 -m pytest
+  if (
+    (parts[0] === "python" || parts[0] === "python3") &&
+    parts[1] === "-m" &&
+    parts[2] === "pytest"
+  ) {
+    return {
+      binary: parts[0],
+      prefixArgs: ["-m", "pytest"],
+      restArgs: parts.slice(3),
+    };
+  }
+
+  // pytest
+  if (parts[0] === "pytest") {
+    return {
+      binary: "pytest",
+      prefixArgs: [],
+      restArgs: parts.slice(1),
+    };
+  }
+
+  return {
+    binary: parts[0],
+    prefixArgs: [],
+    restArgs: parts.slice(1),
+  };
+}
+
+export function reorderFilterFlagsForNode(tokens: string[]): string[] {
+  const filterFlags: string[] = [];
+  const otherTokens: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok === "--") {
+      otherTokens.push(...tokens.slice(i));
+      break;
+    }
+    const flagName = tok.split("=")[0];
+    if (TEST_FILTER_FLAGS.has(flagName)) {
+      filterFlags.push(tok);
+      if (
+        !tok.includes("=") &&
+        i + 1 < tokens.length &&
+        !tokens[i + 1].startsWith("-")
+      ) {
+        filterFlags.push(tokens[++i]);
+      }
+    } else {
+      otherTokens.push(tok);
+    }
+  }
+  return [...filterFlags, ...otherTokens];
+}
+
+export const reorderFlagsBeforeFiles = reorderFilterFlagsForNode;
+
+export function hasTestFilter(cmdStr: string): boolean {
+  const parts = cmdStr.trim().split(/\s+/);
+  for (let i = 1; i < parts.length; i++) {
+    const part = parts[i];
+    if (part === "--") continue;
+    const flagName = part.split("=")[0];
+    if (TEST_FILTER_FLAGS.has(flagName)) return true;
+    if (part.includes("::")) return true;
+  }
+  return false;
+}
+
 export function validateCheckCommand(
   rawCmd: string,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
@@ -1946,15 +2303,44 @@ export function validateCheckCommand(
     }
   }
 
-  // §31.3: Forbidden flags: -exec, --import, -o, --pdb, --run-command
-  const forbiddenFlags = ["-exec", "--import", "-o", "--pdb", "--run-command"];
+  // §31.3: Forbidden flags: -exec, --import, -o, --pdb, --run-command, --script-shell, etc.
+  const forbiddenFlags = [
+    "-exec",
+    "--import",
+    "-o",
+    "--pdb",
+    "--run-command",
+    "--script-shell",
+    "--shell",
+    "--toolchain",
+    "--wrapper",
+  ];
   const parts = trimmed.split(/\s+/);
-  for (const p of parts) {
-    if (forbiddenFlags.includes(p)) {
-      return {
-        valid: false,
-        reason: `checks-refused: forbidden-flag (${p} is not allowed in checks)`,
-      };
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    for (const ff of forbiddenFlags) {
+      if (p === ff || p.startsWith(ff + "=")) {
+        return {
+          valid: false,
+          reason: `checks-refused: forbidden-flag (${p} is not allowed in checks)`,
+        };
+      }
+    }
+    // Specially check cargo dangerous config options (wrapper, runner, linker)
+    if (p === "--config" || p.startsWith("--config=")) {
+      const configVal = p.startsWith("--config=")
+        ? p.slice("--config=".length)
+        : (parts[i + 1] ?? "");
+      if (
+        /(?:rustc-wrapper|target\..*\.runner|target\..*\.linker|build\.rustflags)/i.test(
+          configVal,
+        )
+      ) {
+        return {
+          valid: false,
+          reason: `checks-refused: forbidden-flag (${p} is not allowed in checks)`,
+        };
+      }
     }
   }
 
@@ -1974,16 +2360,69 @@ export function validateCheckCommand(
     };
   }
 
-  const binary = parts[0]!;
-  const args = parts.slice(1);
+  const { binary, prefixArgs, restArgs } = splitRunnerPrefix(parts);
+  let args: string[];
+  const isNodeTest =
+    (binary === "node" && prefixArgs.includes("--test")) ||
+    (binary === "npm" && prefixArgs.includes("--"));
+
+  if (isNodeTest) {
+    const reordered = reorderFilterFlagsForNode(restArgs);
+    args = [...prefixArgs, ...reordered];
+  } else {
+    args = parts.slice(1);
+  }
   return { valid: true, binary, args };
 }
 
+export const DEFAULT_ALLOWED_ENV_VARS: readonly string[] = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "SHELL",
+  "TERM",
+  "TMPDIR",
+  "NODE_ENV",
+  "CI",
+];
+
+export const FORBIDDEN_EXTRA_ENV_PATTERN =
+  /(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
+
+export function buildChecksEnvironment(
+  extraEnvVars: string[] = [],
+  allowedEnvVars: readonly string[] = DEFAULT_ALLOWED_ENV_VARS,
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  for (const k of [...allowedEnvVars, ...extraEnvVars]) {
+    if (FORBIDDEN_EXTRA_ENV_PATTERN.test(k)) {
+      throw new OrchestratorError(
+        "checks-invalid-env",
+        `checks environment variable contains forbidden secret keyword: "${k}"`,
+      );
+    }
+  }
+  const allowedSet = new Set([...allowedEnvVars, ...extraEnvVars]);
+  const env: NodeJS.ProcessEnv = {};
+  for (const k of allowedSet) {
+    if (sourceEnv[k] !== undefined) {
+      env[k] = sourceEnv[k];
+    }
+  }
+  return env;
+}
+
 export async function executeChecks(
-  deps: { cmd?: CmdRunner; repoRoot?: string },
+  deps: { cmd?: CmdRunner; repoRoot?: string; worktreeDir?: string },
   task: TaskQueueRow,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
-): Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean }> {
+  checksConfig?: PolicyChecksConfig,
+  overrideCommands?: string[],
+): Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean; acceptanceVerified?: boolean }> {
   let payloadObj: Record<string, unknown> = {};
   if (task.payload) {
     try {
@@ -1992,10 +2431,15 @@ export async function executeChecks(
   }
 
   let commands: string[] = [];
-  if (Array.isArray(payloadObj.checks_commands)) {
-    commands = payloadObj.checks_commands as string[];
+  const isOverride = Array.isArray(overrideCommands) && overrideCommands.length > 0;
+  if (isOverride) {
+    commands = overrideCommands!;
+  } else if (Array.isArray(payloadObj.checks_commands) && payloadObj.checks_commands.length > 0) {
+    commands = [...(payloadObj.checks_commands as string[])];
   } else if (typeof payloadObj.test_command === "string") {
     commands = [payloadObj.test_command];
+  } else if (Array.isArray(checksConfig?.commands) && checksConfig.commands.length > 0) {
+    commands = [...checksConfig.commands];
   } else if (payloadObj.checks_fail) {
     return {
       ok: false,
@@ -2013,29 +2457,885 @@ export async function executeChecks(
     commands = ["npm test"];
   }
 
-  for (const cmdStr of commands) {
-    const val = validateCheckCommand(cmdStr, allowedRunners);
-    if (!val.valid) {
-      return { ok: false, exitCode: 1, notRun: true, output: val.reason };
+  // §34.5 (ADR-0037, Reviewer Б1-в): Post-code checks must also verify acceptance contract commands!
+  let contractCommands: string[] = [];
+  if (!isOverride) {
+    if (Array.isArray(payloadObj.tdd_commands) && payloadObj.tdd_commands.length > 0) {
+      contractCommands = payloadObj.tdd_commands as string[];
+    } else if (task.acceptance_sha && deps.cmd && deps.repoRoot) {
+      try {
+        const normKey = normalizeTaskKey(task.task_key).toUpperCase();
+        const showRes = await deps.cmd.run("git", [
+          "-C",
+          deps.repoRoot,
+          "show",
+          `${task.acceptance_sha}:docs/specs/acceptance/${normKey}.md`,
+        ]);
+        if (showRes.exitCode === 0 && showRes.stdout) {
+          contractCommands = extractAcceptanceCommands(showRes.stdout, allowedRunners);
+        }
+      } catch {}
+    }
+  }
+
+  // §31.3 / §34.5 (Reviewer Б1-в-1 / Б8): Machine checks on code phase must run in an isolated worktree on result_sha
+  const targetSha =
+    (typeof payloadObj.result_sha === "string" ? payloadObj.result_sha : null) ||
+    (task.branch ? `refs/heads/${task.branch}` : null);
+
+  let tmpWorktree: string | null = null;
+  let workRoot = deps.worktreeDir ?? deps.repoRoot ?? process.cwd();
+
+  if (!deps.worktreeDir && targetSha && deps.cmd && deps.repoRoot) {
+    try {
+      const headRes = await deps.cmd.run("git", ["-C", deps.repoRoot, "rev-parse", "HEAD"]);
+      const targetRes = await deps.cmd.run("git", ["-C", deps.repoRoot, "rev-parse", targetSha]);
+      const currentHead = headRes.exitCode === 0 ? headRes.stdout.trim() : null;
+      const targetCommit = targetRes.exitCode === 0 ? targetRes.stdout.trim() : targetSha;
+
+      if (currentHead && targetCommit && currentHead !== targetCommit) {
+        const tmp = fs.mkdtempSync(
+          path.join(os.tmpdir(), `bb-chk-${normalizeTaskKey(task.task_key)}-`),
+        );
+        const addRes = await deps.cmd.run("git", [
+          "-C",
+          deps.repoRoot,
+          "worktree",
+          "add",
+          "--detach",
+          tmp,
+          targetSha,
+        ]);
+        if (addRes.exitCode === 0) {
+          tmpWorktree = tmp;
+          workRoot = tmp;
+          const nmRepo = path.join(deps.repoRoot, "node_modules");
+          const nmTmp = path.join(tmp, "node_modules");
+          if (fs.existsSync(nmRepo) && !fs.existsSync(nmTmp)) {
+            try {
+              fs.symlinkSync(nmRepo, nmTmp, "junction");
+            } catch {}
+          }
+        } else {
+          try {
+            fs.rmSync(tmp, { recursive: true, force: true });
+          } catch {}
+          return {
+            ok: false,
+            exitCode: 1,
+            notRun: true,
+            output: `checks-not-run: failed to create isolated worktree for checks at ${targetSha}: ${addRes.stderr || addRes.stdout}`,
+          };
+        }
+      }
+    } catch (err: any) {
+      return {
+        ok: false,
+        exitCode: 1,
+        notRun: true,
+        output: `checks-not-run: failed to setup isolated checks worktree: ${err?.message ?? err}`,
+      };
+    }
+  }
+
+  try {
+    // Verify that all test files referenced in contractCommands exist in workRoot
+    if (contractCommands.length > 0 && workRoot) {
+      for (const cmdStr of contractCommands) {
+        const tokens = cmdStr.split(/\s+/).slice(1);
+        for (let i = 0; i < tokens.length; i++) {
+          const tok = tokens[i];
+          if (tok === "--") continue;
+          if (tok.startsWith("-")) {
+            const flagName = tok.split("=")[0];
+            if (
+              !tok.includes("=") &&
+              FLAGS_WITH_VALUES.has(flagName) &&
+              i + 1 < tokens.length &&
+              !tokens[i + 1].startsWith("-")
+            ) {
+              i++;
+            }
+            continue;
+          }
+          if (/^\d+$/.test(tok) || tok === "true" || tok === "false") continue;
+          const cleanPath = tok.split("::")[0];
+          if (
+            cleanPath === "./..." ||
+            cleanPath === "..." ||
+            cleanPath === "." ||
+            cleanPath.endsWith("/...") ||
+            cleanPath.includes("*")
+          ) {
+            continue;
+          }
+          if (
+            cleanPath.includes("/") ||
+            /\.(?:[tj]sx?|py|go|rs|c|cpp|h)$/i.test(cleanPath)
+          ) {
+            const resolved = path.resolve(workRoot, cleanPath);
+            if (!fs.existsSync(resolved)) {
+              return {
+                ok: false,
+                exitCode: 1,
+                output: `checks-failed: acceptance test file "${cleanPath}" was not created by executor`,
+              };
+            }
+          }
+        }
+        if (!commands.includes(cmdStr)) {
+          commands.push(cmdStr);
+        }
+      }
     }
 
-    if (deps.cmd && deps.repoRoot) {
-      const res = await deps.cmd.run(val.binary!, val.args!, {
-        cwd: deps.repoRoot,
-      });
-      if (res.exitCode !== 0) {
+    let timeoutSeconds = 600;
+    if (typeof payloadObj.checks_timeout_seconds === "number") {
+      timeoutSeconds = payloadObj.checks_timeout_seconds;
+    } else if (checksConfig?.timeout_seconds !== undefined) {
+      timeoutSeconds = checksConfig.timeout_seconds;
+    }
+    timeoutSeconds = Math.max(30, Math.min(3600, timeoutSeconds));
+
+    const extraEnv = Array.isArray(payloadObj.checks_extra_env)
+      ? (payloadObj.checks_extra_env as string[])
+      : checksConfig?.extraEnvVars ?? [];
+    const allowedEnv = checksConfig?.allowedEnvVars ?? DEFAULT_ALLOWED_ENV_VARS;
+    let env: NodeJS.ProcessEnv;
+    try {
+      env = buildChecksEnvironment(extraEnv, allowedEnv);
+    } catch (e: any) {
+      return {
+        ok: false,
+        exitCode: 1,
+        notRun: true,
+        output: `checks-invalid-env: ${e?.message ?? e}`,
+      };
+    }
+
+    let lastOutput = "";
+    for (const cmdStr of commands) {
+      const val = validateCheckCommand(cmdStr, allowedRunners);
+      if (!val.valid) {
+        return { ok: false, exitCode: 1, notRun: true, output: val.reason };
+      }
+
+      if (deps.cmd && workRoot) {
+        const res = await deps.cmd.run(val.binary!, val.args!, {
+          cwd: workRoot,
+          timeoutMs: timeoutSeconds * 1000,
+          env,
+          cleanEnv: true,
+        });
+        lastOutput = (res.stdout || res.stderr).trim();
+        if (res.exitCode !== 0) {
+          return {
+            ok: false,
+            exitCode: res.exitCode,
+            output:
+              (res.stderr || res.stdout).trim() ||
+              `test failed with exit code ${res.exitCode}`,
+          };
+        }
+
+        // §34.5 (Reviewer Б1-в-2): For acceptance contract commands, 0 matching tests is a failure!
+        if (contractCommands.includes(cmdStr)) {
+          if (didFilterMatchZeroTests(lastOutput)) {
+            return {
+              ok: false,
+              exitCode: 1,
+              output: `checks-failed: acceptance test command "${cmdStr}" matched 0 tests (test was not created or executed)`,
+            };
+          }
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      exitCode: 0,
+      output: lastOutput || "checks passed",
+      acceptanceVerified: contractCommands.length > 0,
+    };
+  } finally {
+    if (tmpWorktree && deps.cmd && deps.repoRoot) {
+      await deps.cmd
+        .run("git", ["-C", deps.repoRoot, "worktree", "remove", "--force", tmpWorktree])
+        .catch(() => {});
+      try {
+        fs.rmSync(tmpWorktree, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+}
+
+export function validateContractCommand(
+  cmdStr: string,
+  allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
+): { valid: boolean; binary?: string; args?: string[]; reason?: string } {
+  const baseVal = validateCheckCommand(cmdStr, allowedRunners);
+  if (!baseVal.valid) {
+    return baseVal;
+  }
+
+  const parts = cmdStr.trim().split(/\s+/);
+  for (let i = 1; i < parts.length; i++) {
+    const part = parts[i];
+    if (part === "--") continue;
+    if (part.startsWith("-")) {
+      const flagName = part.split("=")[0];
+      if (!ALLOWED_CONTRACT_FLAGS.has(flagName)) {
         return {
-          ok: false,
-          exitCode: res.exitCode,
-          output:
-            (res.stderr || res.stdout).trim() ||
-            `test failed with exit code ${res.exitCode}`,
+          valid: false,
+          reason: `contract-refused: forbidden-flag (${flagName} is not permitted in acceptance contract command)`,
         };
       }
     }
   }
 
-  return { ok: true, exitCode: 0, output: "checks passed" };
+  return baseVal;
+}
+
+export function isTestFilePath(name: string): boolean {
+  const trimmed = name.trim();
+  const clean = trimmed.replace(/\s+\([\d.]+m?s\)$/, "").trim();
+  return (
+    /[/\\]/.test(clean) &&
+    /\.(?:[cm]?[jt]sx?|json)$/i.test(clean)
+  );
+}
+
+export function hasPositiveTestPassCount(output?: string): boolean {
+  if (!output) return false;
+
+  // 1. Pytest / Jest / Vitest: "1 passed", "2 passed", etc. (where number > 0)
+  if (/\b[1-9]\d*\s+passed\b/i.test(output)) return true;
+
+  // 2. Cargo: "test result: ok. 1 passed"
+  if (/test result:\s*ok\.\s*[1-9]\d*\s+passed/i.test(output)) return true;
+
+  // 3. Go: "--- PASS: TestName" or "ok <pkg> <dur>" WITHOUT "[no tests to run]"
+  if (/---\s*PASS:\s+\S+/i.test(output)) return true;
+  const goOkLines = output.match(/^[ \t]*ok\s+\S+\s+[\d.]+s.*$/gm);
+  if (goOkLines && goOkLines.some((line) => !line.includes("[no tests to run]"))) {
+    return true;
+  }
+
+  // 4. Node / TAP: check for passed tests whose names are NOT test file path wrappers!
+  // Spec reporter checkmarks: "✔ <test_name>"
+  const checkMatches = output.match(/^[ \t]*[✔✓]\s+(.+)$/gm);
+  if (checkMatches) {
+    for (const m of checkMatches) {
+      const rawName = m.replace(/^[ \t]*[✔✓]\s+/, "").replace(/\s+\([\d.]+m?s\)$/, "").trim();
+      if (!isTestFilePath(rawName)) {
+        return true;
+      }
+    }
+  }
+
+  // TAP reporter: "ok <N> - <test_name>"
+  const tapMatches = output.match(/^[ \t]*ok\s+\d+\s+-\s+(.+?)(?:\s+#.*)?$/gm);
+  if (tapMatches) {
+    for (const m of tapMatches) {
+      const rawName = m.replace(/^[ \t]*ok\s+\d+\s+-\s+/, "").replace(/\s+#.*$/, "").trim();
+      if (!isTestFilePath(rawName)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+export function didFilterMatchZeroTests(output?: string): boolean {
+  if (!output) return false;
+  // If positive passed tests were detected, tests DID run!
+  if (hasPositiveTestPassCount(output)) return false;
+
+  // Node 22 spec reporter: checkmark lines exist, but ALL of them are file paths!
+  const checkMatches = output.match(/^[ \t]*[✔✓]\s+(.+)$/gm);
+  if (checkMatches && checkMatches.length > 0) {
+    const allFilePaths = checkMatches.every((m) =>
+      isTestFilePath(m.replace(/^[ \t]*[✔✓]\s+/, "")),
+    );
+    if (allFilePaths) return true;
+  }
+
+  // TAP 13: 1..0 plan
+  if (/\b1\.\.0\b/.test(output)) return true;
+
+  // Standard runner zero-match indicators
+  if (/no tests found/i.test(output)) return true;
+  if (/ran 0 test suites/i.test(output)) return true;
+  if (/0\s+passed,\s*0\s+total/i.test(output)) return true;
+  if (/\b0\s+tests?\s+passed\b.*\b0\s+total\b/i.test(output)) return true;
+  if (/total:\s*0/i.test(output) && /passed:\s*0/i.test(output)) return true;
+  if (/(?:#|ℹ)\s*tests\s+0\b/i.test(output)) return true;
+  if (/(?:#|ℹ)\s*pass\s+0\b.*(?:#|ℹ)\s*fail\s+0\b/i.test(output)) return true;
+  if (/collected 0 items/i.test(output)) return true;
+  if (/no tests ran/i.test(output)) return true;
+  if (/no tests collected/i.test(output)) return true;
+  if (/running 0 tests/i.test(output)) return true;
+  if (/0 passed;\s*0 failed;\s*0 ignored/i.test(output)) return true;
+  if (/warning: no tests to run/i.test(output)) return true;
+  if (/\[no tests to run\]/i.test(output)) return true;
+  if (/\[no test files\]/i.test(output)) return true;
+
+  return false;
+}
+
+export function isTargetedCheckCommand(
+  cmdStr: string,
+  allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
+): boolean {
+  const trimmed = cmdStr.trim();
+  if (!trimmed || trimmed.startsWith("#")) return false;
+
+  // Lint is never an acceptance/TDD test runner
+  if (/^npm\s+run\s+lint\b/.test(trimmed)) return false;
+
+  let matchedPrefix = "";
+  for (const runner of allowedRunners) {
+    if (runner.endsWith("*")) {
+      const p = runner.slice(0, -1);
+      if (trimmed.startsWith(p)) {
+        const nextSpace = trimmed.indexOf(" ", p.length);
+        matchedPrefix = nextSpace === -1 ? trimmed : trimmed.slice(0, nextSpace);
+        break;
+      }
+    } else {
+      if (trimmed === runner || trimmed.startsWith(runner + " ")) {
+        matchedPrefix = runner;
+        break;
+      }
+    }
+  }
+
+  if (!matchedPrefix) {
+    const firstWord = trimmed.split(/\s+/)[0];
+    if (allowedRunners.includes(firstWord)) {
+      matchedPrefix = firstWord;
+    } else {
+      return false;
+    }
+  }
+
+  const remainder = trimmed.slice(matchedPrefix.length).trim();
+  if (!remainder) {
+    return false;
+  }
+
+  const tokens = remainder.split(/\s+/).filter(Boolean);
+  let hasFilter = false;
+  let hasPathOrTarget = false;
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok === "--") continue;
+
+    if (tok.startsWith("-")) {
+      const flagName = tok.split("=")[0];
+      if (TEST_FILTER_FLAGS.has(flagName)) {
+        hasFilter = true;
+        break;
+      }
+      if (!tok.includes("=") && FLAGS_WITH_VALUES.has(flagName)) {
+        i++;
+      }
+      continue;
+    }
+
+    if (/^\d+$/.test(tok) || tok === "true" || tok === "false") {
+      continue;
+    }
+
+    const clean = tok.split("::")[0];
+    if (
+      clean.includes("/") ||
+      clean.includes("\\") ||
+      tok.includes("::") ||
+      /\.(?:[tj]sx?|py|go|rs)$/i.test(clean) ||
+      /^(?:test_|.+_test)/i.test(clean) ||
+      clean === "./..." ||
+      clean === "..."
+    ) {
+      hasPathOrTarget = true;
+      break;
+    }
+  }
+
+  return hasFilter || hasPathOrTarget;
+}
+
+export function extractAcceptanceCommands(
+  markdownText: string,
+  allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
+): string[] {
+  const commands: string[] = [];
+
+  // 1. Check YAML frontmatter strictly for tdd_commands
+  const frontmatterMatch = markdownText.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (frontmatterMatch) {
+    const fm = frontmatterMatch[1];
+    const lines = fm.split("\n");
+    let inTdd = false;
+    for (const l of lines) {
+      const trimmed = l.trim();
+      const inlineMatch = trimmed.match(/^tdd_commands:\s*\[(.*)\]\s*$/);
+      if (inlineMatch) {
+        const items = inlineMatch[1].split(",");
+        for (const item of items) {
+          const cmdCandidate = item.trim().replace(/^["']|["']$/g, "").trim();
+          if (cmdCandidate) {
+            const val = validateContractCommand(cmdCandidate, allowedRunners);
+            if (val.valid && isTargetedCheckCommand(cmdCandidate, allowedRunners) && !commands.includes(cmdCandidate)) {
+              commands.push(cmdCandidate);
+            }
+          }
+        }
+        inTdd = false;
+        continue;
+      }
+
+      if (/^tdd_commands:/.test(trimmed)) {
+        inTdd = true;
+        continue;
+      }
+      if (inTdd) {
+        if (/^[a-zA-Z0-9_]+:/.test(trimmed)) {
+          inTdd = false;
+          continue;
+        }
+        if (trimmed.startsWith("-")) {
+          const cmdCandidate = trimmed.replace(/^-\s*/, "").replace(/^["']|["']$/g, "").trim();
+          if (cmdCandidate) {
+            const val = validateContractCommand(cmdCandidate, allowedRunners);
+            if (val.valid && isTargetedCheckCommand(cmdCandidate, allowedRunners) && !commands.includes(cmdCandidate)) {
+              commands.push(cmdCandidate);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Check dedicated sections with code blocks (bash / sh)
+  const lines = markdownText.split("\n");
+  let inDedicatedSection = false;
+  let inCodeBlock = false;
+  let codeBlockLang = "";
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Strictly: ## Тесты договора приёмки | ## Acceptance Tests | ## Команды верификации
+    if (/^##\s+(?:тест[ыа]\s+договора(?:\s+при[её]мки)?|acceptance\s+tests?|команд[ыа]\s+верификации)\s*$/i.test(trimmed)) {
+      inDedicatedSection = true;
+      continue;
+    } else if (/^#{1,2}\s+/.test(trimmed) && inDedicatedSection) {
+      // H1 or H2 closes the dedicated section; H3 (###) does NOT
+      inDedicatedSection = false;
+    }
+
+    if (trimmed.startsWith("```")) {
+      if (inCodeBlock) {
+        inCodeBlock = false;
+        codeBlockLang = "";
+      } else {
+        inCodeBlock = true;
+        codeBlockLang = trimmed.slice(3).trim().toLowerCase();
+      }
+      continue;
+    }
+
+    if (inCodeBlock && inDedicatedSection) {
+      const isAllowedScriptBlock = codeBlockLang === "bash" || codeBlockLang === "sh";
+      if (isAllowedScriptBlock) {
+        if (trimmed && !trimmed.startsWith("#")) {
+          const val = validateContractCommand(trimmed, allowedRunners);
+          if (val.valid && isTargetedCheckCommand(trimmed, allowedRunners) && !commands.includes(trimmed)) {
+            commands.push(trimmed);
+          }
+        }
+      }
+    }
+  }
+
+  return commands;
+}
+
+export type TddVerificationOutcome =
+  | "red_confirmed"
+  | "skipped_new_test"
+  | "skipped_no_commands"
+  | "vacuous"
+  | "not_run";
+
+export interface TddVerificationResult {
+  ok: boolean;
+  failedAsExpected: boolean;
+  outcome?: TddVerificationOutcome;
+  notRun?: boolean;
+  output?: string;
+  newTestFiles?: string[];
+  commands?: string[];
+}
+
+export async function runTddFailFirstVerification(
+  deps: { cmd?: CmdRunner; repoRoot?: string },
+  task: TaskQueueRow,
+  acceptanceSha: string | null,
+  allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
+  checksConfig?: PolicyChecksConfig,
+): Promise<TddVerificationResult> {
+  // §34.5 / Reviewer Б2: without acceptance_sha, no verification
+  if (!acceptanceSha) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      outcome: "skipped_no_commands",
+      output: "tdd check skipped: no acceptance sha",
+    };
+  }
+
+  let payloadObj: Record<string, unknown> = {};
+  if (task.payload) {
+    try {
+      payloadObj = JSON.parse(task.payload);
+    } catch {}
+  }
+  if (payloadObj.skip_tdd_check) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      outcome: "skipped_no_commands",
+      output: "tdd check skipped by configuration",
+    };
+  }
+  if (payloadObj.mock_acceptance_vacuous) {
+    return {
+      ok: true,
+      failedAsExpected: false,
+      outcome: "vacuous",
+      output:
+        "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+    };
+  }
+  if (payloadObj.mock_acceptance_red) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      outcome: "red_confirmed",
+      output: "tdd fail-first verified: tests failed on base commit as expected",
+    };
+  }
+
+  // 1. Explicit commands from payload (prioritize tdd_commands)
+  let commands: string[] | undefined =
+    Array.isArray(payloadObj.tdd_commands) && payloadObj.tdd_commands.length > 0
+      ? (payloadObj.tdd_commands as string[])
+      : undefined;
+
+  // 2. Extract from acceptance contract markdown on acceptanceSha
+  if (!commands && deps.cmd && deps.repoRoot) {
+    try {
+      const normKey = normalizeTaskKey(task.task_key).toUpperCase();
+      const showRes = await deps.cmd.run("git", [
+        "-C",
+        deps.repoRoot,
+        "show",
+        `${acceptanceSha}:docs/specs/acceptance/${normKey}.md`,
+      ]);
+      if (showRes.exitCode === 0 && showRes.stdout) {
+        const extracted = extractAcceptanceCommands(showRes.stdout, allowedRunners);
+        if (extracted.length > 0) {
+          commands = extracted;
+        }
+      }
+    } catch {}
+  }
+
+  // §34.5 / Reviewer Б1: if contract has no explicit test items in dedicated block, skip check.
+  // Never run bare runners or entire project test suite on base code!
+  if (!commands || commands.length === 0) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      outcome: "skipped_no_commands",
+      output: "tdd check skipped: no explicit acceptance test commands configured",
+    };
+  }
+
+  if (!deps.cmd || !deps.repoRoot) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      outcome: "skipped_no_commands",
+      output: "tdd check skipped: no cmd runner",
+    };
+  }
+
+  // §34.5 (ADR-0037): Run checks in an isolated worktree at acceptanceSha
+  let tmpDir: string | null = null;
+  try {
+    try {
+      tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), `bb-tdd-${task.task_key}-`),
+      );
+    } catch (e: any) {
+      return {
+        ok: false,
+        failedAsExpected: false,
+        notRun: true,
+        outcome: "not_run",
+        commands,
+        output: `mkdtemp failed: ${e?.message ?? e}`,
+      };
+    }
+
+    const addRes = await deps.cmd.run("git", [
+      "-C",
+      deps.repoRoot,
+      "worktree",
+      "add",
+      "--detach",
+      tmpDir,
+      acceptanceSha,
+    ]);
+    if (addRes.exitCode !== 0) {
+      return {
+        ok: false,
+        failedAsExpected: false,
+        notRun: true,
+        outcome: "not_run",
+        commands,
+        output: `git worktree add failed: ${addRes.stderr}`,
+      };
+    }
+
+    // Classify commands into runnable (targeting existing tests) vs new test files
+    const runnableCommands: string[] = [];
+    const newTestFiles: string[] = [];
+
+    for (const cmdStr of commands) {
+      const tokens = cmdStr.split(/\s+/).slice(1);
+      const fileCandidates: string[] = [];
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i];
+        if (tok === "--") continue;
+        if (tok.startsWith("-")) {
+          const flagName = tok.split("=")[0];
+          if (!tok.includes("=") && FLAGS_WITH_VALUES.has(flagName) && i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) {
+            i++;
+          }
+          continue;
+        }
+        if (/^\d+$/.test(tok) || tok === "true" || tok === "false") continue;
+        const cleanPath = tok.split("::")[0];
+        if (
+          cleanPath === "./..." ||
+          cleanPath === "..." ||
+          cleanPath === "." ||
+          cleanPath.endsWith("/...") ||
+          cleanPath.includes("*")
+        ) {
+          continue;
+        }
+        if (
+          cleanPath.includes("/") ||
+          /\.(?:[tj]sx?|py|go|rs|c|cpp|h)$/i.test(cleanPath)
+        ) {
+          fileCandidates.push(cleanPath);
+        }
+      }
+
+      if (fileCandidates.length > 0) {
+        let allFilesNew = true;
+        for (const fc of fileCandidates) {
+          const resolvedPath = path.resolve(tmpDir, fc);
+          if (fs.existsSync(resolvedPath)) {
+            allFilesNew = false;
+          } else {
+            if (!newTestFiles.includes(fc)) {
+              newTestFiles.push(fc);
+            }
+          }
+        }
+        if (allFilesNew) {
+          // This command targets a new test file not yet created on acceptance_sha
+          continue;
+        }
+      }
+
+      runnableCommands.push(cmdStr);
+    }
+
+    // If all commands target new test files, skip verification with failedAsExpected: true
+    if (runnableCommands.length === 0) {
+      return {
+        ok: true,
+        failedAsExpected: true,
+        outcome: "skipped_new_test",
+        newTestFiles,
+        commands,
+        output: `tdd check skipped: new test file(s) to be created during code phase (${newTestFiles.join(", ")})`,
+      };
+    }
+
+    const nmRepo = path.join(deps.repoRoot, "node_modules");
+    const nmTmp = path.join(tmpDir, "node_modules");
+    if (fs.existsSync(nmRepo) && !fs.existsSync(nmTmp)) {
+      try {
+        fs.symlinkSync(nmRepo, nmTmp, "junction");
+      } catch {}
+    }
+
+    // Run each runnable command individually (Reviewer Б1-а-3)
+    let confirmedRed = false;
+    let skippedNewTest = false;
+    let notRunFailure: {
+      ok: false;
+      failedAsExpected: false;
+      notRun: true;
+      outcome: "not_run";
+      commands: string[];
+      output: string;
+    } | null = null;
+
+    for (const cmdStr of runnableCommands) {
+      const { binary } = splitRunnerPrefix(cmdStr.trim().split(/\s+/));
+      const isPytest = binary === "pytest" || binary === "python" || binary === "python3";
+      const singleRes = await executeChecks(
+        { cmd: deps.cmd, repoRoot: tmpDir, worktreeDir: tmpDir },
+        task,
+        allowedRunners,
+        checksConfig,
+        [cmdStr],
+      );
+
+      if (singleRes.notRun) {
+        notRunFailure = {
+          ok: false,
+          failedAsExpected: false,
+          notRun: true,
+          outcome: "not_run",
+          commands,
+          output: `tdd check not run: ${singleRes.output}`,
+        };
+        break;
+      }
+
+      const isPytestNoTests = isPytest && singleRes.exitCode === 5;
+      const isZeroMatchingTests = didFilterMatchZeroTests(singleRes.output);
+
+      // §34.5 (Reviewer Б3 / Б4):
+      // If command failed (exitCode !== 0):
+      //   - pytest exit code 5 means no tests collected -> skipped_new_test
+      //   - other non-zero exit codes mean test failed on base commit as expected for TDD! -> confirmedRed = true
+      // If command succeeded (exitCode === 0):
+      //   - if zero matching tests confirmed (isZeroMatchingTests) -> skipped_new_test
+      //   - otherwise, existing tests passed on base commit (do NOT mark skippedNewTest, contract may be vacuous)
+      if (singleRes.exitCode !== 0) {
+        if (isPytestNoTests) {
+          skippedNewTest = true;
+        } else {
+          confirmedRed = true;
+        }
+      } else {
+        if (isZeroMatchingTests) {
+          skippedNewTest = true;
+        }
+      }
+    }
+
+    if (notRunFailure) {
+      return notRunFailure;
+    }
+
+    if (confirmedRed) {
+      return {
+        ok: true,
+        failedAsExpected: true,
+        outcome: "red_confirmed",
+        newTestFiles,
+        commands,
+        output: `tdd fail-first verified: tests failed on base commit as expected`,
+      };
+    }
+
+    if (skippedNewTest || newTestFiles.length > 0) {
+      const details =
+        newTestFiles.length > 0
+          ? `new test file(s) to be created during code phase (${newTestFiles.join(", ")})`
+          : `new test case to be created during code phase (0 tests matched on base commit)`;
+      return {
+        ok: true,
+        failedAsExpected: true,
+        outcome: "skipped_new_test",
+        newTestFiles,
+        commands,
+        output: `tdd check skipped: ${details}`,
+      };
+    }
+
+    return {
+      ok: true,
+      failedAsExpected: false,
+      outcome: "vacuous",
+      commands,
+      output:
+        "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+    };
+  } finally {
+    if (tmpDir) {
+      try {
+        await deps.cmd.run("git", [
+          "-C",
+          deps.repoRoot,
+          "worktree",
+          "remove",
+          "--force",
+          tmpDir,
+        ]);
+      } catch {}
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+}
+
+export function formatDesignCheckPacket(params: {
+  taskKey: string;
+  acceptanceText: string;
+  netDiff: string;
+  checksRunJson?: string;
+  reviewVerdict?: string;
+  reviewComments?: string;
+}): string {
+  return [
+    `# Входные материалы проверки архитектуры и договора приёмки (${params.taskKey})`,
+    "",
+    "## 1. Договор приёмки",
+    params.acceptanceText,
+    "",
+    "## 2. Нетто-дифф реализации",
+    "```diff",
+    params.netDiff,
+    "```",
+    "",
+    "## 3. Протокол машинных проверок",
+    "```json",
+    params.checksRunJson ?? "{}",
+    "```",
+    "",
+    "## 4. Отчёт код-ревью",
+    `Вердикт: ${params.reviewVerdict ?? "OK"}`,
+    params.reviewComments ?? "Замечаний нет.",
+    "",
+    "---",
+    'Верни вердикт строгим JSON последней строкой: {"verdict":"OK"|"CHANGES","blockers":N,"target":"code"|"design"}',
+  ].join("\n");
 }
 
 export async function checkAcceptanceTampered(
@@ -2113,6 +3413,19 @@ export async function commitAcceptanceContract(
     );
   }
   const parentSha = parentRes.stdout.trim();
+
+  // §34.5 (Reviewer Non-blocker 5): If contract blob on parentSha is identical, reuse parentSha without creating duplicate commit
+  const existingBlobRes = await cmd.run(
+    "git",
+    ["rev-parse", `${parentSha}:${relPath}`],
+    { cwd: repoRoot },
+  );
+  if (
+    existingBlobRes.exitCode === 0 &&
+    existingBlobRes.stdout.trim() === blobSha
+  ) {
+    return parentSha;
+  }
 
   const tempIndex = path.join(
     repoRoot,
@@ -2216,7 +3529,12 @@ export interface RunQueueDeps {
   ) => Promise<{ ok: boolean; delegationId?: number; error?: string } | void>;
   runChecks?: (
     task: TaskQueueRow,
-  ) => Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean }>;
+  ) => Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean; acceptanceVerified?: boolean }>;
+  runTddCheck?: (
+    task: TaskQueueRow,
+    acceptanceSha: string | null,
+  ) => Promise<TddVerificationResult>;
+  log?: { warn?: (msg: string) => void; info?: (msg: string) => void };
   requestOwnerGateInteraction?: (
     task: TaskQueueRow,
     gateStage: "pre_code" | "pre_release",
@@ -2269,6 +3587,7 @@ export async function runRunQueue(
     while (progressed && iterations < 25) {
       iterations++;
       progressed = false;
+      const now = deps.now ? deps.now() : Date.now();
 
       // ── 1. Advance active running tasks ───────────────────────────────
       const activeTasks = deps.store.listActiveTasks();
@@ -2318,6 +3637,50 @@ export async function runRunQueue(
                 );
               }
             } catch {}
+          }
+        }
+      }
+
+      // ── 1c. §34.4 (ADR-0037): Queue stall alarm for tasks stuck in queued ─────────
+      const allQueued = deps.store.listQueuedTasks();
+      const queueStallMinutes =
+        deps.policy?.timing?.queueStallMinutes ?? 30;
+      for (const qt of allQueued) {
+        if (qt.node_alarm_at !== null && now >= qt.node_alarm_at) {
+          const elapsedSeconds = Math.max(
+            0,
+            Math.round((now - (qt.entered_at ?? now)) / 1000),
+          );
+          deps.store.recordTaskEvent(
+            "task.alarm_triggered",
+            {
+              task: qt.task_key,
+              taskKey: qt.task_key,
+              node: qt.node,
+              reason: "queued-stalled",
+              elapsedSeconds,
+            },
+            now,
+          );
+          const p = parsePayload(qt.payload);
+          p.queued_stalled = true;
+          const nextAlarm = now + queueStallMinutes * 60_000;
+          deps.store.updateTask(qt.task_key, {
+            node_alarm_at: nextAlarm,
+            payload: JSON.stringify(p),
+          });
+          qt.node_alarm_at = nextAlarm;
+          qt.payload = JSON.stringify(p);
+
+          if (qt.coordinator_thread_id && deps.bbCli) {
+            await deps.bbCli
+              .run([
+                "thread",
+                "tell",
+                qt.coordinator_thread_id,
+                `Внимание: задача ${qt.task_key} ожидает запуска более ${queueStallMinutes} минут. Проверьте статус службы run-queue`,
+              ])
+              .catch(() => {});
           }
         }
       }
@@ -2616,30 +3979,48 @@ async function startQueuedTask(
           { cwd: repoRoot },
         );
         if (isAncestorRes.exitCode !== 0) {
-          const resolution = resolveTransition({
-            route: task.route,
-            node: "start",
-            status: "queued",
-            event: { type: "queue_take", branchExistsWithCommits: true, branch },
-            mode: task.confirmation_mode,
-            counters: extractCounters(task),
-          });
-          const tr = deps.store.transitionTask({
-            taskKey: task.task_key,
-            expectedNode: "start",
-            expectedStatus: "queued",
-            toNode: resolution.toNode,
-            toStatus: resolution.toStatus,
-            actor: "run-queue",
-            reason: resolution.reason,
-            updates: { branch },
-          });
-          if (tr.ok) {
-            const logged = deps.store.listTransitions(task.task_key).at(-1);
-            if (logged) transitions.push(logged);
-            return true;
+          const branchHead = revBranch.stdout.trim();
+          let isOnlyAcceptanceCommit = false;
+          if (task.acceptance_sha && branchHead) {
+            if (branchHead === task.acceptance_sha) {
+              isOnlyAcceptanceCommit = true;
+            } else {
+              const diffRes = await deps.cmd.run(
+                "git",
+                ["diff", "--quiet", task.acceptance_sha, branchHead],
+                { cwd: repoRoot },
+              );
+              if (diffRes.exitCode === 0) {
+                isOnlyAcceptanceCommit = true;
+              }
+            }
           }
-          return false;
+          if (!isOnlyAcceptanceCommit) {
+            const resolution = resolveTransition({
+              route: task.route,
+              node: "start",
+              status: "queued",
+              event: { type: "queue_take", branchExistsWithCommits: true, branch },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
+            const tr = deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "start",
+              expectedStatus: "queued",
+              toNode: resolution.toNode,
+              toStatus: resolution.toStatus,
+              actor: "run-queue",
+              reason: resolution.reason,
+              updates: { branch },
+            });
+            if (tr.ok) {
+              const logged = deps.store.listTransitions(task.task_key).at(-1);
+              if (logged) transitions.push(logged);
+              return true;
+            }
+            return false;
+          }
         }
       } else {
         let baseRef = targetRef;
@@ -2766,6 +4147,142 @@ async function startQueuedTask(
     acceptanceSha = null;
   }
 
+  const cleanedPayload = { ...payload };
+  delete (cleanedPayload as any).queued_stalled;
+  if (resolution.action?.setPayload) {
+    Object.assign(cleanedPayload, resolution.action.setPayload);
+  }
+
+  let startReason = resolution.reason;
+
+  // §34.5 (ADR-0037): TDD Fail-First Verification for fix/simple routes (both auto and manual)
+  if ((task.route === "fix" || task.route === "simple") && acceptanceSha) {
+    const tdd = deps.runTddCheck
+      ? await deps.runTddCheck(task, acceptanceSha)
+      : await runTddFailFirstVerification(
+          { cmd: deps.cmd, repoRoot },
+          task,
+          acceptanceSha,
+          DEFAULT_ALLOWED_RUNNERS,
+          deps.policy?.checks,
+        );
+    if (tdd.notRun) {
+      deps.log?.warn?.(
+        `[orchestrator] tdd fail-first check not run for ${task.task_key}: ${tdd.output}`,
+      );
+      const failTr = resolveTransition({
+        route: task.route,
+        node: "start",
+        status: "queued",
+        event: {
+          type: "git_failure",
+          reason: `tdd-check-not-run: ${tdd.output}`,
+        },
+        mode: task.confirmation_mode,
+        counters: extractCounters(task),
+      });
+      if (failTr.allowed) {
+        deps.store.transitionTask(
+          {
+            taskKey: task.task_key,
+            expectedNode: "start",
+            expectedStatus: "queued",
+            toNode: failTr.toNode,
+            toStatus: failTr.toStatus,
+            actor: "machine:checks",
+            reason: failTr.reason,
+            updates: {
+              branch,
+              acceptance_sha: acceptanceSha,
+            },
+            now,
+          },
+          now,
+        );
+      }
+      return false;
+    }
+    if (!tdd.failedAsExpected) {
+      const vacuousTr = resolveTransition({
+        route: task.route,
+        node: "start",
+        status: "queued",
+        event: {
+          type: "acceptance_vacuous",
+          reason:
+            "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+        },
+        mode: task.confirmation_mode,
+        counters: extractCounters(task),
+      });
+      if (vacuousTr.allowed) {
+        delete (payload as any).queued_stalled;
+        delete (payload as any).queued_stalled_alarm_at;
+        const updates: Partial<TaskQueueRow> = {
+          branch,
+          acceptance_sha: acceptanceSha,
+          payload: JSON.stringify({
+            ...payload,
+            ...(vacuousTr.action?.setPayload ?? {}),
+          }),
+        };
+        if (vacuousTr.counterUpdates) {
+          Object.assign(updates, vacuousTr.counterUpdates);
+        }
+        const vtr = deps.store.transitionTask(
+          {
+            taskKey: task.task_key,
+            expectedNode: "start",
+            expectedStatus: "queued",
+            toNode: vacuousTr.toNode,
+            toStatus: vacuousTr.toStatus,
+            actor: "machine:checks",
+            reason: vacuousTr.reason,
+            updates,
+            timeoutSeconds: getNodeTimeoutSeconds(
+              deps.policy,
+              vacuousTr.toNode,
+            ),
+          },
+          now,
+        );
+        if (vtr.ok && vtr.task) {
+          const logged = deps.store.listTransitions(task.task_key).at(-1);
+          if (logged) transitions.push(logged);
+          if (vacuousTr.action?.dispatchNode) {
+            await deps.dispatchNode?.(
+              vtr.task,
+              vacuousTr.action.dispatchNode,
+            );
+          }
+          return true;
+        }
+        return false;
+      }
+    }
+
+    // §34.5 / Reviewer Б1-в: Record TDD verification outcome in task payload
+    cleanedPayload.tdd_outcome = tdd.outcome;
+    if (tdd.newTestFiles && tdd.newTestFiles.length > 0) {
+      cleanedPayload.tdd_new_tests = tdd.newTestFiles;
+    }
+    if (tdd.commands && tdd.commands.length > 0) {
+      cleanedPayload.tdd_commands = tdd.commands;
+    }
+    cleanedPayload.tdd_output = tdd.output;
+    const checksRun = ((cleanedPayload.checks_run as Record<string, unknown>) || {});
+    checksRun.tdd = {
+      outcome: tdd.outcome,
+      new_tests: tdd.newTestFiles ?? [],
+      commands: tdd.commands ?? [],
+      output: tdd.output,
+    };
+    cleanedPayload.checks_run = checksRun;
+    if (tdd.outcome === "skipped_new_test") {
+      startReason = `${resolution.reason} [tdd: skipped_new_test (${(tdd.newTestFiles ?? []).join(", ")})]`;
+    }
+  }
+
   const tr = deps.store.transitionTask({
     taskKey: task.task_key,
     expectedNode: "start",
@@ -2773,18 +4290,11 @@ async function startQueuedTask(
     toNode: resolution.toNode,
     toStatus: resolution.toStatus,
     actor: "run-queue",
-    reason: resolution.reason,
+    reason: startReason,
     updates: {
       branch,
       acceptance_sha: acceptanceSha,
-      ...(resolution.action?.setPayload
-        ? {
-            payload: JSON.stringify({
-              ...payload,
-              ...resolution.action.setPayload,
-            }),
-          }
-        : {}),
+      payload: JSON.stringify(cleanedPayload),
     },
     timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
   }, now);
@@ -3440,6 +4950,15 @@ async function advanceActiveTask(
           consumed.push(latestDelegation.id);
         }
 
+        const archRoute =
+          latestDelegation?.route ?? payload.design_architect_route ?? null;
+        const archProvider =
+          latestDelegation?.provider ??
+          payload.design_architect_provider ??
+          null;
+        const archModel =
+          (typeof archRoute === "string" && deps.policy?.routes[archRoute]?.model) ? deps.policy.routes[archRoute].model : payload.design_architect_model ?? null;
+
         const tr = deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "design",
@@ -3455,6 +4974,9 @@ async function advanceActiveTask(
               ...(resolution.action?.setPayload ?? {}),
               design_done: false,
               acceptance_text: contractText,
+              design_architect_route: archRoute,
+              design_architect_provider: archProvider,
+              design_architect_model: archModel,
               consumed_delegations: consumed,
               nudge_count: 0,
               last_nudge_at: null,
@@ -3708,11 +5230,25 @@ async function advanceActiveTask(
           consumed.push(latestDelegation.id);
         }
 
+        const specRoute =
+          latestDelegation?.route ?? payload.last_executor_route ?? null;
+        const specProvider =
+          latestDelegation?.provider ??
+          payload.last_executor_provider ??
+          null;
+        const specModel =
+          (typeof specRoute === "string" && deps.policy?.routes[specRoute]?.model)
+            ? deps.policy.routes[specRoute].model
+            : (latestDelegation as any)?.model ?? payload.last_executor_model ?? null;
+
         const updates: Partial<TaskQueueRow> = {
           spec_sha: specSha,
           payload: JSON.stringify({
             ...payload,
             ...(resolution.action?.setPayload ?? {}),
+            last_executor_route: specRoute,
+            last_executor_provider: specProvider,
+            last_executor_model: specModel,
             spec_done: false,
             consumed_delegations: consumed,
             nudge_count: 0,
@@ -3865,10 +5401,140 @@ async function advanceActiveTask(
           consumed.push(latestDelegation.id);
         }
 
+        let tddOutcome: TddVerificationOutcome | undefined;
+        let tddNewTests: string[] | undefined;
+        let tddCommands: string[] | undefined;
+        let tddOutput: string | undefined;
+
+        // §34.5 (ADR-0037): TDD Fail-First Verification for feature route
+        if (verdict === "OK" && task.acceptance_sha) {
+          const tdd = deps.runTddCheck
+            ? await deps.runTddCheck(task, task.acceptance_sha)
+            : await runTddFailFirstVerification(
+                { cmd: deps.cmd, repoRoot },
+                task,
+                task.acceptance_sha,
+                DEFAULT_ALLOWED_RUNNERS,
+                deps.policy?.checks,
+              );
+          if (tdd.notRun) {
+            deps.log?.warn?.(
+              `[orchestrator] tdd fail-first check not run for ${task.task_key}: ${tdd.output}`,
+            );
+            const failTr = resolveTransition({
+              route: task.route,
+              node: "spec_review",
+              status: "running",
+              event: {
+                type: "spec_review_failed",
+                exhausted: true,
+                reason: `tdd-check-not-run: ${tdd.output}`,
+              },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
+            if (failTr.allowed) {
+              deps.store.transitionTask(
+                {
+                  taskKey: task.task_key,
+                  expectedNode: "spec_review",
+                  expectedStatus: "running",
+                  toNode: failTr.toNode,
+                  toStatus: failTr.toStatus,
+                  actor: "machine:checks",
+                  reason: failTr.reason,
+                  now,
+                },
+                now,
+              );
+              return false;
+            }
+          }
+          if (!tdd.failedAsExpected) {
+            const vacuousTr = resolveTransition({
+              route: task.route,
+              node: "spec_review",
+              status: "running",
+              event: {
+                type: "acceptance_vacuous",
+                reason:
+                  "acceptance-contract-vacuous: договор приёмки не содержит падающих тестов; требуется доработка архитектором на узле design",
+              },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
+            if (vacuousTr.allowed) {
+              const updates: Partial<TaskQueueRow> = {
+                payload: JSON.stringify({
+                  ...payload,
+                  vacuous_contract: true,
+                  spec_review_verdict: null,
+                  spec_review_blockers: null,
+                  consumed_delegations: consumed,
+                  nudge_count: 0,
+                  last_nudge_at: null,
+                }),
+              };
+              if (vacuousTr.counterUpdates) {
+                Object.assign(updates, vacuousTr.counterUpdates);
+              }
+              const vtr = deps.store.transitionTask(
+                {
+                  taskKey: task.task_key,
+                  expectedNode: "spec_review",
+                  expectedStatus: "running",
+                  toNode: vacuousTr.toNode,
+                  toStatus: vacuousTr.toStatus,
+                  actor: "machine:checks",
+                  reason: vacuousTr.reason,
+                  updates,
+                  timeoutSeconds: getNodeTimeoutSeconds(
+                    deps.policy,
+                    vacuousTr.toNode,
+                  ),
+                },
+                now,
+              );
+              if (vtr.ok && vtr.task) {
+                const logged = deps.store.listTransitions(task.task_key).at(-1);
+                if (logged) transitions.push(logged);
+                if (vacuousTr.action?.dispatchNode) {
+                  await deps.dispatchNode?.(
+                    vtr.task,
+                    vacuousTr.action.dispatchNode,
+                  );
+                }
+                return true;
+              }
+              return false;
+            }
+          }
+
+          tddOutcome = tdd.outcome;
+          tddNewTests = tdd.newTestFiles;
+          tddCommands = tdd.commands;
+          tddOutput = tdd.output;
+        }
+
+        const checksRun = ((payload.checks_run as Record<string, unknown>) || {});
+        if (tddOutcome) {
+          checksRun.tdd = {
+            outcome: tddOutcome,
+            new_tests: tddNewTests ?? [],
+            commands: tddCommands ?? [],
+            output: tddOutput,
+          };
+        }
+
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
             ...(resolution.action?.setPayload ?? {}),
+            tdd_outcome: tddOutcome ?? payload.tdd_outcome,
+            tdd_new_tests: tddNewTests ?? payload.tdd_new_tests,
+            tdd_commands: tddCommands ?? payload.tdd_commands,
+            tdd_output: tddOutput ?? payload.tdd_output,
+            checks_run: Object.keys(checksRun).length > 0 ? checksRun : payload.checks_run,
             spec_review_verdict: null,
             spec_review_blockers: null,
             consumed_delegations: consumed,
@@ -3880,6 +5546,11 @@ async function advanceActiveTask(
           Object.assign(updates, resolution.counterUpdates);
         }
 
+        const transReason =
+          tddOutcome === "skipped_new_test"
+            ? `${resolution.reason} [tdd: skipped_new_test (${(tddNewTests ?? []).join(", ")})]`
+            : resolution.reason;
+
         const tr = deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "spec_review",
@@ -3887,7 +5558,7 @@ async function advanceActiveTask(
           toNode: resolution.toNode,
           toStatus: resolution.toStatus,
           actor: "run-queue",
-          reason: resolution.reason,
+          reason: transReason,
           updates: Object.keys(updates).length > 0 ? updates : undefined,
           timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
         }, now);
@@ -4031,11 +5702,25 @@ async function advanceActiveTask(
           consumed.push(latestDelegation.id);
         }
 
+        const execRoute =
+          latestDelegation?.route ?? payload.last_executor_route ?? null;
+        const execProvider =
+          latestDelegation?.provider ??
+          payload.last_executor_provider ??
+          null;
+        const execModel =
+          (typeof execRoute === "string" && deps.policy?.routes[execRoute]?.model)
+            ? deps.policy.routes[execRoute].model
+            : (latestDelegation as any)?.model ?? payload.last_executor_model ?? null;
+
         const updates: Partial<TaskQueueRow> = {
           result_sha: resultSha,
           payload: JSON.stringify({
             ...payload,
             ...(resolution.action?.setPayload ?? {}),
+            last_executor_route: execRoute,
+            last_executor_provider: execProvider,
+            last_executor_model: execModel,
             code_done: false,
             result_commits: null,
             acceptance_tampered: false,
@@ -4074,7 +5759,12 @@ async function advanceActiveTask(
     case "checks": {
       const checkResult = deps.runChecks
         ? await deps.runChecks(task)
-        : await executeChecks({ cmd: deps.cmd, repoRoot }, task);
+        : await executeChecks(
+            { cmd: deps.cmd, repoRoot },
+            task,
+            DEFAULT_ALLOWED_RUNNERS,
+            deps.policy?.checks,
+          );
 
       const resolution = resolveTransition({
         route: task.route,
@@ -4091,10 +5781,26 @@ async function advanceActiveTask(
       });
       if (!resolution.allowed) return false;
 
+      const existingChecksRun = ((payload.checks_run as Record<string, unknown>) || {});
+      const checksRun = {
+        ...existingChecksRun,
+        ok: checkResult.ok,
+        exitCode: checkResult.exitCode,
+        output: checkResult.output,
+        acceptance_verified: checkResult.acceptanceVerified,
+        tdd: existingChecksRun.tdd ?? (payload.tdd_outcome ? {
+          outcome: payload.tdd_outcome,
+          new_tests: payload.tdd_new_tests,
+          commands: payload.tdd_commands,
+          output: payload.tdd_output,
+        } : undefined),
+      };
+
       const updates: Partial<TaskQueueRow> = {
         payload: JSON.stringify({
           ...payload,
           ...(resolution.action?.setPayload ?? {}),
+          checks_run: checksRun,
           code_done: false,
           checks_fail: false,
         }),
@@ -4244,10 +5950,59 @@ async function advanceActiveTask(
           consumed.push(latestDelegation.id);
         }
 
+        let designCheckPacket: string | undefined;
+        if (resolution.toNode === "design_check") {
+          let acceptanceText = (payload.acceptance_text as string) ?? "";
+          if (deps.cmd && repoRoot && task.acceptance_sha) {
+            try {
+              const showRes = await deps.cmd.run("git", [
+                "-C",
+                repoRoot,
+                "show",
+                `${task.acceptance_sha}:docs/specs/acceptance/${task.task_key}.md`,
+              ]);
+              if (showRes.exitCode === 0 && showRes.stdout) {
+                acceptanceText = showRes.stdout;
+              }
+            } catch {}
+          }
+          let netDiff = (payload.net_diff as string) ?? "";
+          const rSha = task.result_sha || latestDelegation?.result_sha;
+          if (deps.cmd && repoRoot && task.acceptance_sha && rSha) {
+            try {
+              const diffRes = await deps.cmd.run("git", [
+                "-C",
+                repoRoot,
+                "diff",
+                `${task.acceptance_sha}..${rSha}`,
+              ]);
+              if (diffRes.exitCode === 0) {
+                netDiff = diffRes.stdout;
+              }
+            } catch {}
+          }
+          const checksRunJson =
+            (typeof payload.checks_output === "string" ? payload.checks_output : null) ??
+            (typeof payload.checks_result_json === "string" ? payload.checks_result_json : null) ??
+            JSON.stringify({ ok: true, exitCode: 0 });
+
+          designCheckPacket = formatDesignCheckPacket({
+            taskKey: task.task_key,
+            acceptanceText,
+            netDiff,
+            checksRunJson,
+            reviewVerdict: verdict,
+            reviewComments:
+              (typeof payload.review_comments === "string" ? payload.review_comments : undefined) ??
+              (latestDelegation ? `Auditor verdict: ${verdict}` : undefined),
+          });
+        }
+
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
             ...(resolution.action?.setPayload ?? {}),
+            ...(designCheckPacket ? { design_check_packet: designCheckPacket } : {}),
             review_verdict: null,
             review_blockers: null,
             consumed_delegations: consumed,
@@ -4300,7 +6055,9 @@ async function advanceActiveTask(
         if (parsed) {
           verdict = parsed.verdict;
           blockers = parsed.blockers;
-          if (parsed.target === "design") target = "design";
+          if (parsed.target === "design" || parsed.target === "code") {
+            target = parsed.target;
+          }
         } else {
           const lastNudge = typeof payload.last_nudge_at === "number" ? payload.last_nudge_at : 0;
           const nudgeCount = typeof payload.nudge_count === "number" ? payload.nudge_count : 0;

@@ -1164,34 +1164,36 @@ test("§2.3 --preset: held group of a same-provider+model route refuses it", asy
   );
 });
 
-test("§2.3 --preset: a legacy-spelled held group (review-argon) refuses a web-gemini one-off", async () => {
-  // A route_holds row written before the rename keeps the old spelling;
-  // the one-off's canonical groups must match it through
-  // canonicalQuotaGroup, not just raw names.
+test("§2.3 --preset: a legacy-spelled held group refuses an aliased one-off", async () => {
+  // A route_holds row written under the old group name keeps the old
+  // spelling; the one-off's canonical groups must match it through
+  // `quotaGroupAliases` → canonicalQuotaGroup, not just raw names.
   const policy = JSON.parse(POLICY_TEXT);
-  policy.routes["review-web-gemini"] = {
-    preset: "web-gemini-review",
-    provider: "acp-web-gemini",
+  policy.quotaGroupAliases = { "tab-old": "tab-b" };
+  policy.routes["review-b"] = {
+    preset: "preset-b",
+    provider: "prov-x",
+    quotaGroup: "tab-b",
   };
   const { deps } = makeDeps({
     policyText: JSON.stringify(policy),
-    held: [["review-argon", Date.now() + 60_000]],
+    held: [["tab-old", Date.now() + 60_000]],
     cli: (args) => {
       const key = args.join(" ");
       if (key.startsWith("tasks preset show"))
         return ok(
           JSON.stringify({
-            preset: { providerId: "acp-web-gemini", modelId: "m1" },
+            preset: { providerId: "prov-x", modelId: "m1" },
           }),
         );
       if (key.startsWith("tasks preset list"))
         return ok(
           JSON.stringify({
             presets: [
-              { name: "one-off", providerId: "acp-web-gemini", modelId: "m1" },
+              { name: "one-off", providerId: "prov-x", modelId: "m1" },
               {
-                name: "web-gemini-review",
-                providerId: "acp-web-gemini",
+                name: "preset-b",
+                providerId: "prov-x",
                 modelId: "m1",
               },
             ],
@@ -2571,4 +2573,81 @@ test("§22.1 (ревью): раздача обновляет снимок leaks 
     deps,
   );
   assert.deepEqual(seen, [{ repo, projectId: "proj_bb" }]);
+});
+
+test("§34.6 (ADR-0037): architect level enforces noCode: true and records no_code: 1", async () => {
+  const policyWithArchitect = JSON.stringify({
+    version: 1,
+    levels: {
+      architect: { role: "architect", chain: ["arch-route"] },
+      simple: { chain: ["simple"] },
+    },
+    routes: {
+      "arch-route": { preset: "simple", provider: "acp-opencode" },
+      simple: { preset: "simple", provider: "acp-opencode" },
+    },
+  });
+  const { deps, store } = makeDeps({
+    policyText: policyWithArchitect,
+  });
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "architect", caller: COORDINATOR, noCode: false },
+    deps,
+  );
+  assert.equal(res.ok, true);
+  const row = store.get(res.delegationId)!;
+  assert.equal(row.no_code, 1);
+});
+
+test("§34.6 (ADR-0037): design_check appends design_check_packet and applies isReview", async () => {
+  const policy = JSON.stringify({
+    version: 1,
+    levels: {
+      architect: { role: "architect", chain: ["r1", "r2"] },
+    },
+    routes: {
+      r1: { preset: "simple", provider: "p1", model: "m1" },
+      r2: { preset: "simple", provider: "p2", model: "m2" },
+    },
+  });
+  const { deps, store, spawnArgs } = makeDeps({
+    policyText: policy,
+  });
+  store.insertTask({
+    taskKey: "ARCH-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "architect",
+  });
+  store.transitionTask({
+    taskKey: "ARCH-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "design_check",
+    toStatus: "running",
+    actor: "coordinator",
+    reason: "testing design_check",
+    updates: {
+      payload: JSON.stringify({
+        last_executor_route: "r1",
+        last_executor_provider: "p1",
+        last_executor_model: "m1",
+        design_check_packet: "### PACKET CONTENT ###",
+      }),
+    },
+  });
+
+  const res = await runDelegate(
+    { taskKey: "ARCH-1", level: "architect", caller: COORDINATOR, instructions: "Original instructions" },
+    deps,
+  );
+  assert.equal(res.ok, true);
+  // Reviewer ≠ executor -> r2 picked instead of r1
+  assert.equal(res.route, "r2");
+  const row = store.get(res.delegationId)!;
+  assert.equal(row.no_code, 1);
+  const prompt = spawnArgs[0]?.prompt as string;
+  assert.ok(prompt?.includes("### PACKET CONTENT ###"));
+  assert.ok(prompt?.includes("Original instructions"));
 });

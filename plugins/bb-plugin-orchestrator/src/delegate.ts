@@ -26,8 +26,7 @@ import {
 } from "./instructions.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
-  PRESET_ALIASES,
-  ROUTE_ALIASES,
+  DEFAULT_ROUTE_BUSY_WAIT_SECONDS,
   canonicalPresetName,
   canonicalQuotaGroup,
   canonicalRouteName,
@@ -36,18 +35,11 @@ import {
   quotaGroupOf,
   quotaGroupsForOneOff,
   resolvePolicyRoute,
+  routeNameChain,
   type Policy,
   type PolicyLoad,
   type PolicyRoute,
 } from "./policy.js";
-import {
-  DEFAULT_ROUTE_BUSY_WAIT_SECONDS,
-  PacketSkip,
-  parseAttachSpec,
-  wrapPromptWithPacket,
-  type MaskFn,
-  type PacketGit,
-} from "./packet.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
 import {
   isCoordinator,
@@ -85,9 +77,9 @@ export interface DelegateParams {
   fresh?: boolean;
   /** §4.1 r28: mark the delegation «задача без кода» (no commits expected). */
   noCode?: boolean;
-  /** §20.2 (r33): `--attach` — repo-relative paths whose text goes into
-   * the tool-less route's packet; on tool routes only the path list is
-   * passed. */
+  /** §20.1 п.4 (r34.4): `--attach` — repo-relative paths of the task's
+   * key files; the path list rides in the seed prompt and the task
+   * instructions, the files' bytes are never inlined. */
   attach?: string[];
   caller: ThreadFacts;
 }
@@ -103,13 +95,13 @@ export interface DelegateResult {
    * исполнения medium». */
   note?: string;
   /** `cancelled` when the delegation was cancelled while dispatch ran;
-   * `queued` — parked behind a busy `maxActive` route (§20.2). */
+   * `queued` — parked behind a busy `maxActive` route (§20.1 п.5). */
   status: "running" | "cancelled" | "queued";
   setupErrors: SetupError[];
   /** §22.2: «база не проверена: <причина>» when the published-base
    * check did not run for this dispatch. */
   baseUnchecked?: string;
-  /** §20.2: routes skipped by packet rules («пропущен X: причина»). */
+  /** §20.1 п.5: routes skipped in this dispatch («пропущен X: причина»). */
   skipped?: { route: string; reason: string }[];
 }
 
@@ -238,16 +230,11 @@ export interface DelegateDeps {
   now?: () => number;
   /** §2.3 r24: parsed policy for the level→role map; absent = name rule. */
   policy?: () => Policy | null;
-  /** §20.2 (r33): routes the policy load marked unavailable. */
+  /** routes the policy load marked unavailable. */
   unavailableRoutes?: () => ReadonlySet<string>;
-  /** §20.2: the coordinator's repo path for the packet's git reads. */
-  repoPath?: (row: DelegationRow) => Promise<string | null>;
-  /** §20.2: `git -C <repo> …` for the packet (absent → `packet-repo`). */
-  packetGit?: PacketGit;
-  /** §20.2: release scanner masking over the packet text. */
-  packetMask?: MaskFn;
   /** §18.1: human-facing texts — the language catalog. */
   t?: T;
+  log?: { warn?: (msg: string) => void; info?: (msg: string) => void };
 }
 
 /**
@@ -275,34 +262,55 @@ export interface DispatchStepsDeps {
   now?: () => number;
   /** §2.3 r24: parsed policy for the level→role map; absent = name rule. */
   policy?: () => Policy | null;
-  /** §20.2 (r33): routes the policy load marked unavailable — the
-   * tool-less skip/advance step needs the same filter as `pickRoute`. */
+  /** routes the policy load marked unavailable — the skip/advance
+   * step needs the same filter as `pickRoute`. */
   unavailableRoutes?: () => ReadonlySet<string>;
-  /** §20.2: the coordinator's repo path for the packet's git reads. */
-  repoPath?: (row: DelegationRow) => Promise<string | null>;
-  /** §20.2: `git -C <repo> …` for the packet (absent → `packet-repo`). */
-  packetGit?: PacketGit;
-  /** §20.2: release scanner masking over the packet text. */
-  packetMask?: MaskFn;
   t?: T;
 }
 
 export interface DispatchStepsResult {
   threadId: string | null;
   /** `cancelled` when the delegation was cancelled while dispatch ran;
-   * `queued` — parked behind a busy `maxActive` route (§20.2). */
+   * `queued` — parked behind a busy `maxActive` route (§20.1 п.5). */
   status: "running" | "cancelled" | "queued";
   setupErrors: SetupError[];
   /** §22.2: the published-base check did not run — the localized
    * «база не проверена: <причина>» line for the delegate response. */
   baseUnchecked?: string;
-  /** §20.2: routes skipped by packet rules («пропущен X: причина»). */
+  /** §20.1 п.5: routes skipped in this dispatch («пропущен X: причина»). */
   skipped?: { route: string; reason: string }[];
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-export { PRESET_ALIASES, canonicalPresetName };
+export { canonicalPresetName };
+
+/** §20.1 п.4: the `attach` column's JSON spec — the `--attach` path
+ * list and the explicit `--from` ref, inherited by reissues. */
+interface AttachSpec {
+  paths: string[];
+  from: string | null;
+}
+
+const EMPTY_SPEC: AttachSpec = { paths: [], from: null };
+
+function parseAttachSpec(attach: string | null | undefined): AttachSpec {
+  if (!attach) return EMPTY_SPEC;
+  try {
+    const parsed = JSON.parse(attach) as {
+      paths?: unknown;
+      from?: unknown;
+    };
+    return {
+      paths: Array.isArray(parsed?.paths)
+        ? parsed.paths.filter((p): p is string => typeof p === "string")
+        : [],
+      from: typeof parsed?.from === "string" ? parsed.from : null,
+    };
+  } catch {
+    return EMPTY_SPEC;
+  }
+}
 
 /** orchestrator-release §2 r10 п.4: the release-auditor thread is
  * parent-muted BY CONTRACT — `off` is its expected mode, `auto` every
@@ -429,37 +437,6 @@ export async function runDelegate(
     );
   }
 
-  // §20.3/§21.3 (r33): a tool-less route's preset — or an explicit
-  // `--route` naming a `tools: false` route — is dispatchable only on
-  // auditor/researcher levels; anywhere else → `preset-not-allowed`.
-  const levelRoleNow = roleForLevel(level, policy);
-  if (
-    levelRoleNow !== "auditor" &&
-    levelRoleNow !== "researcher"
-  ) {
-    const toollessHit = params.preset
-      ? Object.entries(policy.routes).find(
-          ([, r]) =>
-            (r.preset === params.preset ||
-              (PRESET_ALIASES[params.preset!] &&
-                r.preset === PRESET_ALIASES[params.preset!])) &&
-            r.tools === false,
-        )
-      : params.route !== undefined &&
-          findRoute(policy, params.route)?.tools === false
-        ? ([params.route, findRoute(policy, params.route)!] as const)
-        : undefined;
-    if (toollessHit) {
-      throw new OrchestratorError(
-        "preset-not-allowed",
-        t("del.presetNotAllowed", {
-          preset: params.preset ?? params.route ?? "",
-          level,
-        }),
-      );
-    }
-  }
-
   // §6: `--from` picks the continuation point, `--fresh` drops it — never
   // both; the silent precedence hid caller mistakes (PLUG-176). The check
   // precedes the limits so a mis-flagged call fails on its own error even
@@ -472,8 +449,8 @@ export async function runDelegate(
     );
   }
 
-  // §20.2: `--attach` paths are repo-relative — no absolute paths, no
-  // `..`, no NUL; they are read from the link commit, not the worktree.
+  // §20.1 п.4: `--attach` paths are repo-relative — no absolute paths,
+  // no `..`, no NUL.
   for (const path of params.attach ?? []) {
     if (
       !path ||
@@ -490,8 +467,11 @@ export async function runDelegate(
   }
 
   const held = store.heldGroups(Date.now());
+  const role = roleForLevel(level, policy);
+  const taskRow = store.getTask?.(taskKey);
   let routeName: string;
   let route: PolicyRoute;
+  let reviewerWarning: string | undefined;
   if (params.preset) {
     // §17.3 (мелко 3): even outside the policy routes the LEVEL still
     // comes from the policy — an undeclared level is a refusal, as
@@ -539,10 +519,10 @@ export async function runDelegate(
       presetModels,
     );
     const canonHeld = new Set(
-      [...held].map((h) => canonicalQuotaGroup(h)),
+      [...held].map((h) => canonicalQuotaGroup(h, policy)),
     );
     const blocked = groups.find(
-      (g) => held.has(g) || canonHeld.has(canonicalQuotaGroup(g)),
+      (g) => held.has(g) || canonHeld.has(canonicalQuotaGroup(g, policy)),
     );
     if (blocked) {
       throw new OrchestratorError(
@@ -553,13 +533,63 @@ export async function runDelegate(
     }
     route = { preset: params.preset, provider };
   } else {
+    // §34.1 / §34.6: reviewer ≠ executor applies to auditors and architects on design_check
+    const isReview =
+      role === "auditor" ||
+      (role === "architect" && taskRow?.node === "design_check");
+    let lastExecRoute: string | undefined;
+    let lastExecProvider: string | undefined;
+    let lastExecModel: string | undefined;
+    if (isReview) {
+      const pastExec = store
+        .delegationsByTask(taskKey)
+        .filter(
+          (r) => roleForLevel(r.level, policy) === "executor" && r.status === "done",
+        )
+        .at(-1);
+      if (pastExec) {
+        lastExecRoute = pastExec.route;
+        lastExecProvider = pastExec.provider;
+        lastExecModel = policy.routes[pastExec.route]?.model;
+      }
+      if (taskRow?.payload) {
+        try {
+          const p = JSON.parse(taskRow.payload);
+          if (taskRow.node === "spec_review") {
+            // For spec_review, take into account both the spec executor and the design architect
+            lastExecRoute = p.last_executor_route ?? p.design_architect_route ?? lastExecRoute;
+            lastExecProvider = p.last_executor_provider ?? p.design_architect_provider ?? lastExecProvider;
+            lastExecModel = p.last_executor_model ?? p.design_architect_model ?? lastExecModel;
+          } else {
+            if (p.last_executor_route) lastExecRoute = p.last_executor_route;
+            if (p.last_executor_provider) lastExecProvider = p.last_executor_provider;
+            if (p.last_executor_model) lastExecModel = p.last_executor_model;
+          }
+          if (lastExecRoute && !lastExecModel && policy.routes[lastExecRoute]?.model) {
+            lastExecModel = policy.routes[lastExecRoute]?.model;
+          }
+        } catch {}
+      }
+    }
     const picked = pickRoute(policy, level, {
       requested: params.route,
       unavailableRoutes: new Set(load.unavailableRoutes),
       heldGroups: held,
+      skipSameModelAsExecutor: isReview,
+      lastExecutorRoute: lastExecRoute,
+      lastExecutorProvider: lastExecProvider,
+      lastExecutorModel: lastExecModel,
     });
     routeName = picked.name;
     route = picked.route;
+    reviewerWarning = picked.warning;
+    if (picked.warning) {
+      if (deps.log?.warn) {
+        deps.log.warn(`[orchestrator] ${picked.warning}`);
+      } else {
+        console.warn(`[orchestrator] ${picked.warning}`);
+      }
+    }
   }
 
   // Limits (§4 step 1) — over the limit is a refusal, not a queue (§10).
@@ -620,6 +650,13 @@ export async function runDelegate(
           : undefined,
       )) ?? null);
 
+  // §34.6 (ADR-0037): Read-only environment on design and design_check for architect
+  const isArchitectNode =
+    role === "architect" ||
+    taskRow?.node === "design" ||
+    taskRow?.node === "design_check";
+  const effectiveNoCode = isArchitectNode ? true : (params.noCode ?? false);
+
   // Step 2 — the unique index makes this atomic across processes.
   let row;
   try {
@@ -634,9 +671,9 @@ export async function runDelegate(
       round,
       continueFrom,
       explicitRoute: params.route !== undefined || params.preset !== undefined,
-      noCode: params.noCode,
-      // §20.2: the packet spec survives onto the row — a reissue onto a
-      // tool-less route rebuilds the same material.
+      noCode: effectiveNoCode,
+      // §20.1 п.4: the attach spec survives onto the row — a reissue
+      // lists the same `--attach` paths in the seed prompt.
       attach:
         params.attach?.length || params.from
           ? JSON.stringify({
@@ -659,6 +696,23 @@ export async function runDelegate(
     throw e;
   }
 
+  let instructions = reviewerWarning
+    ? (params.instructions
+        ? `${reviewerWarning}\n\n${params.instructions}`
+        : reviewerWarning)
+    : params.instructions;
+  // §34.6: Attach standardized design_check packet if present in task payload
+  if (taskRow?.node === "design_check" && taskRow?.payload) {
+    try {
+      const pl = JSON.parse(taskRow.payload);
+      if (typeof pl.design_check_packet === "string" && pl.design_check_packet) {
+        instructions = instructions
+          ? `${instructions}\n\n${pl.design_check_packet}`
+          : pl.design_check_packet;
+      }
+    } catch {}
+  }
+
   // Steps 3–7 — shared with the watchdog's reissue (§5.4): the same
   // function dispatches, attaches, finalizes and reports.
   let res: DispatchStepsResult;
@@ -666,7 +720,7 @@ export async function runDelegate(
     res = await dispatchToRoute(
       row,
       {
-        instructions: params.instructions,
+        instructions,
         levelNote,
         // §17.2 (PLUG-211 С4): a manual delegate owns the refusal comment.
         commentOnRefusal: true,
@@ -764,25 +818,21 @@ interface DispatchOpts {
    * resolved to) — a LOCAL target branch with unpublished commits
    * refuses `from-unpublished` before the spawn. */
   from?: string;
-  /** §20.2 (r33): the effective tool-less role for this row — set by
-   * `dispatchToRoute` for the packet wrap inside the dispatch paths. */
-  toolless?: "auditor" | "researcher" | "architect";
-  /** §20.2: the «маршрут занят» gate — evaluated INSIDE the dispatch
-   * path after the packet is built, so attach refusals and packet
-   * skips land before the row ever parks. "queued" while the wait
-   * holds, "busy-expired" past `routeBusyWaitSeconds`, null on a free
-   * slot. */
+  /** §20.1 п.5: the «маршрут занят» gate — evaluated INSIDE the
+   * dispatch path so dispatch refusals land before the row ever
+   * parks. "queued" while the wait holds, "busy-expired" past
+   * `routeBusyWaitSeconds`, null on a free slot. */
   busyGate?: () => Promise<"queued" | "busy-expired" | null>;
-  /** §20.2: routes already skipped by packet rules in this dispatch. */
+  /** §20.1 п.5: routes already skipped in this dispatch. */
   _skipped?: { route: string; reason: string }[];
 }
 
 /**
- * §20.2: the quota groups a delegation occupies for the `maxActive`
- * busy count — a policy route's own `quotaGroup`; a `preset:` one-off
- * shares the groups of every policy route on its provider (same idea
- * as `quotaGroupsForOneOff`, minus the model lookup the busy check
- * cannot afford per pass).
+ * §20.1 п.5: the quota groups a delegation occupies for the
+ * `maxActive` busy count — a policy route's own `quotaGroup`; a
+ * `preset:` one-off shares the groups of every policy route on its
+ * provider (same idea as `quotaGroupsForOneOff`, minus the model
+ * lookup the busy check cannot afford per pass).
  */
 export function quotaGroupsOfRow(
   row: DelegationRow,
@@ -791,20 +841,24 @@ export function quotaGroupsOfRow(
   if (!row.route.startsWith("preset:")) {
     const route = findRoute(policy, row.route);
     return new Set([
-      canonicalQuotaGroup(route ? quotaGroupOf(route, row.route) : row.route),
+      canonicalQuotaGroup(
+        route ? quotaGroupOf(route, row.route, policy) : row.route,
+        policy,
+      ),
     ]);
   }
-  const canon = canonicalQuotaGroup(row.route);
+  const canon = canonicalQuotaGroup(row.route, policy);
   const groups = new Set([canon]);
   if (canon.startsWith("preset:")) {
     const p = canon.slice("preset:".length);
-    const alias = PRESET_ALIASES[p];
-    if (alias) groups.add(`preset:${alias}`);
+    for (const n of routeNameChain(p, policy?.presetAliases).slice(1)) {
+      groups.add(`preset:${n}`);
+    }
   }
   if (policy) {
     for (const [name, route] of Object.entries(policy.routes)) {
       if (route.provider === row.provider) {
-        groups.add(quotaGroupOf(route, name));
+        groups.add(quotaGroupOf(route, name, policy));
       }
     }
   }
@@ -825,38 +879,10 @@ export async function dispatchToRoute(
     ? undefined
     : findRoute(policy, row.route);
 
-  // §20.1/§20.3 (r33): a `tools: false` route — or a `preset:` one-off
-  // of an audit/research level naming such a route's preset — gets the
-  // material packet instead of repo access. The flag is valid only
-  // under auditor/researcher levels (policy validation gates the
-  // chains; an explicit --route reaching a wrong level is refused here
-  // like a bad --preset).
-  const toolless =
-    policyRoute?.tools === false ||
-    (row.route.startsWith("preset:") &&
-      (role === "auditor" || role === "researcher" || role === "architect") &&
-      Object.values(policy?.routes ?? {}).some(
-        (r) =>
-          r.tools === false &&
-          (r.preset === row.preset ||
-            (PRESET_ALIASES[row.preset] !== undefined &&
-              r.preset === PRESET_ALIASES[row.preset])),
-      ));
-  if (toolless && role !== "auditor" && role !== "researcher" && role !== "architect") {
-    await refuseDispatch(
-      row,
-      opts,
-      deps,
-      `preset-not-allowed: route "${row.route}" is a tool-less route ` +
-        `outside auditor/researcher/architect levels`,
-      "preset-not-allowed",
-    );
-  }
-
   /**
-   * §20.2: hand this `dispatching` row to the next usable chain route
-   * (packet skip, busy-wait expired). Returns the follow-up dispatch
-   * result, or null when the chain is exhausted.
+   * §20.1 п.5: hand this `dispatching` row to the next usable chain
+   * route (busy-wait expired). Returns the follow-up dispatch result,
+   * or null when the chain is exhausted.
    */
   const advanceRoute = async (
     reason: string,
@@ -864,12 +890,13 @@ export async function dispatchToRoute(
     const level = policy?.levels[row.level];
     if (!policy || !level) return null;
     const held = store.heldGroups(now());
-    const canonHeld = new Set([...held].map((h) => canonicalQuotaGroup(h)));
+    const canonHeld = new Set(
+      [...held].map((h) => canonicalQuotaGroup(h, policy)),
+    );
     const unavailable = deps.unavailableRoutes?.() ?? new Set<string>();
     const matchRoute = (a: string, b: string) =>
       a === b ||
-      canonicalRouteName(a) === canonicalRouteName(b) ||
-      ROUTE_ALIASES[a] === b;
+      canonicalRouteName(a, policy) === canonicalRouteName(b, policy);
     const idx = level.chain.findIndex((c) => matchRoute(c, row.route));
     // The route just burned and every route this dispatch already
     // skipped are out — an explicit --route/--preset inside the chain
@@ -878,27 +905,21 @@ export async function dispatchToRoute(
     // restart recursed dispatchToRoute → advanceRoute forever).
     const skipped = new Set((opts._skipped ?? []).map((s) => s.route));
     skipped.add(row.route);
+    const namesOf = (name: string) =>
+      routeNameChain(name, policy.routeAliases);
     const isSkipped = (name: string) =>
-      skipped.has(name) ||
-      (ROUTE_ALIASES[name] !== undefined && skipped.has(ROUTE_ALIASES[name])) ||
-      skipped.has(canonicalRouteName(name));
+      namesOf(name).some((n) => skipped.has(n));
     const isUnavailable = (name: string) =>
-      unavailable.has(name) ||
-      (ROUTE_ALIASES[name] !== undefined && unavailable.has(ROUTE_ALIASES[name])) ||
-      unavailable.has(canonicalRouteName(name));
+      namesOf(name).some((n) => unavailable.has(n));
     const candidates =
       idx === -1 ? level.chain : level.chain.slice(idx + 1);
     for (const name of candidates) {
       if (isSkipped(name) || isUnavailable(name)) continue;
       const next = findRoute(policy, name);
       if (!next) continue;
-      const alias = ROUTE_ALIASES[name];
-      const canon = canonicalRouteName(name);
-      const qg = quotaGroupOf(next, name);
+      const qg = quotaGroupOf(next, name, policy);
       if (
-        held.has(name) ||
-        (alias && held.has(alias)) ||
-        held.has(canon) ||
+        namesOf(name).some((n) => held.has(n)) ||
         held.has(qg) ||
         canonHeld.has(qg)
       ) {
@@ -922,32 +943,28 @@ export async function dispatchToRoute(
     return null;
   };
 
-  // §20.2 «маршрут занят»: a tool-less route with `maxActive` parks the
-  // row `dispatching` under `queued_at` instead of falling to the next
-  // (paid) route at once; `routeBusyWaitSeconds` out → the next route.
-  // The gate runs INSIDE the dispatch path (after the packet is built):
-  // an attach refusal or a packet skip lands at once instead of
-  // parking the row behind a route it would never reach.
-  const toollessRoute = toolless ? policyRoute : undefined;
-  const routeCap = toollessRoute?.maxActive;
+  // §20.1 п.5 «маршрут занят»: a route with `maxActive` parks the row
+  // `dispatching` under `queued_at` instead of falling to the next
+  // route at once; `routeBusyWaitSeconds` out → the next route. The
+  // gate runs INSIDE the dispatch path so a refusal lands at once
+  // instead of parking the row behind a route it would never reach.
+  const routeCap = policyRoute?.maxActive;
   const busyGate =
-    toollessRoute !== undefined && routeCap !== undefined
+    policyRoute !== undefined && routeCap !== undefined
       ? async (): Promise<"queued" | "busy-expired" | null> => {
-          const group = quotaGroupOf(toollessRoute, row.route);
-          // A freed slot goes to the first parked row («освободился →
-          // ушло на review-argon»): rows ahead of this one are the
-          // dispatched ones (no queued_at) plus the claims parked
-          // earlier — a newcomer queues behind every parked row, a
-          // parked row only behind older claims. Helpers on the same
-          // quotaGroup occupy a slot like a running row (§21.4: the
-          // argon tab is shared).
-          // r33 ревью 2: a row's queue rank — a dispatched row (-1) is
-          // ahead of everyone; a parked claim keeps its queued_at
-          // position; a row still building its packet (dispatching, no
-          // thread, no queued_at) ranks LAST so it neither occupies a
-          // slot it never claimed nor blocks parked rows. Two parallel
-          // builders tie on MAX and the lower id wins — the later one
-          // queues instead of BOTH parking behind a phantom.
+          const group = quotaGroupOf(policyRoute, row.route, policy);
+          // A freed slot goes to the first parked row: rows ahead of
+          // this one are the dispatched ones (no queued_at) plus the
+          // claims parked earlier — a newcomer queues behind every
+          // parked row, a parked row only behind older claims. Helpers
+          // on the same quotaGroup occupy a slot like a running row.
+          // A row's queue rank — a dispatched row (-1) is ahead of
+          // everyone; a parked claim keeps its queued_at position; a
+          // row still dispatching (no thread, no queued_at) ranks LAST
+          // so it neither occupies a slot it never claimed nor blocks
+          // parked rows. Two parallel dispatchers tie on MAX and the
+          // lower id wins — the later one queues instead of BOTH
+          // parking behind a phantom.
           const rank = (x: DelegationRow) =>
             x.thread_id !== null
               ? -1
@@ -969,8 +986,9 @@ export async function dispatchToRoute(
                 if (h.route === null) return false;
                 const hr = findRoute(policy, h.route);
                 return (
-                  (hr ? quotaGroupOf(hr, h.route) : canonicalQuotaGroup(h.route)) ===
-                  group
+                  (hr
+                    ? quotaGroupOf(hr, h.route, policy)
+                    : canonicalQuotaGroup(h.route, policy)) === group
                 );
               }).length;
           if (busy >= routeCap) {
@@ -979,17 +997,16 @@ export async function dispatchToRoute(
               return "queued";
             }
             const waitMs =
-              (toollessRoute.routeBusyWaitSeconds ??
+              (policyRoute.routeBusyWaitSeconds ??
                 DEFAULT_ROUTE_BUSY_WAIT_SECONDS) * 1000;
             if (now() - row.queued_at < waitMs) return "queued";
             return "busy-expired";
           }
-          // A free slot (or a first dispatch). The queue mark is NOT
-          // cleared here: a parked row that passed the gate keeps its
-          // claim while the spawn is in flight — `setThreadInfo` drops
-          // `queued_at` atomically with the thread_id write (r33
-          // ревью 2: clearing early left a window where the row held
-          // no slot at all).
+          // A free slot (or a first dispatch). The row keeps its
+          // `queued_at` claim through this gate; the spawn path below
+          // resets it right before spawning (`setQueuedAt(null)`) so a
+          // later `dispatch-unknown` lands in the §7 reconcile, not
+          // back in the queue-retry branch.
           return null;
         }
       : undefined;
@@ -1008,10 +1025,11 @@ export async function dispatchToRoute(
       ? store.resultRefForSha(row.task_key, row.continue_from)
       : null;
   const spec = parseAttachSpec(row.attach);
-  const attachLine =
-    !toolless && spec.paths.length
-      ? t("instr.attachList", { list: spec.paths.join(", ") })
-      : undefined;
+  // §20.1 п.4: the `--attach` paths ride in the instructions as a
+  // list — the agent opens them in its own working copy.
+  const attachLine = spec.paths.length
+    ? t("instr.attachList", { list: spec.paths.join(", ") })
+    : undefined;
   const extra =
     [opts.instructions?.trim(), attachLine?.trim()]
       .filter(Boolean)
@@ -1039,7 +1057,6 @@ export async function dispatchToRoute(
   );
   const innerOpts: DispatchOpts = {
     ...opts,
-    toolless: toolless ? (role as "auditor" | "researcher" | "architect") : undefined,
     busyGate,
   };
   // §4 r30: the plugin spawns the executor itself — the parent,
@@ -1062,21 +1079,8 @@ export async function dispatchToRoute(
         opts,
         deps,
         (deps.t ?? T_RU)("del.routeBusyExhausted", { route: row.route }),
+        "route-busy-timeout",
       );
-    }
-    if (e instanceof PacketSkip) {
-      const advanced = await advanceRoute(e.reason);
-      if (advanced) return advanced;
-      // Chain exhausted — the refusal keeps the skip's own code
-      // (§20.2 names packet-empty/packet-too-large verbatim), not the
-      // generic dispatch-failed.
-      await refuseDispatch(row, opts, deps, e.reason, e.reason);
-    }
-    if (
-      e instanceof OrchestratorError &&
-      /^(attach|packet)-/.test(e.code)
-    ) {
-      await refuseDispatch(row, opts, deps, e.message, e.code);
     }
     if (!(e instanceof SpawnSchemaRefusal)) throw e;
     const t = deps.t ?? T_RU;
@@ -1085,25 +1089,13 @@ export async function dispatchToRoute(
       "own-spawn",
       t("del.ownSpawnUnavailable", { error: message(e) }),
     );
-    if (innerOpts.toolless) {
-      // §20.2 п.4 (аудит C): the `bb tasks dispatch` fallback builds
-      // the seed itself — task text first, `--instructions` after — so
-      // the packet's header could never lead the first prompt. A
-      // tool-less route that the own-spawn path can't serve advances
-      // to the next chain route instead of shipping a malformed
-      // packet.
-      const advanced = await advanceRoute("own-spawn-refused");
-      if (advanced) return advanced;
-      await refuseDispatch(row, opts, deps, message(e));
-    }
     try {
       const res = await dispatchViaTasksCli(row, instructions, innerOpts, deps);
       if (opts._skipped?.length) res.skipped = opts._skipped;
       return res;
     } catch (e2) {
       // The fallback path surfaces the same outcomes as the primary
-      // one — a burned route advances, a skip keeps its code (r33
-      // ревью 2).
+      // one — a burned route advances (r33 ревью 2).
       if (e2 instanceof RouteBusyExpired) {
         const advanced = await advanceRoute("route-busy");
         if (advanced) return advanced;
@@ -1112,26 +1104,16 @@ export async function dispatchToRoute(
           opts,
           deps,
           t("del.routeBusyExhausted", { route: row.route }),
+          "route-busy-timeout",
         );
-      }
-      if (e2 instanceof PacketSkip) {
-        const advanced = await advanceRoute(e2.reason);
-        if (advanced) return advanced;
-        await refuseDispatch(row, opts, deps, e2.reason, e2.reason);
-      }
-      if (
-        e2 instanceof OrchestratorError &&
-        /^(attach|packet)-/.test(e2.code)
-      ) {
-        await refuseDispatch(row, opts, deps, e2.message, e2.code);
       }
       throw e2;
     }
   }
 }
 
-/** §20.2: the parked wait ran out inside the dispatch path — the row
- * moves to the next chain route (`dispatchToRoute` handles it). */
+/** §20.1 п.5: the parked wait ran out inside the dispatch path — the
+ * row moves to the next chain route (`dispatchToRoute` handles it). */
 class RouteBusyExpired extends Error {
   constructor() {
     super("route-busy");
@@ -1332,9 +1314,7 @@ export function buildSeedPrompt(input: {
 }
 
 /** The «Preset instructions»/«Additional instructions» sections of the
- * seed prompt — for a `tools: false` packet they ride AFTER the
- * material (§20.2 п.4: шапка → задача → --stat → файлы → дифф →
- * инструкции), so they are built apart from `buildSeedPrompt`. */
+ * seed prompt. */
 function instructionSections(
   presetInstructions?: string,
   extraInstructions?: string,
@@ -1355,8 +1335,8 @@ function instructionSections(
  * attempt: the refusal comment (caller-initiated only), then remove the
  * record (`onDispatchFailure: remove`, §4 п.3) or mark it `failed`
  * (`fail` — the §5.4 reissue rows must never silently vanish) and throw
- * `dispatch-failed` — or the caller's own code (`attach-*`, `packet-*`,
- * `preset-not-allowed`): §20.2 names those refusal codes verbatim. */
+ * `dispatch-failed` — or the caller's own code (`route-busy-timeout`,
+ * `preset-not-allowed`). */
 async function refuseDispatch(
   row: DelegationRow,
   opts: DispatchOpts,
@@ -1554,60 +1534,28 @@ async function dispatchViaSpawn(
     }
   }
 
-  // (б) The BB seed prompt and the `KEY · title` width-120 title. A
-  // tool-less route takes the seed WITHOUT the instruction sections —
-  // §20.2 п.4 puts them after the material («инструкции пресета/доп.»),
-  // so they ride the packet's `trailing` slot instead.
+  // (б) The BB seed prompt and the `KEY · title` width-120 title.
   const title = delegatedThreadTitle(task!.key!, task!.title!);
-  let prompt = buildSeedPrompt({
+  const prompt = buildSeedPrompt({
     task: { key: task!.key!, title: task!.title!, description: task!.description },
     project: shown.project ?? {},
     subtasks: shown.subtasks ?? [],
     attachments: shown.attachments ?? [],
     recentComments: (shown.comments ?? []).slice(-5),
-    presetInstructions: opts.toolless ? undefined : p!.instructions,
-    extraInstructions: opts.toolless ? undefined : instructions,
+    presetInstructions: p!.instructions,
+    extraInstructions: instructions,
   });
-  // §20.2/§21.3: a tool-less route gets the material packet — header,
-  // task, --stat, attached files, diff, instructions — wrapped around
-  // the seed. `PacketSkip` and the `attach-*`/`packet-*` refusals
-  // bubble to `dispatchToRoute` (skip → next route, refusal →
-  // drop/fail).
-  if (opts.toolless) {
-    const policyRoute = row.route.startsWith("preset:")
-      ? undefined
-      : findRoute(deps.policy?.(), row.route);
-    prompt = (
-      await wrapPromptWithPacket({
-        role: opts.toolless,
-        prompt,
-        trailing:
-          instructionSections(p!.instructions, instructions).join(
-            "\n\n",
-          ) || undefined,
-        spec: parseAttachSpec(row.attach),
-        continueFrom: row.continue_from,
-        baseBranch: p!.baseBranch,
-        maxPromptBytes: policyRoute?.maxPromptBytes,
-        repoPath: (await deps.repoPath?.(row)) ?? null,
-        git: deps.packetGit,
-        mask: deps.packetMask,
-        projectId: row.project_id,
-        t,
-      })
-    ).prompt;
-  }
 
-  // §20.2 «маршрут занят»: the busy gate sits AFTER the packet — an
-  // attach refusal or a packet skip lands at once instead of parking
-  // the row behind a route it would never reach.
+  // §20.1 п.5 «маршрут занят»: the busy gate sits before the spawn —
+  // a refusal lands at once instead of parking the row behind a route
+  // it would never reach.
   const gate = await opts.busyGate?.();
   if (gate === "queued") {
     return { threadId: null, status: "queued", setupErrors: [] };
   }
   if (gate === "busy-expired") throw new RouteBusyExpired();
 
-  // §20.2 (аудит C): past the gate the row gives its queue claim back —
+  // §20.1 п.5: past the gate the row gives its queue claim back —
   // `queued_at` resets BEFORE the spawn. A `dispatch-unknown` after
   // this point must land in the §7 reconcile (postDispatchGrace + the
   // `delegationId` label search), not in the queue-retry branch, which
@@ -1709,16 +1657,15 @@ async function dispatchViaTasksCli(
   const { store, bbCli } = deps;
   const cliInstructions = instructions;
 
-  // §20.2 «маршрут занят»: the fallback honors the same busy gate —
-  // after the packet, before the dispatch (r33 ревью 2: a schema
-  // refusal on a busy tool-less route must queue/advance exactly like
-  // the primary path).
+  // §20.1 п.5 «маршрут занят»: the fallback honors the same busy gate
+  // (r33 ревью 2: a schema refusal on a busy route must queue/advance
+  // exactly like the primary path).
   const gate = await opts.busyGate?.();
   if (gate === "queued") {
     return { threadId: null, status: "queued", setupErrors: [] };
   }
   if (gate === "busy-expired") throw new RouteBusyExpired();
-  // §20.2 (аудит C): same release as the spawn path — a dispatch
+  // §20.1 п.5: same release as the spawn path — a dispatch
   // timeout/unknown below goes to the §7 reconcile, not back to the
   // queue-retry branch.
   if (row.queued_at != null) store.setQueuedAt(row.id, null);

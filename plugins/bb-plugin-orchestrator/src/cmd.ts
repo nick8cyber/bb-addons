@@ -15,6 +15,8 @@ export interface CmdRunOptions {
   env?: NodeJS.ProcessEnv;
   /** Fed to the child's stdin (closed afterwards). */
   stdin?: string;
+  /** §34.3: Clean environment — only variables in `env` are passed to child. */
+  cleanEnv?: boolean;
 }
 
 export interface CmdRunner {
@@ -69,12 +71,17 @@ export function createCmd(): CmdRunner {
           {
             cwd: opts?.cwd,
             env:
-              basename(file) === "git"
-                ? { ...envWithoutGit(), ...opts?.env }
-                : opts?.env
-                  ? { ...process.env, ...opts.env }
-                  : undefined,
+              opts?.cleanEnv
+                ? opts?.env
+                  ? { ...opts.env }
+                  : {}
+                : basename(file) === "git"
+                  ? { ...envWithoutGit(), ...opts?.env }
+                  : opts?.env
+                    ? { ...process.env, ...opts.env }
+                    : undefined,
             timeout: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+            killSignal: "SIGKILL",
             maxBuffer: MAX_BUFFER,
           },
           (error, stdout, stderr) => {
