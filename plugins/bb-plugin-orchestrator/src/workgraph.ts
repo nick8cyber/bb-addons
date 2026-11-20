@@ -2100,6 +2100,7 @@ export const FLAGS_WITH_VALUES = new Set([
   "-j",
   "-p",
   "-c",
+  "-o",
   "--config",
   "--test-concurrency",
   "--timeout",
@@ -2117,7 +2118,106 @@ export const FLAGS_WITH_VALUES = new Set([
   "--testPathPattern",
   "-g",
   "--grep",
+  "--tb",
+  "--features",
+  "--package",
+  "--bin",
+  "--example",
+  "--bench",
+  "--profile",
+  "--override-ini",
 ]);
+
+export function splitRunnerPrefix(parts: string[]): {
+  binary: string;
+  prefixArgs: string[];
+  restArgs: string[];
+} {
+  if (parts.length === 0) {
+    return { binary: "", prefixArgs: [], restArgs: [] };
+  }
+
+  // npm commands: npm test, npm run test, npm run test:*
+  if (parts[0] === "npm") {
+    const ddIdx = parts.indexOf("--");
+    if (ddIdx !== -1) {
+      return {
+        binary: "npm",
+        prefixArgs: parts.slice(1, ddIdx + 1),
+        restArgs: parts.slice(ddIdx + 1),
+      };
+    }
+    if (parts[1] === "run") {
+      return {
+        binary: "npm",
+        prefixArgs: parts.slice(1, 3),
+        restArgs: parts.slice(3),
+      };
+    }
+    if (parts[1] === "test") {
+      return {
+        binary: "npm",
+        prefixArgs: ["test"],
+        restArgs: parts.slice(2),
+      };
+    }
+  }
+
+  // cargo test
+  if (parts[0] === "cargo" && parts[1] === "test") {
+    return {
+      binary: "cargo",
+      prefixArgs: ["test"],
+      restArgs: parts.slice(2),
+    };
+  }
+
+  // go test
+  if (parts[0] === "go" && parts[1] === "test") {
+    return {
+      binary: "go",
+      prefixArgs: ["test"],
+      restArgs: parts.slice(2),
+    };
+  }
+
+  // node --test
+  if (parts[0] === "node" && parts[1] === "--test") {
+    return {
+      binary: "node",
+      prefixArgs: ["--test"],
+      restArgs: parts.slice(2),
+    };
+  }
+
+  // python / python3 -m pytest
+  if (
+    (parts[0] === "python" || parts[0] === "python3") &&
+    parts[1] === "-m" &&
+    parts[2] === "pytest"
+  ) {
+    return {
+      binary: parts[0],
+      prefixArgs: ["-m", "pytest"],
+      restArgs: parts.slice(3),
+    };
+  }
+
+  // pytest
+  if (parts[0] === "pytest") {
+    return {
+      binary: "pytest",
+      prefixArgs: [],
+      restArgs: parts.slice(1),
+    };
+  }
+
+  return {
+    binary: parts[0],
+    prefixArgs: [],
+    restArgs: parts.slice(1),
+  };
+}
 
 export function reorderFlagsBeforeFiles(tokens: string[]): string[] {
   const flags: string[] = [];
@@ -2259,17 +2359,9 @@ export function validateCheckCommand(
     };
   }
 
-  const binary = parts[0]!;
-  const rawArgs = parts.slice(1);
-  let args = rawArgs;
-  if (rawArgs.includes("--")) {
-    const ddIdx = rawArgs.indexOf("--");
-    const before = rawArgs.slice(0, ddIdx + 1);
-    const after = reorderFlagsBeforeFiles(rawArgs.slice(ddIdx + 1));
-    args = [...before, ...after];
-  } else {
-    args = reorderFlagsBeforeFiles(rawArgs);
-  }
+  const { binary, prefixArgs, restArgs } = splitRunnerPrefix(parts);
+  const reordered = reorderFlagsBeforeFiles(restArgs);
+  const args = [...prefixArgs, ...reordered];
   return { valid: true, binary, args };
 }
 
@@ -2379,6 +2471,7 @@ export async function executeChecks(
   // §31.3 / §34.5 (Reviewer Б1-в-1): Machine checks on code phase must run in an isolated worktree on result_sha
   const targetSha =
     (typeof payloadObj.result_sha === "string" ? payloadObj.result_sha : null) ||
+    (typeof (task as any).result_sha === "string" ? (task as any).result_sha : null) ||
     (task.branch ? `refs/heads/${task.branch}` : null);
 
   let tmpWorktree: string | null = null;
@@ -2418,9 +2511,22 @@ export async function executeChecks(
           try {
             fs.rmSync(tmp, { recursive: true, force: true });
           } catch {}
+          return {
+            ok: false,
+            exitCode: 1,
+            notRun: true,
+            output: `checks-not-run: failed to create isolated worktree for checks at ${targetSha}: ${addRes.stderr || addRes.stdout}`,
+          };
         }
       }
-    } catch {}
+    } catch (err: any) {
+      return {
+        ok: false,
+        exitCode: 1,
+        notRun: true,
+        output: `checks-not-run: failed to setup isolated checks worktree: ${err?.message ?? err}`,
+      };
+    }
   }
 
   try {
@@ -2581,15 +2687,34 @@ export function validateContractCommand(
   return baseVal;
 }
 
+export function hasPositiveTestPassCount(output?: string): boolean {
+  if (!output) return false;
+  // Node / TAP: "# pass 1", "ℹ pass 1", "# tests 1", "ℹ tests 1" (where number > 0)
+  if (/(?:#|ℹ)\s*pass\s+[1-9]\d*/i.test(output)) return true;
+  // Pytest / Jest / Vitest: "1 passed", "2 passed", etc. (where number > 0)
+  if (/\b[1-9]\d*\s+passed\b/i.test(output)) return true;
+  // Cargo: "test result: ok. 1 passed"
+  if (/test result:\s*ok\.\s*[1-9]\d*\s+passed/i.test(output)) return true;
+  // Go: "--- PASS: TestName" or "ok  <pkg>  0.123s"
+  if (/---\s*PASS:\s+\S+/i.test(output)) return true;
+  if (/^ok\s+\S+\s+[\d.]+s/m.test(output)) return true;
+  // TAP: "ok 1 - test name"
+  if (/^ok\s+[1-9]\d*\s+-/m.test(output)) return true;
+  return false;
+}
+
 export function didFilterMatchZeroTests(output?: string): boolean {
   if (!output) return false;
+  // If positive passed tests were detected in the summary, then tests DID run!
+  if (hasPositiveTestPassCount(output)) return false;
+
   if (/no tests found/i.test(output)) return true;
   if (/ran 0 test suites/i.test(output)) return true;
   if (/0\s+passed,\s*0\s+total/i.test(output)) return true;
   if (/\b0\s+tests?\s+passed\b.*\b0\s+total\b/i.test(output)) return true;
   if (/total:\s*0/i.test(output) && /passed:\s*0/i.test(output)) return true;
-  if (/#\s*tests\s+0\b/i.test(output)) return true;
-  if (/#\s*pass\s+0\b.*#\s*fail\s+0\b/i.test(output)) return true;
+  if (/(?:#|ℹ)\s*tests\s+0\b/i.test(output)) return true;
+  if (/(?:#|ℹ)\s*pass\s+0\b.*(?:#|ℹ)\s*fail\s+0\b/i.test(output)) return true;
   if (/\b1\.\.0\b/.test(output)) return true;
   if (/collected 0 items/i.test(output)) return true;
   if (/no tests ran/i.test(output)) return true;
@@ -3021,7 +3146,7 @@ export async function runTddFailFirstVerification(
     } | null = null;
 
     for (const cmdStr of runnableCommands) {
-      const isFiltered = hasTestFilter(cmdStr);
+      const isPytest = /pytest\b/.test(cmdStr);
       const singleRes = await executeChecks(
         { cmd: deps.cmd, repoRoot: tmpDir, worktreeDir: tmpDir },
         task,
@@ -3042,14 +3167,26 @@ export async function runTddFailFirstVerification(
         break;
       }
 
-      const isPytestNoTests = singleRes.exitCode === 5;
+      const isPytestNoTests = isPytest && singleRes.exitCode === 5;
       const isZeroMatchingTests = didFilterMatchZeroTests(singleRes.output);
 
-      // §34.5 (Reviewer Б1-а-2): If a command is filtered or produced 0 matching tests, it targets a new test case
-      if (isPytestNoTests || isZeroMatchingTests || (isFiltered && singleRes.exitCode === 0)) {
-        skippedNewTest = true;
-      } else if (singleRes.exitCode !== 0) {
-        confirmedRed = true;
+      // §34.5 (Reviewer Б3 / Б4):
+      // If command failed (exitCode !== 0):
+      //   - pytest exit code 5 means no tests collected -> skipped_new_test
+      //   - other non-zero exit codes mean test failed on base commit as expected for TDD! -> confirmedRed = true
+      // If command succeeded (exitCode === 0):
+      //   - if zero matching tests confirmed (isZeroMatchingTests) -> skipped_new_test
+      //   - otherwise, existing tests passed on base commit (do NOT mark skippedNewTest, contract may be vacuous)
+      if (singleRes.exitCode !== 0) {
+        if (isPytestNoTests) {
+          skippedNewTest = true;
+        } else {
+          confirmedRed = true;
+        }
+      } else {
+        if (isZeroMatchingTests) {
+          skippedNewTest = true;
+        }
       }
     }
 

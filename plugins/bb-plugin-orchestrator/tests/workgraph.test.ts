@@ -2585,207 +2585,223 @@ test("§34.5 (ADR-0037 / Reviewer Б1-в): executeChecks prioritizes overrideCom
 
 test("§34.5 (ADR-0037 / Reviewer Б1-а): runTddFailFirstVerification skips check when test file is new (does not exist on base commit)", async () => {
   const tmpRepo = makeTempDir("bb-tdd-repo-");
-  const cmd = createCmd();
-  await cmd.run("git", ["init"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
-  writeFileSync(path.join(tmpRepo, "README.md"), "# Repo\n");
-  await cmd.run("git", ["add", "README.md"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "initial commit"], { cwd: tmpRepo });
+  try {
+    const cmd = createCmd();
+    await cmd.run("git", ["init"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+    writeFileSync(path.join(tmpRepo, "README.md"), "# Repo\n");
+    await cmd.run("git", ["add", "README.md"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "initial commit"], { cwd: tmpRepo });
 
-  const normKey = "TDD-NEW";
-  const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
-  const fs = await import("node:fs");
-  fs.mkdirSync(accDir, { recursive: true });
-  writeFileSync(
-    path.join(accDir, `${normKey}.md`),
-    `# Contract
+    const normKey = "TDD-NEW";
+    const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+    const fs = await import("node:fs");
+    fs.mkdirSync(accDir, { recursive: true });
+    writeFileSync(
+      path.join(accDir, `${normKey}.md`),
+      `# Contract
 ## Тесты договора приёмки
 \`\`\`bash
 npm test tests/new-feature.test.js
 \`\`\`
 `,
-  );
-  await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "acceptance contract"], { cwd: tmpRepo });
-  const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
-  const accSha = rev.stdout.trim();
+    );
+    await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "acceptance contract"], { cwd: tmpRepo });
+    const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+    const accSha = rev.stdout.trim();
 
-  // On accSha, tests/new-feature.test.js does NOT exist.
-  // Prior behavior was: notRun: true -> stalled!
-  // New behavior: failedAsExpected: true, output notes skipped new test file!
-  const res = await runTddFailFirstVerification(
-    { cmd, repoRoot: tmpRepo },
-    { task_key: normKey } as any,
-    accSha,
-  );
-  assert.equal(res.ok, true);
-  assert.equal(res.failedAsExpected, true);
-  assert.equal(res.notRun, undefined);
-  assert.ok(res.output?.includes("new test file(s) to be created during code phase"));
-  assert.ok(res.output?.includes("tests/new-feature.test.js"));
+    // On accSha, tests/new-feature.test.js does NOT exist.
+    // Prior behavior was: notRun: true -> stalled!
+    // New behavior: failedAsExpected: true, output notes skipped new test file!
+    const res = await runTddFailFirstVerification(
+      { cmd, repoRoot: tmpRepo },
+      { task_key: normKey } as any,
+      accSha,
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.failedAsExpected, true);
+    assert.equal(res.notRun, undefined);
+    assert.ok(res.output?.includes("new test file(s) to be created during code phase"));
+    assert.ok(res.output?.includes("tests/new-feature.test.js"));
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
 });
 
 test("§34.5 (ADR-0037 / Reviewer Non-blocker 1): runTddFailFirstVerification strips pytest selectors and ignores go package globs", async () => {
   const tmpRepo = makeTempDir("bb-tdd-repo-");
-  const cmd = createCmd();
-  await cmd.run("git", ["init"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+  try {
+    const cmd = createCmd();
+    await cmd.run("git", ["init"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
 
-  const fs = await import("node:fs");
-  const testsDir = path.join(tmpRepo, "tests");
-  fs.mkdirSync(testsDir, { recursive: true });
-  writeFileSync(path.join(testsDir, "test_bug.py"), "def test_x(): pass\n");
-  await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
+    const fs = await import("node:fs");
+    const testsDir = path.join(tmpRepo, "tests");
+    fs.mkdirSync(testsDir, { recursive: true });
+    writeFileSync(path.join(testsDir, "test_bug.py"), "def test_x(): pass\n");
+    await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
 
-  const normKey = "TDD-SEL";
-  const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
-  fs.mkdirSync(accDir, { recursive: true });
-  writeFileSync(
-    path.join(accDir, `${normKey}.md`),
-    `# Contract
+    const normKey = "TDD-SEL";
+    const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+    fs.mkdirSync(accDir, { recursive: true });
+    writeFileSync(
+      path.join(accDir, `${normKey}.md`),
+      `# Contract
 ## Тесты договора приёмки
 \`\`\`bash
 pytest tests/test_bug.py::test_x
 go test ./... -run TestBug
 \`\`\`
 `,
-  );
-  await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "contract with selectors"], { cwd: tmpRepo });
-  const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
-  const accSha = rev.stdout.trim();
+    );
+    await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "contract with selectors"], { cwd: tmpRepo });
+    const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+    const accSha = rev.stdout.trim();
 
-  // Mock runner that returns non-zero for checks so tdd verifies failedAsExpected
-  const mockCmd: CmdRunner = {
-    run: async (bin, args, opts) => {
-      if (bin === "git") {
-        return cmd.run(bin, args, opts);
-      }
-      return { exitCode: 1, stdout: "tests failed as expected", stderr: "" };
-    },
-  };
+    // Mock runner that returns non-zero for checks so tdd verifies failedAsExpected
+    const mockCmd: CmdRunner = {
+      run: async (bin, args, opts) => {
+        if (bin === "git") {
+          return cmd.run(bin, args, opts);
+        }
+        return { exitCode: 1, stdout: "tests failed as expected", stderr: "" };
+      },
+    };
 
-  const res = await runTddFailFirstVerification(
-    { cmd: mockCmd, repoRoot: tmpRepo },
-    { task_key: normKey } as any,
-    accSha,
-    ["pytest", "go test ./..."],
-  );
-  assert.equal(res.ok, true);
-  assert.equal(res.failedAsExpected, true);
-  assert.equal(res.notRun, undefined);
-  assert.ok(res.output?.includes("tdd fail-first verified"));
+    const res = await runTddFailFirstVerification(
+      { cmd: mockCmd, repoRoot: tmpRepo },
+      { task_key: normKey } as any,
+      accSha,
+      ["pytest", "go test ./..."],
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.failedAsExpected, true);
+    assert.equal(res.notRun, undefined);
+    assert.ok(res.output?.includes("tdd fail-first verified"));
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
 });
 
 test("§34.5 (ADR-0037 / Reviewer Б1-а): Mixed contract (new file + existing file) does not trigger acceptance_vacuous", async () => {
   const tmpRepo = makeTempDir("bb-mixed-contract-");
-  const cmd = createCmd();
-  await cmd.run("git", ["init"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+  try {
+    const cmd = createCmd();
+    await cmd.run("git", ["init"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
 
-  const fs = await import("node:fs");
-  const testsDir = path.join(tmpRepo, "tests");
-  fs.mkdirSync(testsDir, { recursive: true });
-  writeFileSync(path.join(testsDir, "sort.test.ts"), "def test_sort(): pass\n");
-  await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
+    const fs = await import("node:fs");
+    const testsDir = path.join(tmpRepo, "tests");
+    fs.mkdirSync(testsDir, { recursive: true });
+    writeFileSync(path.join(testsDir, "sort.test.ts"), "def test_sort(): pass\n");
+    await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
 
-  const normKey = "TDD-MIXED";
-  const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
-  fs.mkdirSync(accDir, { recursive: true });
-  writeFileSync(
-    path.join(accDir, `${normKey}.md`),
-    `# Contract
+    const normKey = "TDD-MIXED";
+    const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+    fs.mkdirSync(accDir, { recursive: true });
+    writeFileSync(
+      path.join(accDir, `${normKey}.md`),
+      `# Contract
 ## Тесты договора приёмки
 \`\`\`bash
 npm test tests/sort.test.ts
 npm test tests/new-feature.test.ts
 \`\`\`
 `,
-  );
-  await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "mixed contract"], { cwd: tmpRepo });
-  const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
-  const accSha = rev.stdout.trim();
+    );
+    await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "mixed contract"], { cwd: tmpRepo });
+    const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+    const accSha = rev.stdout.trim();
 
-  // Mock runner where existing test passes (exit 0)
-  const mockCmd: CmdRunner = {
-    run: async (bin, args, opts) => {
-      if (bin === "git") {
-        return cmd.run(bin, args, opts);
-      }
-      return { exitCode: 0, stdout: "1 passed, 1 total", stderr: "" };
-    },
-  };
+    // Mock runner where existing test passes (exit 0)
+    const mockCmd: CmdRunner = {
+      run: async (bin, args, opts) => {
+        if (bin === "git") {
+          return cmd.run(bin, args, opts);
+        }
+        return { exitCode: 0, stdout: "1 passed, 1 total", stderr: "" };
+      },
+    };
 
-  const res = await runTddFailFirstVerification(
-    { cmd: mockCmd, repoRoot: tmpRepo },
-    { task_key: normKey } as any,
-    accSha,
-    ["npm test"],
-  );
-  assert.equal(res.ok, true);
-  assert.equal(res.failedAsExpected, true);
-  assert.equal(res.outcome, "skipped_new_test");
-  assert.ok(res.newTestFiles?.includes("tests/new-feature.test.ts"));
-  assert.ok(res.output?.includes("new test file(s) to be created during code phase"));
+    const res = await runTddFailFirstVerification(
+      { cmd: mockCmd, repoRoot: tmpRepo },
+      { task_key: normKey } as any,
+      accSha,
+      ["npm test"],
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.failedAsExpected, true);
+    assert.equal(res.outcome, "skipped_new_test");
+    assert.ok(res.newTestFiles?.includes("tests/new-feature.test.ts"));
+    assert.ok(res.output?.includes("new test file(s) to be created during code phase"));
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
 });
 
 test("§34.5 (ADR-0037 / Reviewer Б1-а): New test case in existing file with filter matching 0 tests returns skipped_new_test", async () => {
   const tmpRepo = makeTempDir("bb-zero-tests-");
-  const cmd = createCmd();
-  await cmd.run("git", ["init"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+  try {
+    const cmd = createCmd();
+    await cmd.run("git", ["init"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
 
-  const fs = await import("node:fs");
-  const testsDir = path.join(tmpRepo, "tests");
-  fs.mkdirSync(testsDir, { recursive: true });
-  writeFileSync(path.join(testsDir, "sort.test.ts"), "def test_sort(): pass\n");
-  await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
+    const fs = await import("node:fs");
+    const testsDir = path.join(tmpRepo, "tests");
+    fs.mkdirSync(testsDir, { recursive: true });
+    writeFileSync(path.join(testsDir, "sort.test.ts"), "def test_sort(): pass\n");
+    await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
 
-  const normKey = "TDD-ZERO";
-  const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
-  fs.mkdirSync(accDir, { recursive: true });
-  writeFileSync(
-    path.join(accDir, `${normKey}.md`),
-    `# Contract
+    const normKey = "TDD-ZERO";
+    const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+    fs.mkdirSync(accDir, { recursive: true });
+    writeFileSync(
+      path.join(accDir, `${normKey}.md`),
+      `# Contract
 ## Тесты договора приёмки
 \`\`\`bash
 npm test -- tests/sort.test.ts --test-name-pattern=handles-empty
 \`\`\`
 `,
-  );
-  await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "filtered test case"], { cwd: tmpRepo });
-  const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
-  const accSha = rev.stdout.trim();
+    );
+    await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "filtered test case"], { cwd: tmpRepo });
+    const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+    const accSha = rev.stdout.trim();
 
-  // Mock runner returning 0 tests passed / no tests found
-  const mockCmd: CmdRunner = {
-    run: async (bin, args, opts) => {
-      if (bin === "git") {
-        return cmd.run(bin, args, opts);
-      }
-      return { exitCode: 0, stdout: "No tests found. 0 passed, 0 total", stderr: "" };
-    },
-  };
+    // Mock runner returning 0 tests passed / no tests found
+    const mockCmd: CmdRunner = {
+      run: async (bin, args, opts) => {
+        if (bin === "git") {
+          return cmd.run(bin, args, opts);
+        }
+        return { exitCode: 0, stdout: "No tests found. 0 passed, 0 total", stderr: "" };
+      },
+    };
 
-  const res = await runTddFailFirstVerification(
-    { cmd: mockCmd, repoRoot: tmpRepo },
-    { task_key: normKey } as any,
-    accSha,
-    ["npm test"],
-  );
-  assert.equal(res.ok, true);
-  assert.equal(res.failedAsExpected, true);
-  assert.equal(res.outcome, "skipped_new_test");
-  assert.ok(res.output?.includes("0 tests matched on base commit"));
+    const res = await runTddFailFirstVerification(
+      { cmd: mockCmd, repoRoot: tmpRepo },
+      { task_key: normKey } as any,
+      accSha,
+      ["npm test"],
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.failedAsExpected, true);
+    assert.equal(res.outcome, "skipped_new_test");
+    assert.ok(res.output?.includes("0 tests matched on base commit"));
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
 });
 
 test("§34.5 (ADR-0037 / Reviewer Non-blockers 1, 2, 3): validateContractCommand and isTargetedCheckCommand whitelist", async () => {
@@ -3005,99 +3021,257 @@ test("§34.5 / Reviewer Б1-в-1: executeChecks runs in detached worktree at res
 
 test("§34.5 / Reviewer Б1-в-2: executeChecks fails when contract command matches 0 tests (e.g. TAP 1..0)", async () => {
   const tmpRepo = makeTempDir("bb-zero-check-");
-  const testsDir = path.join(tmpRepo, "tests");
-  fs.mkdirSync(testsDir, { recursive: true });
-  writeFileSync(path.join(testsDir, "sort.test.js"), "def test(): pass\n");
+  try {
+    const testsDir = path.join(tmpRepo, "tests");
+    fs.mkdirSync(testsDir, { recursive: true });
+    writeFileSync(path.join(testsDir, "sort.test.js"), "def test(): pass\n");
 
-  const task: any = {
-    task_key: "PLUG-B1V2",
-    payload: JSON.stringify({
-      tdd_commands: ["npm test -- --test-name-pattern=handles-empty tests/sort.test.js"],
-      checks_commands: ["npm test -- --test-name-pattern=handles-empty tests/sort.test.js"],
-    }),
-  };
+    const task: any = {
+      task_key: "PLUG-B1V2",
+      payload: JSON.stringify({
+        tdd_commands: ["npm test -- --test-name-pattern=handles-empty tests/sort.test.js"],
+        checks_commands: ["npm test -- --test-name-pattern=handles-empty tests/sort.test.js"],
+      }),
+    };
 
-  // Mock runner returning exitCode 0 but TAP 1..0 (0 tests matched)
-  const mockCmd: CmdRunner = {
-    run: async () => ({
-      exitCode: 0,
-      stdout: "TAP version 13\n1..0\n# Subtest: tests/sort.test.js\nok 1 - tests/sort.test.js\n1..1\n# tests 1\n# pass 1\n",
-      stderr: "",
-    }),
-  };
+    // Mock runner returning exitCode 0 but genuine 0 tests matched
+    const mockCmd: CmdRunner = {
+      run: async () => ({
+        exitCode: 0,
+        stdout: "TAP version 13\n1..0\n# tests 0\n# pass 0\n",
+        stderr: "",
+      }),
+    };
 
-  const checkRes = await executeChecks(
-    { cmd: mockCmd, repoRoot: tmpRepo },
-    task,
-    ["npm test"],
-  );
+    const checkRes = await executeChecks(
+      { cmd: mockCmd, repoRoot: tmpRepo },
+      task,
+      ["npm test"],
+    );
 
-  assert.equal(checkRes.ok, false);
-  assert.equal(checkRes.exitCode, 1);
-  assert.ok(checkRes.output?.includes("matched 0 tests (test was not created or executed)"));
+    assert.equal(checkRes.ok, false);
+    assert.equal(checkRes.exitCode, 1);
+    assert.ok(checkRes.output?.includes("matched 0 tests (test was not created or executed)"));
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
+
+test("§34.5 / Reviewer Б3: didFilterMatchZeroTests and executeChecks do NOT fail on multi-file runs with 1..0 if total tests passed", async () => {
+  const tmpRepo = makeTempDir("bb-multifile-check-");
+  try {
+    const testsDir = path.join(tmpRepo, "tests");
+    fs.mkdirSync(testsDir, { recursive: true });
+    writeFileSync(path.join(testsDir, "sort.test.js"), "console.log('test');\n");
+
+    // Output from Node.js with 2 files where file 2 has 1..0 but total pass is 2
+    const multiFileOutput = "TAP version 13\n# file 1\nok 1 - test 1\nok 2 - test 2\n# file 2\n1..0\n# tests 2\n# pass 2\n";
+    assert.equal(didFilterMatchZeroTests(multiFileOutput), false);
+
+    // Multi-package Go output where one pkg has [no tests to run] but another passed
+    const multiPkgGo = "?   my/pkg1  [no tests to run]\n--- PASS: TestBug (0.01s)\nok  my/pkg2  0.02s\n";
+    assert.equal(didFilterMatchZeroTests(multiPkgGo), false);
+
+    // Multi-binary Cargo output where doc-tests ran 0 but unit tests passed
+    const multiBinaryCargo = "running 2 tests\ntest test_a ... ok\ntest test_b ... ok\ntest result: ok. 2 passed; 0 failed\n   Doc-tests\nrunning 0 tests\ntest result: ok. 0 passed; 0 failed\n";
+    assert.equal(didFilterMatchZeroTests(multiBinaryCargo), false);
+
+    const task: any = {
+      task_key: "PLUG-B3",
+      payload: JSON.stringify({
+        tdd_commands: ["npm test -- tests/sort.test.js"],
+        checks_commands: ["npm test -- tests/sort.test.js"],
+      }),
+    };
+
+    const mockCmd: CmdRunner = {
+      run: async () => ({
+        exitCode: 0,
+        stdout: multiFileOutput,
+        stderr: "",
+      }),
+    };
+
+    const checkRes = await executeChecks(
+      { cmd: mockCmd, repoRoot: tmpRepo },
+      task,
+      ["npm test"],
+    );
+
+    assert.equal(checkRes.ok, true);
+    assert.equal(checkRes.exitCode, 0);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
+
+test("§34.5 / Reviewer Non-blocker 1: executeChecks returns notRun when detached worktree creation fails", async () => {
+  const tmpRepo = makeTempDir("bb-wt-fail-");
+  try {
+    const task: any = {
+      task_key: "PLUG-WTFAIL",
+      branch: "bb/plug-wtfail",
+      payload: JSON.stringify({
+        result_sha: "sha12345",
+        checks_commands: ["npm test"],
+      }),
+    };
+
+    const mockCmd: CmdRunner = {
+      run: async (bin, args) => {
+        if (bin === "git") {
+          if (args.includes("rev-parse") && args.includes("HEAD")) {
+            return { exitCode: 0, stdout: "head1111\n", stderr: "" };
+          }
+          if (args.includes("rev-parse") && args.includes("sha12345")) {
+            return { exitCode: 0, stdout: "sha12345\n", stderr: "" };
+          }
+          if (args.includes("worktree") && args.includes("add")) {
+            return { exitCode: 128, stdout: "", stderr: "fatal: invalid reference: sha12345" };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    const res = await executeChecks(
+      { cmd: mockCmd, repoRoot: tmpRepo },
+      task,
+      ["npm test"],
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(res.notRun, true);
+    assert.ok(res.output?.includes("failed to create isolated worktree for checks"));
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
+
+test("§34.5 / Reviewer Б4: runTddFailFirstVerification catches vacuous contract even with test filter", async () => {
+  const tmpRepo = makeTempDir("bb-vacuous-filter-");
+  try {
+    const cmd = createCmd();
+    await cmd.run("git", ["init"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+
+    const testsDir = path.join(tmpRepo, "tests");
+    fs.mkdirSync(testsDir, { recursive: true });
+    writeFileSync(path.join(testsDir, "sort.test.js"), "def test_ok(): pass\n");
+    await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
+
+    const normKey = "TDD-VAC";
+    const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+    fs.mkdirSync(accDir, { recursive: true });
+    writeFileSync(
+      path.join(accDir, `${normKey}.md`),
+      `# Contract
+## Тесты договора приёмки
+\`\`\`bash
+npm test -- --test-name-pattern=test_ok tests/sort.test.js
+\`\`\`
+`,
+    );
+    await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "contract targeting existing passing test"], { cwd: tmpRepo });
+    const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+    const accSha = rev.stdout.trim();
+
+    // Mock runner returning exitCode 0 and positive passed test (1 passed)
+    const mockCmd: CmdRunner = {
+      run: async (bin, args, opts) => {
+        if (bin === "git") {
+          return cmd.run(bin, args, opts);
+        }
+        return { exitCode: 0, stdout: "TAP version 13\nok 1 - test_ok\n# tests 1\n# pass 1\n", stderr: "" };
+      },
+    };
+
+    const res = await runTddFailFirstVerification(
+      { cmd: mockCmd, repoRoot: tmpRepo },
+      { task_key: normKey } as any,
+      accSha,
+      ["npm test"],
+    );
+
+    // Blocker Б4: must NOT be skipped_new_test! Must be marked vacuous!
+    assert.equal(res.ok, true);
+    assert.equal(res.failedAsExpected, false);
+    assert.equal(res.outcome, "vacuous");
+    assert.ok(res.output?.includes("договор приёмки уже полностью проходит"));
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
 });
 
 test("§34.5 / Reviewer Б1-а-2 & Б1-а-3: runTddFailFirstVerification handles filtered commands and multi-command contracts", async () => {
   const tmpRepo = makeTempDir("bb-multi-contract-");
-  const cmd = createCmd();
-  await cmd.run("git", ["init"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
-  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+  try {
+    const cmd = createCmd();
+    await cmd.run("git", ["init"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
 
-  const testsDir = path.join(tmpRepo, "tests");
-  fs.mkdirSync(testsDir, { recursive: true });
-  writeFileSync(path.join(testsDir, "sort.test.js"), "def test_sort(): pass\n");
-  await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
+    const testsDir = path.join(tmpRepo, "tests");
+    fs.mkdirSync(testsDir, { recursive: true });
+    writeFileSync(path.join(testsDir, "sort.test.js"), "def test_sort(): pass\n");
+    await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
 
-  const normKey = "TDD-MULTI";
-  const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
-  fs.mkdirSync(accDir, { recursive: true });
-  writeFileSync(
-    path.join(accDir, `${normKey}.md`),
-    `# Contract
+    const normKey = "TDD-MULTI";
+    const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+    fs.mkdirSync(accDir, { recursive: true });
+    writeFileSync(
+      path.join(accDir, `${normKey}.md`),
+      `# Contract
 ## Тесты договора приёмки
 \`\`\`bash
 npm test -- --test-name-pattern=new_case tests/sort.test.js
 npm test tests/sort.test.js
 \`\`\`
 `,
-  );
-  await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
-  await cmd.run("git", ["commit", "-m", "multi command contract"], { cwd: tmpRepo });
-  const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
-  const accSha = rev.stdout.trim();
+    );
+    await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "multi command contract"], { cwd: tmpRepo });
+    const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+    const accSha = rev.stdout.trim();
 
-  // Command 1: new_case filter -> returns 1..0 (0 tests matched, exit 0)
-  // Command 2: regression test -> returns 1..1 (1 test matched, exit 0)
-  const mockCmd: CmdRunner = {
-    run: async (bin, args, opts) => {
-      if (bin === "git") {
-        return cmd.run(bin, args, opts);
-      }
-      const fullCmd = [bin, ...args].join(" ");
-      if (fullCmd.includes("new_case")) {
-        return { exitCode: 0, stdout: "TAP version 13\n1..0\n# tests 0", stderr: "" };
-      }
-      return { exitCode: 0, stdout: "TAP version 13\n1..1\n# pass 1", stderr: "" };
-    },
-  };
+    // Command 1: new_case filter -> returns 1..0 (0 tests matched, exit 0)
+    // Command 2: regression test -> returns 1..1 (1 test matched, exit 0)
+    const mockCmd: CmdRunner = {
+      run: async (bin, args, opts) => {
+        if (bin === "git") {
+          return cmd.run(bin, args, opts);
+        }
+        const fullCmd = [bin, ...args].join(" ");
+        if (fullCmd.includes("new_case")) {
+          return { exitCode: 0, stdout: "TAP version 13\n1..0\n# tests 0\n# pass 0\n", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "TAP version 13\n1..1\n# pass 1\n", stderr: "" };
+      },
+    };
 
-  const res = await runTddFailFirstVerification(
-    { cmd: mockCmd, repoRoot: tmpRepo },
-    { task_key: normKey } as any,
-    accSha,
-    ["npm test"],
-  );
+    const res = await runTddFailFirstVerification(
+      { cmd: mockCmd, repoRoot: tmpRepo },
+      { task_key: normKey } as any,
+      accSha,
+      ["npm test"],
+    );
 
-  // Blocker Б1-а-3: Multi-command contract is NOT vacuous! It returns skipped_new_test with failedAsExpected: true
-  assert.equal(res.ok, true);
-  assert.equal(res.failedAsExpected, true);
-  assert.equal(res.outcome, "skipped_new_test");
-  assert.ok(res.output?.includes("0 tests matched on base commit"));
+    // Blocker Б1-а-3: Multi-command contract is NOT vacuous! It returns skipped_new_test with failedAsExpected: true
+    assert.equal(res.ok, true);
+    assert.equal(res.failedAsExpected, true);
+    assert.equal(res.outcome, "skipped_new_test");
+    assert.ok(res.output?.includes("0 tests matched on base commit"));
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
 });
 
-test("§34.5 / Reviewer Б1-а-2: validateCheckCommand normalizes runner flags before positional test files", () => {
+test("§34.5 / Reviewer Б1-а-2 & Б2: validateCheckCommand normalizes runner flags before positional test files without breaking runner subcommands", () => {
   // node --test style: flags after file moved before file
   const valNode = validateCheckCommand("npm test -- tests/sort.test.js --test-name-pattern=handles-empty");
   assert.equal(valNode.valid, true);
@@ -3107,6 +3281,30 @@ test("§34.5 / Reviewer Б1-а-2: validateCheckCommand normalizes runner flags b
   const valPytest = validateCheckCommand("pytest tests/test_sort.py -k test_empty");
   assert.equal(valPytest.valid, true);
   assert.deepEqual(valPytest.args, ["-k", "test_empty", "tests/test_sort.py"]);
+
+  // Blocker Б2: cargo test --release keeps 'test' subcommand first!
+  const valCargoRelease = validateCheckCommand("cargo test --release");
+  assert.equal(valCargoRelease.valid, true);
+  assert.equal(valCargoRelease.binary, "cargo");
+  assert.deepEqual(valCargoRelease.args, ["test", "--release"]);
+
+  // Blocker Б2: go test ./... -run TestBug keeps 'test' subcommand first!
+  const valGoTest = validateCheckCommand("go test ./... -run TestBug");
+  assert.equal(valGoTest.valid, true);
+  assert.equal(valGoTest.binary, "go");
+  assert.deepEqual(valGoTest.args, ["test", "-run", "TestBug", "./..."]);
+
+  // Blocker Б2: cargo test foo --features x keeps 'test' first and --features with its value!
+  const valCargoFeatures = validateCheckCommand("cargo test foo --features x");
+  assert.equal(valCargoFeatures.valid, true);
+  assert.equal(valCargoFeatures.binary, "cargo");
+  assert.deepEqual(valCargoFeatures.args, ["test", "--features", "x", "foo"]);
+
+  // Blocker Б2: pytest tests/t.py --tb short keeps --tb with its value!
+  const valPytestTb = validateCheckCommand("pytest tests/t.py --tb short");
+  assert.equal(valPytestTb.valid, true);
+  assert.equal(valPytestTb.binary, "pytest");
+  assert.deepEqual(valPytestTb.args, ["--tb", "short", "tests/t.py"]);
 
   // hasTestFilter helper
   assert.equal(hasTestFilter("npm test -- tests/sort.test.js --test-name-pattern=handles-empty"), true);
