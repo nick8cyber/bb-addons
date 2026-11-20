@@ -7,10 +7,9 @@
 import fs, { existsSync, readFileSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { OrchestratorError } from "./errors.js";
 import type { CmdRunner } from "./cmd.js";
-import type { BbCli } from "./bb-cli.js";
+import { createBbCli, type BbCli } from "./bb-cli.js";
 import type {
   ConfirmationMode,
   DelegationStore,
@@ -344,17 +343,40 @@ export interface TaskTrackerLike {
   } | null;
 }
 
+export type TaskTrackerOrOptions =
+  | TaskTrackerLike
+  | {
+      tracker?: TaskTrackerLike | null;
+      bbCli?: BbCli | null;
+      cmd?: CmdRunner | null;
+    }
+  | null;
+
+function extractProjectIdFromRecord(res: any): string | null {
+  if (!res || typeof res !== "object") return null;
+  const taskObj = res.task ?? res;
+  const projObj = res.project ?? taskObj.project;
+  const pid =
+    taskObj.projectId ??
+    projObj?.linkedBbProjectId ??
+    projObj?.id;
+  if (typeof pid === "string" && pid.trim()) {
+    return pid.trim();
+  }
+  return null;
+}
+
 /**
  * §32.2 п.2 (PLUG-361): Task Project Resolution strictly in order:
  * 1) task_queue: project_id column (or payload.project_id);
  * 2) delegations: project_id column from active or latest completed delegation;
  * 3) tracker: metadata query via tracker API bb tasks / tracker.getTask(taskKey) -> task.projectId.
  */
-export function resolveTaskProjectId(
+export async function resolveTaskProjectId(
   store: DelegationStore,
   taskKey: string,
-  tracker?: TaskTrackerLike | null,
-): string | null {
+  options?: TaskTrackerOrOptions,
+): Promise<string | null> {
   const key = normalizeTaskKey(taskKey);
 
   // 1) task_queue: project_id column or payload.project_id
@@ -388,33 +410,56 @@ export function resolveTaskProjectId(
   }
 
   // 3) tracker: metadata via tracker API bb tasks / tracker.getTask(taskKey)
+  let tracker: TaskTrackerLike | undefined | null;
+  let bbCli: BbCli | undefined | null;
+  let cmd: CmdRunner | undefined | null;
+  if (options) {
+    if ("getTask" in options && typeof (options as any).getTask === "function") {
+      tracker = options as TaskTrackerLike;
+    } else {
+      const opts = options as {
+        tracker?: TaskTrackerLike | null;
+        bbCli?: BbCli | null;
+        cmd?: CmdRunner | null;
+      };
+      tracker = opts.tracker;
+      bbCli = opts.bbCli;
+      cmd = opts.cmd;
+    }
+  }
+
   if (tracker) {
     try {
-      const res = tracker.getTask(key);
-      if (res) {
-        const pid =
-          res.projectId ??
-          res.project?.linkedBbProjectId ??
-          res.project?.id;
-        if (typeof pid === "string" && pid.trim()) {
-          return pid.trim();
-        }
+      const res = await tracker.getTask(key);
+      const pid = extractProjectIdFromRecord(res);
+      if (pid) return pid;
+    } catch {}
+  } else if (bbCli) {
+    try {
+      const res = await bbCli.run(["tasks", "show", key, "--json"], { timeoutMs: 5000 });
+      if (res.exitCode === 0 && res.stdout) {
+        const parsed = JSON.parse(res.stdout);
+        const pid = extractProjectIdFromRecord(parsed);
+        if (pid) return pid;
+      }
+    } catch {}
+  } else if (cmd) {
+    try {
+      const res = await cmd.run("bb", ["tasks", "show", key, "--json"], { timeoutMs: 5000 });
+      if (res.exitCode === 0 && res.stdout) {
+        const parsed = JSON.parse(res.stdout);
+        const pid = extractProjectIdFromRecord(parsed);
+        if (pid) return pid;
       }
     } catch {}
   } else if (typeof process !== "undefined" && process.env?.PATH) {
     try {
-      const out = execFileSync("bb", ["tasks", "show", key, "--json"], {
-        encoding: "utf-8",
-        timeout: 3000,
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      const parsed = JSON.parse(out);
-      const pid =
-        parsed.project?.linkedBbProjectId ??
-        parsed.task?.projectId ??
-        parsed.project?.id;
-      if (typeof pid === "string" && pid.trim()) {
-        return pid.trim();
+      const defaultCli = createBbCli();
+      const res = await defaultCli.run(["tasks", "show", key, "--json"], { timeoutMs: 5000 });
+      if (res.exitCode === 0 && res.stdout) {
+        const parsed = JSON.parse(res.stdout);
+        const pid = extractProjectIdFromRecord(parsed);
+        if (pid) return pid;
       }
     } catch {}
   }
@@ -432,16 +477,18 @@ export interface DirectActionOptions {
   projectsMap?: Record<string, WorkGraphMode>;
   getWorkGraphMode?: (projectId?: string | null) => WorkGraphMode;
   tracker?: TaskTrackerLike | null;
+  bbCli?: BbCli | null;
+  cmd?: CmdRunner | null;
   log?: { warn?: (msg: string) => void; info?: (msg: string) => void };
 }
 
 /** §32 п.1 + §32.2 (PLUG-361): In strict mode, blocks direct delegate, merge, release. In shadow mode, logs mirror audit. In off mode, silent. */
-export function assertGraphAllowsDirectAction(
+export async function assertGraphAllowsDirectAction(
   store: DelegationStore,
   taskKey: string,
   mode: WorkGraphMode | ((projectId?: string | null) => WorkGraphMode),
   action?: DirectActionOptions,
-): void {
+): Promise<void> {
   const key = normalizeTaskKey(taskKey);
 
   // 1. Determine global mode
@@ -449,7 +496,11 @@ export function assertGraphAllowsDirectAction(
     typeof mode === "function" ? mode(undefined) : normalizeWorkGraphMode(mode);
 
   // 2. Resolve task projectId using 3-step order
-  const projectId = resolveTaskProjectId(store, key, action?.tracker);
+  const projectId = await resolveTaskProjectId(store, key, {
+    tracker: action?.tracker,
+    bbCli: action?.bbCli,
+    cmd: action?.cmd,
+  });
 
   let effectiveMode: WorkGraphMode;
   if (!projectId) {
@@ -916,6 +967,8 @@ export async function runEnqueue(
     bbCli?: BbCli;
     ctx: PluginCliContext;
     workGraphMode: WorkGraphMode;
+    projectId?: string | null;
+    tracker?: TaskTrackerLike | null;
     repoRoot?: string;
     mergeBaseBranch?: string;
     now?: () => number;
@@ -1380,11 +1433,22 @@ export async function runEnqueue(
     deps.policy?.timing?.queueStallMinutes ?? 30;
   const initialNodeAlarmAt = now + queueStallMinutes * 60_000;
 
+  const targetProjectId =
+    (deps.projectId && deps.projectId.trim()) ||
+    (await resolveTaskProjectId(deps.store, taskKey, {
+      bbCli: deps.bbCli,
+      cmd: deps.cmd,
+      tracker: deps.tracker,
+    })) ||
+    (deps.ctx.projectId && deps.ctx.projectId.trim()) ||
+    "";
+
   if (existing) {
     // Reissue / reset
     const task = deps.store.resetTaskForEnqueue(
       {
         taskKey,
+        projectId: targetProjectId || existing.project_id,
         route,
         level,
         priority,
@@ -1406,7 +1470,7 @@ export async function runEnqueue(
   const task = deps.store.insertTask(
     {
       taskKey,
-      projectId: deps.ctx.projectId ?? "default",
+      projectId: targetProjectId,
       coordinatorThreadId: deps.ctx.threadId ?? "",
       route,
       level,
@@ -3954,7 +4018,9 @@ export async function runRunQueue(
       if (deps.requestOwnerGateInteraction) {
         const waitingTasks = deps.store.listWaitingApprovalTasks();
         for (const task of waitingTasks) {
-          if (getTaskMode(task.project_id) === "off") continue;
+          const taskMode = getTaskMode(task.project_id);
+          if (taskMode === "off") continue;
+          if (taskMode === "shadow" && !deps.autoAdvance) continue;
           if (!task.interaction_id) {
             try {
               const payload = parsePayload(task.payload);
@@ -3990,7 +4056,9 @@ export async function runRunQueue(
       const queueStallMinutes =
         deps.policy?.timing?.queueStallMinutes ?? 30;
       for (const qt of allQueued) {
-        if (getTaskMode(qt.project_id) === "off") continue;
+        const taskMode = getTaskMode(qt.project_id);
+        if (taskMode === "off") continue;
+        if (taskMode === "shadow" && !deps.autoAdvance) continue;
         if (qt.node_alarm_at !== null && now >= qt.node_alarm_at) {
           const elapsedSeconds = Math.max(
             0,
@@ -4051,9 +4119,10 @@ export async function runRunQueue(
       }
 
       // ── 2. Take queued tasks ──────────────────────────────────────────
-      const currentActive = deps.store.listActiveTasks().filter(
-        (t) => getTaskMode(t.project_id) !== "off",
-      ).length;
+      const currentActive = deps.store.listActiveTasks().filter((t) => {
+        const m = getTaskMode(t.project_id);
+        return m === "strict" || (m === "shadow" && deps.autoAdvance);
+      }).length;
       let availableSlots = maxActiveTasks - currentActive;
 
       if (availableSlots > 0) {
@@ -4135,8 +4204,10 @@ export async function runRunQueue(
   // §32 (Б4 / 5в): In shadow mode without autoAdvance, record simulated evaluation
   const hasShadowTasks =
     deps.workGraphMode === "shadow" ||
-    Object.values(deps.workGraphProjects ?? {}).some((m) => m === "shadow");
-  if (hasShadowTasks && !shouldAdvance) {
+    Object.values(deps.workGraphProjects ?? {}).some((m) => m === "shadow") ||
+    finalQueued.some((t) => getTaskMode(t.project_id) === "shadow") ||
+    finalActive.some((t) => getTaskMode(t.project_id) === "shadow");
+  if (hasShadowTasks && !deps.autoAdvance) {
     // 1. Evaluate queued tasks: start -> <target_node>
     for (const t of finalQueued) {
       if (getTaskMode(t.project_id) !== "shadow") continue;

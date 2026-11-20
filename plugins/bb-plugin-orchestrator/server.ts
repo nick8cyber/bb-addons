@@ -2372,7 +2372,7 @@ export async function createPlugin(
       }
       if (!key) return { taskKey: null, mode: null, workGraph: getWorkGraphMode() };
       const mode = store.getTaskConfirmationMode(key);
-      const taskPid = resolveTaskProjectId(store, key);
+      const taskPid = await resolveTaskProjectId(store, key, { bbCli });
       return { taskKey: key, mode, workGraph: getWorkGraphMode(taskPid) };
     },
     async setTaskConfirmationMode(input) {
@@ -2420,7 +2420,7 @@ export async function createPlugin(
       return { ok: true as const };
     },
     async ownerApprove(input) {
-      const taskPid = resolveTaskProjectId(store, input.taskKey);
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
       const res = await runApprove(input.taskKey, input.comment, {
         store,
         ctx: {},
@@ -2441,7 +2441,7 @@ export async function createPlugin(
       };
     },
     async ownerReject(input) {
-      const taskPid = resolveTaskProjectId(store, input.taskKey);
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
       const res = await runReject(input.taskKey, input.target, input.reason, {
         store,
         ctx: {},
@@ -2462,7 +2462,7 @@ export async function createPlugin(
       };
     },
     async ownerDefer(input) {
-      const taskPid = resolveTaskProjectId(store, input.taskKey);
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
       const res = await runDefer(input.taskKey, input.reason, {
         store,
         ctx: {},
@@ -2482,7 +2482,7 @@ export async function createPlugin(
       };
     },
     async ownerResume(input) {
-      const taskPid = resolveTaskProjectId(store, input.taskKey);
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
       const res = await runResume(input.taskKey, input.target, {
         store,
         ctx: {},
@@ -2503,7 +2503,7 @@ export async function createPlugin(
       };
     },
     async ownerDequeue(input) {
-      const taskPid = resolveTaskProjectId(store, input.taskKey);
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
       const res = await runDequeue(input.taskKey, input.reason, {
         store,
         cmd: cmdRunner,
@@ -2569,13 +2569,14 @@ export async function createPlugin(
       // §5.6 (r33.11): a productive call resets the idle nudge schedule.
       watchdog.markCoordinatorAction(ctx.threadId);
       try {
-        assertGraphAllowsDirectAction(store, params.taskKey, getWorkGraphMode, {
+        await assertGraphAllowsDirectAction(store, params.taskKey, getWorkGraphMode, {
           command: "delegate",
           level: params.level,
           route: params.route,
           actor: "shadow:coordinator",
           policy: policyLoad.policy,
           log: bb.log,
+          bbCli,
         });
         const res = await delegate({ ...params, threadId: ctx.threadId });
         return JSON.stringify({
@@ -2736,11 +2737,12 @@ export async function createPlugin(
             watchdog.markCoordinatorAction(row.coordinator_thread_id);
           }
         }
-        assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode, {
+        await assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode, {
           command: "merge",
           actor: "shadow:coordinator",
           policy: policyLoad.policy,
           log: bb.log,
+          bbCli,
         });
         return JSON.stringify(
           await mergeDelegation({ ...params, callerThreadId: ctx.threadId }),
@@ -3476,13 +3478,14 @@ export async function createPlugin(
               t("cli.delegateUsage"),
             );
           }
-          assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode, {
+          await assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode, {
             command: "delegate",
             level,
             route: flag("--route"),
             actor: "shadow:coordinator",
             policy: policyLoad.policy,
             log: bb.log,
+            bbCli,
           });
           const attach = flags("--attach");
           const res = await delegate({
@@ -3653,11 +3656,12 @@ export async function createPlugin(
               watchdog.markCoordinatorAction(row.coordinator_thread_id);
             }
           }
-          assertGraphAllowsDirectAction(store, ref, getWorkGraphMode, {
+          await assertGraphAllowsDirectAction(store, ref, getWorkGraphMode, {
             command: "merge",
             actor: "shadow:coordinator",
             policy: policyLoad.policy,
             log: bb.log,
+            bbCli,
           });
           if (!ctx.threadId) {
             throw new OrchestratorError(
@@ -3820,11 +3824,12 @@ export async function createPlugin(
               t("cli.releaseUsageShort"),
             );
           }
-          assertGraphAllowsDirectAction(store, key, getWorkGraphMode, {
+          await assertGraphAllowsDirectAction(store, key, getWorkGraphMode, {
             command: "release",
             actor: "shadow:coordinator",
             policy: policyLoad.policy,
             log: bb.log,
+            bbCli,
           });
           if (flag("--kb") && flag("--no-kb")) {
             throw new OrchestratorError(
@@ -4107,7 +4112,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator enqueue <KEY> ...",
             );
           }
-          const taskProjId = resolveTaskProjectId(store, taskKey) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
           if (getWorkGraphMode(taskProjId) === "off") {
             throw new OrchestratorError(
               "graph-disabled",
@@ -4176,6 +4181,7 @@ abandoned: ${res.reported
               cmd: cmdRunner,
               bbCli,
               ctx,
+              projectId: taskProjId,
               workGraphMode: getWorkGraphMode(taskProjId),
               repoRoot: wtCtx.repoRoot,
               mergeBaseBranch: wtCtx.mergeBaseBranch,
@@ -4201,7 +4207,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator dequeue <KEY> ...",
             );
           }
-          const taskProjId = resolveTaskProjectId(store, taskKey) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
           if (getWorkGraphMode(taskProjId) === "off") {
             throw new OrchestratorError(
               "graph-disabled",
@@ -4241,7 +4247,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator defer <KEY> --reason <причина>",
             );
           }
-          const taskProjId = resolveTaskProjectId(store, taskKey) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
           const res = await runDefer(taskKey, flag("--reason"), {
             store,
             ctx,
@@ -4264,7 +4270,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator reject <KEY> [--target <t>] --reason <причина>",
             );
           }
-          const taskProjId = resolveTaskProjectId(store, taskKey) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
           const res = await runReject(taskKey, flag("--target"), flag("--reason"), {
             store,
             ctx,
@@ -4292,7 +4298,7 @@ abandoned: ${res.reported
             ctx.projectId,
             ctx.cwd,
           ).catch(() => null);
-          const taskProjId = resolveTaskProjectId(store, taskKey) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
           const res = await runResume(taskKey, flag("--target"), {
             store,
             ctx,
@@ -4318,7 +4324,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator approve <KEY> [--comment <text>]",
             );
           }
-          const taskProjId = resolveTaskProjectId(store, taskKey) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
           const res = await runApprove(taskKey, flag("--comment"), {
             store,
             ctx,
@@ -4342,7 +4348,7 @@ abandoned: ${res.reported
               'укажи ключ и заметку: bb orchestrator release-note <KEY> "<заметка>"',
             );
           }
-          const taskProjId = resolveTaskProjectId(store, taskKey) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
           const res = await runReleaseNote(taskKey, note, {
             store,
             ctx,

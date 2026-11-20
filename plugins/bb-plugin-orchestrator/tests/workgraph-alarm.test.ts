@@ -601,23 +601,23 @@ test("§28.2 п. 5: Active running thread gets up to 3× timeout before stalling
   assert.equal(task.status, "stalled", "Running thread must be stalled once 3× timeout is exceeded");
 });
 
-test("§32: Strict mode guards block direct delegate, merge, release", () => {
+test("§32: Strict mode guards block direct delegate, merge, release", async () => {
   const store = createTestStore();
   const t0 = 1_000_000;
 
   // 1. Task not enqueued -> graph-required
-  assert.throws(
-    () => assertGraphAllowsDirectAction(store, "UNKNOWN-99", "strict", { command: "delegate" }),
+  await assert.rejects(
+    async () => await assertGraphAllowsDirectAction(store, "UNKNOWN-99", "strict", { command: "delegate" }),
     (e: any) => e.code === "graph-required",
   );
 
-  assert.throws(
-    () => assertGraphAllowsDirectAction(store, "UNKNOWN-99", "strict", { command: "merge" }),
+  await assert.rejects(
+    async () => await assertGraphAllowsDirectAction(store, "UNKNOWN-99", "strict", { command: "merge" }),
     (e: any) => e.code === "graph-required",
   );
 
-  assert.throws(
-    () => assertGraphAllowsDirectAction(store, "UNKNOWN-99", "strict", { command: "release" }),
+  await assert.rejects(
+    async () => await assertGraphAllowsDirectAction(store, "UNKNOWN-99", "strict", { command: "release" }),
     (e: any) => e.code === "graph-required",
   );
 
@@ -631,8 +631,8 @@ test("§32: Strict mode guards block direct delegate, merge, release", () => {
     confirmationMode: "auto",
   }, t0);
 
-  assert.throws(
-    () => assertGraphAllowsDirectAction(store, "ACTIVE-99", "strict", { command: "delegate" }),
+  await assert.rejects(
+    async () => await assertGraphAllowsDirectAction(store, "ACTIVE-99", "strict", { command: "delegate" }),
     (e: any) => e.code === "graph-managed" && e.message.includes("управляется графом"),
   );
 
@@ -647,8 +647,8 @@ test("§32: Strict mode guards block direct delegate, merge, release", () => {
     reason: "done",
   }, t0);
 
-  assert.throws(
-    () => assertGraphAllowsDirectAction(store, "ACTIVE-99", "strict", { command: "delegate" }),
+  await assert.rejects(
+    async () => await assertGraphAllowsDirectAction(store, "ACTIVE-99", "strict", { command: "delegate" }),
     (e: any) => e.code === "graph-managed" && e.message.includes("завершена (done)"),
   );
 });
