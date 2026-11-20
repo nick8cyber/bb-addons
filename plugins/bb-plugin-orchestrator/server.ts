@@ -141,6 +141,7 @@ import {
   type T,
 } from "./src/i18n/index.js";
 import { KbService, parseKbConfig, type KbConfig } from "./src/kb.js";
+import { verifyInstalledBuild } from "./src/build-check.js";
 import {
   assertGraphAllowsDirectAction,
   normalizeWorkGraphMode,
@@ -152,6 +153,8 @@ import {
   runReleaseNote,
   runResume,
   runRunQueue,
+  resolveTransition,
+  extractCounters,
   type WorkGraphMode,
 } from "./src/workgraph.js";
 
@@ -192,7 +195,10 @@ export const rpcContract = defineRpcContract({
   // §29.2 (Б2, r34.2): проектная настройка approvalMode (тумблер координатора)
   projectApprovalMode: {
     input: z.object({ projectId: z.string().nullable().optional() }),
-    output: z.object({ mode: z.enum(["auto", "manual"]).nullable() }),
+    output: z.object({
+      mode: z.enum(["auto", "manual"]).nullable(),
+      workGraph: z.enum(["off", "shadow", "strict"]).optional(),
+    }),
   },
   setProjectApprovalMode: {
     input: z.object({
@@ -210,6 +216,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({
       taskKey: z.string().nullable(),
       mode: z.enum(["auto", "manual"]).nullable(),
+      workGraph: z.enum(["off", "shadow", "strict"]).optional(),
     }),
   },
   setTaskConfirmationMode: {
@@ -687,19 +694,38 @@ export async function createPlugin(
     const waitingAtStartup = store.listWaitingApprovalTasks();
     for (const t of waitingAtStartup) {
       if (t.interaction_id) {
+        const resolution = resolveTransition({
+          route: t.route,
+          node: "owner_gate",
+          status: "waiting_approval",
+          event: {
+            type: "owner_gate_timeout",
+            reason: "server restart / stale interaction cleared",
+          },
+          mode: t.confirmation_mode,
+          counters: extractCounters(t),
+        });
         store.transitionTask({
           taskKey: t.task_key,
           expectedNode: "owner_gate",
           expectedStatus: "waiting_approval",
-          toNode: "owner_gate",
-          toStatus: "waiting_approval",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
           actor: "orchestrator",
-          reason: "gate-timeout: server restart / stale interaction cleared",
+          reason: resolution.reason,
           updates: { interaction_id: null },
         });
       }
     }
   } catch {}
+  // §24.3: verify installed build matches repo code at startup
+  verifyInstalledBuild().then((buildCheck) => {
+    if (buildCheck.outcome !== "MATCH") {
+      bb.log.warn(`orchestrator: installed build check [${buildCheck.outcome}]: ${buildCheck.details}`);
+    } else {
+      bb.log.info?.(`orchestrator: installed build matches code (${buildCheck.expectedCommit?.slice(0, 8)})`);
+    }
+  }).catch(() => {});
   const janitorStore = new JanitorStore(db);
   const enqueue = createDelegateQueue();
   const positiveInt = (v: string | undefined, dflt: number): number => {
@@ -1695,20 +1721,40 @@ export async function createPlugin(
             current.status === "waiting_approval" &&
             current.interaction_id === interactionId
           ) {
-            const reason =
-              result.outcome === "cancelled"
-                ? `gate-timeout: card cancelled (${result.reason})`
-                : "gate-submitted: card completed";
-            store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "owner_gate",
-              expectedStatus: "waiting_approval",
-              toNode: "owner_gate",
-              toStatus: "waiting_approval",
-              actor: "orchestrator",
-              reason,
-              updates: { interaction_id: null },
-            });
+            if (result.outcome === "cancelled") {
+              const resolution = resolveTransition({
+                route: task.route,
+                node: "owner_gate",
+                status: "waiting_approval",
+                event: {
+                  type: "owner_gate_timeout",
+                  reason: `card cancelled (${result.reason})`,
+                },
+                mode: task.confirmation_mode,
+                counters: extractCounters(task),
+              });
+              store.transitionTask({
+                taskKey: task.task_key,
+                expectedNode: "owner_gate",
+                expectedStatus: "waiting_approval",
+                toNode: resolution.toNode,
+                toStatus: resolution.toStatus,
+                actor: "orchestrator",
+                reason: resolution.reason,
+                updates: { interaction_id: null },
+              });
+            } else {
+              store.transitionTask({
+                taskKey: task.task_key,
+                expectedNode: "owner_gate",
+                expectedStatus: "waiting_approval",
+                toNode: "owner_gate",
+                toStatus: "waiting_approval",
+                actor: "orchestrator",
+                reason: "gate-submitted: card completed",
+                updates: { interaction_id: null },
+              });
+            }
           }
         })
         .catch((err) => {
@@ -2279,7 +2325,7 @@ export async function createPlugin(
       log: bb.log,
     }),
     async projectApprovalMode() {
-      return { mode: getApprovalMode() };
+      return { mode: getApprovalMode(), workGraph: getWorkGraphMode() };
     },
     async setProjectApprovalMode(input) {
       const modeVal = input.mode ?? "";
@@ -2300,9 +2346,9 @@ export async function createPlugin(
           if (t) key = t.task_key;
         }
       }
-      if (!key) return { taskKey: null, mode: null };
+      if (!key) return { taskKey: null, mode: null, workGraph: getWorkGraphMode() };
       const mode = store.getTaskConfirmationMode(key);
-      return { taskKey: key, mode };
+      return { taskKey: key, mode, workGraph: getWorkGraphMode() };
     },
     async setTaskConfirmationMode(input) {
       let key = input.taskKey ? normalizeTaskKey(input.taskKey) : undefined;

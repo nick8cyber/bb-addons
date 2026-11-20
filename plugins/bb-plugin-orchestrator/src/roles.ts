@@ -95,7 +95,8 @@ export const WINDOW_ROLE_IDS = [
   "architect",
 ] as const;
 
-export const DEFAULT_ROLE: RoleId = "orchestrator";
+// §15 (r34): Default role is executor by owner decision (15.11) and UI parity (app.tsx).
+export const DEFAULT_ROLE: RoleId = "executor";
 
 export interface RoleDefinition {
   id: RoleId;

@@ -15,6 +15,7 @@ import {
   type PluginPendingInteractionProps,
   type PluginThreadHeaderActionProps,
 } from "@get-bb/plugin-sdk/app";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useEffect, useState, type ChangeEvent } from "react";
 import type { rpcContract } from "./server";
 import { createT, resolveLang } from "./src/i18n/index.js";
@@ -146,6 +147,254 @@ function RoleSelect() {
         )}
       </select>
     </label>
+  );
+}
+
+/**
+ * §29.2 (20.11 решение владельца, PLUG-359):
+ * Единый компактный селектор роли и режима одобрения в строке поля ввода.
+ * Вместо «подпись Роль + список + тумблер» — одна кнопка-меню.
+ * По нажатию открывается меню из двух секций:
+ * 1) «Роль»: список доступных ролей треда, галочкой отмечена активная роль;
+ * 2) Разделитель и «Одобрение»: «✅ Авто» и «👤 Сам», галочкой отмечен текущий режим;
+ *    секция отображается ТОЛЬКО если workGraph != off и роль orchestrator или executor.
+ * Выбор в одной секции не закрывает меню и не меняет другую.
+ */
+function RoleApprovalMenu() {
+  const view = useComposerView();
+  const rpc = useRpc<Contract>();
+  const { values } = useSettings();
+  const t = createT(resolveLang(values?.language));
+
+  const scope = view?.scope;
+  const isThread = scope?.kind === "thread";
+  const projectId = scope?.kind === "new-thread" ? scope.projectId : null;
+  const threadId = scope?.kind === "thread" ? scope.threadId : null;
+
+  const [role, setRole] = useState<string>(DEFAULT_ROLE);
+  const [lockedLabel, setLockedLabel] = useState<string | null>(null);
+  const [taskKey, setTaskKey] = useState<string | null>(null);
+  const [mode, setMode] = useState<"auto" | "manual" | null>(null);
+  const [serverWorkGraph, setServerWorkGraph] = useState<string | null>(null);
+
+  const report = (next: RoleId) => {
+    setRole(next);
+    if (isThread && threadId) {
+      void rpc
+        .call("setThreadRole", { threadId, role: next })
+        .catch(() => undefined);
+      return;
+    }
+    void rpc
+      .call("setPendingRole", { projectId, role: next })
+      .catch(() => undefined);
+  };
+
+  const switchMode = (nextMode: "auto" | "manual") => {
+    setMode(nextMode);
+    if (role === "orchestrator") {
+      void rpc
+        .call("setProjectApprovalMode", { projectId, mode: nextMode })
+        .catch(() => {});
+    } else if (role === "executor" && taskKey) {
+      void rpc
+        .call("setTaskConfirmationMode", { taskKey, mode: nextMode })
+        .catch(() => {});
+    }
+  };
+
+  useEffect(() => {
+    let alive = true;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const applyRole = (next: string) => {
+      if (!alive) return;
+      if (PICKABLE.has(next)) {
+        setRole(next);
+        setLockedLabel(null);
+      } else {
+        setLockedLabel(next === "helper" ? t("app.roleHelper") : next);
+      }
+    };
+
+    const loadRole = () =>
+      isThread && threadId
+        ? rpc
+            .call("threadRole", { threadId })
+            .then((res) => applyRole(res?.role ?? "none"))
+            .catch(() => {
+              retryTimer = setTimeout(() => {
+                if (!alive) return;
+                void rpc
+                  .call("threadRole", { threadId })
+                  .then((res) => applyRole(res?.role ?? "none"))
+                  .catch(() => applyRole("none"));
+              }, 1000);
+            })
+        : rpc
+            .call("pendingRole", { projectId })
+            .then((res) => applyRole(res?.role ?? DEFAULT_ROLE))
+            .catch(() => {
+              retryTimer = setTimeout(() => {
+                if (!alive) return;
+                void rpc
+                  .call("pendingRole", { projectId })
+                  .then((res) => applyRole(res?.role ?? DEFAULT_ROLE))
+                  .catch(() => applyRole(DEFAULT_ROLE));
+              }, 1000);
+            });
+
+    void loadRole();
+
+    // Mode loading
+    if (role === "orchestrator") {
+      void rpc
+        .call("projectApprovalMode", { projectId })
+        .then((res) => {
+          if (!alive) return;
+          if (res?.mode) setMode(res.mode);
+          if (res?.workGraph) setServerWorkGraph(res.workGraph);
+        })
+        .catch(() => {});
+    } else if (role === "executor" && threadId) {
+      void rpc
+        .call("taskConfirmationMode", { threadId })
+        .then((res) => {
+          if (!alive) return;
+          if (res?.taskKey) setTaskKey(res.taskKey);
+          if (res?.mode) setMode(res.mode);
+          if (res?.workGraph) setServerWorkGraph(res.workGraph);
+        })
+        .catch(() => {});
+    }
+
+    return () => {
+      alive = false;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+    };
+  }, [projectId, threadId, isThread, role]);
+
+  // Determine if workGraph is active
+  const workGraphVal = (values?.workGraph as string) ?? serverWorkGraph ?? "off";
+  const workGraphOn = workGraphVal === "strict" || workGraphVal === "shadow";
+  const hasApproval =
+    workGraphOn && (role === "orchestrator" || role === "executor");
+
+  const currentMode =
+    role === "orchestrator" ? mode : (mode ?? "auto");
+  const modeGlyph = currentMode === "manual" ? "👤" : "✅";
+
+  const activeOption = ROLE_OPTIONS.find((o) => o.id === role);
+  const roleLabel =
+    lockedLabel !== null
+      ? lockedLabel
+      : activeOption
+      ? t(activeOption.labelKey)
+      : role;
+
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          className="orch-role-menu-trigger"
+          title={
+            hasApproval
+              ? role === "orchestrator"
+                ? `${roleLabel} (${t("app.approvalModeProject")}: ${
+                    currentMode === "manual" ? t("app.modeManual") : t("app.modeAuto")
+                  })`
+                : `${roleLabel} (${t("app.approvalModeTask", { task: taskKey ?? "" })}: ${
+                    currentMode === "manual" ? t("app.modeManual") : t("app.modeAuto")
+                  })`
+              : roleLabel
+          }
+        >
+          <span>{roleLabel}</span>
+          {hasApproval && <span>{modeGlyph}</span>}
+          <span style={{ opacity: 0.6, fontSize: 10, marginLeft: 1 }}>▾</span>
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          className="orch-role-menu-content"
+          sideOffset={5}
+          align="start"
+        >
+          <DropdownMenu.Label className="orch-role-menu-label">
+            {t("app.role")}
+          </DropdownMenu.Label>
+          {lockedLabel !== null ? (
+            <DropdownMenu.Item
+              disabled
+              className="orch-role-menu-item"
+              onSelect={(e) => e.preventDefault()}
+            >
+              <span>{lockedLabel}</span>
+              <span style={{ color: "#4ade80", fontWeight: 600 }}>✓</span>
+            </DropdownMenu.Item>
+          ) : (
+            ROLE_OPTIONS.map((opt) => {
+              const isSelected = role === opt.id;
+              return (
+                <DropdownMenu.Item
+                  key={opt.id}
+                  className="orch-role-menu-item"
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    report(opt.id);
+                  }}
+                >
+                  <span style={{ fontWeight: isSelected ? 600 : 400 }}>
+                    {t(opt.labelKey)}
+                  </span>
+                  {isSelected && (
+                    <span style={{ color: "#4ade80", fontWeight: 600 }}>✓</span>
+                  )}
+                </DropdownMenu.Item>
+              );
+            })
+          )}
+
+          {hasApproval && (
+            <>
+              <DropdownMenu.Separator className="orch-role-menu-separator" />
+              <DropdownMenu.Label className="orch-role-menu-label">
+                {t("app.approvalMode")}
+              </DropdownMenu.Label>
+              <DropdownMenu.Item
+                className="orch-role-menu-item"
+                onSelect={(e) => {
+                  e.preventDefault();
+                  switchMode("auto");
+                }}
+              >
+                <span style={{ fontWeight: currentMode === "auto" ? 600 : 400 }}>
+                  ✅ {t("app.modeAuto")}
+                </span>
+                {currentMode === "auto" && (
+                  <span style={{ color: "#4ade80", fontWeight: 600 }}>✓</span>
+                )}
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                className="orch-role-menu-item"
+                onSelect={(e) => {
+                  e.preventDefault();
+                  switchMode("manual");
+                }}
+              >
+                <span style={{ fontWeight: currentMode === "manual" ? 600 : 400 }}>
+                  👤 {t("app.modeManual")}
+                </span>
+                {currentMode === "manual" && (
+                  <span style={{ color: "#4ade80", fontWeight: 600 }}>✓</span>
+                )}
+              </DropdownMenu.Item>
+            </>
+          )}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
   );
 }
 
@@ -710,8 +959,7 @@ export default definePluginApp((app) => {
     id: "orchestrator-role",
     scopes: ["new-thread", "thread"],
     actions: [
-      { id: "role-select", component: RoleSelect },
-      { id: "mode-toggle", component: ApprovalModeToggle },
+      { id: "role-menu", component: RoleApprovalMenu },
     ],
   });
 

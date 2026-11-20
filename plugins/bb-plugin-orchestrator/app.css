@@ -1,0 +1,71 @@
+.orch-role-menu-content {
+  min-width: 150px;
+  max-width: 240px;
+  background: var(--popover, #1e1e24);
+  color: var(--popover-foreground, #f4f4f5);
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  z-index: 2147483000;
+  font-size: 12px;
+}
+
+.orch-role-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 12px;
+  outline: none;
+  user-select: none;
+  transition: background-color 0.1s;
+}
+
+.orch-role-menu-item[data-highlighted] {
+  background: var(--accent, rgba(128, 128, 128, 0.2));
+  color: var(--accent-foreground, inherit);
+}
+
+.orch-role-menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: inherit;
+  font-size: 12px;
+  color: inherit;
+  background: rgba(128, 128, 128, 0.12);
+  border: 1px solid rgba(128, 128, 128, 0.35);
+  border-radius: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  outline: none;
+  height: 26px;
+  box-sizing: border-box;
+}
+
+.orch-role-menu-trigger:hover {
+  background: rgba(128, 128, 128, 0.2);
+}
+
+.orch-role-menu-trigger:focus-visible {
+  border-color: var(--ring, rgba(59, 130, 246, 0.8));
+}
+
+.orch-role-menu-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted-foreground, rgba(128, 128, 128, 0.9));
+  padding: 4px 8px 2px;
+  user-select: none;
+}
+
+.orch-role-menu-separator {
+  height: 1px;
+  background: var(--border, rgba(128, 128, 128, 0.2));
+  margin: 4px 0;
+}

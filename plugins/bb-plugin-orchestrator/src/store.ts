@@ -4240,6 +4240,14 @@ export class DelegationStore {
       .all() as TaskQueueRow[];
   }
 
+  listPrOpenTasks(): TaskQueueRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM task_queue WHERE status = 'pr_open' AND node = 'release' ORDER BY priority DESC, created_at ASC`,
+      )
+      .all() as TaskQueueRow[];
+  }
+
   listAllTasks(): TaskQueueRow[] {
     return this.db
       .prepare(

@@ -10,6 +10,7 @@ import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
   decideRole,
   DEFAULT_HANDOFF_PATH,
+  DEFAULT_ROLE,
   DEFAULT_USER_THREAD_PLUGINS,
   HANDOFF_PATH_MAX,
   handleMessageDispatch,
@@ -1324,3 +1325,8 @@ test("§18.6: composed role + a 1500-char rule stays under 4096 — the SDK neve
     );
   }
 });
+
+test("roles: DEFAULT_ROLE is executor (owner decision 15.11 & UI parity)", () => {
+  assert.equal(DEFAULT_ROLE, "executor");
+});
+

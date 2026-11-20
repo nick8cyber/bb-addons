@@ -82,6 +82,17 @@ export interface Policy {
   routes: Record<string, PolicyRoute>;
   /** §31 / §34.3: Configuration for checks node. */
   checks?: PolicyChecksConfig;
+  /** §31.7 (r34.2): Configuration for route limits on fix/simple routes. */
+  routeLimits?: RouteLimitsConfig;
+}
+
+/** §31.7: Route boundaries configuration for fix and simple routes. */
+export interface RouteLimitsConfig {
+  maxFiles?: number;
+  maxLines?: number;
+  specPaths?: string[];
+  migrationPaths?: string[];
+  apiPaths?: string[];
 }
 
 /** §28.2 п. 3: Конфигурация узлов (node_policy): таймаут, попытки, уровень. */
@@ -696,6 +707,39 @@ export function parsePolicy(
     }
   }
 
+  // §31.7 (r34.2): Configuration for route boundaries (routeLimits) on fix/simple routes
+  let routeLimits: RouteLimitsConfig | undefined;
+  if (raw.routeLimits !== undefined) {
+    if (!isRecord(raw.routeLimits)) {
+      warn("routeLimits", "routeLimits configuration must be an object");
+    } else {
+      routeLimits = {};
+      if (raw.routeLimits.maxFiles !== undefined) {
+        if (typeof raw.routeLimits.maxFiles !== "number" || !Number.isInteger(raw.routeLimits.maxFiles) || raw.routeLimits.maxFiles < 1) {
+          warn("routeLimits.maxFiles", "maxFiles must be a positive integer");
+        } else {
+          routeLimits.maxFiles = raw.routeLimits.maxFiles;
+        }
+      }
+      if (raw.routeLimits.maxLines !== undefined) {
+        if (typeof raw.routeLimits.maxLines !== "number" || !Number.isInteger(raw.routeLimits.maxLines) || raw.routeLimits.maxLines < 1) {
+          warn("routeLimits.maxLines", "maxLines must be a positive integer");
+        } else {
+          routeLimits.maxLines = raw.routeLimits.maxLines;
+        }
+      }
+      for (const key of ["specPaths", "migrationPaths", "apiPaths"] as const) {
+        if (raw.routeLimits[key] !== undefined) {
+          if (!Array.isArray(raw.routeLimits[key]) || !raw.routeLimits[key].every(isNonEmptyString)) {
+            warn(`routeLimits.${key}`, `${key} must be an array of non-empty strings`);
+          } else {
+            routeLimits[key] = [...(raw.routeLimits[key] as string[])];
+          }
+        }
+      }
+    }
+  }
+
   let maxRunSeconds: number | undefined;
   if (raw.maxRunSeconds !== undefined) {
     const v = raw.maxRunSeconds;
@@ -762,6 +806,7 @@ export function parsePolicy(
         ? { quotaGroupAliases }
         : {}),
       ...(checks && Object.keys(checks).length > 0 ? { checks } : {}),
+      ...(routeLimits && Object.keys(routeLimits).length > 0 ? { routeLimits } : {}),
       levels,
       routes,
     },

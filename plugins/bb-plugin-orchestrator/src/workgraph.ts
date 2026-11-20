@@ -27,6 +27,14 @@ import {
   normalizeTaskKey,
 } from "./store.js";
 import { verdictDetailsInBody } from "./release.js";
+import {
+  checkRouteLimits,
+  type RouteLimitsCheckResult,
+} from "./route-limits.js";
+import {
+  verifySpecReferences,
+  type SpecReferenceCheckResult,
+} from "./spec-check.js";
 import type { PluginCliContext } from "@get-bb/plugin-sdk";
 import type { T } from "./i18n/index.js";
 import {
@@ -3550,6 +3558,22 @@ export interface RunQueueDeps {
     task: TaskQueueRow,
     resultSha: string,
   ) => Promise<boolean>;
+  checkRouteLimits?: (
+    task: TaskQueueRow,
+    resultSha: string,
+  ) => Promise<RouteLimitsCheckResult>;
+  verifySpecReferences?: (
+    task: TaskQueueRow,
+    specSha: string,
+    mergeBaseBranch: string,
+  ) => Promise<SpecReferenceCheckResult>;
+  checkPrStatus?: (
+    task: TaskQueueRow,
+  ) => Promise<{
+    state: "MERGED" | "CLOSED" | "CHANGES_REQUESTED" | "OPEN";
+    mergeCommit?: string;
+    error?: string;
+  }>;
 }
 
 export interface RunQueueResult {
@@ -3560,6 +3584,125 @@ export interface RunQueueResult {
   advancedCount: number;
   tasks: TaskQueueRow[];
   transitions: TaskTransitionRow[];
+}
+
+async function advancePrOpenTask(
+  task: TaskQueueRow,
+  deps: RunQueueDeps,
+  transitions: TaskTransitionRow[],
+  now: number,
+): Promise<boolean> {
+  let prState: {
+    state: "MERGED" | "CLOSED" | "CHANGES_REQUESTED" | "OPEN";
+    mergeCommit?: string;
+  } | null = null;
+
+  if (deps.checkPrStatus) {
+    prState = await deps.checkPrStatus(task);
+  } else {
+    const payload = parsePayload(task.payload);
+    if (typeof payload.pr_status === "string") {
+      const s = payload.pr_status.toUpperCase();
+      prState = {
+        state: (s === "MERGED" || s === "CLOSED" || s === "CHANGES_REQUESTED" ? s : "OPEN") as any,
+        mergeCommit: typeof payload.pr_merge_sha === "string" ? payload.pr_merge_sha : undefined,
+      };
+    } else if (payload.pr_changes_requested === true) {
+      prState = { state: "CHANGES_REQUESTED" };
+    } else {
+      const rel =
+        deps.store.activeReleaseByTask(task.task_key) ??
+        deps.store.latestReleaseByTask(task.task_key);
+      if (rel) {
+        if (rel.pr_state === "merged" || rel.pr_state === "merging") {
+          prState = { state: "MERGED", mergeCommit: rel.pr_merge_sha ?? undefined };
+        } else if (rel.pr_state === "closed" || rel.pr_state === "closed_final") {
+          prState = { state: "CLOSED" };
+        }
+      }
+    }
+  }
+
+  if (!prState || prState.state === "OPEN") {
+    return false;
+  }
+
+  let event: TransitionEvent | null = null;
+  if (prState.state === "MERGED") {
+    event = { type: "pr_merged" };
+  } else if (prState.state === "CHANGES_REQUESTED") {
+    event = { type: "pr_changes_requested" };
+  } else if (prState.state === "CLOSED") {
+    event = { type: "pr_closed" };
+  }
+
+  if (!event) return false;
+
+  const resolution = resolveTransition({
+    route: task.route,
+    node: "release",
+    status: "pr_open",
+    event,
+    mode: task.confirmation_mode,
+    counters: extractCounters(task),
+  });
+
+  if (!resolution.allowed) return false;
+
+  const payload = parsePayload(task.payload);
+  const updates: Partial<TaskQueueRow> = {};
+  if (resolution.counterUpdates) {
+    Object.assign(updates, resolution.counterUpdates);
+  }
+  if (prState.mergeCommit) {
+    updates.result_sha = prState.mergeCommit;
+  }
+  if (prState.state === "CLOSED") {
+    updates.payload = JSON.stringify({
+      ...payload,
+      stalled_reason: "pr_closed",
+      pr_status: null,
+    });
+  } else if (prState.state === "CHANGES_REQUESTED") {
+    updates.payload = JSON.stringify({
+      ...payload,
+      pr_changes_requested: false,
+      pr_status: null,
+      code_done: false,
+      spec_done: false,
+    });
+  }
+
+  const tr = deps.store.transitionTask(
+    {
+      taskKey: task.task_key,
+      expectedNode: "release",
+      expectedStatus: "pr_open",
+      toNode: resolution.toNode,
+      toStatus: resolution.toStatus,
+      actor: "run-queue",
+      reason: resolution.reason,
+      updates: Object.keys(updates).length > 0 ? updates : undefined,
+      timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+    },
+    now,
+  );
+
+  if (tr.ok && tr.task) {
+    const logged = deps.store.listTransitions(task.task_key).at(-1);
+    if (logged) transitions.push(logged);
+    if (resolution.toStatus === "done" && deps.bbCli) {
+      try {
+        await deps.bbCli.run(["tasks", "update", task.task_key, "--status", "done"]);
+      } catch {}
+    }
+    if (resolution.action?.dispatchNode) {
+      await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+    }
+    return true;
+  }
+
+  return false;
 }
 
 export async function runRunQueue(
@@ -3683,6 +3826,23 @@ export async function runRunQueue(
               .catch(() => {});
           }
         }
+      }
+
+      // ── 1d. Advance tasks waiting in release (pr_open) ─────────
+      const prOpenTasks = deps.store.listPrOpenTasks ? deps.store.listPrOpenTasks() : [];
+      for (const pt of prOpenTasks) {
+        try {
+          const advanced = await advancePrOpenTask(
+            pt,
+            deps,
+            transitions,
+            now,
+          );
+          if (advanced) {
+            progressed = true;
+            advancedCount++;
+          }
+        } catch {}
       }
 
       // ── 2. Take queued tasks ──────────────────────────────────────────
@@ -4039,7 +4199,7 @@ async function startQueuedTask(
             route: task.route,
             node: "start",
             status: "queued",
-            event: { type: "git_failure", reason },
+            event: { type: "git_failure", reason, gitError: reason },
             mode: task.confirmation_mode,
             counters: extractCounters(task),
           });
@@ -5208,19 +5368,57 @@ async function advanceActiveTask(
           } catch {}
         }
 
-        const resolution = resolveTransition({
-          route: task.route,
-          node: "spec",
-          status: "running",
-          event: {
-            type: "spec_delivered",
-            specSha,
-            acceptanceTampered: tampered,
-            filesOutsideDocs,
-          },
-          mode: task.confirmation_mode,
-          counters: extractCounters(task),
-        });
+        let specRefCheck: SpecReferenceCheckResult = { valid: true };
+        if (deps.verifySpecReferences) {
+          specRefCheck = await deps.verifySpecReferences(task, specSha, mergeBaseBranch);
+        } else if (deps.cmd && specSha && !specSha.startsWith("sha-")) {
+          try {
+            specRefCheck = await verifySpecReferences(
+              { cmd: deps.cmd, repoRoot },
+              task,
+              specSha,
+              mergeBaseBranch,
+            );
+          } catch (err: any) {
+            specRefCheck = { valid: false, notRun: true, reason: err?.message };
+          }
+        }
+
+        if (specRefCheck.notRun) {
+          return false;
+        }
+
+        let resolution: TransitionResolution;
+        if (!specRefCheck.valid) {
+          resolution = resolveTransition({
+            route: task.route,
+            node: "spec",
+            status: "running",
+            event: {
+              type: "spec_invalid_reference",
+              invalidCodebaseReference: true,
+              specSha,
+              reason: specRefCheck.reason,
+            },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+        } else {
+          resolution = resolveTransition({
+            route: task.route,
+            node: "spec",
+            status: "running",
+            event: {
+              type: "spec_delivered",
+              specSha,
+              acceptanceTampered: tampered,
+              filesOutsideDocs,
+              invalidCodebaseReference: false,
+            },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+        }
         if (!resolution.allowed) return false;
 
         const consumed = Array.isArray(payload.consumed_delegations)
@@ -5679,20 +5877,57 @@ async function advanceActiveTask(
               resultSha,
             );
 
-        const resolution = resolveTransition({
-          route: task.route,
-          node: "code",
-          status: "running",
-          event: {
-            type: "code_delivered",
-            resultSha,
-            commits,
-            noCode: Boolean(payload.no_code),
-            acceptanceTampered: tampered,
-          },
-          mode: task.confirmation_mode,
-          counters: extractCounters(task),
-        });
+        let routeLimitRes: RouteLimitsCheckResult = { violated: false };
+        if (deps.checkRouteLimits) {
+          routeLimitRes = await deps.checkRouteLimits(task, resultSha);
+        } else if (
+          deps.cmd &&
+          resultSha &&
+          !resultSha.startsWith("sha-") &&
+          (task.route === "fix" || task.route === "simple")
+        ) {
+          try {
+            routeLimitRes = await checkRouteLimits(
+              { cmd: deps.cmd, repoRoot },
+              task,
+              resultSha,
+              deps.policy?.routeLimits,
+            );
+          } catch {}
+        }
+
+        let resolution: TransitionResolution;
+        if (routeLimitRes.violated) {
+          resolution = resolveTransition({
+            route: task.route,
+            node: "code",
+            status: "running",
+            event: {
+              type: "code_route_violation",
+              routeViolation: true,
+              resultSha,
+              reason: routeLimitRes.reason,
+            },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+        } else {
+          resolution = resolveTransition({
+            route: task.route,
+            node: "code",
+            status: "running",
+            event: {
+              type: "code_delivered",
+              resultSha,
+              commits,
+              noCode: Boolean(payload.no_code),
+              acceptanceTampered: tampered,
+              routeViolation: false,
+            },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+        }
         if (!resolution.allowed) return false;
 
         const consumed = Array.isArray(payload.consumed_delegations)
@@ -5729,6 +5964,16 @@ async function advanceActiveTask(
             last_nudge_at: null,
           }),
         };
+        if (
+          resolution.ruleId === "rule-32-code-route-violation" ||
+          resolution.action?.setPayload?.route_escalated === "feature"
+        ) {
+          updates.route = "feature";
+          updates.code_attempts = 0;
+          updates.check_attempts = 0;
+          updates.code_review_rounds = 0;
+          updates.design_check_rounds = 0;
+        }
         if (resolution.counterUpdates) {
           Object.assign(updates, resolution.counterUpdates);
         }
@@ -6333,7 +6578,8 @@ async function advanceActiveTask(
     case "research": {
       if (
         latestDelegation?.status === "done" ||
-        payload.research_done === true
+        payload.research_done === true ||
+        (latestDelegation && latestDelegation.status !== "running")
       ) {
         const report =
           (latestDelegation
@@ -6345,7 +6591,79 @@ async function advanceActiveTask(
             : null) ||
           (typeof payload.research_report === "string"
             ? payload.research_report
-            : "done");
+            : null) ||
+          (payload.research_done === true ? "done" : null) ||
+          (latestDelegation?.status === "done" && !latestDelegation.thread_id
+            ? "done"
+            : null);
+
+        if (!report) {
+          const lastNudge =
+            typeof payload.last_nudge_at === "number" ? payload.last_nudge_at : 0;
+          const nudgeCount =
+            typeof payload.nudge_count === "number" ? payload.nudge_count : 0;
+          if (nudgeCount > 0 && nudgeCount < 3 && now - lastNudge < 60_000) {
+            return false;
+          }
+          const exhausted = nudgeCount >= 3;
+          const resolution = resolveTransition({
+            route: task.route,
+            node: "research",
+            status: "running",
+            event: {
+              type: "research_question_or_no_report",
+              nudgeCount,
+              exhausted,
+              reason: exhausted
+                ? "research-no-report: exhausted nudges (3) -> stalled"
+                : "question without report: stay in research, nudge",
+            },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+          if (!resolution.allowed) return false;
+
+          if (latestDelegation?.thread_id && deps.bbCli && !exhausted) {
+            await deps.bbCli
+              .run([
+                "thread",
+                "tell",
+                latestDelegation.thread_id,
+                "Предоставь отчёт исследования или зафиксируй результаты в задаче.",
+              ])
+              .catch(() => {});
+          }
+
+          const tr = deps.store.transitionTask(
+            {
+              taskKey: task.task_key,
+              expectedNode: "research",
+              expectedStatus: "running",
+              toNode: resolution.toNode,
+              toStatus: resolution.toStatus,
+              actor: "run-queue",
+              reason: resolution.reason,
+              updates: {
+                payload: JSON.stringify({
+                  ...payload,
+                  nudge_count: nudgeCount + 1,
+                  last_nudge_at: now,
+                }),
+              },
+              timeoutSeconds: getNodeTimeoutSeconds(
+                deps.policy,
+                resolution.toNode,
+              ),
+            },
+            now,
+          );
+          if (tr.ok) {
+            const logged = deps.store.listTransitions(task.task_key).at(-1);
+            if (logged) transitions.push(logged);
+            return true;
+          }
+          return false;
+        }
 
         const resolution = resolveTransition({
           route: task.route,
