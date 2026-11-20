@@ -407,7 +407,7 @@ await waitFor(() => deltasFor(T6).some((d) => d.kind === "turn.boundary"), 20000
 
 // ----------------------------------------------------------------------------
 // Test 7: [[interrupted-preserve-prior-text]]
-// Prior text before interruption in same segment is preserved and closed cleanly.
+// Prior text before steer in same segment is preserved, steer occurs, service line suppressed.
 // ----------------------------------------------------------------------------
 const T7 = "t7_prior_text";
 start(701, T7);
@@ -421,6 +421,24 @@ send({
   params: { threadId: T7, providerThreadId: ptid7, clientRequestId: creq(), input: [{ type: "text", text: "Run [[interrupted-preserve-prior-text]]" }], options },
 });
 
+// Wait for prompt to reach fake agy and stream prior text
+await waitFor(() => deltasFor(T7).some((d) => d.kind === "item.textDelta" && (d.text ?? "").includes("Prior text")), 10000, "t7 prior text");
+
+// Now send steer
+send({
+  jsonrpc: "2.0",
+  id: 703,
+  method: "turn/steer",
+  params: {
+    threadId: T7,
+    providerThreadId: ptid7,
+    clientRequestId: creq(),
+    expectedTurnId: "any",
+    input: [{ type: "text", text: "STEER-ANSWER: follow up" }],
+    options,
+  },
+});
+
 await waitFor(() => deltasFor(T7).some((d) => d.kind === "turn.boundary"), 20000, "t7 turn boundary");
 
 {
@@ -429,11 +447,72 @@ await waitFor(() => deltasFor(T7).some((d) => d.kind === "turn.boundary"), 20000
   const allText = textDeltas.join("");
   check("t7/prior-text-preserved", allText.includes("Prior text before steer."), `got: "${allText}"`);
   check("t7/interrupted-string-not-in-deltas", !allText.includes("stream was interrupted"), `got: "${allText}"`);
+  check("t7/continuation-after-steer", allText.includes("Continuing after steer."));
   check("t7/has-text-close", deltas.some((d) => d.kind === "item.textClose" && d.channel === "agentMessage"));
+  const logFound = bridgeLog().includes(`suppress interrupted stream: thread=${T7} continued=yes`);
+  check("t7/audit-log-continued-yes", logFound);
 }
 
 // ----------------------------------------------------------------------------
-// Test 8: Pool state and accounts ledger unaffected
+// Test 8: Quota string in a separate chunk inside prose -> delivered, no cooldown
+// ----------------------------------------------------------------------------
+const T8 = "t8_quota_in_prose";
+start(801, T8);
+await waitFor(() => replies(801).length === 1, 20000, "t8-start");
+const ptid8 = replies(801)[0]?.result?.providerThreadId;
+
+send({
+  jsonrpc: "2.0",
+  id: 802,
+  method: "turn/start",
+  params: { threadId: T8, providerThreadId: ptid8, clientRequestId: creq(), input: [{ type: "text", text: "Run [[quota-in-prose-chunked]]" }], options },
+});
+
+await waitFor(() => deltasFor(T8).some((d) => d.kind === "turn.boundary"), 20000, "t8 turn boundary");
+
+{
+  const deltas = deltasFor(T8);
+  const textDeltas = deltas.filter((d) => d.kind === "item.textDelta" && d.channel === "agentMessage").map((d) => d.text);
+  const allText = textDeltas.join("");
+  check("t8/prose-head-delivered", allText.includes("Here is the log line I saw:"), `got: "${allText}"`);
+  check("t8/quota-quote-delivered", allText.includes("Individual quota reached"), `got: "${allText}"`);
+  const boundary = deltas.find((d) => d.kind === "turn.boundary");
+  check("t8/boundary-completed", boundary?.status === "completed");
+  const a1 = ledger().accounts?.a1;
+  check("t8/a1-not-cooled", a1?.cooldownUntilMs === 0, `cooldown: ${a1?.cooldownUntilMs}`);
+  check("t8/a1-not-parked", a1?.parkedReason === undefined);
+}
+
+// ----------------------------------------------------------------------------
+// Test 9: Interrupted string in a separate chunk inside prose -> delivered
+// ----------------------------------------------------------------------------
+const T9 = "t9_interrupted_in_prose";
+start(901, T9);
+await waitFor(() => replies(901).length === 1, 20000, "t9-start");
+const ptid9 = replies(901)[0]?.result?.providerThreadId;
+
+send({
+  jsonrpc: "2.0",
+  id: 902,
+  method: "turn/start",
+  params: { threadId: T9, providerThreadId: ptid9, clientRequestId: creq(), input: [{ type: "text", text: "Run [[interrupted-in-prose-chunked]]" }], options },
+});
+
+await waitFor(() => deltasFor(T9).some((d) => d.kind === "turn.boundary"), 20000, "t9 turn boundary");
+
+{
+  const deltas = deltasFor(T9);
+  const textDeltas = deltas.filter((d) => d.kind === "item.textDelta" && d.channel === "agentMessage").map((d) => d.text);
+  const allText = textDeltas.join("");
+  check("t9/prose-head-delivered", allText.includes("Analysis log:"), `got: "${allText}"`);
+  check("t9/interrupted-quote-delivered", allText.includes("The stream was interrupted."), `got: "${allText}"`);
+  check("t9/prose-tail-delivered", allText.includes("This is normal prose continuing after quote."), `got: "${allText}"`);
+  const boundary = deltas.find((d) => d.kind === "turn.boundary");
+  check("t9/boundary-completed", boundary?.status === "completed");
+}
+
+// ----------------------------------------------------------------------------
+// Test 10: Pool state and accounts ledger unaffected
 // ----------------------------------------------------------------------------
 {
   const currentLedger = ledger();

@@ -4261,9 +4261,7 @@ function processDeltaLine(
   for (const delta of deltas) {
     switch (delta.kind) {
       case "turn.open": {
-        if (session.interruptedPending) {
-          resolveInterruptedPending(session, "aborted");
-        }
+        session.interruptedPending = false;
         session.bridgeTurnBusy = true;
         session.streamedAgentMessage = false;
         session.agentMessageText = "";
@@ -4404,7 +4402,7 @@ function processDeltaLine(
           }
           // Default divergence: flush buffered candidate chunks and process normally
           flushCandidateBuffer(session, out);
-          session.agentMessageText = "";
+          session.agentMessageText = candidateText;
           session.streamedAgentMessage = true;
           if (session.compact?.collecting) {
             session.compact.summaryBuf += delta.text;

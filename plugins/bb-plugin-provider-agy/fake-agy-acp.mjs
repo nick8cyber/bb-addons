@@ -399,8 +399,26 @@ async function runPrompt(id, text) {
   }
   if (text.includes("[[interrupted-preserve-prior-text]]") || mode === "interrupted-preserve-prior-text") {
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Prior text before steer.\n" } });
-    upd({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "re-thinking" } });
+    for (let i = 0; i < 50; i++) {
+      if (cancelled) break;
+      await sleep(50);
+    }
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ The stream was interrupted. Please continue the task you were working on.\n" } });
+    upd({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "re-thinking" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Continuing after steer." } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[quota-in-prose-chunked]]") || mode === "quota-in-prose-chunked") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Here is the log line I saw:\n" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h0m0s.\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[interrupted-in-prose-chunked]]") || mode === "interrupted-in-prose-chunked") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Analysis log:\n" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ The stream was interrupted. Please continue the task you were working on.\n" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\nThis is normal prose continuing after quote." } });
     out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
     return;
   }
