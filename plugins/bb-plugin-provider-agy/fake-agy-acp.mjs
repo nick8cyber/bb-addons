@@ -326,6 +326,29 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
     return;
   }
+  if (text.includes("[[steer-marker]]") || mode === "steer-marker") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached" } });
+    for (let i = 0; i < 50; i++) {
+      if (cancelled) break;
+      await sleep(100);
+    }
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[stop-marker]]") || mode === "stop-marker") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached" } });
+    for (let i = 0; i < 50; i++) {
+      if (cancelled) break;
+      await sleep(100);
+    }
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("steered input") || text.includes("STEER-ANSWER")) {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "STEER-ANSWER" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
   if (text.includes("[[askperm]]")) {
     const rid = `perm-${++seq}`;
     out({ jsonrpc: "2.0", id: rid, method: "session/request_permission",
@@ -464,7 +487,10 @@ rlFake.on("line", (line) => {
       return;
     }
     case "session/cancel":
-      out({ jsonrpc: "2.0", id: msg.id, result: {} });
+      cancelled = true;
+      if (msg.id !== undefined) {
+        out({ jsonrpc: "2.0", id: msg.id, result: {} });
+      }
       return;
     case "authenticate":
       out({ jsonrpc: "2.0", id: msg.id, result: {} });

@@ -159,8 +159,17 @@ const options = {
   approvalReviewer: null,
   permissionEscalation: null,
 };
+const ALPHABET = "23456789abcdefghijkmnpqrstuvwxyz";
 let creqN = 0;
-const creq = () => `creq_${"aaaaaaaaaa".slice(0, 9)}${"abcdefghjkmnpqrstuvwxyz"[creqN++ % 24]}`;
+const creq = () => {
+  let n = ++creqN;
+  let s = "";
+  for (let i = 0; i < 10; i++) {
+    s += ALPHABET[n % ALPHABET.length];
+    n = Math.floor(n / ALPHABET.length) + (i + 1);
+  }
+  return `creq_${s}`;
+};
 const deltas = (tid) => messages.filter((m) => m.method === "thread/delta" && m.params.threadId === tid).flatMap((m) => m.params.deltas);
 const boundaries = (tid) => deltas(tid).filter((d) => d.kind === "turn.boundary");
 const lastPtid = (tid) =>
@@ -397,6 +406,68 @@ const start = (id, tid, customOpts = options) =>
   check("blocker1/seed-quota-next-turn-succeeds", boundaries("t-b1-seedquota").at(-1)?.status === "completed");
 }
 
+// Test 1d: model update during compaction queues and runs with new model
+{
+  resetAcpPool();
+  start(130, "t-b1-model-compact");
+  await waitFor(() => replies(130).length === 1, 20000, "t-b1-model-compact start");
+  const ptid = replies(130)[0].result.providerThreadId;
+
+  // Initial turn
+  send({
+    jsonrpc: "2.0",
+    id: 131,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-model-compact",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "initial turn text", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-model-compact").length >= 1, 20000, "t-b1-model-compact initial");
+
+  setControl({ compactMode: "fail", summaryMode: "ok", seedMode: "ok" });
+  const compactMention = {
+    start: 0,
+    end: 8,
+    resource: { kind: "command", trigger: "/", name: "compact", source: "command", origin: "builtin", label: "/compact", argumentHint: null },
+  };
+  // Start compaction
+  send({
+    jsonrpc: "2.0",
+    id: 132,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-model-compact",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "/compact", mentions: [compactMention] }],
+    },
+  });
+
+  // While compaction is running, send turn with updated model
+  const newModelOpts = { ...options, model: "custom-model" };
+  send({
+    jsonrpc: "2.0",
+    id: 133,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-model-compact",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options: newModelOpts,
+      input: [{ type: "text", text: "queued turn with new model", mentions: [] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b1-model-compact").length >= 4, 30000, "t-b1-model-compact all finished");
+  check("blocker1/model-update-during-compaction-succeeds", boundaries("t-b1-model-compact").at(-1)?.status === "completed");
+  setControl({ compactMode: "ok", summaryMode: "ok", seedMode: "ok" });
+}
+
 // ----------------------------------------------------------------------------
 // BLOCKER 2: Prefix buffering & heldTextClose
 // ----------------------------------------------------------------------------
@@ -587,34 +658,76 @@ const start = (id, tid, customOpts = options) =>
   await waitFor(() => replies(260).length === 1, 20000, "t-b2-steer start");
   const ptid = replies(260)[0].result.providerThreadId;
 
-  // Initial turn
+  // Turn with [[steer-marker]] — outputs quota candidate prefix and pauses
   send({
     jsonrpc: "2.0",
     id: 261,
     method: "turn/start",
-    params: { threadId: "t-b2-steer", providerThreadId: ptid, clientRequestId: creq(), options, input: [{ type: "text", text: "initial", mentions: [] }] },
+    params: { threadId: "t-b2-steer", providerThreadId: ptid, clientRequestId: creq(), options, input: [{ type: "text", text: "[[steer-marker]]", mentions: [] }] },
   });
-  await waitFor(() => boundaries("t-b2-steer").length >= 1, 20000, "t-b2-steer initial");
+  await waitFor(() => deltas("t-b2-steer").some((d) => d.kind === "turn.open"), 10000, "t-b2-steer turn.open");
+  const liveTurnId = deltas("t-b2-steer").find((d) => d.kind === "turn.open")?.providerTurnId ?? "";
+  await sleep(200);
 
-  // Send turn/steer
+  // Send turn/steer while candidate is buffered
   send({
     jsonrpc: "2.0",
     id: 262,
     method: "turn/steer",
-    params: { threadId: "t-b2-steer", clientRequestId: creq(), input: [{ type: "text", text: "steered input", mentions: [] }] },
+    params: {
+      threadId: "t-b2-steer",
+      providerThreadId: ptid,
+      expectedTurnId: "turn-1",
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "steered input", mentions: [] }],
+    },
   });
-  await waitFor(() => replies(262).length >= 1 || boundaries("t-b2-steer").length >= 2, 20000, "t-b2-steer replied");
-  check("blocker2/steer-processed", replies(262).length >= 1 || boundaries("t-b2-steer").length >= 2);
+  await waitFor(() => replies(262).length >= 1, 20000, "t-b2-steer replied");
+  await waitFor(
+    () => deltas("t-b2-steer").map((d) => d.text ?? "").join("").includes("STEER-ANSWER"),
+    20000,
+    "t-b2-steer STEER-ANSWER arrived"
+  );
+  await waitFor(() => boundaries("t-b2-steer").length >= 1, 20000, "t-b2-steer finished");
+  const steerTexts = deltas("t-b2-steer").map((d) => d.text ?? "").join("");
+  check("blocker2/steer-processed", steerTexts.includes("STEER-ANSWER"), `steerTexts=${steerTexts}`);
+  check("blocker2/steer-no-rotation", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+  check("blocker2/steer-turn-completed", boundaries("t-b2-steer").at(-1)?.status === "completed");
 }
 
-// Test 2h: thread/stop clears state
+// Test 2h: thread/stop clears state while candidate is in buffer
 {
   resetAcpPool();
   start(270, "t-b2-stop");
   await waitFor(() => replies(270).length === 1, 20000, "t-b2-stop start");
-  send({ jsonrpc: "2.0", id: 271, method: "thread/stop", params: { threadId: "t-b2-stop" } });
-  await waitFor(() => replies(271).length === 1, 20000, "t-b2-stop replied");
-  check("blocker2/stop-discards-session", replies(271).length === 1);
+  const ptid = replies(270)[0].result.providerThreadId;
+
+  // Turn with [[stop-marker]] — outputs quota candidate prefix and pauses
+  send({
+    jsonrpc: "2.0",
+    id: 271,
+    method: "turn/start",
+    params: { threadId: "t-b2-stop", providerThreadId: ptid, clientRequestId: creq(), options, input: [{ type: "text", text: "[[stop-marker]]", mentions: [] }] },
+  });
+  await sleep(200);
+
+  send({
+    jsonrpc: "2.0",
+    id: 272,
+    method: "thread/stop",
+    params: { threadId: "t-b2-stop", providerThreadId: ptid, intent: "interrupt", activeTurnId: "turn-1" },
+  });
+  await waitFor(() => replies(272).length === 1, 20000, "t-b2-stop replied");
+  await sleep(200);
+
+  const stopTexts = deltas("t-b2-stop").map((d) => d.text ?? "").join("");
+  const closes = deltas("t-b2-stop").filter((d) => d.kind === "item.textClose" && d.channel === "agentMessage");
+  check("blocker2/stop-discards-session", replies(272).length === 1);
+  check("blocker2/stop-no-marker-leak", !stopTexts.includes("⚠"));
+  check("blocker2/stop-no-held-close-leak", closes.length === 0, `closes=${JSON.stringify(closes)}`);
+  check("blocker2/stop-no-cooldown", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+  check("blocker2/stop-no-rotation", !messages.some((m) => m.method === "session/replaced" && m.params.threadId === "t-b2-stop"));
 }
 
 // ----------------------------------------------------------------------------
@@ -819,20 +932,54 @@ const start = (id, tid, customOpts = options) =>
     `reply=${JSON.stringify(reply312)} settledErrors=${settledErrors.length}`
   );
 
-  // Unblock timer cancelled on thread/stop
+  // Unblock timer cancelled on thread/stop: quota with Resets in 1s -> thread/stop -> wait > 1s -> verify allowed never arrives
   directSend({
     jsonrpc: "2.0",
-    id: 313,
+    id: 315,
+    method: "thread/start",
+    params: { threadId: "t-b3-timer-stop", cwd: directWs, options: directOpts, instructionMode: "append" },
+  });
+  await waitFor(() => replies(315).length === 1, 20000, "direct timer-stop start");
+  const ptidTimerStop = replies(315)[0]?.result?.providerThreadId;
+
+  // Initial turn
+  directSend({
+    jsonrpc: "2.0",
+    id: 3151,
+    method: "turn/start",
+    params: { threadId: "t-b3-timer-stop", providerThreadId: ptidTimerStop, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "init", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b3-timer-stop").length >= 1, 20000, "direct timer-stop init");
+
+  // Send turn with quota failure (returns 1s countdown)
+  setControl({ quotaMsg: "Quota exhausted; retry later. Resets in 1s." });
+  directSend({
+    jsonrpc: "2.0",
+    id: 316,
+    method: "turn/start",
+    params: { threadId: "t-b3-timer-stop", providerThreadId: ptidTimerStop, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "[[quota]]", mentions: [] }] },
+  });
+  await waitFor(() => rateLimits("t-b3-timer-stop").some((r) => r.rateLimits?.status === "blocked"), 20000, "rateLimits blocked for timer-stop");
+
+  // Stop thread immediately while timer is armed
+  directSend({
+    jsonrpc: "2.0",
+    id: 317,
     method: "thread/stop",
     params: {
-      threadId: "t-b3-queued",
-      providerThreadId: ptidQueued,
+      threadId: "t-b3-timer-stop",
+      providerThreadId: ptidTimerStop,
       intent: "interrupt",
-      activeTurnId: "",
+      activeTurnId: "turn-1",
     },
   });
-  await waitFor(() => replies(313).length === 1, 10000, "direct thread stop");
-  check("blocker3/direct-thread-stop-unblock-timer", replies(313).length === 1);
+  await waitFor(() => replies(317).length === 1, 10000, "direct timer-stop replied");
+
+  // Wait > 1s to verify unblock timer was cancelled and does not emit allowed
+  await sleep(1500);
+  const rlTimerStop = rateLimits("t-b3-timer-stop");
+  const unblockFiredAfterStop = rlTimerStop.some((r) => r.rateLimits?.status === "allowed");
+  check("blocker3/direct-thread-stop-unblock-timer", !unblockFiredAfterStop, `unblockFiredAfterStop=${unblockFiredAfterStop}`);
 
   // Unblock timer expiration in direct mode
   directSend({

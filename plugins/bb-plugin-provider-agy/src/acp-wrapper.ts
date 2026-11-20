@@ -2890,9 +2890,6 @@ function emitRateLimits(
     );
     session.unblockTimer = setTimeout(() => {
       session.unblockTimer = null;
-      if (session.stopped || sessions.get(session.threadId) !== session) {
-        return;
-      }
       session.rateLimitsBlocked = false;
       session.blockedResetsAtMs = null;
       emitRateLimits(session, "allowed", null, null);
@@ -4251,9 +4248,6 @@ function processDeltaLine(
         const isVal = isAgentValidationMessage(session.agentMessageText);
         const isQuota = isAgentQuotaMessage(session.agentMessageText);
         if (isVal) {
-          if (session.heldTextClose !== null) {
-            out.push({ ...session.heldTextClose });
-          }
           session.candidateBuffer = [];
           session.heldTextClose = null;
           session.agentMessageText = "";
@@ -4262,14 +4256,14 @@ function processDeltaLine(
         }
         if (isQuota) {
           const refusal = session.agentMessageText.trim();
-          if (session.heldTextClose !== null) {
-            out.push({ ...session.heldTextClose });
-          }
           session.candidateBuffer = [];
           session.heldTextClose = null;
           session.agentMessageText = "";
           onQuotaRefusalBoundary(session, refusal);
           continue;
+        }
+        if (session.stopped) {
+          sessions.delete(session.threadId);
         }
         flushCandidateBuffer(session, out);
         session.agentMessageText = "";
@@ -4330,6 +4324,10 @@ function processDeltaLine(
       }
       case "item.textClose": {
         if (delta.channel === "agentMessage") {
+          if (session.stopped) {
+            session.heldTextClose = null;
+            continue;
+          }
           if (
             isAgentQuotaMessage(session.agentMessageText) ||
             isAgentValidationMessage(session.agentMessageText)
@@ -4346,6 +4344,10 @@ function processDeltaLine(
       case "item.close": {
         const item = optionsRecord(delta.item);
         if (item.type === "agentMessage") {
+          if (session.stopped) {
+            session.heldTextClose = null;
+            continue;
+          }
           if (
             isAgentQuotaMessage(session.agentMessageText) ||
             isAgentValidationMessage(session.agentMessageText)
@@ -4554,6 +4556,9 @@ function interceptOutbound(line: string): void {
       const category = classifyError(message);
       if (
         session !== undefined &&
+        (session.daemonTurnOpen ||
+          session.bridgeTurnBusy ||
+          session.compact !== null) &&
         (category === "rate-limit" ||
           isTosDisabled(message) ||
           isValidationRequired(message) ||
@@ -5109,7 +5114,9 @@ function discardSession(session: WSession): void {
     }
   }
   resolveInteractions(session.threadId);
-  sessions.delete(session.threadId);
+  if (!session.bridgeTurnBusy && !session.daemonTurnOpen) {
+    sessions.delete(session.threadId);
+  }
   // The thread record survives discard: it is the rebuild source for
   // unknown-session turns after a wrapper restart or a transient resume
   // failure. Only an explicit thread/discard forgets it.
@@ -5539,6 +5546,20 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
     sendError(id, -32000, retryMsg);
     return;
   }
+  const turnOptions = optionsRecord(params.options);
+  const incoming = resolveModelSelection(
+    typeof turnOptions.model === "string" ? turnOptions.model : undefined,
+    typeof turnOptions.reasoningLevel === "string"
+      ? turnOptions.reasoningLevel
+      : undefined,
+  );
+  if (incoming.modelId !== undefined && incoming.modelId !== session.model) {
+    // The new model rides every later session build (rotation included)
+    // via baseOptions — the generic bridge only applies it at session
+    // construction.
+    session.model = incoming.modelId;
+    session.baseOptions = { ...session.baseOptions, model: turnOptions.model };
+  }
   // §7: a turn on a cooled account rotates first, then replays as handoff;
   // §2.3: a turn whose options name a model the session's account does not
   // offer rotates the same way, with the "model" cause. A restoring session
@@ -5549,20 +5570,6 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
     !session.restoring &&
     session.compact === null
   ) {
-    const turnOptions = optionsRecord(params.options);
-    const incoming = resolveModelSelection(
-      typeof turnOptions.model === "string" ? turnOptions.model : undefined,
-      typeof turnOptions.reasoningLevel === "string"
-        ? turnOptions.reasoningLevel
-        : undefined,
-    );
-    if (incoming.modelId !== undefined && incoming.modelId !== session.model) {
-      // The new model rides every later session build (rotation included)
-      // via baseOptions — the generic bridge only applies it at session
-      // construction.
-      session.model = incoming.modelId;
-      session.baseOptions = { ...session.baseOptions, model: turnOptions.model };
-    }
     const { cooled } = sessionAccountCooled(session);
     // §2.3 п.7: parked counts on parkedReason alone — an expired cooldown
     // must not let a turn through to a banned home.
