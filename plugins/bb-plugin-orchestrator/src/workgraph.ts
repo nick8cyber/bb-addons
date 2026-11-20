@@ -2045,6 +2045,119 @@ export const DEFAULT_ALLOWED_RUNNERS: readonly string[] = [
   "go test ./...",
 ];
 
+export const BARE_CHECK_RUNNERS = new Set([
+  "npm test",
+  "npm run test",
+  "npm run test:*",
+  "npm run lint",
+  "pytest",
+  "cargo test",
+  "go test",
+  "go test ./...",
+]);
+
+export const TEST_FILTER_FLAGS = new Set([
+  "-k",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "-run",
+  "--run",
+  "--test",
+  "--filter",
+  "--testPathPattern",
+  "-g",
+  "--grep",
+]);
+
+export const ALLOWED_CONTRACT_FLAGS = new Set([
+  "--",
+  "-k",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "-run",
+  "--run",
+  "--test",
+  "--filter",
+  "--testPathPattern",
+  "-g",
+  "--grep",
+  "-v",
+  "-q",
+  "--silent",
+  "--bail",
+  "-s",
+  "--nocapture",
+  "--release",
+  "--no-coverage",
+]);
+
+export const FLAGS_WITH_VALUES = new Set([
+  "-n",
+  "--maxfail",
+  "--jobs",
+  "-j",
+  "-p",
+  "-c",
+  "--config",
+  "--test-concurrency",
+  "--timeout",
+  "--target",
+  "--workers",
+  "--retries",
+  "-k",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "-run",
+  "--run",
+  "--test",
+  "--filter",
+  "--testPathPattern",
+  "-g",
+  "--grep",
+]);
+
+export function reorderFlagsBeforeFiles(tokens: string[]): string[] {
+  const flags: string[] = [];
+  const positional: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok === "--") {
+      positional.push(...tokens.slice(i));
+      break;
+    }
+    if (tok.startsWith("-")) {
+      flags.push(tok);
+      const flagName = tok.split("=")[0];
+      if (
+        !tok.includes("=") &&
+        FLAGS_WITH_VALUES.has(flagName) &&
+        i + 1 < tokens.length &&
+        !tokens[i + 1].startsWith("-")
+      ) {
+        flags.push(tokens[++i]);
+      }
+    } else {
+      positional.push(tok);
+    }
+  }
+  return [...flags, ...positional];
+}
+
+export function hasTestFilter(cmdStr: string): boolean {
+  const parts = cmdStr.trim().split(/\s+/);
+  for (let i = 1; i < parts.length; i++) {
+    const part = parts[i];
+    if (part === "--") continue;
+    const flagName = part.split("=")[0];
+    if (TEST_FILTER_FLAGS.has(flagName)) return true;
+    if (part.includes("::")) return true;
+  }
+  return false;
+}
+
 export function validateCheckCommand(
   rawCmd: string,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
@@ -2147,7 +2260,16 @@ export function validateCheckCommand(
   }
 
   const binary = parts[0]!;
-  const args = parts.slice(1);
+  const rawArgs = parts.slice(1);
+  let args = rawArgs;
+  if (rawArgs.includes("--")) {
+    const ddIdx = rawArgs.indexOf("--");
+    const before = rawArgs.slice(0, ddIdx + 1);
+    const after = reorderFlagsBeforeFiles(rawArgs.slice(ddIdx + 1));
+    args = [...before, ...after];
+  } else {
+    args = reorderFlagsBeforeFiles(rawArgs);
+  }
   return { valid: true, binary, args };
 }
 
@@ -2193,7 +2315,7 @@ export function buildChecksEnvironment(
 }
 
 export async function executeChecks(
-  deps: { cmd?: CmdRunner; repoRoot?: string },
+  deps: { cmd?: CmdRunner; repoRoot?: string; worktreeDir?: string },
   task: TaskQueueRow,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
   checksConfig?: PolicyChecksConfig,
@@ -2252,9 +2374,58 @@ export async function executeChecks(
         }
       } catch {}
     }
+  }
 
-    // Verify that all test files referenced in contractCommands exist in repoRoot
-    if (contractCommands.length > 0 && deps.repoRoot) {
+  // §31.3 / §34.5 (Reviewer Б1-в-1): Machine checks on code phase must run in an isolated worktree on result_sha
+  const targetSha =
+    (typeof payloadObj.result_sha === "string" ? payloadObj.result_sha : null) ||
+    (task.branch ? `refs/heads/${task.branch}` : null);
+
+  let tmpWorktree: string | null = null;
+  let workRoot = deps.worktreeDir ?? deps.repoRoot ?? process.cwd();
+
+  if (!deps.worktreeDir && targetSha && deps.cmd && deps.repoRoot) {
+    try {
+      const headRes = await deps.cmd.run("git", ["-C", deps.repoRoot, "rev-parse", "HEAD"]);
+      const targetRes = await deps.cmd.run("git", ["-C", deps.repoRoot, "rev-parse", targetSha]);
+      const currentHead = headRes.exitCode === 0 ? headRes.stdout.trim() : null;
+      const targetCommit = targetRes.exitCode === 0 ? targetRes.stdout.trim() : targetSha;
+
+      if (currentHead && targetCommit && currentHead !== targetCommit) {
+        const tmp = fs.mkdtempSync(
+          path.join(os.tmpdir(), `bb-chk-${normalizeTaskKey(task.task_key)}-`),
+        );
+        const addRes = await deps.cmd.run("git", [
+          "-C",
+          deps.repoRoot,
+          "worktree",
+          "add",
+          "--detach",
+          tmp,
+          targetSha,
+        ]);
+        if (addRes.exitCode === 0) {
+          tmpWorktree = tmp;
+          workRoot = tmp;
+          const nmRepo = path.join(deps.repoRoot, "node_modules");
+          const nmTmp = path.join(tmp, "node_modules");
+          if (fs.existsSync(nmRepo) && !fs.existsSync(nmTmp)) {
+            try {
+              fs.symlinkSync(nmRepo, nmTmp, "junction");
+            } catch {}
+          }
+        } else {
+          try {
+            fs.rmSync(tmp, { recursive: true, force: true });
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  try {
+    // Verify that all test files referenced in contractCommands exist in workRoot
+    if (contractCommands.length > 0 && workRoot) {
       for (const cmdStr of contractCommands) {
         const tokens = cmdStr.split(/\s+/).slice(1);
         for (let i = 0; i < tokens.length; i++) {
@@ -2262,7 +2433,12 @@ export async function executeChecks(
           if (tok === "--") continue;
           if (tok.startsWith("-")) {
             const flagName = tok.split("=")[0];
-            if (!tok.includes("=") && (FLAGS_WITH_VALUES.has(flagName) || (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")))) {
+            if (
+              !tok.includes("=") &&
+              FLAGS_WITH_VALUES.has(flagName) &&
+              i + 1 < tokens.length &&
+              !tokens[i + 1].startsWith("-")
+            ) {
               i++;
             }
             continue;
@@ -2282,7 +2458,7 @@ export async function executeChecks(
             cleanPath.includes("/") ||
             /\.(?:[tj]sx?|py|go|rs|c|cpp|h)$/i.test(cleanPath)
           ) {
-            const resolved = path.resolve(deps.repoRoot, cleanPath);
+            const resolved = path.resolve(workRoot, cleanPath);
             if (!fs.existsSync(resolved)) {
               return {
                 ok: false,
@@ -2297,135 +2473,86 @@ export async function executeChecks(
         }
       }
     }
-  }
 
-  let timeoutSeconds = 600;
-  if (typeof payloadObj.checks_timeout_seconds === "number") {
-    timeoutSeconds = payloadObj.checks_timeout_seconds;
-  } else if (checksConfig?.timeout_seconds !== undefined) {
-    timeoutSeconds = checksConfig.timeout_seconds;
-  }
-  timeoutSeconds = Math.max(30, Math.min(3600, timeoutSeconds));
+    let timeoutSeconds = 600;
+    if (typeof payloadObj.checks_timeout_seconds === "number") {
+      timeoutSeconds = payloadObj.checks_timeout_seconds;
+    } else if (checksConfig?.timeout_seconds !== undefined) {
+      timeoutSeconds = checksConfig.timeout_seconds;
+    }
+    timeoutSeconds = Math.max(30, Math.min(3600, timeoutSeconds));
 
-  const extraEnv = Array.isArray(payloadObj.checks_extra_env)
-    ? (payloadObj.checks_extra_env as string[])
-    : checksConfig?.extraEnvVars ?? [];
-  const allowedEnv = checksConfig?.allowedEnvVars ?? DEFAULT_ALLOWED_ENV_VARS;
-  let env: NodeJS.ProcessEnv;
-  try {
-    env = buildChecksEnvironment(extraEnv, allowedEnv);
-  } catch (e: any) {
-    return {
-      ok: false,
-      exitCode: 1,
-      notRun: true,
-      output: `checks-invalid-env: ${e?.message ?? e}`,
-    };
-  }
-
-  let lastOutput = "";
-  for (const cmdStr of commands) {
-    const val = validateCheckCommand(cmdStr, allowedRunners);
-    if (!val.valid) {
-      return { ok: false, exitCode: 1, notRun: true, output: val.reason };
+    const extraEnv = Array.isArray(payloadObj.checks_extra_env)
+      ? (payloadObj.checks_extra_env as string[])
+      : checksConfig?.extraEnvVars ?? [];
+    const allowedEnv = checksConfig?.allowedEnvVars ?? DEFAULT_ALLOWED_ENV_VARS;
+    let env: NodeJS.ProcessEnv;
+    try {
+      env = buildChecksEnvironment(extraEnv, allowedEnv);
+    } catch (e: any) {
+      return {
+        ok: false,
+        exitCode: 1,
+        notRun: true,
+        output: `checks-invalid-env: ${e?.message ?? e}`,
+      };
     }
 
-    if (deps.cmd && deps.repoRoot) {
-      const res = await deps.cmd.run(val.binary!, val.args!, {
-        cwd: deps.repoRoot,
-        timeoutMs: timeoutSeconds * 1000,
-        env,
-        cleanEnv: true,
-      });
-      lastOutput = (res.stdout || res.stderr).trim();
-      if (res.exitCode !== 0) {
-        return {
-          ok: false,
-          exitCode: res.exitCode,
-          output:
-            (res.stderr || res.stdout).trim() ||
-            `test failed with exit code ${res.exitCode}`,
-        };
+    let lastOutput = "";
+    for (const cmdStr of commands) {
+      const val = validateCheckCommand(cmdStr, allowedRunners);
+      if (!val.valid) {
+        return { ok: false, exitCode: 1, notRun: true, output: val.reason };
+      }
+
+      if (deps.cmd && workRoot) {
+        const res = await deps.cmd.run(val.binary!, val.args!, {
+          cwd: workRoot,
+          timeoutMs: timeoutSeconds * 1000,
+          env,
+          cleanEnv: true,
+        });
+        lastOutput = (res.stdout || res.stderr).trim();
+        if (res.exitCode !== 0) {
+          return {
+            ok: false,
+            exitCode: res.exitCode,
+            output:
+              (res.stderr || res.stdout).trim() ||
+              `test failed with exit code ${res.exitCode}`,
+          };
+        }
+
+        // §34.5 (Reviewer Б1-в-2): For acceptance contract commands, 0 matching tests is a failure!
+        if (contractCommands.includes(cmdStr)) {
+          if (didFilterMatchZeroTests(lastOutput)) {
+            return {
+              ok: false,
+              exitCode: 1,
+              output: `checks-failed: acceptance test command "${cmdStr}" matched 0 tests (test was not created or executed)`,
+            };
+          }
+        }
       }
     }
+
+    return {
+      ok: true,
+      exitCode: 0,
+      output: lastOutput || "checks passed",
+      acceptanceVerified: contractCommands.length > 0,
+    };
+  } finally {
+    if (tmpWorktree && deps.cmd && deps.repoRoot) {
+      await deps.cmd
+        .run("git", ["-C", deps.repoRoot, "worktree", "remove", "--force", tmpWorktree])
+        .catch(() => {});
+      try {
+        fs.rmSync(tmpWorktree, { recursive: true, force: true });
+      } catch {}
+    }
   }
-
-  return { ok: true, exitCode: 0, output: lastOutput || "checks passed", acceptanceVerified: contractCommands.length > 0 };
 }
-
-export const BARE_CHECK_RUNNERS = new Set([
-  "npm test",
-  "npm run test",
-  "npm run test:*",
-  "npm run lint",
-  "pytest",
-  "cargo test",
-  "go test",
-  "go test ./...",
-]);
-
-export const TEST_FILTER_FLAGS = new Set([
-  "-k",
-  "-t",
-  "--test-name-pattern",
-  "--testNamePattern",
-  "-run",
-  "--run",
-  "--test",
-  "--filter",
-  "--testPathPattern",
-  "-g",
-  "--grep",
-]);
-
-export const ALLOWED_CONTRACT_FLAGS = new Set([
-  "--",
-  "-k",
-  "-t",
-  "--test-name-pattern",
-  "--testNamePattern",
-  "-run",
-  "--run",
-  "--test",
-  "--filter",
-  "--testPathPattern",
-  "-g",
-  "--grep",
-  "-v",
-  "-q",
-  "--silent",
-  "--bail",
-  "-s",
-  "--nocapture",
-  "--release",
-  "--no-coverage",
-]);
-
-export const FLAGS_WITH_VALUES = new Set([
-  "-n",
-  "--maxfail",
-  "--jobs",
-  "-j",
-  "-p",
-  "-c",
-  "--config",
-  "--test-concurrency",
-  "--timeout",
-  "--target",
-  "--workers",
-  "--retries",
-  "-k",
-  "-t",
-  "--test-name-pattern",
-  "--testNamePattern",
-  "-run",
-  "--run",
-  "--test",
-  "--filter",
-  "--testPathPattern",
-  "-g",
-  "--grep",
-]);
 
 export function validateContractCommand(
   cmdStr: string,
@@ -2463,6 +2590,7 @@ export function didFilterMatchZeroTests(output?: string): boolean {
   if (/total:\s*0/i.test(output) && /passed:\s*0/i.test(output)) return true;
   if (/#\s*tests\s+0\b/i.test(output)) return true;
   if (/#\s*pass\s+0\b.*#\s*fail\s+0\b/i.test(output)) return true;
+  if (/\b1\.\.0\b/.test(output)) return true;
   if (/collected 0 items/i.test(output)) return true;
   if (/no tests ran/i.test(output)) return true;
   if (/no tests collected/i.test(output)) return true;
@@ -2815,7 +2943,7 @@ export async function runTddFailFirstVerification(
         if (tok === "--") continue;
         if (tok.startsWith("-")) {
           const flagName = tok.split("=")[0];
-          if (!tok.includes("=") && (FLAGS_WITH_VALUES.has(flagName) || (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")))) {
+          if (!tok.includes("=") && FLAGS_WITH_VALUES.has(flagName) && i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) {
             i++;
           }
           continue;
@@ -2880,58 +3008,78 @@ export async function runTddFailFirstVerification(
       } catch {}
     }
 
-    const checkRes = await executeChecks(
-      { cmd: deps.cmd, repoRoot: tmpDir },
-      task,
-      allowedRunners,
-      checksConfig,
-      runnableCommands,
-    );
-    if (checkRes.notRun) {
-      return {
-        ok: false,
-        failedAsExpected: false,
-        notRun: true,
-        outcome: "not_run",
-        commands,
-        output: `tdd check not run: ${checkRes.output}`,
-      };
+    // Run each runnable command individually (Reviewer Б1-а-3)
+    let confirmedRed = false;
+    let skippedNewTest = false;
+    let notRunFailure: {
+      ok: false;
+      failedAsExpected: false;
+      notRun: true;
+      outcome: "not_run";
+      commands: string[];
+      output: string;
+    } | null = null;
+
+    for (const cmdStr of runnableCommands) {
+      const isFiltered = hasTestFilter(cmdStr);
+      const singleRes = await executeChecks(
+        { cmd: deps.cmd, repoRoot: tmpDir, worktreeDir: tmpDir },
+        task,
+        allowedRunners,
+        checksConfig,
+        [cmdStr],
+      );
+
+      if (singleRes.notRun) {
+        notRunFailure = {
+          ok: false,
+          failedAsExpected: false,
+          notRun: true,
+          outcome: "not_run",
+          commands,
+          output: `tdd check not run: ${singleRes.output}`,
+        };
+        break;
+      }
+
+      const isPytestNoTests = singleRes.exitCode === 5;
+      const isZeroMatchingTests = didFilterMatchZeroTests(singleRes.output);
+
+      // §34.5 (Reviewer Б1-а-2): If a command is filtered or produced 0 matching tests, it targets a new test case
+      if (isPytestNoTests || isZeroMatchingTests || (isFiltered && singleRes.exitCode === 0)) {
+        skippedNewTest = true;
+      } else if (singleRes.exitCode !== 0) {
+        confirmedRed = true;
+      }
     }
 
-    const isPytestNoTests = checkRes.exitCode === 5;
-    const isZeroMatchingTests = didFilterMatchZeroTests(checkRes.output);
-
-    if (isPytestNoTests || isZeroMatchingTests) {
-      return {
-        ok: true,
-        failedAsExpected: true,
-        outcome: "skipped_new_test",
-        newTestFiles,
-        commands,
-        output: `tdd check skipped: new test case to be created during code phase (0 tests matched on base commit)`,
-      };
+    if (notRunFailure) {
+      return notRunFailure;
     }
 
-    if (checkRes.exitCode !== 0) {
+    if (confirmedRed) {
       return {
         ok: true,
         failedAsExpected: true,
         outcome: "red_confirmed",
         newTestFiles,
         commands,
-        output: `tdd fail-first verified: tests failed on base commit as expected (exitCode: ${checkRes.exitCode})`,
+        output: `tdd fail-first verified: tests failed on base commit as expected`,
       };
     }
 
-    // If there are new test files in the contract, it CANNOT be vacuous!
-    if (newTestFiles.length > 0) {
+    if (skippedNewTest || newTestFiles.length > 0) {
+      const details =
+        newTestFiles.length > 0
+          ? `new test file(s) to be created during code phase (${newTestFiles.join(", ")})`
+          : `new test case to be created during code phase (0 tests matched on base commit)`;
       return {
         ok: true,
         failedAsExpected: true,
         outcome: "skipped_new_test",
         newTestFiles,
         commands,
-        output: `tdd check skipped: new test file(s) to be created during code phase (${newTestFiles.join(", ")})`,
+        output: `tdd check skipped: ${details}`,
       };
     }
 
