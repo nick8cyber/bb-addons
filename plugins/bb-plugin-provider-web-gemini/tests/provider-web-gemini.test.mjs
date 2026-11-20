@@ -25,6 +25,7 @@ import {
   isBbSystemInstructionsBlock,
   collectUploadFiles,
   pruneDir,
+  settleBackend,
 } from "../acp-server.mjs";
 
 const require = createRequire(import.meta.url);
@@ -344,6 +345,16 @@ test("3. classifyFailure correctly classifies errors", () => {
   assert.equal(cCarbonLocked.rotatable, true);
   assert.equal(cCarbonLocked.cooldownMs, 0);
   assert.equal(cCarbonLocked.lockedModel, "carbon");
+
+  // Argon model locked resolves to canonical neon in classifyFailure
+  const errArgonLocked = new ModelUnavailable("model", "argon locked: paid upgrade required");
+  errArgonLocked.isLocked = true;
+  errArgonLocked.lockedModel = "argon";
+  const cArgonLocked = classifyFailure(errArgonLocked);
+  assert.equal(cArgonLocked.category, "model-locked");
+  assert.equal(cArgonLocked.rotatable, true);
+  assert.equal(cArgonLocked.cooldownMs, 0);
+  assert.equal(cArgonLocked.lockedModel, "neon", "classifyFailure must normalize lockedModel 'argon' to 'neon'");
 });
 
 test("4. gemini-driver strict selectModelAndThinking and no fallback", async () => {
@@ -1873,7 +1884,7 @@ test("10. Smart model routing: pickBackendFromState prioritizes pro accounts for
   assert.equal(zeroPick.none, true, "When all accounts have priority 0, pickBackendFromState returns none");
 });
 
-test("10b. legacy accounts-state.json with lockedModels:['argon'] normalizes to neon and blocks neon", () => {
+test("10b. legacy accounts-state.json with lockedModels:['argon'] normalizes to neon and blocks neon", async () => {
   const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "gemini-locked-state-")));
   const ledgerPath = path.join(tmpDir, "accounts-state.json");
   fs.writeFileSync(
@@ -1910,6 +1921,49 @@ test("10b. legacy accounts-state.json with lockedModels:['argon'] normalizes to 
     pick.none,
     true,
     "pickBackendFromState must consider neon blocked on the account"
+  );
+
+  assert.equal(
+    modelSupportedOnAccount("argon", backend, state),
+    false,
+    "modelSupportedOnAccount must consider argon alias blocked when account had argon/neon locked"
+  );
+  const pickArgon = pickBackendFromState(state, null, "test-owner", Date.now(), "argon", [backend]);
+  assert.equal(
+    pickArgon.none,
+    true,
+    "pickBackendFromState with model:'argon' must be blocked when account has lockedModels containing neon"
+  );
+
+  const neonLockedState = {
+    accounts: {
+      "acc-neon": { lockedModels: ["neon"], priority: 10, tier: "pro" },
+    },
+    leases: {},
+  };
+  const neonLockedBackend = { id: "acc-neon", priority: 10, tier: "pro", cdp: "9222" };
+  assert.equal(
+    modelSupportedOnAccount("argon", neonLockedBackend, neonLockedState),
+    false,
+    "modelSupportedOnAccount('argon') must be blocked when lockedModels contains ['neon']"
+  );
+  const pickArgonFromNeonLock = pickBackendFromState(neonLockedState, null, "test-owner", Date.now(), "argon", [neonLockedBackend]);
+  assert.equal(
+    pickArgonFromNeonLock.none,
+    true,
+    "pickBackendFromState('argon') must be blocked when lockedModels contains ['neon']"
+  );
+
+  // (c) settleBackend with lockedModel: "argon" writes canonical "neon" to ledger
+  const tmpSettleDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "settle-test-")));
+  const settleLedger = path.join(tmpSettleDir, "accounts-state.json");
+  const settleLock = path.join(tmpSettleDir, "accounts-state.json.lock");
+  await settleBackend("acc-settle", "sess-test", 0, "test failure", null, "argon", settleLedger, settleLock);
+  const settleState = loadState(settleLedger);
+  assert.deepEqual(
+    settleState.accounts["acc-settle"]?.lockedModels,
+    ["neon"],
+    "settleBackend with lockedModel:'argon' must write canonical 'neon' to accounts-state.json"
   );
 });
 

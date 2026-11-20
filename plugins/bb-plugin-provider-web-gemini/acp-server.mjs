@@ -69,6 +69,7 @@ const LEDGER_FILE = join(STATE_DIR, "accounts-state.json");
 const LOCK_FILE = join(STATE_DIR, "accounts-state.json.lock");
 const LOCK_STALE_MS = 5000;
 const LEASE_TTL_MS = 10 * 60_000;
+// 20 minutes (prevents timeout of long deep reviews on neon high).
 const SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000;
 
 // PLUG-291: каталоги веб-вложений (исходящие uploads, входящие downloads) и
@@ -248,20 +249,20 @@ function isPidAlive(pid) {
   }
 }
 
-function acquireLock() {
-  mkdirSync(STATE_DIR, { recursive: true });
+function acquireLock(lockPath = LOCK_FILE) {
+  mkdirSync(dirname(lockPath), { recursive: true });
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     try {
-      const fd = openSync(LOCK_FILE, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR);
+      const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR);
       closeSync(fd);
       return;
     } catch (e) {
       if (e.code !== "EEXIST") throw e;
       try {
-        const st = statSync(LOCK_FILE);
+        const st = statSync(lockPath);
         if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-          try { unlinkSync(LOCK_FILE); } catch {}
+          try { unlinkSync(lockPath); } catch {}
           continue;
         }
       } catch {}
@@ -272,9 +273,9 @@ function acquireLock() {
   throw new Error("accounts-state lock held for over 10s");
 }
 
-function releaseLock() {
+function releaseLock(lockPath = LOCK_FILE) {
   try {
-    unlinkSync(LOCK_FILE);
+    unlinkSync(lockPath);
   } catch {}
 }
 
@@ -316,27 +317,27 @@ export function loadState(ledgerPath = LEDGER_FILE) {
   return state;
 }
 
-function saveState(state) {
-  mkdirSync(STATE_DIR, { recursive: true });
-  const tmp = `${LEDGER_FILE}.${process.pid}.${Date.now()}.tmp`;
+function saveState(state, ledgerPath = LEDGER_FILE) {
+  mkdirSync(dirname(ledgerPath), { recursive: true });
+  const tmp = `${ledgerPath}.${process.pid}.${Date.now()}.tmp`;
   const data = {
     accounts: state.accounts || {},
     leases: state.leases || {},
   };
   if (state.breaker) data.breaker = state.breaker;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  renameSync(tmp, LEDGER_FILE);
+  renameSync(tmp, ledgerPath);
 }
 
-export function withStateLock(fn) {
-  acquireLock();
+export function withStateLock(fn, ledgerPath = LEDGER_FILE, lockPath = LOCK_FILE) {
+  acquireLock(lockPath);
   try {
-    const state = loadState();
+    const state = loadState(ledgerPath);
     const result = fn(state);
-    saveState(state);
+    saveState(state, ledgerPath);
     return result;
   } finally {
-    releaseLock();
+    releaseLock(lockPath);
   }
 }
 
@@ -404,7 +405,7 @@ export function pickBackendFromState(state, excludeId, owner, now, requestedMode
     return e && (e.inUseUntilMs ?? 0) > now && e.owner !== owner ? e.inUseUntilMs : 0;
   };
 
-  const req = requestedModel ? requestedModel.toLowerCase() : null;
+  const req = requestedModel ? (resolveModelId(requestedModel) || requestedModel.toLowerCase()) : null;
   const candidates = backends.filter((b) => {
     const prio = getAccountPriority(b, state);
     if (b.id === excludeId || prio <= 0) return false;
@@ -795,10 +796,10 @@ export function classifyFailure(err, authHint = null) {
     (err && (err.isLocked || err.code === "ARGON_MODEL_LOCKED")) ||
     /locked:\s*paid upgrade required|paid upgrade required/i.test(message)
   ) {
-    const lockedModel = (
+    const rawLocked =
       err?.lockedModel ||
-      (message.match(/^(\w+)\s+locked/i)?.[1] || "carbon")
-    ).toLowerCase();
+      (message.match(/^(\w+)\s+locked/i)?.[1] || "carbon");
+    const lockedModel = (resolveModelId(rawLocked) || String(rawLocked).toLowerCase());
     return {
       category: "model-locked",
       cooldownMs: 0,
@@ -840,7 +841,7 @@ export function classifyFailure(err, authHint = null) {
   };
 }
 
-async function settleBackend(backendId, sessionId, untilMs, message, parkedReason, lockedModel = null) {
+export async function settleBackend(backendId, sessionId, untilMs, message, parkedReason, lockedModel = null, ledgerPath = LEDGER_FILE, lockPath = LOCK_FILE) {
   const owner = `${process.pid}:${sessionId}`;
   return withStateLock((state) => {
     if (state.leases && state.leases[backendId] && state.leases[backendId].pid === process.pid) {
@@ -853,11 +854,12 @@ async function settleBackend(backendId, sessionId, untilMs, message, parkedReaso
     }
     e.lastError = String(message).slice(0, 500);
     if (lockedModel) {
+      const canonical = resolveModelId(lockedModel) || String(lockedModel).toLowerCase();
       if (!Array.isArray(e.lockedModels)) e.lockedModels = [];
-      if (!e.lockedModels.includes(lockedModel)) {
-        e.lockedModels.push(lockedModel);
+      if (!e.lockedModels.includes(canonical)) {
+        e.lockedModels.push(canonical);
       }
-      if (lockedModel === "carbon") {
+      if (canonical === "carbon") {
         e.tier = "pro";
       }
     }
@@ -878,7 +880,7 @@ async function settleBackend(backendId, sessionId, untilMs, message, parkedReaso
     }
     if (untilMs > 0) e.cooldownUntilMs = Math.max(e.cooldownUntilMs ?? 0, untilMs);
     return "cooled";
-  });
+  }, ledgerPath, lockPath);
 }
 
 let driver = null;
@@ -1011,7 +1013,7 @@ export function resolveModelId(val) {
 // runtime checks in pickBackendFromState and bindBackend (lockedModels in
 // accounts-state.json + carbon requires the ultra tier).
 export function modelSupportedOnAccount(model, b, state) {
-  const req = model ? String(model).toLowerCase() : null;
+  const req = model ? (resolveModelId(model) || String(model).toLowerCase()) : null;
   if (!req || !b) return true;
   const st = state || { accounts: Object.create(null) };
   const e = accEntry(st, b.id);
@@ -1279,7 +1281,9 @@ async function probeAuthHint(backend) {
 /* ---------- backend binding ---------- */
 async function bindBackend(s, sessionId, profile = s) {
   const owner = `${process.pid}:${sessionId}`;
-  const reqModel = profile.model ? profile.model.toLowerCase() : null;
+  const reqModel = profile.model
+    ? (resolveModelId(profile.model) || profile.model.toLowerCase())
+    : null;
 
   if (profile.account && profile.account !== "auto") {
     const b = BACKENDS.find((x) => x.id === profile.account);
@@ -1387,6 +1391,12 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
   const { task, context } = attachments;
   const tj = task?.journal;
   const profile = tj?.turn.profile ?? s;
+  if (profile?.model) {
+    profile.model = resolveModelId(profile.model) || profile.model.toLowerCase();
+  }
+  if (s.model) {
+    s.model = resolveModelId(s.model) || s.model.toLowerCase();
+  }
   const budgets = tj?.turn.budgets;
   const maxContextBytes = budgets?.maxTotalBytes ?? context?.settings.maxTotalBytes;
   const maxToolRounds = budgets?.maxToolRounds ?? webTools.MAX_TOOL_ROUNDS;

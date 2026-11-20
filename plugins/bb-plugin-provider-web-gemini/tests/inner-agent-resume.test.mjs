@@ -292,6 +292,62 @@ test("session/load resolves a legacy argon model in the saved session record to 
   );
 });
 
+test("resuming an unfinished turn with turn.profile.model:'argon' routes by neon and honors lockedModels:['neon']", async (t) => {
+  const repo = setup(t);
+  const first = fixture(t, repo, `(request) => request.count === 1
+    ? { text: '<tool name="read_file" path="docs/notes.txt"/>' }
+    : new Promise(() => {})`);
+  const sessionId = await first.newSession();
+  const text = task("Review the change", { ref: "review" });
+  first.notifyPrompt(sessionId, text);
+  await waitFor(() => first.requests().length >= 2);
+  first.kill();
+  await waitFor(() => first.child.exitCode !== null || first.child.signalCode !== null);
+
+  const recs = records(first.state);
+  const turnEntry = turns(first.state, recs[0].key)[0];
+  assert.equal(turnEntry.record.outcome, null);
+
+  // Set turn.profile.model to "argon" in the saved turn record
+  turnEntry.record.profile = { ...(turnEntry.record.profile || {}), model: "argon", thinking: "high", account: "auto" };
+  writeFileSync(
+    join(journalTurnsDir(first.state, recs[0].key, 1), "turn.json"),
+    JSON.stringify(turnEntry.record, null, 2)
+  );
+
+  // Configure backends: one with neon locked, one free
+  const backendLocked = { id: "acc-locked", cdp: 19223, profileDir: repo.tmp, tier: "pro", priority: 10 };
+  const backendFree = { id: "acc-free", cdp: 19224, profileDir: repo.tmp, tier: "pro", priority: 10 };
+  const stateFile = join(first.state, "accounts-state.json");
+  writeFileSync(
+    stateFile,
+    JSON.stringify({
+      accounts: {
+        "acc-locked": { lockedModels: ["neon"] },
+        "acc-free": { lockedModels: [] },
+      },
+      leases: {},
+    })
+  );
+
+  const app = fixture(t, repo, `() => ({ text: ${JSON.stringify(FINAL)} })`, {
+    stateDir: first.state,
+    backends: [backendLocked, backendFree],
+  });
+  const loaded = await app.loadSession(sessionId);
+  assert.ok(loaded.result);
+
+  const response = await app.prompt(sessionId, "продолжай");
+  assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response.error));
+
+  const [req] = app.requests();
+  assert.equal(req.account, "acc-free", "must skip acc-locked because neon is locked and route to acc-free");
+  assert.equal(req.model, "neon", "must route by canonical model 'neon'");
+
+  const done = turns(first.state, recs[0].key)[0].record;
+  assert.equal(done.outcome, "passed");
+});
+
 test("session/load resumes by redelivering the saved package when the conversation is gone", async (t) => {
   const repo = setup(t);
   repo.write("appendix.txt", "saved attachment bytes\n");
