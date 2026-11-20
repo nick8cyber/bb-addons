@@ -1141,7 +1141,7 @@ test("f1: allow does NOT suppress categories 1-2", async () => {
     commits: [],
     added: [
       { file: "docs/PLAN.md", line: 1, text: "vless://srv/x y@gmail.com" },
-      { file: "docs/PLAN.md", line: 2, text: "thr_abc1234567" },
+      { file: "docs/PLAN.md", line: 2, text: "proj_abc1234567" },
     ],
     leaks: {
       machine: "block",
@@ -1153,6 +1153,26 @@ test("f1: allow does NOT suppress categories 1-2", async () => {
   assert.ok(findings.some((f) => f.category === 1));
   assert.ok(findings.some((f) => f.category === 2 && f.rule === "personal-email"));
   assert.ok(!findings.some((f) => f.category === 4));
+});
+
+test("f1.1: real thread ID thr_[a-z0-9]{10} in docs/ is banned and NOT suppressed by leaks.allow", async () => {
+  const cmd: CmdRunner = { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) };
+  const findings = await machineScan(cmd, {
+    repoPath: "/r", baseSha: "a".repeat(40), headSha: "b".repeat(40),
+    commits: [],
+    added: [
+      { file: "docs/PLAN.md", line: 1, text: "reference to thr_dsjymhnts5" },
+    ],
+    leaks: {
+      machine: "block",
+      bbIds: "warn",
+      trailers: "warn",
+      allow: ["docs/"],
+    },
+  });
+  const docLeak = findings.find((f) => f.category === 4 && f.rule === "bb-thread-id");
+  assert.ok(docLeak, "Must produce a category 4 bb-thread-id finding even with docs/ in allow");
+  assert.equal(docLeak.severity, "block", "Docs thread ID finding must have severity block");
 });
 
 test("f2: maskSecrets applied to fix and file fields", async () => {

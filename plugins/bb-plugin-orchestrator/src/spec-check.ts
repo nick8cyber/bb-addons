@@ -102,16 +102,16 @@ export async function verifySpecReferences(
     return { valid: false, notRun: true, reason: "missing cmd runner or repoRoot" };
   }
 
-  // Get list of changed spec/docs files
+  // Get diff of added lines in docs/ (-U0 gives zero context lines)
   let diffRes = await deps.cmd.run(
     "git",
-    ["diff", "--name-only", `${mergeBaseBranch}...${specSha}`, "--", "docs/"],
+    ["diff", "-U0", `${mergeBaseBranch}...${specSha}`, "--", "docs/"],
     { cwd: deps.repoRoot },
   );
   if (diffRes.exitCode !== 0) {
     diffRes = await deps.cmd.run(
       "git",
-      ["diff", "--name-only", `${specSha}~1`, specSha, "--", "docs/"],
+      ["diff", "-U0", `${specSha}~1`, specSha, "--", "docs/"],
       { cwd: deps.repoRoot },
     );
   }
@@ -123,44 +123,25 @@ export async function verifySpecReferences(
     };
   }
 
-  const specFiles = diffRes.stdout
+  // Extract only added lines (starts with '+' and not '+++')
+  const addedLines = diffRes.stdout
     .split("\n")
-    .map((f) => f.trim())
-    .filter((f) => f.length > 0 && f.endsWith(".md"));
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1));
 
-  if (specFiles.length === 0) {
-    // If no docs files were modified, nothing to verify
+  if (addedLines.length === 0) {
+    // If no docs lines were added, nothing to verify
     return { valid: true };
   }
 
-  const allDeclaredNew = new Set<string>();
-  const allReferencedPaths = new Set<string>();
-  const allReferencedSymbols = new Set<string>();
-
-  for (const file of specFiles) {
-    const showRes = await deps.cmd.run(
-      "git",
-      ["show", `${specSha}:${file}`],
-      { cwd: deps.repoRoot },
-    );
-    if (showRes.exitCode !== 0) {
-      return {
-        valid: false,
-        notRun: true,
-        reason: `spec-not-run: git show failed for ${file}: ${showRes.stderr}`,
-      };
-    }
-    const { declaredNew, referencedPaths, referencedSymbols } = parseSpecEntities(showRes.stdout);
-    for (const d of declaredNew) allDeclaredNew.add(d);
-    for (const p of referencedPaths) allReferencedPaths.add(p);
-    for (const s of referencedSymbols) allReferencedSymbols.add(s);
-  }
+  const addedContent = addedLines.join("\n");
+  const { declaredNew, referencedPaths, referencedSymbols } = parseSpecEntities(addedContent);
 
   const missing: string[] = [];
 
   // Check file paths against base commit
-  for (const p of allReferencedPaths) {
-    if (allDeclaredNew.has(p)) continue;
+  for (const p of referencedPaths) {
+    if (declaredNew.has(p)) continue;
     // Check if file exists on mergeBaseBranch
     const catRes = await deps.cmd.run(
       "git",
@@ -173,8 +154,8 @@ export async function verifySpecReferences(
   }
 
   // Check symbols against base commit codebase (text search without AST/package.json)
-  for (const sym of allReferencedSymbols) {
-    if (allDeclaredNew.has(sym)) continue;
+  for (const sym of referencedSymbols) {
+    if (declaredNew.has(sym)) continue;
     // Search codebase on base commit for symbol (excluding docs/)
     const grepRes = await deps.cmd.run(
       "git",

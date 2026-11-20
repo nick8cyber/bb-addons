@@ -128,6 +128,14 @@ export function isSyntheticEmail(m: string): boolean {
   return allSameChar(local);
 }
 
+/** §4 / r34.2: real 10-char thread IDs (e.g. thr_dsjymhnts5) vs synthetic placeholders (thr_xxxxxxxxxx). */
+export function hasRealDocsThreadId(text: string): boolean {
+  for (const m of text.matchAll(/\bthr_([a-z0-9]{10})\b/gi)) {
+    if (!allSameChar(m[1]!)) return true;
+  }
+  return false;
+}
+
 /** Unmasked secret-shaped values of a line — used to decide whether a
  * gitleaks hit inside an `allow` file is all-synthetic (§4 r11.1). */
 export function secretValues(text: string): string[] {
@@ -435,8 +443,14 @@ export function scanAddedLinesCore(
         fragment: fragmentAround(text, h.index),
       });
     }
+    const inDocs = /(?:^|\/)docs(?:\/|$)/.test(file);
     for (const h of hitEntries(text, bbRules)) {
-      if (allowed) continue;
+      if (allowed) {
+        // §4 / r34.2: real 10-char thread IDs in docs/ are banned unconditionally (no leaks.allow bypass)
+        const isBannedDocsThreadId =
+          inDocs && h.rule === "bb-thread-id" && hasRealDocsThreadId(text);
+        if (!isBannedDocsThreadId) continue;
+      }
       if (h.rule === "task-key") {
         const tokens = text.match(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/g) ?? [];
         if (!tokens.some(isTaskKeyToken)) continue;

@@ -198,8 +198,17 @@ const TYPE_KEY = {
   machine: "typeMachine",
   bbid: "typeThreadId",
 };
-const severityOf = (f) =>
-  f.category <= 2 ? "block" : f.category === 3 ? leaks.machine : leaks.bbIds;
+const severityOf = (f) => {
+  if (
+    f.kind === "bbid" &&
+    f.file &&
+    /(?:^|\/)docs(?:\/|$)/.test(f.file) &&
+    scan.hasRealDocsThreadId(f.fragment)
+  ) {
+    return "block";
+  }
+  return f.category <= 2 ? "block" : f.category === 3 ? leaks.machine : leaks.bbIds;
+};
 
 let blocked = false;
 for (const f of findings) {

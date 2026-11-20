@@ -26,6 +26,7 @@ import {
   MACHINE_RULES,
   bbIdRules,
   hasBbIds,
+  hasRealDocsThreadId,
   hits,
   hostRe,
   isAllowed,
@@ -42,6 +43,7 @@ import {
 
 export {
   hasBbIds,
+  hasRealDocsThreadId,
   isAllowed,
   maskSecrets,
   parseAddedLines,
@@ -209,9 +211,21 @@ function scanAddedLines(
           at(f, t("scan.machine", { rule: f.rule, text: f.fragment }), leaks.machine),
         );
         break;
-      case "bbid":
-        findings.push(at(f, t("scan.bbId", { rule: f.rule }), leaks.bbIds));
+      case "bbid": {
+        const isBannedDocsThreadId =
+          f.rule === "bb-thread-id" &&
+          f.file !== null &&
+          /(?:^|\/)docs(?:\/|$)/.test(f.file) &&
+          hasRealDocsThreadId(f.fragment);
+        findings.push(
+          at(
+            f,
+            t("scan.bbId", { rule: f.rule }),
+            isBannedDocsThreadId ? "block" : leaks.bbIds,
+          ),
+        );
         break;
+      }
     }
   }
   return findings;
