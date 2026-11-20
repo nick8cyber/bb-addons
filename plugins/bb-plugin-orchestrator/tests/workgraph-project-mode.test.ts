@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { createPlugin } from "../server.js";
+import type { CmdRunner } from "../src/cmd.js";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
+import { makeTempDir } from "./helpers/temp.js";
 import {
   parseWorkGraphProjects,
   resolveWorkGraphMode,
@@ -9,6 +13,7 @@ import {
   assertGraphAllowsDirectAction,
   runRunQueue,
   runEnqueue,
+  type WorkGraphMode,
 } from "../src/workgraph.js";
 
 function createTestStore(): DelegationStore {
@@ -606,4 +611,326 @@ test("runRunQueue: задачи проектов в режиме 'off' не пр
   const taskOff = store.getTask("TASK-OFF");
   assert.equal(taskOff?.node, "start");
   assert.equal(taskOff?.status, "queued");
+});
+
+test("runRunQueue: изолированный запуск очереди с двумя репозиториями и разными базовыми ветками", async () => {
+  const store = createTestStore();
+  const t0 = 1_000_000;
+
+  store.insertTask(
+    {
+      taskKey: "TASK-REPO-A",
+      projectId: "proj_a",
+      coordinatorThreadId: "thr_coord_a",
+      route: "feature",
+      level: "medium",
+      confirmationMode: "auto",
+    },
+    t0,
+  );
+
+  store.insertTask(
+    {
+      taskKey: "TASK-REPO-B",
+      projectId: "proj_b",
+      coordinatorThreadId: "thr_coord_b",
+      route: "feature",
+      level: "medium",
+      confirmationMode: "auto",
+    },
+    t0,
+  );
+
+  const gitCalls: Array<{ repoRoot?: string; args: string[] }> = [];
+  const mockCmd: CmdRunner = {
+    run: async (_cmd: string, args: string[], opts?: { cwd?: string }) => {
+      gitCalls.push({ repoRoot: opts?.cwd, args });
+      return { exitCode: 1, stdout: "", stderr: "" };
+    },
+  };
+
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    workGraphProjects: {
+      proj_a: "strict",
+      proj_b: "strict",
+    },
+    maxActiveTasks: 5,
+    now: () => t0,
+    cmd: mockCmd,
+    resolveTaskRepoContext: (task) => {
+      if (task.project_id === "proj_a") {
+        return { repoRoot: "/repos/project-a", mergeBaseBranch: "main" };
+      }
+      if (task.project_id === "proj_b") {
+        return { repoRoot: "/repos/project-b", mergeBaseBranch: "master" };
+      }
+      return null;
+    },
+  });
+
+  // Verify git calls for task A ran in /repos/project-a with main/origin/main
+  const aCalls = gitCalls.filter((c) => c.repoRoot === "/repos/project-a");
+  assert.ok(aCalls.length > 0, "Git calls for project A must run in /repos/project-a");
+  assert.ok(
+    aCalls.some((c) => c.args.some((a) => a.includes("task-repo-a"))),
+    "Project A git call must reference task-repo-a branch",
+  );
+  assert.ok(
+    aCalls.some((c) => c.args.some((a) => a.includes("origin/main"))),
+    "Project A git call must reference origin/main base branch",
+  );
+
+  // Verify git calls for task B ran in /repos/project-b with master/origin/master
+  const bCalls = gitCalls.filter((c) => c.repoRoot === "/repos/project-b");
+  assert.ok(bCalls.length > 0, "Git calls for project B must run in /repos/project-b");
+  assert.ok(
+    bCalls.some((c) => c.args.some((a) => a.includes("task-repo-b"))),
+    "Project B git call must reference task-repo-b branch",
+  );
+  assert.ok(
+    bCalls.some((c) => c.args.some((a) => a.includes("origin/master"))),
+    "Project B git call must reference origin/master base branch",
+  );
+
+  // Neither project executed in the other project's repository
+  assert.ok(
+    !aCalls.some((c) => c.args.some((a) => a.includes("task-repo-b") || a.includes("master"))),
+    "Project A repo must not process TASK-REPO-B or master",
+  );
+  assert.ok(
+    !bCalls.some((c) => c.args.some((a) => a.includes("task-repo-a") || a.includes("main"))),
+    "Project B repo must not process TASK-REPO-A or main",
+  );
+});
+
+test("runRunQueue: отрицательная проверка — недоступный контекст задачи не выполняет Git-вызовов и не блокирует другие задачи", async () => {
+  const store = createTestStore();
+  const t0 = 1700000000000;
+
+  // Insert Task 1 (proj_bad, no confirmed repo context)
+  store.insertTask(
+    {
+      taskKey: "TASK-BAD-REPO",
+      projectId: "proj_bad",
+      coordinatorThreadId: "thr_coord_bad",
+      route: "feature",
+      level: "medium",
+      confirmationMode: "auto",
+    },
+    t0,
+  );
+
+  // Insert Task 2 (proj_good, valid repo context)
+  store.insertTask(
+    {
+      taskKey: "TASK-GOOD-REPO",
+      projectId: "proj_good",
+      coordinatorThreadId: "thr_coord_good",
+      route: "feature",
+      level: "medium",
+      confirmationMode: "auto",
+    },
+    t0,
+  );
+
+  const gitCalls: Array<{ repoRoot?: string; args: string[] }> = [];
+  const warnings: string[] = [];
+
+  const mockCmd: CmdRunner = {
+    run: async (_cmd: string, args: string[], opts?: { cwd?: string }) => {
+      gitCalls.push({ repoRoot: opts?.cwd, args });
+      return { exitCode: 1, stdout: "", stderr: "" };
+    },
+  };
+
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    workGraphProjects: {
+      proj_bad: "strict",
+      proj_good: "strict",
+    },
+    maxActiveTasks: 5,
+    now: () => t0,
+    cmd: mockCmd,
+    log: {
+      warn: (msg: string) => warnings.push(msg),
+    },
+    resolveTaskRepoContext: async (task) => {
+      if (task.project_id === "proj_good") {
+        return { repoRoot: "/repos/proj-good", mergeBaseBranch: "main" };
+      }
+      // proj_bad returns null (unavailable repo context)
+      return null;
+    },
+  });
+
+  // Verify warning was recorded for TASK-BAD-REPO without git calls
+  assert.ok(
+    warnings.some((w) => w.includes("TASK-BAD-REPO") && w.includes("proj_bad")),
+    "Warning must be logged for TASK-BAD-REPO indicating unavailable repo context",
+  );
+
+  // Zero git calls must be made in any foreign directory or for TASK-BAD-REPO
+  assert.ok(
+    !gitCalls.some((c) => c.args.some((a) => a.toLowerCase().includes("task-bad-repo"))),
+    "TASK-BAD-REPO must have made zero git calls",
+  );
+
+  // TASK-GOOD-REPO must have proceeded and run in /repos/proj-good
+  const goodCalls = gitCalls.filter((c) => c.repoRoot === "/repos/proj-good");
+  assert.ok(goodCalls.length > 0, "TASK-GOOD-REPO must make git calls in /repos/proj-good");
+  assert.ok(
+    goodCalls.some((c) => c.args.some((a) => a.toLowerCase().includes("task-good-repo"))),
+    "Git calls for good task must reference task-good-repo branch",
+  );
+});
+
+test("connected RPC & UI: projectApprovalMode & taskConfirmationMode с реактивным обновлением при открытом треде", async () => {
+  const mockThreads: Record<string, { projectId?: string; environmentId?: string; status?: string }> = {
+    thr_in_strict: { projectId: "proj_strict", status: "running" },
+    thr_in_off: { projectId: "proj_off", status: "running" },
+    thr_unknown_proj: { projectId: "proj_unknown", status: "running" },
+  };
+
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    dataDir: makeTempDir("orch-rpc-mode-"),
+    settings: {
+      workGraph: "shadow", // global shadow
+      workGraphProjects: JSON.stringify({
+        proj_strict: "strict",
+        proj_off: "off",
+      }),
+      language: "ru",
+    },
+    sdk: {
+      threads: {
+        get: async ({ threadId }: { threadId: string }) => {
+          const t = mockThreads[threadId];
+          if (!t) throw new Error(`thread ${threadId} not found`);
+          return t;
+        },
+      },
+    },
+  });
+
+  await createPlugin(host.bb, {
+    bbCli: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+  });
+
+  // 1. Thread in off project: overrides global shadow -> off
+  const resOffTask = (await host.harness.callRpc("taskConfirmationMode", {
+    threadId: "thr_in_off",
+  })) as { taskKey: string | null; workGraph: string; projectId: string | null };
+  assert.equal(resOffTask.workGraph, "off", "proj_off overrides global shadow with off");
+  assert.equal(resOffTask.projectId, "proj_off");
+
+  const resOffProj = (await host.harness.callRpc("projectApprovalMode", {
+    threadId: "thr_in_off",
+  })) as { workGraph: string; projectId: string | null };
+  assert.equal(resOffProj.workGraph, "off", "proj_off projectApprovalMode returns off");
+  assert.equal(resOffProj.projectId, "proj_off");
+
+  // 2. Thread in strict project: overrides global shadow -> strict
+  const resStrictTask = (await host.harness.callRpc("taskConfirmationMode", {
+    threadId: "thr_in_strict",
+  })) as { taskKey: string | null; workGraph: string; projectId: string | null };
+  assert.equal(resStrictTask.workGraph, "strict", "proj_strict overrides global shadow with strict");
+  assert.equal(resStrictTask.projectId, "proj_strict");
+
+  const resStrictProj = (await host.harness.callRpc("projectApprovalMode", {
+    threadId: "thr_in_strict",
+  })) as { workGraph: string; projectId: string | null };
+  assert.equal(resStrictProj.workGraph, "strict", "proj_strict projectApprovalMode returns strict");
+  assert.equal(resStrictProj.projectId, "proj_strict");
+
+  // 3. Thread in unknown project: falls back to global shadow
+  const resUnknownTask = (await host.harness.callRpc("taskConfirmationMode", {
+    threadId: "thr_unknown_proj",
+  })) as { taskKey: string | null; workGraph: string; projectId: string | null };
+  assert.equal(resUnknownTask.workGraph, "shadow", "unknown project falls back to global shadow");
+
+  // 4. Reactive change while thread is open:
+  // Switch proj_off to strict on the fly in settings
+  await host.harness.setSettings({
+    workGraphProjects: JSON.stringify({
+      proj_off: "strict",
+      proj_strict: "strict",
+    }),
+  });
+
+  // Re-check with the same open threadId thr_in_off
+  const resUpdatedTask = (await host.harness.callRpc("taskConfirmationMode", {
+    threadId: "thr_in_off",
+  })) as { taskKey: string | null; workGraph: string; projectId: string | null };
+  assert.equal(
+    resUpdatedTask.workGraph,
+    "strict",
+    "After settings change, open thread in proj_off immediately reflects strict",
+  );
+
+  const resUpdatedProj = (await host.harness.callRpc("projectApprovalMode", {
+    threadId: "thr_in_off",
+  })) as { workGraph: string; projectId: string | null };
+  assert.equal(
+    resUpdatedProj.workGraph,
+    "strict",
+    "After settings change, projectApprovalMode for open thread reflects strict",
+  );
+
+  // 5. Global setting change: change global workGraph from shadow to off
+  await host.harness.setSettings({
+    workGraph: "off",
+  });
+
+  const resGlobalUpdated = (await host.harness.callRpc("taskConfirmationMode", {
+    threadId: "thr_unknown_proj",
+  })) as { taskKey: string | null; workGraph: string; projectId: string | null };
+  assert.equal(
+    resGlobalUpdated.workGraph,
+    "off",
+    "After global setting change to off, thread in unknown project reflects off",
+  );
+});
+
+test("connected server run-queue resolver: недоступный контекст не использует process.cwd и пропускает Git-вызовы", async () => {
+  const gitCalls: Array<{ cmd: string; args: string[]; cwd?: string }> = [];
+  const mockCmdRunner: CmdRunner = {
+    run: async (c: string, args: string[], opts?: { cwd?: string }) => {
+      gitCalls.push({ cmd: c, args, cwd: opts?.cwd });
+      return { exitCode: 1, stdout: "", stderr: "" };
+    },
+  };
+
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    dataDir: makeTempDir("orch-server-resolver-"),
+    settings: {
+      workGraph: "strict",
+      language: "ru",
+    },
+    sdk: {
+      projects: {
+        list: async () => [], // No projects have configured repo paths
+      },
+    },
+  });
+
+  await createPlugin(host.bb, {
+    bbCli: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+    cmd: mockCmdRunner,
+  });
+
+  // Call run-queue with a caller cwd pointing to a fake process dir
+  const res = await host.harness.runCli(["run-queue"], { cwd: "/some/process/dir" });
+  assert.equal(res.exitCode, 0);
+
+  // Ensure no git calls were made in /some/process/dir
+  assert.ok(
+    !gitCalls.some((c) => c.cwd === "/some/process/dir" && c.args.some((a) => a.includes("rev-parse") || a.includes("branch"))),
+    "run-queue must not run git commands in caller cwd when task repo context is missing",
+  );
 });

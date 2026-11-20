@@ -197,10 +197,14 @@ export const rpcContract = defineRpcContract({
   },
   // §29.2 (Б2, r34.2): проектная настройка approvalMode (тумблер координатора)
   projectApprovalMode: {
-    input: z.object({ projectId: z.string().nullable().optional() }),
+    input: z.object({
+      projectId: z.string().nullable().optional(),
+      threadId: z.string().nullable().optional(),
+    }),
     output: z.object({
       mode: z.enum(["auto", "manual"]).nullable(),
       workGraph: z.enum(["off", "shadow", "strict"]).optional(),
+      projectId: z.string().nullable().optional(),
     }),
   },
   setProjectApprovalMode: {
@@ -215,11 +219,13 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       taskKey: z.string().optional(),
       threadId: z.string().optional(),
+      projectId: z.string().optional(),
     }),
     output: z.object({
       taskKey: z.string().nullable(),
       mode: z.enum(["auto", "manual"]).nullable(),
       workGraph: z.enum(["off", "shadow", "strict"]).optional(),
+      projectId: z.string().nullable().optional(),
     }),
   },
   setTaskConfirmationMode: {
@@ -1846,6 +1852,18 @@ export async function createPlugin(
       bbCli,
       t,
       requestOwnerGateInteraction,
+      log: bb.log,
+      resolveTaskRepoContext: async (task) => {
+        try {
+          return await resolveWorktreeContext(
+            task.coordinator_thread_id || undefined,
+            task.project_id || undefined,
+            undefined,
+          );
+        } catch {
+          return null;
+        }
+      },
     }).catch((e) =>
       bb.log.warn(`orchestrator run-queue: ${describeError(e)}`),
     );
@@ -1881,12 +1899,27 @@ export async function createPlugin(
     callCwd?: string,
   ) => {
     if (threadId) {
-      const env = await environmentOf(threadId).catch(() => null);
-      if (env?.path) {
-        return {
-          repoRoot: env.path,
-          mergeBaseBranch: env.mergeBaseBranch || "main",
-        };
+      let matchesProject = true;
+      if (projectId) {
+        try {
+          const t = (await bb.sdk.threads.get({ threadId })) as {
+            projectId?: string | null;
+          };
+          if (t?.projectId && t.projectId !== projectId) {
+            matchesProject = false;
+          }
+        } catch {
+          matchesProject = false;
+        }
+      }
+      if (matchesProject) {
+        const env = await environmentOf(threadId).catch(() => null);
+        if (env?.path) {
+          return {
+            repoRoot: env.path,
+            mergeBaseBranch: env.mergeBaseBranch || "main",
+          };
+        }
       }
     }
     let repoRoot: string | null = null;
@@ -2349,7 +2382,20 @@ export async function createPlugin(
       log: bb.log,
     }),
     async projectApprovalMode(input) {
-      return { mode: getApprovalMode(), workGraph: getWorkGraphMode(input?.projectId) };
+      let pid = input?.projectId;
+      if (!pid && input?.threadId) {
+        try {
+          const t = (await bb.sdk.threads.get({ threadId: input.threadId })) as {
+            projectId?: string | null;
+          };
+          if (t?.projectId) pid = t.projectId;
+        } catch {}
+      }
+      return {
+        mode: getApprovalMode(),
+        workGraph: getWorkGraphMode(pid),
+        projectId: pid ?? null,
+      };
     },
     async setProjectApprovalMode(input) {
       const modeVal = input.mode ?? "";
@@ -2359,21 +2405,45 @@ export async function createPlugin(
     },
     async taskConfirmationMode(input) {
       let key = input.taskKey ? normalizeTaskKey(input.taskKey) : undefined;
-      if (!key && input.threadId) {
-        const del = store.byThreadId(input.threadId);
-        if (del?.task_key) {
-          key = del.task_key;
-        } else {
-          const t = store
-            .listAllTasks()
-            .find((r: TaskQueueRow) => r.coordinator_thread_id === input.threadId);
-          if (t) key = t.task_key;
+      let threadPid = input.projectId;
+      if (input.threadId) {
+        if (!key) {
+          const del = store.byThreadId(input.threadId);
+          if (del?.task_key) {
+            key = del.task_key;
+          } else {
+            const t = store
+              .listAllTasks()
+              .find((r: TaskQueueRow) => r.coordinator_thread_id === input.threadId);
+            if (t) key = t.task_key;
+          }
+        }
+        if (!threadPid) {
+          try {
+            const t = (await bb.sdk.threads.get({ threadId: input.threadId })) as {
+              projectId?: string | null;
+            };
+            if (t?.projectId) threadPid = t.projectId;
+          } catch {}
         }
       }
-      if (!key) return { taskKey: null, mode: null, workGraph: getWorkGraphMode() };
+      if (!key) {
+        return {
+          taskKey: null,
+          mode: null,
+          workGraph: getWorkGraphMode(threadPid),
+          projectId: threadPid ?? null,
+        };
+      }
       const mode = store.getTaskConfirmationMode(key);
       const taskPid = await resolveTaskProjectId(store, key, { bbCli });
-      return { taskKey: key, mode, workGraph: getWorkGraphMode(taskPid) };
+      const finalPid = taskPid ?? threadPid;
+      return {
+        taskKey: key,
+        mode,
+        workGraph: getWorkGraphMode(finalPid),
+        projectId: finalPid ?? null,
+      };
     },
     async setTaskConfirmationMode(input) {
       let key = input.taskKey ? normalizeTaskKey(input.taskKey) : undefined;
@@ -4390,6 +4460,18 @@ abandoned: ${res.reported
             bbCli,
             t,
             requestOwnerGateInteraction,
+            log: bb.log,
+            resolveTaskRepoContext: async (task) => {
+              try {
+                return await resolveWorktreeContext(
+                  task.coordinator_thread_id || undefined,
+                  task.project_id || undefined,
+                  task.project_id ? undefined : (ctx.cwd || process.cwd()),
+                );
+              } catch {
+                return null;
+              }
+            },
           });
           return json
             ? jsonOk(res)

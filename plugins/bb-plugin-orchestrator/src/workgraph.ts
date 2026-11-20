@@ -3782,6 +3782,12 @@ export interface RunQueueDeps {
   maxActiveTasks?: number;
   repoRoot?: string;
   mergeBaseBranch?: string;
+  resolveTaskRepoContext?: (
+    task: TaskQueueRow,
+  ) =>
+    | Promise<{ repoRoot: string; mergeBaseBranch: string } | null>
+    | { repoRoot: string; mergeBaseBranch: string }
+    | null;
   cmd?: CmdRunner;
   bbCli?: BbCli;
   t?: T;
@@ -4011,11 +4017,22 @@ export async function runRunQueue(
         if (taskMode === "off") continue;
         if (taskMode === "shadow" && !deps.autoAdvance) continue;
         try {
+          const taskRepo = deps.resolveTaskRepoContext
+            ? await deps.resolveTaskRepoContext(task)
+            : { repoRoot, mergeBaseBranch };
+          if (!taskRepo?.repoRoot) {
+            const warnMsg = `orchestrator: task ${task.task_key} repo context unavailable for project ${task.project_id ?? "unknown"}; skipping git steps`;
+            if (deps.log?.warn) deps.log.warn(warnMsg);
+            else console.warn(warnMsg);
+            continue;
+          }
+          const taskRepoRoot = taskRepo.repoRoot;
+          const taskMergeBase = taskRepo.mergeBaseBranch ?? mergeBaseBranch;
           const advanced = await advanceActiveTask(
             task,
             deps,
-            repoRoot,
-            mergeBaseBranch,
+            taskRepoRoot,
+            taskMergeBase,
             transitions,
           );
           if (advanced) {
@@ -4162,11 +4179,22 @@ export async function runRunQueue(
           if (!depsSatisfied) continue;
 
           try {
+            const taskRepo = deps.resolveTaskRepoContext
+              ? await deps.resolveTaskRepoContext(t)
+              : { repoRoot, mergeBaseBranch };
+            if (!taskRepo?.repoRoot) {
+              const warnMsg = `orchestrator: task ${t.task_key} repo context unavailable for project ${t.project_id ?? "unknown"}; skipping git steps`;
+              if (deps.log?.warn) deps.log.warn(warnMsg);
+              else console.warn(warnMsg);
+              continue;
+            }
+            const taskRepoRoot = taskRepo.repoRoot;
+            const taskMergeBase = taskRepo.mergeBaseBranch ?? mergeBaseBranch;
             const started = await startQueuedTask(
               t,
               deps,
-              repoRoot,
-              mergeBaseBranch,
+              taskRepoRoot,
+              taskMergeBase,
               transitions,
             );
             if (started) {
