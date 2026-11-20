@@ -4359,6 +4359,11 @@ function processDeltaLine(
             session.interruptedPending = true;
             const rest = trimmedLeading.slice(firstNl + 1);
             if (rest.length > 0) {
+              if (isAgentMarkerCandidate(rest)) {
+                session.agentMessageText = rest;
+                session.candidateBuffer.push({ ...delta, text: rest });
+                continue;
+              }
               const restDelta = { ...delta, text: rest };
               session.agentMessageText = rest;
               out.push(restDelta);

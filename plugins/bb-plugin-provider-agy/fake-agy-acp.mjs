@@ -358,7 +358,8 @@ async function runPrompt(id, text) {
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n" } });
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ " } });
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The stream was interrupted. " } });
-    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Please continue the task you were working on.\n" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Please continue the task you were working on." } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n" } });
     upd({ sessionUpdate: "tool_call", toolCallId: "tc-int1", title: "run_command", kind: "execute", status: "in_progress", rawInput: { command: "echo ok" } });
     upd({ sessionUpdate: "tool_call_update", toolCallId: "tc-int1", status: "completed", rawOutput: "ok" });
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "All done after tool." } });
