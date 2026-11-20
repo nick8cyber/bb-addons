@@ -119,8 +119,9 @@ function acp(repo, model, { mode = "write", owner = true, env = {} } = {}) {
   ].join("\n"));
   const args = [entry, "--session-access=" + mode];
   if (owner) args.push("--bb-thread-id=" + thread);
+  const { BB_THREAD_ID: _inheritedThread, ...inheritedEnv } = process.env;
   const child = spawn(process.execPath, args, {
-    env: { ...process.env, BB_CLI: repo.bb, WEB_GEMINI_STATE_DIR: repo.state, WEB_GEMINI_POOL_FILE: repo.pool,
+    env: { ...inheritedEnv, BB_CLI: repo.bb, WEB_GEMINI_STATE_DIR: repo.state, WEB_GEMINI_POOL_FILE: repo.pool,
       WEB_GEMINI_FAKE: "0", ARGON_FAKE: "0", WEB_GEMINI_BACKENDS: "[]", ...env },
     stdio: ["pipe", "pipe", "pipe"],
   });

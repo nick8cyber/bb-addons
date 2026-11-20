@@ -157,7 +157,8 @@ startServer({ webDriver: { async sendPrompt(options) {
     const host = fileURLToPath(new URL("../host.mjs", import.meta.url));
     rpc = rpcProcess(t, [worker, host, "provider-fixture", dir], process.env);
   } else {
-    rpc = rpcProcess(t, args, { ...process.env, ...env });
+    const { BB_THREAD_ID: _inheritedThread, ...inheritedEnv } = process.env;
+    rpc = rpcProcess(t, args, { ...inheritedEnv, ...env });
   }
   const { child, messages, send, notify } = rpc;
   return {

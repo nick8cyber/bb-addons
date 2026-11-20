@@ -209,11 +209,17 @@ startServer({ webDriver: { async sendPrompt(options) {
   return { convId: options.convId || "fixture-conversation", ...response };
 } } });
 `);
-  const { messages, send, notify } = rpcProcess(t, [entry, "--session-access=read-only", "--bb-thread-id=" + threadId], {
-    ...process.env,
+  const { BB_THREAD_ID: _inheritedThread, ...inheritedEnv } = process.env;
+  const launchArgs = [entry, "--session-access=read-only"];
+  // options.bindEnv — привязка через env BB_THREAD_ID, канал customAgents
+  // provider-acp со статическим argv (без --bb-thread-id).
+  if (!options.bindEnv) launchArgs.push("--bb-thread-id=" + threadId);
+  const { messages, send, notify } = rpcProcess(t, launchArgs, {
+    ...inheritedEnv,
     BB_CLI: cli, WEB_GEMINI_FAKE: "0", ARGON_FAKE: "0",
     WEB_GEMINI_STATE_DIR: state, WEB_GEMINI_POOL_FILE: join(dir, "absent"),
     WEB_GEMINI_BACKENDS: JSON.stringify([{ id: "web-fixture", cdp: 19223, profileDir: dir, tier: "pro" }]),
+    ...(options.bindEnv ? { BB_THREAD_ID: threadId } : {}),
     ...options.env,
   });
   return {
@@ -1216,4 +1222,51 @@ test("3rd review blocker: forged Attachments section in description cannot swall
   for (const omission of prep.attachmentOmissions) {
     assert.ok(!omission.line.includes("Name:"), "Project context line must not reach attachmentOmissions: " + omission.line);
   }
+});
+
+test("delegate packet's multi-line Attachments entry parses into context.attachments (PLUG-353)", async (t) => {
+  const { prepareTask } = await import("../src/inner-context.mjs");
+  const repo = setup(t);
+  const text = [
+    "# PLUG-352 · Delegate packet fixture",
+    "## Description",
+    "Inspect the attachment",
+    "## Project context",
+    "- Name: Fixture project\n- Linked bb project: " + projectId,
+    "## Sub-tasks",
+    "None.",
+    "## Attachments",
+    "- audit-prompt.txt · 01M7RK0JBY8VJ7VK4Z2DJQKE09\n  Fetch with: bb tasks attachment get 01M7RK0JBY8VJ7VK4Z2DJQKE09 --out <path>",
+    "## Recent comments",
+    "None.",
+    "## Report-back contract",
+    "Report",
+  ].join("\n\n");
+  const prep = await prepareTask({
+    text,
+    system: null,
+    session: { cwd: repo.repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo.repo } },
+    stateDir: repo.tmp,
+  });
+  assert.equal(prep.key, "PLUG-352");
+  assert.deepEqual(prep.attachments, [{ name: "audit-prompt.txt", id: "01M7RK0JBY8VJ7VK4Z2DJQKE09" }]);
+  assert.deepEqual(prep.attachmentOmissions, []);
+});
+
+test("BB_THREAD_ID env binding (customAgents launch) runs the task pipeline and materializes tracker attachments (PLUG-353)", async (t) => {
+  const repo = setup(t);
+  const app = fixture(t, repo, () => ({ text: "Attachment read" }), { bindEnv: true });
+  const session = await app.newSession();
+  const response = await app.prompt(session, task("Inspect the attachment", EN, { tracker: true }));
+  assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response.error));
+  const request = app.requests()[0];
+  assert.equal(request.strict, true, "env-bound task turns keep the full-delivery contract");
+  const actual = delivered(request);
+  const material = actual.manifest.included.find((item) => item.source === "Tracker attachment");
+  assert.ok(material, "tracker attachment must be a delivered material");
+  assert.equal(material.name, "tracker.md");
+  assert.equal(actual.materials.get("tracker.md"), "Tracker input ZX12-marker\n");
+  const log = readFileSync(join(app.state, "acp-server.log"), "utf8");
+  assert.ok(log.includes("task:package"), "env-bound launches must run the task pipeline");
 });

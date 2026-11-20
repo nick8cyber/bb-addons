@@ -42,7 +42,12 @@ const require = createRequire(join(HERE, "package.json"));
 console.log = console.error;
 
 const FAKE = process.env.WEB_GEMINI_FAKE === "1" || process.env.ARGON_FAKE === "1";
-const BB_THREAD_ARG = process.argv.find((arg) => arg.startsWith("--bb-thread-id="));
+// Привязка к BB-треду приходит двумя каналами: argv `--bb-thread-id=`
+// (запуск через deriveProviderOptions плагина) и env BB_THREAD_ID —
+// единственный канал для `customAgents` provider-acp, чей argv статичен.
+// В обоих случаях id проверяется через `bb thread show` до доверия.
+const BB_THREAD_ARG = process.argv.find((arg) => arg.startsWith("--bb-thread-id=")) ??
+  (process.env.BB_THREAD_ID ? "--bb-thread-id=" + process.env.BB_THREAD_ID : undefined);
 const BB_THREAD_ID = BB_THREAD_ARG?.slice("--bb-thread-id=".length);
 const SESSION_ACCESS = process.argv.find((arg) => arg.startsWith("--session-access="))?.split("=")[1];
 const WRITE_LAUNCH = SESSION_ACCESS === "write" && Boolean(BB_THREAD_ID);

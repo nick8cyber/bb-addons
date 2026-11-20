@@ -131,9 +131,12 @@ function trackTmpDir(dir) {
   return dir;
 }
 function spawnServer(env) {
+  // Наследованный BB_THREAD_ID (запуск тестов из bb-треда) не должен
+  // превращать голый запуск в привязанный к чужому треду.
+  const { BB_THREAD_ID: _inheritedThread, ...cleanEnv } = env;
   const proc = spawn("node", ["acp-server.mjs"], {
     cwd: PLUGIN_ROOT,
-    env,
+    env: cleanEnv,
     stdio: ["pipe", "pipe", "pipe"],
     detached: true,
   });
