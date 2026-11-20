@@ -27,4 +27,4 @@ date: 2026-11-20
 - Команды, которые agy запускает в треде, тоже видят `SSH_CONNECTION`.
 - Аккаунты, добавленные на macOS до этой правки, могут иметь токен только в Keychain — их добавляют заново через `scripts/add-account.mjs`.
 - На macOS решение не проверено (Mac на стенде нет); поведение выведено из общего кода agy и проверки на Linux.
-- Замечания ревью (PLUG-357): маркер имеет абсолютный приоритет и последнее слово над `options.envVars` сессии (включён в `PROTECTED_CHILD_ENV`) и над `install.env` реестра установок на всех путях запуска аккаунтов пула (`session/new`, `session/load`, `agy models`, stream-json, `add-account`).
+- Замечания ревью (PLUG-357): маркер имеет абсолютный приоритет и последнее слово над `options.envVars` сессии (ключ `SSH_CONNECTION` отбрасывается из `envVars` при запуске пул-аккаунта) и над `install.env` реестра установок на всех путях запуска аккаунтов пула (`session/new`, `session/load`, опрос `agy models`, включая пробники каталога, stream-json, `add-account`). В прямом режиме, в relay и при `AGY_KEYRING=1` ключ `SSH_CONNECTION` из `envVars` не фильтруется.
