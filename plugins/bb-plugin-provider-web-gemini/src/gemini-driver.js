@@ -549,8 +549,8 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
       const btnAria = ((await btn.getAttribute('aria-label')) || '').toLowerCase();
       const m = model.toLowerCase();
       const modelKeywords = {
-        argon: ['argon', 'neon', 'deeper analysis', 'глубокий анализ', 'код и анализ'],
         neon: ['neon', 'deeper analysis', 'глубокий анализ', 'argon', 'код и анализ'],
+        argon: ['neon', 'deeper analysis', 'глубокий анализ', 'argon', 'код и анализ'],
         carbon: ['carbon', 'code & complex work', 'code and complex work', 'самые сложные задачи'],
         hydrogen: ['hydrogen', 'повседневные дела'],
         pro: ['pro', 'исследования'],

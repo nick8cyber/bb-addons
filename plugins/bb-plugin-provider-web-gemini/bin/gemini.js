@@ -22,7 +22,7 @@ Usage:
   cat file | gemini [options] [prompt...]
 
 Options:
-  -m, --model <name>       Model to use (e.g. argon, pro, flash)
+  -m, --model <name>       Model to use (e.g. neon, pro, flash)
   -t, --thinking <level>   Thinking reasoning depth (e.g. low, medium, high)
   -n, --new                Start a new chat session
   -f, --file <path>        Attach a file using Gemini's '+' (Upload & tools) button
@@ -57,7 +57,7 @@ Examples:
   gemini --headless native "Run with Chrome native headless=new"
   gemini --visible "Run with visible browser"
   cat file.txt | gemini "Summarize this file"
-  gemini -m argon -t high "Complex reasoning query"
+  gemini -m neon -t high "Complex reasoning query"
   gemini -n "Start fresh conversation"
   gemini -l
   gemini -l --json

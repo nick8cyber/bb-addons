@@ -31,14 +31,14 @@ async function run() {
     throw new Error(`Test 1 exceeded duration limit (${duration1}ms > 25000ms) - possible 30s timeout issue`);
   }
 
-  // Test 2: Switching model to 'argon' to verify dynamic model transition
-  console.log('\n[test-driver] Test 2: Exercising model="argon"...');
+  // Test 2: Switching model to 'neon' to verify dynamic model transition
+  console.log('\n[test-driver] Test 2: Exercising model="neon"...');
   const t1 = Date.now();
   let streamedText2 = '';
 
   const result2 = await sendPrompt({
     prompt: 'Echo the single word: OK',
-    model: 'argon',
+    model: 'neon',
     isNewChat: false,
     onChunk: (chunk) => {
       process.stdout.write(chunk);

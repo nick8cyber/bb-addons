@@ -120,7 +120,7 @@ export function createSessionRecord(stateDir, fields) {
     accessCeiling: fields.accessCeiling ?? "read-only",
     accessMode: fields.accessMode ?? "read-only",
     roots: Array.isArray(fields.roots) ? fields.roots : [],
-    model: fields.model ?? "argon",
+    model: fields.model ?? "neon",
     thinking: fields.thinking ?? "medium",
     account: fields.account ?? "auto",
     convId: fields.convId ?? null,
