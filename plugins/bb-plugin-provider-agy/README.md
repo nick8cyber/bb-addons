@@ -309,6 +309,13 @@ The `⚠ Individual quota reached. … Resets in 8m11s.` notice arrives with its
 message reaching the thread on two channels within one turn is reported once
 (per-turn dedup); the next turn is free to report it again.
 
+On the ACP transport agy reports the same exhausted window as ordinary agent
+text and closes the turn cleanly — no error ever reaches the bridge. The
+wrapper recognises that exact one-line message, hides it, cools the account
+until the stated reset and re-runs the turn on a free sibling (or fails with
+the `rate-limit` error when none is free) — spec `provider-agy-acp.md` §2.3
+п. 13.
+
 A period of blocked quota is reported to bb natively, not just as error
 text. When the classified message carries the reset window — `Resets in
 1h13m29s.`, `Resets in 47m42s.`, `Resets in 8m11s.` — the bridge opens the
