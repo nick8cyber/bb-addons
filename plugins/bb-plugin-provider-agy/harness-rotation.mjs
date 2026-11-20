@@ -75,7 +75,7 @@ const fake = new URL("./fake-agy-errors.mjs", import.meta.url).pathname;
 writeFileSync(shim, `#!/bin/sh\nexec /usr/bin/node ${fake} "$@"\n`);
 chmodSync(shim, 0o755);
 process.env.AGY_PATH = shim;
-process.env.AGY_FAKE_RECORD_ENV = "HOME,HTTPS_PROXY";
+process.env.AGY_FAKE_RECORD_ENV = "HOME,HTTPS_PROXY,SSH_CONNECTION";
 process.env.AGY_FAKE_TRANSCRIPT = join(root, "stdin.ndjson");
 process.env.AGY_CLIPROXY = "0";
 process.env.AGY_IDLE_KILL_MS = "1500";
@@ -2150,6 +2150,16 @@ await sleep(100);
     quotaSaw("t-quota-prose"),
     `entry=${JSON.stringify(qpEntry)} saw=${quotaSaw("t-quota-prose")} ` +
       `statuses=${statuses("t-quota-prose")}`);
+
+  // §2.3 п.14: every pool-account ACP launch carries the SSH marker that
+  // makes agy keep the token in the account's file, not the OS keyring.
+  {
+    const poolNews = acpTranscript().filter((l) => l.method === "session/new" && /^m[1-4]$/u.test(l.home ?? ""));
+    check("models/file-token-storage-env",
+      poolNews.length > 0 &&
+      poolNews.every((l) => l.__env?.SSH_CONNECTION === (process.env.SSH_CONNECTION || "127.0.0.1 0 127.0.0.1 0")),
+      JSON.stringify([...new Set(poolNews.map((l) => l.__env?.SSH_CONNECTION ?? null))]));
+  }
 
   // Q. §2.3 п.11 (ревизия 13.1): VALIDATION_REQUIRED on the INTERNAL
   // thread/start of a rotation sibling parks it permanently — not the

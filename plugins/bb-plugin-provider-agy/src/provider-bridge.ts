@@ -61,6 +61,7 @@ import {
   type AgyUsage,
   agySpawnArgs,
   agyUserMessageLine,
+  fileTokenStorageEnv,
   parseAgyLine,
   parseAgyModelsOutput,
   resolveAgyCommand,
@@ -1843,7 +1844,10 @@ function childEnvOverlay(session: Session): Record<string, string> {
         );
       }
       if (account !== null) {
-        const overlay: Record<string, string> = { HOME: account.home };
+        const overlay: Record<string, string> = {
+          ...fileTokenStorageEnv(process.env), // provider-agy-acp §2.3 п.14
+          HOME: account.home,
+        };
         if (account.proxy !== null) {
           overlay.HTTPS_PROXY = account.proxy;
           overlay.https_proxy = account.proxy;
@@ -1864,6 +1868,9 @@ function childEnvOverlay(session: Session): Record<string, string> {
 /** Overlay keys a session's envVars passthrough may not override. */
 const PROTECTED_CHILD_ENV = new Set([
   "HOME",
+  // provider-agy-acp §2.3 п.14: the file-token-storage marker of a pool
+  // account — without it agy would read the machine-wide OS keyring.
+  "SSH_CONNECTION",
   "GEMINI_API_KEY",
   "GOOGLE_GEMINI_BASE_URL",
   "HTTPS_PROXY",
@@ -3118,6 +3125,7 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
       );
       if (account !== null) {
         env.HOME = account.home;
+        Object.assign(env, fileTokenStorageEnv(process.env)); // §2.3 п.14
         if (account.proxy !== null) {
           env.HTTPS_PROXY = account.proxy;
           env.https_proxy = account.proxy;

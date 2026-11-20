@@ -55,6 +55,17 @@ the credential belongs to the machine that runs the turn. Both steps happen
    this plugin was developed against — so treat that path as a credential when
    you back the machine up or share it.
 
+   **Pool accounts never use the keyring.** The keyring is one slot per
+   machine user, so on macOS (Keychain) or a Linux desktop every pool account
+   would run as whoever signed in last. Each agy launch on a pool account —
+   sessions, `agy models` probes, `scripts/add-account.mjs` sign-in — therefore
+   carries `SSH_CONNECTION` (the host's own, or the placeholder
+   `127.0.0.1 0 127.0.0.1 0`): agy picks its file store when it sees an SSH
+   session and logs "Using file-based token storage because SSH session
+   detected". A direct launch on your own `HOME` (no pool) is left alone.
+   `AGY_KEYRING=1` turns this off. Accounts added on macOS before this change
+   may have their token only in Keychain — re-add them with `add-account`.
+
    A host with no browser at all can skip the account entirely: set
    `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` and
    export `GEMINI_API_KEY`. agy then talks to the Gemini API directly, and says

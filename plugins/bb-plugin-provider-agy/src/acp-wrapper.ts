@@ -108,7 +108,11 @@ import {
   type AcpUsage,
   type TokenBreakdown,
 } from "./recovery.js";
-import { parseAgyModelsOutput, resolveAgyCommand } from "./agy-cli.js";
+import {
+  fileTokenStorageEnv,
+  parseAgyModelsOutput,
+  resolveAgyCommand,
+} from "./agy-cli.js";
 import {
   INSTALL_NAME_RE,
   installsRegistry,
@@ -1768,6 +1772,9 @@ function buildLaunch(session: WSession): string | null {
     );
     if (account !== null) {
       geminiDir = join(account.home, ".gemini");
+      // §2.3 п.14: the pool account's token is its own file, never the
+      // machine-wide OS keyring.
+      Object.assign(env, fileTokenStorageEnv(process.env));
       if (account.proxy !== null) {
         env.HTTPS_PROXY = account.proxy;
         env.https_proxy = account.proxy;
@@ -1951,6 +1958,7 @@ function maintenanceEnvAndArgs(): {
         }
       }
       args.push("--gemini-dir", join(account.home, ".gemini"));
+      Object.assign(env, fileTokenStorageEnv(process.env)); // §2.3 п.14
       if (account.proxy !== null) {
         env.HTTPS_PROXY = account.proxy;
         env.https_proxy = account.proxy;
@@ -2495,6 +2503,7 @@ function runModelProbe(account: AccountHome, done: () => void): void {
         env: {
           ...process.env,
           ...(resolution.kind === "bin" ? resolution.env : {}),
+          ...fileTokenStorageEnv(process.env), // §2.3 п.14
           HOME: account.home,
           ...(account.proxy !== null
             ? {
