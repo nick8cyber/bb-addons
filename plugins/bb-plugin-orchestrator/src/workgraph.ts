@@ -2219,32 +2219,33 @@ export function splitRunnerPrefix(parts: string[]): {
   };
 }
 
-export function reorderFlagsBeforeFiles(tokens: string[]): string[] {
-  const flags: string[] = [];
-  const positional: string[] = [];
+export function reorderFilterFlagsForNode(tokens: string[]): string[] {
+  const filterFlags: string[] = [];
+  const otherTokens: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
     if (tok === "--") {
-      positional.push(...tokens.slice(i));
+      otherTokens.push(...tokens.slice(i));
       break;
     }
-    if (tok.startsWith("-")) {
-      flags.push(tok);
-      const flagName = tok.split("=")[0];
+    const flagName = tok.split("=")[0];
+    if (TEST_FILTER_FLAGS.has(flagName)) {
+      filterFlags.push(tok);
       if (
         !tok.includes("=") &&
-        FLAGS_WITH_VALUES.has(flagName) &&
         i + 1 < tokens.length &&
         !tokens[i + 1].startsWith("-")
       ) {
-        flags.push(tokens[++i]);
+        filterFlags.push(tokens[++i]);
       }
     } else {
-      positional.push(tok);
+      otherTokens.push(tok);
     }
   }
-  return [...flags, ...positional];
+  return [...filterFlags, ...otherTokens];
 }
+
+export const reorderFlagsBeforeFiles = reorderFilterFlagsForNode;
 
 export function hasTestFilter(cmdStr: string): boolean {
   const parts = cmdStr.trim().split(/\s+/);
@@ -2360,8 +2361,17 @@ export function validateCheckCommand(
   }
 
   const { binary, prefixArgs, restArgs } = splitRunnerPrefix(parts);
-  const reordered = reorderFlagsBeforeFiles(restArgs);
-  const args = [...prefixArgs, ...reordered];
+  let args: string[];
+  const isNodeTest =
+    (binary === "node" && prefixArgs.includes("--test")) ||
+    (binary === "npm" && prefixArgs.includes("--"));
+
+  if (isNodeTest) {
+    const reordered = reorderFilterFlagsForNode(restArgs);
+    args = [...prefixArgs, ...reordered];
+  } else {
+    args = parts.slice(1);
+  }
   return { valid: true, binary, args };
 }
 
@@ -2468,10 +2478,9 @@ export async function executeChecks(
     }
   }
 
-  // §31.3 / §34.5 (Reviewer Б1-в-1): Machine checks on code phase must run in an isolated worktree on result_sha
+  // §31.3 / §34.5 (Reviewer Б1-в-1 / Б8): Machine checks on code phase must run in an isolated worktree on result_sha
   const targetSha =
     (typeof payloadObj.result_sha === "string" ? payloadObj.result_sha : null) ||
-    (typeof (task as any).result_sha === "string" ? (task as any).result_sha : null) ||
     (task.branch ? `refs/heads/${task.branch}` : null);
 
   let tmpWorktree: string | null = null;
@@ -2687,27 +2696,75 @@ export function validateContractCommand(
   return baseVal;
 }
 
+export function isTestFilePath(name: string): boolean {
+  const trimmed = name.trim();
+  const clean = trimmed.replace(/\s+\([\d.]+m?s\)$/, "").trim();
+  return (
+    /[/\\]/.test(clean) &&
+    /\.(?:[cm]?[jt]sx?|json)$/i.test(clean)
+  );
+}
+
 export function hasPositiveTestPassCount(output?: string): boolean {
   if (!output) return false;
-  // Node / TAP: "# pass 1", "ℹ pass 1", "# tests 1", "ℹ tests 1" (where number > 0)
-  if (/(?:#|ℹ)\s*pass\s+[1-9]\d*/i.test(output)) return true;
-  // Pytest / Jest / Vitest: "1 passed", "2 passed", etc. (where number > 0)
+
+  // 1. Pytest / Jest / Vitest: "1 passed", "2 passed", etc. (where number > 0)
   if (/\b[1-9]\d*\s+passed\b/i.test(output)) return true;
-  // Cargo: "test result: ok. 1 passed"
+
+  // 2. Cargo: "test result: ok. 1 passed"
   if (/test result:\s*ok\.\s*[1-9]\d*\s+passed/i.test(output)) return true;
-  // Go: "--- PASS: TestName" or "ok  <pkg>  0.123s"
+
+  // 3. Go: "--- PASS: TestName" or "ok <pkg> <dur>" WITHOUT "[no tests to run]"
   if (/---\s*PASS:\s+\S+/i.test(output)) return true;
-  if (/^ok\s+\S+\s+[\d.]+s/m.test(output)) return true;
-  // TAP: "ok 1 - test name"
-  if (/^ok\s+[1-9]\d*\s+-/m.test(output)) return true;
+  const goOkLines = output.match(/^[ \t]*ok\s+\S+\s+[\d.]+s.*$/gm);
+  if (goOkLines && goOkLines.some((line) => !line.includes("[no tests to run]"))) {
+    return true;
+  }
+
+  // 4. Node / TAP: check for passed tests whose names are NOT test file path wrappers!
+  // Spec reporter checkmarks: "✔ <test_name>"
+  const checkMatches = output.match(/^[ \t]*[✔✓]\s+(.+)$/gm);
+  if (checkMatches) {
+    for (const m of checkMatches) {
+      const rawName = m.replace(/^[ \t]*[✔✓]\s+/, "").replace(/\s+\([\d.]+m?s\)$/, "").trim();
+      if (!isTestFilePath(rawName)) {
+        return true;
+      }
+    }
+  }
+
+  // TAP reporter: "ok <N> - <test_name>"
+  const tapMatches = output.match(/^[ \t]*ok\s+\d+\s+-\s+(.+?)(?:\s+#.*)?$/gm);
+  if (tapMatches) {
+    for (const m of tapMatches) {
+      const rawName = m.replace(/^[ \t]*ok\s+\d+\s+-\s+/, "").replace(/\s+#.*$/, "").trim();
+      if (!isTestFilePath(rawName)) {
+        return true;
+      }
+    }
+  }
+
   return false;
 }
 
 export function didFilterMatchZeroTests(output?: string): boolean {
   if (!output) return false;
-  // If positive passed tests were detected in the summary, then tests DID run!
+  // If positive passed tests were detected, tests DID run!
   if (hasPositiveTestPassCount(output)) return false;
 
+  // Node 22 spec reporter: checkmark lines exist, but ALL of them are file paths!
+  const checkMatches = output.match(/^[ \t]*[✔✓]\s+(.+)$/gm);
+  if (checkMatches && checkMatches.length > 0) {
+    const allFilePaths = checkMatches.every((m) =>
+      isTestFilePath(m.replace(/^[ \t]*[✔✓]\s+/, "")),
+    );
+    if (allFilePaths) return true;
+  }
+
+  // TAP 13: 1..0 plan
+  if (/\b1\.\.0\b/.test(output)) return true;
+
+  // Standard runner zero-match indicators
   if (/no tests found/i.test(output)) return true;
   if (/ran 0 test suites/i.test(output)) return true;
   if (/0\s+passed,\s*0\s+total/i.test(output)) return true;
@@ -2715,7 +2772,6 @@ export function didFilterMatchZeroTests(output?: string): boolean {
   if (/total:\s*0/i.test(output) && /passed:\s*0/i.test(output)) return true;
   if (/(?:#|ℹ)\s*tests\s+0\b/i.test(output)) return true;
   if (/(?:#|ℹ)\s*pass\s+0\b.*(?:#|ℹ)\s*fail\s+0\b/i.test(output)) return true;
-  if (/\b1\.\.0\b/.test(output)) return true;
   if (/collected 0 items/i.test(output)) return true;
   if (/no tests ran/i.test(output)) return true;
   if (/no tests collected/i.test(output)) return true;
@@ -2724,6 +2780,7 @@ export function didFilterMatchZeroTests(output?: string): boolean {
   if (/warning: no tests to run/i.test(output)) return true;
   if (/\[no tests to run\]/i.test(output)) return true;
   if (/\[no test files\]/i.test(output)) return true;
+
   return false;
 }
 
@@ -3146,7 +3203,8 @@ export async function runTddFailFirstVerification(
     } | null = null;
 
     for (const cmdStr of runnableCommands) {
-      const isPytest = /pytest\b/.test(cmdStr);
+      const { binary } = splitRunnerPrefix(cmdStr.trim().split(/\s+/));
+      const isPytest = binary === "pytest" || binary === "python" || binary === "python3";
       const singleRes = await executeChecks(
         { cmd: deps.cmd, repoRoot: tmpDir, worktreeDir: tmpDir },
         task,

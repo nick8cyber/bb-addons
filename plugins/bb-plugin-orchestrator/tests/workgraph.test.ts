@@ -3271,45 +3271,236 @@ npm test tests/sort.test.js
   }
 });
 
-test("§34.5 / Reviewer Б1-а-2 & Б2: validateCheckCommand normalizes runner flags before positional test files without breaking runner subcommands", () => {
-  // node --test style: flags after file moved before file
+test("§34.5 / Reviewer Б1-а-2 & Б7: validateCheckCommand preserves owner flags and only reorders test filter flags for Node", () => {
+  // node --test style: filter flags after file moved before file
   const valNode = validateCheckCommand("npm test -- tests/sort.test.js --test-name-pattern=handles-empty");
   assert.equal(valNode.valid, true);
   assert.deepEqual(valNode.args, ["test", "--", "--test-name-pattern=handles-empty", "tests/sort.test.js"]);
 
-  // pytest style: -k test_empty moved before test file
-  const valPytest = validateCheckCommand("pytest tests/test_sort.py -k test_empty");
-  assert.equal(valPytest.valid, true);
-  assert.deepEqual(valPytest.args, ["-k", "test_empty", "tests/test_sort.py"]);
+  // node --test style with -t flag
+  const valNodeT = validateCheckCommand("npm test -- tests/sort.test.js -t handles-empty");
+  assert.equal(valNodeT.valid, true);
+  assert.deepEqual(valNodeT.args, ["test", "--", "-t", "handles-empty", "tests/sort.test.js"]);
 
-  // Blocker Б2: cargo test --release keeps 'test' subcommand first!
+  // node with non-filter flags: flags are NOT moved or separated!
+  const valNodeReporter = validateCheckCommand("npm test -- tests/a.test.js --test-reporter tap");
+  assert.equal(valNodeReporter.valid, true);
+  assert.deepEqual(valNodeReporter.args, ["test", "--", "tests/a.test.js", "--test-reporter", "tap"]);
+
+  // Blocker Б7: pytest flags like -m slow are UNTOUCHED and NOT separated!
+  const valPytestM = validateCheckCommand("pytest tests/test_x.py -m slow");
+  assert.equal(valPytestM.valid, true);
+  assert.equal(valPytestM.binary, "pytest");
+  assert.deepEqual(valPytestM.args, ["tests/test_x.py", "-m", "slow"]);
+
+  // pytest --tb short is UNTOUCHED!
+  const valPytestTb = validateCheckCommand("pytest tests/t.py --tb short");
+  assert.equal(valPytestTb.valid, true);
+  assert.equal(valPytestTb.binary, "pytest");
+  assert.deepEqual(valPytestTb.args, ["tests/t.py", "--tb", "short"]);
+
+  // Blocker Б7: cargo test commands are UNTOUCHED!
   const valCargoRelease = validateCheckCommand("cargo test --release");
   assert.equal(valCargoRelease.valid, true);
   assert.equal(valCargoRelease.binary, "cargo");
   assert.deepEqual(valCargoRelease.args, ["test", "--release"]);
 
-  // Blocker Б2: go test ./... -run TestBug keeps 'test' subcommand first!
-  const valGoTest = validateCheckCommand("go test ./... -run TestBug");
-  assert.equal(valGoTest.valid, true);
-  assert.equal(valGoTest.binary, "go");
-  assert.deepEqual(valGoTest.args, ["test", "-run", "TestBug", "./..."]);
-
-  // Blocker Б2: cargo test foo --features x keeps 'test' first and --features with its value!
   const valCargoFeatures = validateCheckCommand("cargo test foo --features x");
   assert.equal(valCargoFeatures.valid, true);
   assert.equal(valCargoFeatures.binary, "cargo");
-  assert.deepEqual(valCargoFeatures.args, ["test", "--features", "x", "foo"]);
+  assert.deepEqual(valCargoFeatures.args, ["test", "foo", "--features", "x"]);
 
-  // Blocker Б2: pytest tests/t.py --tb short keeps --tb with its value!
-  const valPytestTb = validateCheckCommand("pytest tests/t.py --tb short");
-  assert.equal(valPytestTb.valid, true);
-  assert.equal(valPytestTb.binary, "pytest");
-  assert.deepEqual(valPytestTb.args, ["--tb", "short", "tests/t.py"]);
+  // Blocker Б7: go test commands with flags are UNTOUCHED!
+  const valGoTimeout = validateCheckCommand("go test ./... -timeout 120s");
+  assert.equal(valGoTimeout.valid, true);
+  assert.equal(valGoTimeout.binary, "go");
+  assert.deepEqual(valGoTimeout.args, ["test", "./...", "-timeout", "120s"]);
+
+  const valGoCount = validateCheckCommand("go test ./pkg -count 1 -run TestX", ["go test*"]);
+  assert.equal(valGoCount.valid, true);
+  assert.equal(valGoCount.binary, "go");
+  assert.deepEqual(valGoCount.args, ["test", "./pkg", "-count", "1", "-run", "TestX"]);
 
   // hasTestFilter helper
   assert.equal(hasTestFilter("npm test -- tests/sort.test.js --test-name-pattern=handles-empty"), true);
   assert.equal(hasTestFilter("npm test tests/sort.test.js"), false);
   assert.equal(hasTestFilter("pytest tests/test_sort.py::test_empty"), true);
+});
+
+test("§34.5 / Reviewer Б5 & Б6: didFilterMatchZeroTests accurately distinguishes zero-matches in Node 22 and Go", () => {
+  // Blocker Б5: Node 22 spec reporter with 0 matches only outputs checkmark on file path!
+  const nodeZeroMatchSpec = "✔ /tmp/sort.test.js (58.376889ms)\nℹ tests 1\nℹ suites 0\nℹ pass 1\nℹ fail 0\n";
+  assert.equal(didFilterMatchZeroTests(nodeZeroMatchSpec), true);
+
+  // Node 22 with real matching test outputs checkmark on test name!
+  const nodeRealMatchSpec = "✔ handles-empty (1.150445ms)\n✔ /tmp/file2.test.js (58.376889ms)\nℹ tests 2\nℹ suites 0\nℹ pass 2\n";
+  assert.equal(didFilterMatchZeroTests(nodeRealMatchSpec), false);
+
+  // Blocker Б6: Go with 0 matches outputs ok ... [no tests to run]!
+  const goZeroMatch = "ok  ex.com/a  0.002s [no tests to run]\n";
+  assert.equal(didFilterMatchZeroTests(goZeroMatch), true);
+
+  // Go with multiple packages all having [no tests to run]
+  const goMultiZeroMatch = "ok  pkg1  0.010s [no tests to run]\nok  pkg2  0.012s [no tests to run]\n";
+  assert.equal(didFilterMatchZeroTests(goMultiZeroMatch), true);
+
+  // Go with one package matching a real test
+  const goRealMatch = "=== RUN   TestNew\n--- PASS: TestNew (0.01s)\nPASS\nok  pkg1  0.020s\nok  pkg2  0.010s [no tests to run]\n";
+  assert.equal(didFilterMatchZeroTests(goRealMatch), false);
+});
+
+test("§34.5 / Reviewer Non-blocker 1 & Б5: End-to-end verification with REAL node --test runner", async () => {
+  const tmpRepo = makeTempDir("bb-real-node-");
+  try {
+    const cmd = createCmd();
+    await cmd.run("git", ["init"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+
+    const testsDir = path.join(tmpRepo, "tests");
+    fs.mkdirSync(testsDir, { recursive: true });
+    writeFileSync(
+      path.join(testsDir, "sort.test.js"),
+      `const test = require("node:test");\ntest("handles-empty", () => {});\n`,
+    );
+    await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "existing test file"], { cwd: tmpRepo });
+
+    const normKey = "REAL-NODE";
+    const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+    fs.mkdirSync(accDir, { recursive: true });
+
+    // 1. Contract with new test case (non-existent test in existing file)
+    writeFileSync(
+      path.join(accDir, `${normKey}.md`),
+      `# Contract\n## Тесты договора приёмки\n\`\`\`bash\nnode --test --test-name-pattern=brand-new-case tests/sort.test.js\n\`\`\`\n`,
+    );
+    await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "contract for new test case"], { cwd: tmpRepo });
+    const rev1 = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+    const accSha1 = rev1.stdout.trim();
+
+    // Run TDD fail-first verification using REAL node --test command!
+    const tddRes1 = await runTddFailFirstVerification(
+      { cmd, repoRoot: tmpRepo },
+      { task_key: normKey } as any,
+      accSha1,
+      ["node --test"],
+    );
+
+    // Blocker Б5: must be skipped_new_test on real Node 22, NOT vacuous!
+    assert.equal(tddRes1.ok, true);
+    assert.equal(tddRes1.failedAsExpected, true);
+    assert.equal(tddRes1.outcome, "skipped_new_test");
+    assert.ok(tddRes1.output?.includes("0 tests matched on base commit"));
+
+    // 2. Contract targeting an existing passing test: must be vacuous!
+    writeFileSync(
+      path.join(accDir, `${normKey}.md`),
+      `# Contract\n## Тесты договора приёмки\n\`\`\`bash\nnode --test --test-name-pattern=handles-empty tests/sort.test.js\n\`\`\`\n`,
+    );
+    await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "contract for existing test"], { cwd: tmpRepo });
+    const rev2 = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+    const accSha2 = rev2.stdout.trim();
+
+    const tddRes2 = await runTddFailFirstVerification(
+      { cmd, repoRoot: tmpRepo },
+      { task_key: normKey } as any,
+      accSha2,
+      ["node --test"],
+    );
+
+    // Vacuous contract correctly rejected!
+    assert.equal(tddRes2.ok, true);
+    assert.equal(tddRes2.failedAsExpected, false);
+    assert.equal(tddRes2.outcome, "vacuous");
+
+    // 3. Post-code executeChecks on commit without brand-new-case must fail with matched 0 tests!
+    const postCodeRes = await executeChecks(
+      { cmd, repoRoot: tmpRepo, worktreeDir: tmpRepo },
+      {
+        task_key: normKey,
+        payload: JSON.stringify({
+          checks_commands: ["node --test --test-name-pattern=brand-new-case tests/sort.test.js"],
+          tdd_commands: ["node --test --test-name-pattern=brand-new-case tests/sort.test.js"],
+        }),
+      } as any,
+      ["node --test"],
+    );
+
+    assert.equal(postCodeRes.ok, false);
+    assert.equal(postCodeRes.exitCode, 1);
+    assert.ok(postCodeRes.output?.includes("matched 0 tests (test was not created or executed)"));
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
+
+test("§34.5 / Reviewer Б8: executeChecks uses task.branch when task.result_sha has stale commit from past release", async () => {
+  const tmpRepo = makeTempDir("bb-stale-sha-");
+  try {
+    const cmd = createCmd();
+    await cmd.run("git", ["init"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+    await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+
+    // Commit 1 on main (initial release)
+    writeFileSync(path.join(tmpRepo, "README.md"), "# Initial\n");
+    await cmd.run("git", ["add", "README.md"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "stale release commit"], { cwd: tmpRepo });
+    const revOld = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+    const staleResultSha = revOld.stdout.trim();
+
+    // Create branch and commit new change
+    const branch = "bb/plug-b8";
+    await cmd.run("git", ["checkout", "-b", branch], { cwd: tmpRepo });
+    const testsDir = path.join(tmpRepo, "tests");
+    fs.mkdirSync(testsDir, { recursive: true });
+    writeFileSync(path.join(testsDir, "feature.test.js"), "console.log('pass');\n");
+    await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+    await cmd.run("git", ["commit", "-m", "new commit on branch"], { cwd: tmpRepo });
+
+    // Switch repoRoot back to main where tests/feature.test.js does NOT exist
+    await cmd.run("git", ["checkout", "master"], { cwd: tmpRepo }).catch(async () => {
+      await cmd.run("git", ["checkout", "main"], { cwd: tmpRepo });
+    });
+
+    const task: any = {
+      task_key: "PLUG-B8",
+      branch,
+      result_sha: staleResultSha, // stale release SHA
+      payload: JSON.stringify({
+        // payload.result_sha is not set (e.g. after pr_changes_requested)
+        tdd_commands: ["npm test tests/feature.test.js"],
+        checks_commands: ["npm test tests/feature.test.js"],
+      }),
+    };
+
+    const executedCwds: string[] = [];
+    const mockCmd: CmdRunner = {
+      run: async (bin, args, opts) => {
+        if (bin === "git") {
+          return cmd.run(bin, args, opts);
+        }
+        executedCwds.push(opts?.cwd || "");
+        return { exitCode: 0, stdout: "ok 1 - feature\n# pass 1", stderr: "" };
+      },
+    };
+
+    const res = await executeChecks(
+      { cmd: mockCmd, repoRoot: tmpRepo },
+      task,
+      ["npm test"],
+    );
+
+    // Blocker Б8: must succeed because checks run on branch where feature.test.js exists, NOT on staleResultSha!
+    assert.equal(res.ok, true);
+    assert.equal(res.acceptanceVerified, true);
+    assert.equal(executedCwds.length, 1);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
 });
 
 
