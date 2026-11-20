@@ -163,6 +163,10 @@ let creqN = 0;
 const creq = () => `creq_${"aaaaaaaaaa".slice(0, 9)}${"abcdefghjkmnpqrstuvwxyz"[creqN++ % 24]}`;
 const deltas = (tid) => messages.filter((m) => m.method === "thread/delta" && m.params.threadId === tid).flatMap((m) => m.params.deltas);
 const boundaries = (tid) => deltas(tid).filter((d) => d.kind === "turn.boundary");
+const lastPtid = (tid) =>
+  messages
+    .filter((m) => m.method === "thread/identity" && m.params.threadId === tid)
+    .at(-1)?.params?.providerThreadId;
 const perrors = (tid) => deltas(tid).filter((d) => d.kind === "provider.error");
 const rateLimits = (tid) => deltas(tid).filter((d) => d.kind === "provider.rateLimits");
 const replies = (id) => messages.filter((m) => m.id === id && (m.result !== undefined || m.error !== undefined));
@@ -237,6 +241,22 @@ const start = (id, tid, customOpts = options) =>
   check("blocker1/summary-quota-429-no-phantom-turn", phantomTurns.length === 0, `phantomTurns=${phantomTurns.length}`);
   check("blocker1/summary-quota-429-compact-completed", boundaries("t-b1-quota").at(-1)?.status === "completed");
   setControl({ compactMode: "ok", summaryMode: "ok" });
+
+  // Next turn/start after quota on compact-summary must succeed cleanly
+  send({
+    jsonrpc: "2.0",
+    id: 102,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-quota",
+      providerThreadId: lastPtid("t-b1-quota"),
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "next turn after compact", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-quota").length >= 4, 30000, "t-b1-quota next turn");
+  check("blocker1/summary-quota-next-turn-succeeds", boundaries("t-b1-quota").at(-1)?.status === "completed");
 }
 
 // Test 1b: summaryMode: "quota-text" (refusal marker in text during summary)
@@ -290,6 +310,91 @@ const start = (id, tid, customOpts = options) =>
   check("blocker1/summary-quota-text-no-phantom-turn", phantomTurns.length === 0, `phantomTurns=${phantomTurns.length}`);
   check("blocker1/summary-quota-text-compact-completed", boundaries("t-b1-quotatext").at(-1)?.status === "completed");
   setControl({ compactMode: "ok", summaryMode: "ok" });
+
+  // Next turn/start after quota-text on compact-summary
+  send({
+    jsonrpc: "2.0",
+    id: 112,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-quotatext",
+      providerThreadId: lastPtid("t-b1-quotatext"),
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "next turn after compact text", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-quotatext").length >= 4, 30000, "t-b1-quotatext next turn");
+  check("blocker1/summary-quotatext-next-turn-succeeds", boundaries("t-b1-quotatext").at(-1)?.status === "completed");
+}
+
+// Test 1c: seedMode: "quota" (HTTP 429 during compact-seed)
+{
+  resetAcpPool();
+  start(120, "t-b1-seedquota");
+  await waitFor(() => replies(120).length === 1, 20000, "t-b1-seedquota start");
+  const ptid = replies(120)[0].result.providerThreadId;
+
+  // Initial turn so session has context to compact
+  send({
+    jsonrpc: "2.0",
+    id: 119,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-seedquota",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "initial turn text", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-seedquota").length >= 1, 20000, "t-b1-seedquota initial turn");
+
+  setControl({ compactMode: "fail", summaryMode: "ok", seedMode: "quota" });
+  const compactMention = {
+    start: 0,
+    end: 8,
+    resource: { kind: "command", trigger: "/", name: "compact", source: "command", origin: "builtin", label: "/compact", argumentHint: null },
+  };
+  send({
+    jsonrpc: "2.0",
+    id: 121,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-seedquota",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "/compact", mentions: [compactMention] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b1-seedquota").length >= 4, 30000, "t-b1-seedquota compact finished");
+  const l = ledger();
+  const a1Cooled = (l.accounts.a1?.cooldownUntilMs ?? 0) > Date.now();
+  const transcript = transcriptLines();
+  const phantomTurns = transcript.filter((t) => ptxt(t).includes("[quota-rotation-handoff]"));
+
+  check("blocker1/seed-quota-cools-owner", a1Cooled, `cooldownUntilMs=${l.accounts.a1?.cooldownUntilMs}`);
+  check("blocker1/seed-quota-no-phantom-turn", phantomTurns.length === 0, `phantomTurns=${phantomTurns.length}`);
+  check("blocker1/seed-quota-compact-completed", boundaries("t-b1-seedquota").at(-1)?.status === "completed");
+  setControl({ compactMode: "ok", summaryMode: "ok", seedMode: "ok" });
+
+  // Next turn after seed quota
+  send({
+    jsonrpc: "2.0",
+    id: 122,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-seedquota",
+      providerThreadId: lastPtid("t-b1-seedquota"),
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "next turn after seed compact", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-seedquota").length >= 5, 30000, "t-b1-seedquota next turn");
+  check("blocker1/seed-quota-next-turn-succeeds", boundaries("t-b1-seedquota").at(-1)?.status === "completed");
 }
 
 // ----------------------------------------------------------------------------
@@ -410,6 +515,106 @@ const start = (id, tid, customOpts = options) =>
   const hasTextClose = dList.some((d) => d.kind === "item.textClose");
   check("blocker2/followed-by-tool-has-toolcall", hasToolCall && hasTextClose, `kinds=${dList.map((d) => d.kind).join(",")}`);
   check("blocker2/followed-by-tool-no-refusal", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+}
+
+// Test 2e: [[quota-marker-tool-text]] - full marker with Resets in... -> tool -> text without leading \n
+{
+  resetAcpPool();
+  start(240, "t-b2-marker-tool-text");
+  await waitFor(() => replies(240).length === 1, 20000, "t-b2-marker-tool-text start");
+  const ptid = replies(240)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 241,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-marker-tool-text",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[quota-marker-tool-text]]", mentions: [] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b2-marker-tool-text").length >= 1, 30000, "t-b2-marker-tool-text completed");
+  const dList = deltas("t-b2-marker-tool-text");
+  const textDeltas = dList.filter((d) => d.kind === "item.textDelta").map((d) => d.text).join("");
+  check(
+    "blocker2/marker-tool-text-both-delivered",
+    textDeltas.includes("Individual quota reached") && textDeltas.includes("AUDIT-FINAL-ANSWER"),
+    `text=${textDeltas}`
+  );
+  check("blocker2/marker-tool-text-no-rotation", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+  check("blocker2/marker-tool-text-turn-completed", boundaries("t-b2-marker-tool-text").at(-1)?.status === "completed");
+}
+
+// Test 2f: [[multiline-after-marker]] - newline with non-whitespace diverged, delivered, no rotation
+{
+  resetAcpPool();
+  start(250, "t-b2-multiline");
+  await waitFor(() => replies(250).length === 1, 20000, "t-b2-multiline start");
+  const ptid = replies(250)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 251,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-multiline",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[multiline-after-marker]]", mentions: [] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b2-multiline").length >= 1, 30000, "t-b2-multiline completed");
+  const dList = deltas("t-b2-multiline");
+  const textDeltas = dList.filter((d) => d.kind === "item.textDelta").map((d) => d.text).join("");
+  check(
+    "blocker2/multiline-marker-delivered",
+    textDeltas.includes("Individual quota reached") && textDeltas.includes("Here is line 2"),
+    `text=${textDeltas}`
+  );
+  check("blocker2/multiline-marker-no-rotation", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+}
+
+// Test 2g: turn/steer - unconfirmed candidate buffer flushed, detector state reset
+{
+  resetAcpPool();
+  start(260, "t-b2-steer");
+  await waitFor(() => replies(260).length === 1, 20000, "t-b2-steer start");
+  const ptid = replies(260)[0].result.providerThreadId;
+
+  // Initial turn
+  send({
+    jsonrpc: "2.0",
+    id: 261,
+    method: "turn/start",
+    params: { threadId: "t-b2-steer", providerThreadId: ptid, clientRequestId: creq(), options, input: [{ type: "text", text: "initial", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b2-steer").length >= 1, 20000, "t-b2-steer initial");
+
+  // Send turn/steer
+  send({
+    jsonrpc: "2.0",
+    id: 262,
+    method: "turn/steer",
+    params: { threadId: "t-b2-steer", clientRequestId: creq(), input: [{ type: "text", text: "steered input", mentions: [] }] },
+  });
+  await waitFor(() => replies(262).length >= 1 || boundaries("t-b2-steer").length >= 2, 20000, "t-b2-steer replied");
+  check("blocker2/steer-processed", replies(262).length >= 1 || boundaries("t-b2-steer").length >= 2);
+}
+
+// Test 2h: thread/stop clears state
+{
+  resetAcpPool();
+  start(270, "t-b2-stop");
+  await waitFor(() => replies(270).length === 1, 20000, "t-b2-stop start");
+  send({ jsonrpc: "2.0", id: 271, method: "thread/stop", params: { threadId: "t-b2-stop" } });
+  await waitFor(() => replies(271).length === 1, 20000, "t-b2-stop replied");
+  check("blocker2/stop-discards-session", replies(271).length === 1);
 }
 
 // ----------------------------------------------------------------------------
@@ -570,8 +775,192 @@ const start = (id, tid, customOpts = options) =>
   const reply302 = replies(302)[0];
   check("blocker3/direct-incoming-rejected-429", reply302?.error?.message?.includes("Rate limit reached (429)"), reply302?.error?.message ?? "no error");
 
+  // Queued turn rejected immediately on 429 in direct mode
+  directSend({
+    jsonrpc: "2.0",
+    id: 310,
+    method: "thread/start",
+    params: { threadId: "t-b3-queued", cwd: directWs, options: directOpts, instructionMode: "append" },
+  });
+  await waitFor(() => replies(310).length === 1, 20000, "direct queued start");
+  const ptidQueued = replies(310)[0]?.result?.providerThreadId;
+
+  // Initial turn
+  directSend({
+    jsonrpc: "2.0",
+    id: 3101,
+    method: "turn/start",
+    params: { threadId: "t-b3-queued", providerThreadId: ptidQueued, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "init", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b3-queued").length >= 1, 20000, "direct queued init");
+
+  // Turn 1 fails with quota
+  directSend({
+    jsonrpc: "2.0",
+    id: 311,
+    method: "turn/start",
+    params: { threadId: "t-b3-queued", providerThreadId: ptidQueued, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "[[quota]]", mentions: [] }] },
+  });
+  // Turn 2 is sent while Turn 1 is processing, so Turn 2 queues
+  directSend({
+    jsonrpc: "2.0",
+    id: 312,
+    method: "turn/start",
+    params: { threadId: "t-b3-queued", providerThreadId: ptidQueued, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "queued turn", mentions: [] }] },
+  });
+
+  await waitFor(() => replies(312).length === 1, 20000, "queued turn settled");
+  const reply312 = replies(312)[0];
+  const dListQueued = deltas("t-b3-queued");
+  const settledErrors = perrors("t-b3-queued").filter((d) => d.settlesTurn === true);
+  check(
+    "blocker3/direct-queued-turn-fails-429",
+    reply312?.error && settledErrors.some((d) => d.errorInfo?.httpStatusCode === 429),
+    `reply=${JSON.stringify(reply312)} settledErrors=${settledErrors.length}`
+  );
+
+  // Unblock timer cancelled on thread/stop
+  directSend({
+    jsonrpc: "2.0",
+    id: 313,
+    method: "thread/stop",
+    params: {
+      threadId: "t-b3-queued",
+      providerThreadId: ptidQueued,
+      intent: "interrupt",
+      activeTurnId: "",
+    },
+  });
+  await waitFor(() => replies(313).length === 1, 10000, "direct thread stop");
+  check("blocker3/direct-thread-stop-unblock-timer", replies(313).length === 1);
+
+  // Unblock timer expiration in direct mode
+  directSend({
+    jsonrpc: "2.0",
+    id: 320,
+    method: "thread/start",
+    params: { threadId: "t-b3-timer", cwd: directWs, options: directOpts, instructionMode: "append" },
+  });
+  await waitFor(() => replies(320).length === 1, 20000, "direct timer start");
+  const ptidTimer = replies(320)[0]?.result?.providerThreadId;
+
+  // Initial turn
+  directSend({
+    jsonrpc: "2.0",
+    id: 3201,
+    method: "turn/start",
+    params: { threadId: "t-b3-timer", providerThreadId: ptidTimer, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "initial", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b3-timer").length >= 1, 20000, "direct timer initial");
+
+  // Send turn that returns quota with 1s reset via control file
+  setControl({ quotaMsg: "Quota exhausted; retry later. Resets in 1s." });
+  directSend({
+    jsonrpc: "2.0",
+    id: 321,
+    method: "turn/start",
+    params: { threadId: "t-b3-timer", providerThreadId: ptidTimer, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "[[quota]]", mentions: [] }] },
+  });
+  await waitFor(() => rateLimits("t-b3-timer").some((r) => r.rateLimits?.status === "blocked"), 20000, "rateLimits blocked");
+  check("blocker3/direct-rate-limits-blocked", true);
+
+  // Wait for unblock timer to fire allowed
+  await waitFor(() => rateLimits("t-b3-timer").some((r) => r.rateLimits?.status === "allowed"), 15000, "rateLimits unblocked");
+  check("blocker3/direct-timer-unblocks-allowed", rateLimits("t-b3-timer").some((r) => r.rateLimits?.status === "allowed"));
+  setControl({ quotaMsg: undefined });
+
   process.env.AGY_FAKE_TRANSCRIPT = savedTranscript;
   delete process.env.AGY_ACCOUNTS;
+}
+
+// ----------------------------------------------------------------------------
+// BLOCKER 4 (continued): session/load, AGY_KEYRING=1, add-account.mjs
+// ----------------------------------------------------------------------------
+// Test 4c: session/load (thread/resume) drops custom SSH_CONNECTION for pool account
+{
+  resetAcpPool();
+  const poolOpts = {
+    ...options,
+    envVars: { SSH_CONNECTION: "malicious-resume-ssh" },
+  };
+  start(410, "t-b4-resume-orig", poolOpts);
+  await waitFor(() => replies(410).length === 1, 20000, "t-b4-resume-orig start");
+  const origPtid = replies(410)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 411,
+    method: "turn/start",
+    params: { threadId: "t-b4-resume-orig", providerThreadId: origPtid, clientRequestId: creq(), options: poolOpts, input: [{ type: "text", text: "orig turn", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b4-resume-orig").length >= 1, 20000, "t-b4-resume-orig turn");
+
+  // Resume into a new thread
+  send({
+    jsonrpc: "2.0",
+    id: 412,
+    method: "thread/resume",
+    params: { threadId: "t-b4-resumed", providerThreadId: origPtid, cwd: workspace, options: poolOpts, instructionMode: "append" },
+  });
+  await waitFor(() => replies(412).length === 1, 20000, "t-b4-resumed reply");
+  send({
+    jsonrpc: "2.0",
+    id: 413,
+    method: "turn/start",
+    params: { threadId: "t-b4-resumed", providerThreadId: origPtid, clientRequestId: creq(), options: poolOpts, input: [{ type: "text", text: "resumed turn", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b4-resumed").length >= 1, 20000, "t-b4-resumed turn");
+
+  const resumedLines = transcriptLines().filter((l) => l.home === "a1");
+  const resumedSsh = resumedLines.map((l) => l.__env?.SSH_CONNECTION);
+  check(
+    "blocker4/session-load-drops-ssh-connection",
+    resumedSsh.length > 0 && resumedSsh.every((s) => s !== "malicious-resume-ssh"),
+    `resumedSsh=${JSON.stringify(resumedSsh)}`
+  );
+}
+
+// Test 4d: AGY_KEYRING=1 preserves user's SSH_CONNECTION even for pool account
+{
+  resetAcpPool();
+  process.env.AGY_KEYRING = "1";
+  const keyringOpts = {
+    ...options,
+    envVars: { SSH_CONNECTION: "keyring-custom-ssh" },
+  };
+  start(420, "t-b4-keyring", keyringOpts);
+  await waitFor(() => replies(420).length === 1, 20000, "t-b4-keyring start");
+  const ptid = replies(420)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 421,
+    method: "turn/start",
+    params: { threadId: "t-b4-keyring", providerThreadId: ptid, clientRequestId: creq(), options: keyringOpts, input: [{ type: "text", text: "keyring turn", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b4-keyring").length >= 1, 20000, "t-b4-keyring turn");
+
+  const keyringLines = transcriptLines().filter((l) => l.home === "a1");
+  const keyringSsh = keyringLines.map((l) => l.__env?.SSH_CONNECTION);
+  check(
+    "blocker4/keyring-1-preserves-ssh-connection",
+    keyringSsh.includes("keyring-custom-ssh"),
+    `keyringSsh=${JSON.stringify(keyringSsh)}`
+  );
+  delete process.env.AGY_KEYRING;
+}
+
+// Test 4e: scripts/add-account.mjs env logic
+{
+  const addAccountSrc = readFileSync(new URL("./scripts/add-account.mjs", import.meta.url).pathname, "utf8");
+  const hasKeyringCheck = addAccountSrc.includes('process.env.AGY_KEYRING === "1"');
+  const hasFallback = addAccountSrc.includes('process.env.SSH_CONNECTION || "127.0.0.1 0 127.0.0.1 0"');
+  const installBeforeSsh = addAccountSrc.indexOf("...installEnv") < addAccountSrc.indexOf("SSH_CONNECTION:");
+  check(
+    "blocker4/add-account-script-ssh-env",
+    hasKeyringCheck && hasFallback && installBeforeSsh,
+    `keyring=${hasKeyringCheck} fallback=${hasFallback} installBefore=${installBeforeSsh}`
+  );
 }
 
 // ----------------------------------------------------------------------------

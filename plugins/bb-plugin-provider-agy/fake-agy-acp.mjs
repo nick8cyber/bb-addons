@@ -179,6 +179,11 @@ async function runPrompt(id, text) {
   const mode = ctl.modeByLabel?.[homeLabel] ?? ctl.errorMode ?? modeEnv;
   const compactMode = ctl.compactMode ?? compactModeEnv;
   const summaryMode = ctl.summaryMode ?? summaryModeEnv;
+  const seedMode = ctl.seedMode ?? process.env.AGY_FAKE_SEED_MODE ?? "ok";
+  const quotaMsg =
+    ctl.quotaMsg ??
+    process.env.AGY_FAKE_QUOTA_MSG ??
+    "Quota exhausted for this account; retry later. Resets in 0h0m4s.";
   const replayable = ["agent_message_chunk","agent_thought_chunk","user_message_chunk","tool_call","tool_call_update","plan"];
   const upd = (update, record = true) => {
     if (record && replayable.includes(update.sessionUpdate)) replayed.push(update);
@@ -286,11 +291,38 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
     return;
   }
+  if (
+    (text.includes("[compaction-handoff]") || text.includes("[compaction-memo]")) &&
+    seedMode === "quota"
+  ) {
+    if (controlFile !== null) {
+      try {
+        const c = JSON.parse(readFileSync(controlFile, "utf8"));
+        c.seedMode = "ok";
+        writeFileSync(controlFile, JSON.stringify(c));
+      } catch {}
+    }
+    out({ jsonrpc: "2.0", id, error: { code: 429, message: quotaMsg } });
+    return;
+  }
   if (text.includes("[[quota-followed-by-tool]]") || mode === "quota-followed-by-tool") {
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached" } });
     upd({ sessionUpdate: "tool_call", toolCallId: "tc-follow", title: "run_command", kind: "execute", status: "in_progress", rawInput: { command: "echo ok" } });
     upd({ sessionUpdate: "tool_call_update", toolCallId: "tc-follow", status: "completed", rawOutput: "ok" });
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "finished" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[quota-marker-tool-text]]") || mode === "quota-marker-tool-text") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached. Resets in 1h." } });
+    upd({ sessionUpdate: "tool_call", toolCallId: "tc-follow", title: "run_command", kind: "execute", status: "in_progress", rawInput: { command: "echo ok" } });
+    upd({ sessionUpdate: "tool_call_update", toolCallId: "tc-follow", status: "completed", rawOutput: "ok" });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: " AUDIT-FINAL-ANSWER" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[multiline-after-marker]]") || mode === "multiline-after-marker") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached\nHere is line 2 explaining something" } });
     out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
     return;
   }

@@ -3547,6 +3547,12 @@ function handleCompactClassifiedError(
   const plan = planRotation(session, cause, message);
   switch (plan) {
     case "rotate": {
+      if (compact.seedAttempts >= COMPACT_SEED_MAX_ATTEMPTS) {
+        session.compact = null;
+        session.settledInternal = null;
+        failOut(session, poolExhaustedText(cause, message));
+        return;
+      }
       const { account } = freeSibling(session, session.accountLabel);
       if (account !== null) {
         const movedFrom = session.accountLabel;
@@ -3778,6 +3784,20 @@ function runCompactSeed(session: WSession): void {
         if (status === "completed") {
           s.compact = null;
           drainQueue(s);
+          return;
+        }
+        const armed = s.armedError;
+        const errText = armed !== null && !armed.handled ? armed.message : "";
+        const parkedCause = parkedCauseOf(errText);
+        if (parkedCause !== null) {
+          compactParked(s, parkedCause, errText);
+          return;
+        }
+        if (
+          classifyError(errText) === "rate-limit" ||
+          isAgentQuotaMessage(s.agentMessageText)
+        ) {
+          handleCompactClassifiedError(s, "quota", errText);
           return;
         }
         if (
@@ -4194,6 +4214,7 @@ function flushCandidateBuffer(
   if (session.heldTextClose !== null) {
     out.push(session.heldTextClose);
     session.heldTextClose = null;
+    session.agentMessageText = "";
   }
 }
 
@@ -4227,14 +4248,9 @@ function processDeltaLine(
       case "turn.boundary": {
         // §2.3 п.11 & п.13 (ревизия 18): if candidate buffer or current text matched
         // a full validation or quota refusal, the marker is confirmed at boundary
-        const isVal =
-          session.validationRefusal ||
-          isAgentValidationMessage(session.agentMessageText);
-        const isQuota =
-          session.quotaRefusalText !== null ||
-          isAgentQuotaMessage(session.agentMessageText);
+        const isVal = isAgentValidationMessage(session.agentMessageText);
+        const isQuota = isAgentQuotaMessage(session.agentMessageText);
         if (isVal) {
-          session.validationRefusal = false;
           if (session.heldTextClose !== null) {
             out.push({ ...session.heldTextClose });
           }
@@ -4245,10 +4261,7 @@ function processDeltaLine(
           continue;
         }
         if (isQuota) {
-          const refusal = (
-            session.quotaRefusalText ?? session.agentMessageText
-          ).trim();
-          session.quotaRefusalText = null;
+          const refusal = session.agentMessageText.trim();
           if (session.heldTextClose !== null) {
             out.push({ ...session.heldTextClose });
           }
@@ -4279,13 +4292,7 @@ function processDeltaLine(
         ) {
           if (session.heldTextClose !== null) {
             flushCandidateBuffer(session, out);
-          }
-          if (session.validationRefusal) {
-            continue;
-          }
-          if (session.quotaRefusalText !== null) {
-            session.quotaRefusalText += delta.text;
-            continue;
+            session.agentMessageText = "";
           }
           const candidateText = session.agentMessageText + delta.text;
           if (isAgentMarkerCandidate(candidateText)) {
@@ -4311,19 +4318,13 @@ function processDeltaLine(
         if (item.type === "compaction") {
           session.compactInFlight = true;
         }
-        if (item.type === "agentMessage") {
-          if (session.heldTextClose !== null) {
-            flushCandidateBuffer(session, out);
-          }
-          session.agentMessageText = "";
-        } else {
-          if (
-            session.heldTextClose !== null ||
-            session.candidateBuffer.length > 0
-          ) {
-            flushCandidateBuffer(session, out);
-          }
+        if (
+          session.heldTextClose !== null ||
+          session.candidateBuffer.length > 0
+        ) {
+          flushCandidateBuffer(session, out);
         }
+        session.agentMessageText = "";
         out.push(delta);
         continue;
       }
@@ -4337,6 +4338,30 @@ function processDeltaLine(
             continue;
           }
           flushCandidateBuffer(session, out);
+          session.agentMessageText = "";
+        }
+        out.push(delta);
+        continue;
+      }
+      case "item.close": {
+        const item = optionsRecord(delta.item);
+        if (item.type === "agentMessage") {
+          if (
+            isAgentQuotaMessage(session.agentMessageText) ||
+            isAgentValidationMessage(session.agentMessageText)
+          ) {
+            session.heldTextClose = delta;
+            continue;
+          }
+          flushCandidateBuffer(session, out);
+          session.agentMessageText = "";
+        } else {
+          if (
+            session.heldTextClose !== null ||
+            session.candidateBuffer.length > 0
+          ) {
+            flushCandidateBuffer(session, out);
+          }
           session.agentMessageText = "";
         }
         out.push(delta);
@@ -4385,6 +4410,7 @@ function processDeltaLine(
           ) {
             flushCandidateBuffer(session, out);
           }
+          session.agentMessageText = "";
         }
         out.push(delta);
         continue;
@@ -4522,6 +4548,45 @@ function interceptOutbound(line: string): void {
           : undefined;
       if (session?.suppressErrorNotify) {
         session.suppressErrorNotify = false;
+        return;
+      }
+      const message = typeof params.message === "string" ? params.message : "";
+      const category = classifyError(message);
+      if (
+        session !== undefined &&
+        (category === "rate-limit" ||
+          isTosDisabled(message) ||
+          isValidationRequired(message) ||
+          isAuthDead(message) ||
+          isAccountIneligible(message) ||
+          isModelRefusal(message))
+      ) {
+        session.bridgeTurnBusy = false;
+        session.settledInternal = null;
+        const cause: RotationCause = isTosDisabled(message)
+          ? "tos-disabled"
+          : category === "rate-limit"
+            ? "quota"
+            : isValidationRequired(message)
+              ? "validation-required"
+              : isAuthDead(message)
+                ? "auth-dead"
+                : isModelRefusal(message)
+                  ? "model"
+                  : "ineligible";
+        if (
+          cause === "model" &&
+          dataDir !== "" &&
+          session.accountLabel !== null &&
+          session.model !== undefined
+        ) {
+          markAccountModelUnsupported(
+            dataDir,
+            session.accountLabel,
+            session.model,
+          );
+        }
+        handleClassifiedError(session, cause, message);
         return;
       }
       rawWrite(`${line}\n`);
@@ -5478,7 +5543,12 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
   // §2.3: a turn whose options name a model the session's account does not
   // offer rotates the same way, with the "model" cause. A restoring session
   // already ran those checks inside its rebuild — turns just queue on it.
-  if (!session.rotating && !session.stopped && !session.restoring) {
+  if (
+    !session.rotating &&
+    !session.stopped &&
+    !session.restoring &&
+    session.compact === null
+  ) {
     const turnOptions = optionsRecord(params.options);
     const incoming = resolveModelSelection(
       typeof turnOptions.model === "string" ? turnOptions.model : undefined,
