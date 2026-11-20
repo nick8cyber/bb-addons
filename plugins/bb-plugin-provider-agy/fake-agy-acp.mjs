@@ -344,6 +344,15 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
     return;
   }
+  if (text.includes("[[normal-stop]]") || mode === "normal-stop") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "normal partial answer" } });
+    for (let i = 0; i < 50; i++) {
+      if (cancelled) break;
+      await sleep(50);
+    }
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
+    return;
+  }
   if (text.includes("steered input") || text.includes("STEER-ANSWER")) {
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "STEER-ANSWER" } });
     out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
@@ -373,14 +382,19 @@ async function runPrompt(id, text) {
     }
     if (text.includes("[[hold]]")) {
       const deadline = Date.now() + 30_000;
-      for (;;) { if (releaseFile && existsSync(releaseFile)) break; if (Date.now() > deadline) break; await sleep(20); }
+      for (;;) {
+        if (cancelled) break;
+        if (releaseFile && existsSync(releaseFile)) break;
+        if (Date.now() > deadline) break;
+        await sleep(20);
+      }
     }
     if (summaryMode === "empty" && text.startsWith("[compaction-fallback]")) {
       // empty summary reply
     } else {
       upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: " done" } });
     }
-    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
   }
   function usage() {
     usageTotal += 100;

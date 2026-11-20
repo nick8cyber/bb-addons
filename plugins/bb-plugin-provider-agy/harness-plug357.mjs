@@ -463,8 +463,10 @@ const start = (id, tid, customOpts = options) =>
     },
   });
 
-  await waitFor(() => boundaries("t-b1-model-compact").length >= 4, 30000, "t-b1-model-compact all finished");
+  await waitFor(() => boundaries("t-b1-model-compact").length >= 5, 30000, "t-b1-model-compact all finished");
   check("blocker1/model-update-during-compaction-succeeds", boundaries("t-b1-model-compact").at(-1)?.status === "completed");
+  const modelLines = transcriptLines().filter((l) => JSON.stringify(l).includes("custom-model"));
+  check("blocker1/model-update-during-compaction-applied", modelLines.length > 0, `modelLines=${modelLines.length}`);
   setControl({ compactMode: "ok", summaryMode: "ok", seedMode: "ok" });
 }
 
@@ -666,7 +668,8 @@ const start = (id, tid, customOpts = options) =>
     params: { threadId: "t-b2-steer", providerThreadId: ptid, clientRequestId: creq(), options, input: [{ type: "text", text: "[[steer-marker]]", mentions: [] }] },
   });
   await waitFor(() => deltas("t-b2-steer").some((d) => d.kind === "turn.open"), 10000, "t-b2-steer turn.open");
-  const liveTurnId = deltas("t-b2-steer").find((d) => d.kind === "turn.open")?.providerTurnId ?? "";
+  const to = deltas("t-b2-steer").find((d) => d.kind === "turn.open");
+  const liveTurnId = to?.turnId ?? to?.providerTurnId ?? "turn-1";
   await sleep(200);
 
   // Send turn/steer while candidate is buffered
@@ -677,7 +680,7 @@ const start = (id, tid, customOpts = options) =>
     params: {
       threadId: "t-b2-steer",
       providerThreadId: ptid,
-      expectedTurnId: "turn-1",
+      expectedTurnId: liveTurnId,
       clientRequestId: creq(),
       options,
       input: [{ type: "text", text: "steered input", mentions: [] }],
@@ -692,6 +695,7 @@ const start = (id, tid, customOpts = options) =>
   await waitFor(() => boundaries("t-b2-steer").length >= 1, 20000, "t-b2-steer finished");
   const steerTexts = deltas("t-b2-steer").map((d) => d.text ?? "").join("");
   check("blocker2/steer-processed", steerTexts.includes("STEER-ANSWER"), `steerTexts=${steerTexts}`);
+  check("blocker2/steer-flushed-candidate", steerTexts.includes("⚠ Individual quota reached"), `steerTexts=${steerTexts}`);
   check("blocker2/steer-no-rotation", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
   check("blocker2/steer-turn-completed", boundaries("t-b2-steer").at(-1)?.status === "completed");
 }
@@ -728,6 +732,104 @@ const start = (id, tid, customOpts = options) =>
   check("blocker2/stop-no-held-close-leak", closes.length === 0, `closes=${JSON.stringify(closes)}`);
   check("blocker2/stop-no-cooldown", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
   check("blocker2/stop-no-rotation", !messages.some((m) => m.method === "session/replaced" && m.params.threadId === "t-b2-stop"));
+}
+
+// Test 2i: thread/stop on normal streaming answer preserves textClose
+{
+  resetAcpPool();
+  start(280, "t-b2-normal-stop");
+  await waitFor(() => replies(280).length === 1, 20000, "t-b2-normal-stop start");
+  const ptid = replies(280)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 281,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-normal-stop",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[normal-stop]]", mentions: [] }],
+    },
+  });
+  await waitFor(
+    () => deltas("t-b2-normal-stop").some((d) => d.kind === "item.textDelta" && (d.text ?? "").includes("normal")),
+    20000,
+    "t-b2-normal-stop partial answer arrived"
+  );
+
+  const liveTurnId = deltas("t-b2-normal-stop").find((d) => d.kind === "turn.open")?.providerTurnId ?? "turn-1";
+  send({
+    jsonrpc: "2.0",
+    id: 282,
+    method: "thread/stop",
+    params: { threadId: "t-b2-normal-stop", providerThreadId: ptid, intent: "interrupt", activeTurnId: liveTurnId },
+  });
+  await waitFor(() => replies(282).length === 1, 20000, "t-b2-normal-stop replied");
+  await waitFor(() => boundaries("t-b2-normal-stop").length >= 1, 20000, "t-b2-normal-stop boundary");
+
+  const normalTexts = deltas("t-b2-normal-stop").filter((d) => d.kind === "item.textDelta").map((d) => d.text ?? "").join("");
+  const closes = deltas("t-b2-normal-stop").filter((d) => d.kind === "item.textClose" && d.channel === "agentMessage");
+  check("blocker2/normal-stop-streamed-text", normalTexts.includes("normal partial answer"), `normalTexts=${normalTexts}`);
+  check("blocker2/normal-stop-has-text-close", closes.length >= 1, `closes=${JSON.stringify(closes)}`);
+  check("blocker2/normal-stop-boundary-interrupted", boundaries("t-b2-normal-stop").at(-1)?.status === "interrupted" || boundaries("t-b2-normal-stop").at(-1)?.status === "completed");
+}
+
+// Test 2j: thread/discard mid-turn followed by turn/start fails fast with -32000
+{
+  resetAcpPool();
+  start(290, "t-b2-discard-turn");
+  await waitFor(() => replies(290).length === 1, 20000, "t-b2-discard-turn start");
+  const ptid = replies(290)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 291,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-discard-turn",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[normal-stop]]", mentions: [] }],
+    },
+  });
+  await waitFor(
+    () => deltas("t-b2-discard-turn").some((d) => d.kind === "item.textDelta" && (d.text ?? "").includes("normal")),
+    20000,
+    "t-b2-discard-turn partial answer arrived"
+  );
+
+  // Send thread/discard mid-turn
+  send({
+    jsonrpc: "2.0",
+    id: 292,
+    method: "thread/discard",
+    params: { threadId: "t-b2-discard-turn" },
+  });
+  await waitFor(() => replies(292).length === 1, 20000, "t-b2-discard-turn discard replied");
+
+  // Subsequent turn/start must fail fast (-32000), NOT hang in queue
+  send({
+    jsonrpc: "2.0",
+    id: 293,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-discard-turn",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "after discard", mentions: [] }],
+    },
+  });
+  await waitFor(() => replies(293).length === 1, 20000, "t-b2-discard-turn after-discard turn/start replied");
+  const reply293 = replies(293)[0];
+  check(
+    "blocker2/discard-midturn-turn-start-fails-fast",
+    reply293?.error?.code === -32000,
+    `reply=${JSON.stringify(reply293)}`
+  );
 }
 
 // ----------------------------------------------------------------------------

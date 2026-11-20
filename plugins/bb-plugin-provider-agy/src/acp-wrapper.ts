@@ -765,9 +765,12 @@ interface WSession {
   blockedResetsAtMs: number | null;
   /** §2.3 п.13 (ревизия 18): unblock timer for direct/relay mode rateLimitsBlocked */
   unblockTimer: NodeJS.Timeout | null;
+  /** §2.3 п.13 (ревизия 18): true if at least one agentMessage text delta has been sent to client in current segment */
+  streamedAgentMessage: boolean;
 }
 
 const sessions = new Map<string, WSession>();
+const stoppingSessions = new Map<string, WSession>();
 
 function newSession(threadId: string, cwd: string): WSession {
   return {
@@ -819,6 +822,7 @@ function newSession(threadId: string, cwd: string): WSession {
     heldTextClose: null,
     blockedResetsAtMs: null,
     unblockTimer: null,
+    streamedAgentMessage: false,
   };
 }
 
@@ -2890,6 +2894,9 @@ function emitRateLimits(
     );
     session.unblockTimer = setTimeout(() => {
       session.unblockTimer = null;
+      if (session.stopped || sessions.get(session.threadId) !== session) {
+        return;
+      }
       session.rateLimitsBlocked = false;
       session.blockedResetsAtMs = null;
       emitRateLimits(session, "allowed", null, null);
@@ -4206,12 +4213,14 @@ function flushCandidateBuffer(
       ).slice(-HANDOFF_STREAMED_TEXT_CAP);
     }
     out.push(b);
+    session.streamedAgentMessage = true;
   }
   session.candidateBuffer = [];
   if (session.heldTextClose !== null) {
     out.push(session.heldTextClose);
     session.heldTextClose = null;
     session.agentMessageText = "";
+    session.streamedAgentMessage = false;
   }
 }
 
@@ -4219,7 +4228,7 @@ function processDeltaLine(
   threadId: string,
   deltas: Record<string, unknown>[],
 ): Record<string, unknown>[] {
-  const session = sessions.get(threadId);
+  const session = sessions.get(threadId) ?? stoppingSessions.get(threadId);
   if (session === undefined) {
     return deltas;
   }
@@ -4229,6 +4238,7 @@ function processDeltaLine(
     switch (delta.kind) {
       case "turn.open": {
         session.bridgeTurnBusy = true;
+        session.streamedAgentMessage = false;
         session.agentMessageText = "";
         session.quotaRefusalText = null;
         session.validationRefusal = false;
@@ -4262,8 +4272,9 @@ function processDeltaLine(
           onQuotaRefusalBoundary(session, refusal);
           continue;
         }
+        session.streamedAgentMessage = false;
         if (session.stopped) {
-          sessions.delete(session.threadId);
+          stoppingSessions.delete(session.threadId);
         }
         flushCandidateBuffer(session, out);
         session.agentMessageText = "";
@@ -4297,6 +4308,7 @@ function processDeltaLine(
           // Divergence: flush buffered candidate chunks and process normally
           flushCandidateBuffer(session, out);
           session.agentMessageText = candidateText;
+          session.streamedAgentMessage = true;
           if (session.compact?.collecting) {
             session.compact.summaryBuf += delta.text;
           }
@@ -4324,7 +4336,7 @@ function processDeltaLine(
       }
       case "item.textClose": {
         if (delta.channel === "agentMessage") {
-          if (session.stopped) {
+          if (session.stopped && !session.streamedAgentMessage) {
             session.heldTextClose = null;
             continue;
           }
@@ -4344,7 +4356,7 @@ function processDeltaLine(
       case "item.close": {
         const item = optionsRecord(delta.item);
         if (item.type === "agentMessage") {
-          if (session.stopped) {
+          if (session.stopped && !session.streamedAgentMessage) {
             session.heldTextClose = null;
             continue;
           }
@@ -4357,6 +4369,7 @@ function processDeltaLine(
           }
           flushCandidateBuffer(session, out);
           session.agentMessageText = "";
+          session.streamedAgentMessage = false;
         } else {
           if (
             session.heldTextClose !== null ||
@@ -5114,9 +5127,12 @@ function discardSession(session: WSession): void {
     }
   }
   resolveInteractions(session.threadId);
-  if (!session.bridgeTurnBusy && !session.daemonTurnOpen) {
-    sessions.delete(session.threadId);
-  }
+  sessions.delete(session.threadId);
+  stoppingSessions.set(session.threadId, session);
+  const timer = setTimeout(() => {
+    stoppingSessions.delete(session.threadId);
+  }, 10000);
+  timer.unref?.();
   // The thread record survives discard: it is the rebuild source for
   // unknown-session turns after a wrapper restart or a transient resume
   // failure. Only an explicit thread/discard forgets it.
@@ -5129,6 +5145,7 @@ function handleThreadStart(id: JsonRpcId, params: Record<string, unknown>): void
     feedLine({ jsonrpc: "2.0", id, method: "thread/start", params });
     return;
   }
+  stoppingSessions.delete(threadId);
   const existing = sessions.get(threadId);
   if (existing !== undefined) {
     discardSession(existing);
@@ -5226,6 +5243,7 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
     feedLine({ jsonrpc: "2.0", id, method: "thread/resume", params });
     return;
   }
+  stoppingSessions.delete(threadId);
   const existing = sessions.get(threadId);
   if (existing !== undefined) {
     discardSession(existing);
@@ -5509,7 +5527,7 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
     return;
   }
   const session = sessions.get(threadId);
-  if (session === undefined) {
+  if (session === undefined || session.stopped) {
     restoreUnknownSession(id, "turn/start", params);
     return;
   }
@@ -5653,7 +5671,7 @@ function handleTurnSteer(id: JsonRpcId, params: Record<string, unknown>): void {
   const threadId = params.threadId;
   const session =
     typeof threadId === "string" ? sessions.get(threadId) : undefined;
-  if (session === undefined) {
+  if (session === undefined || session.stopped) {
     if (typeof threadId === "string") {
       restoreUnknownSession(id, "turn/steer", params);
       return;
@@ -5778,12 +5796,13 @@ function handleLine(line: string): void {
     case "thread/discard": {
       const session =
         typeof params.threadId === "string"
-          ? sessions.get(params.threadId)
+          ? (sessions.get(params.threadId) ?? stoppingSessions.get(params.threadId))
           : undefined;
       if (session !== undefined) {
         discardSession(session);
       }
       if (typeof params.threadId === "string") {
+        stoppingSessions.delete(params.threadId);
         forgetThreadRecord(params.threadId);
       }
       acpBridge.handleLine(line);
@@ -5836,9 +5855,12 @@ export const experimental_providerBridge = {
   },
   handleLine,
   onClose: () => {
-    for (const session of sessions.values()) {
+    for (const session of [...sessions.values(), ...stoppingSessions.values()]) {
       if (session.waitTimer !== null) {
         clearTimeout(session.waitTimer);
+      }
+      if (session.unblockTimer !== null) {
+        clearTimeout(session.unblockTimer);
       }
     }
     reapOrphanShims();
