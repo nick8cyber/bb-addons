@@ -13,6 +13,8 @@ import {
   classifyFailure,
   loadBackends,
   withStateLock,
+  loadState,
+  modelSupportedOnAccount,
   pickBackendFromState,
   getAccountPriority,
   getAccountTier,
@@ -1869,6 +1871,46 @@ test("10. Smart model routing: pickBackendFromState prioritizes pro accounts for
   fakeState.accounts["ultra-1"].priority = 0;
   const zeroPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "neon", testBackends);
   assert.equal(zeroPick.none, true, "When all accounts have priority 0, pickBackendFromState returns none");
+});
+
+test("10b. legacy accounts-state.json with lockedModels:['argon'] normalizes to neon and blocks neon", () => {
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "gemini-locked-state-")));
+  const ledgerPath = path.join(tmpDir, "accounts-state.json");
+  fs.writeFileSync(
+    ledgerPath,
+    JSON.stringify({
+      accounts: {
+        "acc-legacy": {
+          cooldownUntilMs: 0,
+          lastUsedMs: 0,
+          lastError: null,
+          lockedModels: ["argon", "custom-unknown"],
+        },
+      },
+      leases: {},
+    })
+  );
+
+  const state = loadState(ledgerPath);
+  assert.deepEqual(
+    state.accounts["acc-legacy"].lockedModels,
+    ["neon", "custom-unknown"],
+    "argon in lockedModels must normalize to neon while preserving unknown models"
+  );
+
+  const backend = { id: "acc-legacy", priority: 10, tier: "pro", cdp: "9222" };
+  assert.equal(
+    modelSupportedOnAccount("neon", backend, state),
+    false,
+    "modelSupportedOnAccount must consider neon blocked when account had argon locked"
+  );
+
+  const pick = pickBackendFromState(state, null, "test-owner", Date.now(), "neon", [backend]);
+  assert.equal(
+    pick.none,
+    true,
+    "pickBackendFromState must consider neon blocked on the account"
+  );
 });
 
 test("11. acp-server slog and lifecycle guards, driver :visible and RU selectors", async () => {

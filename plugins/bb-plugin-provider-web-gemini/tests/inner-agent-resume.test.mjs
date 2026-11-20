@@ -282,7 +282,7 @@ test("session/load resolves a legacy argon model in the saved session record to 
   first.kill();
   await waitFor(() => first.child.exitCode !== null || first.child.signalCode !== null);
 
-  const app = fixture(t, repo, () => ({ text: FINAL }), { stateDir: first.state });
+  const app = fixture(t, repo, `() => ({ text: ${JSON.stringify(FINAL)} })`, { stateDir: first.state });
   const loaded = await app.loadSession(sessionId);
   assert.ok(loaded.result, JSON.stringify(loaded.error));
   assert.equal(loaded.result.models.currentModelId, "neon", "legacy saved model must resolve to neon");

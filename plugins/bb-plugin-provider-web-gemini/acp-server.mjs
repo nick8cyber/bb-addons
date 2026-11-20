@@ -278,18 +278,23 @@ function releaseLock() {
   } catch {}
 }
 
-function loadState() {
+export function loadState(ledgerPath = LEDGER_FILE) {
   let state = { accounts: Object.create(null), leases: Object.create(null) };
   try {
-    if (existsSync(LEDGER_FILE)) {
-      const raw = JSON.parse(readFileSync(LEDGER_FILE, "utf8"));
+    if (existsSync(ledgerPath)) {
+      const raw = JSON.parse(readFileSync(ledgerPath, "utf8"));
       state.accounts = Object.assign(Object.create(null), raw.accounts || {});
+      for (const acc of Object.values(state.accounts)) {
+        if (acc && Array.isArray(acc.lockedModels)) {
+          acc.lockedModels = [...new Set(acc.lockedModels.map((m) => resolveModelId(m) || m))];
+        }
+      }
       state.leases = Object.assign(Object.create(null), raw.leases || {});
       if (raw.breaker) state.breaker = raw.breaker;
     }
   } catch (e) {
-    if (e.code !== "ENOENT" && existsSync(LEDGER_FILE)) {
-      try { renameSync(LEDGER_FILE, `${LEDGER_FILE}.corrupt-${Date.now()}`); } catch {}
+    if (e.code !== "ENOENT" && existsSync(ledgerPath)) {
+      try { renameSync(ledgerPath, `${ledgerPath}.corrupt-${Date.now()}`); } catch {}
     }
   }
 
