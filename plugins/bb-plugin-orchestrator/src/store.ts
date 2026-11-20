@@ -3965,10 +3965,15 @@ export class DelegationStore {
           ? JSON.stringify(input.dependsOn.map(normalizeTaskKey))
           : null;
       const branch = input.branch !== undefined ? input.branch : existing.branch;
+      const projectId =
+        input.projectId !== undefined && input.projectId.trim()
+          ? input.projectId.trim()
+          : existing.project_id;
 
       this.db
         .prepare(
           `UPDATE task_queue SET
+            project_id = ?,
             route = ?, level = ?, priority = ?, depends_on = ?, confirmation_mode = ?,
             branch = ?, release_note = ?, payload = ?,
             node = 'start', status = 'queued',
@@ -3980,6 +3985,7 @@ export class DelegationStore {
           WHERE task_key = ?`,
         )
         .run(
+          projectId,
           input.route,
           input.level,
           priority,
