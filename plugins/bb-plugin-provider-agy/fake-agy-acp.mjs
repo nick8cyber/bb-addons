@@ -179,6 +179,11 @@ async function runPrompt(id, text) {
   const mode = ctl.modeByLabel?.[homeLabel] ?? ctl.errorMode ?? modeEnv;
   const compactMode = ctl.compactMode ?? compactModeEnv;
   const summaryMode = ctl.summaryMode ?? summaryModeEnv;
+  const seedMode = ctl.seedMode ?? process.env.AGY_FAKE_SEED_MODE ?? "ok";
+  const quotaMsg =
+    ctl.quotaMsg ??
+    process.env.AGY_FAKE_QUOTA_MSG ??
+    "Quota exhausted for this account; retry later. Resets in 0h0m4s.";
   const replayable = ["agent_message_chunk","agent_thought_chunk","user_message_chunk","tool_call","tool_call_update","plan"];
   const upd = (update, record = true) => {
     if (record && replayable.includes(update.sessionUpdate)) replayed.push(update);
@@ -242,12 +247,115 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, error: { code: 401, message: "Authentication required" } });
     return;
   }
-  if (/^\s*\/compact\s*$/u.test(text) && compactMode === "fail") {
+  if (/(?:^|\n)\s*\/compact\s*$/u.test(text) && compactMode === "fail") {
     out({ jsonrpc: "2.0", id, error: { code: 500, message: "API error (attempt 1): INTERNAL (code 500): cannot compact" } });
     return;
   }
-  if (text.startsWith("[compaction-fallback]") && summaryMode === "fail") {
+  if (text.includes("[compaction-fallback]") && summaryMode === "fail") {
     out({ jsonrpc: "2.0", id, error: { code: 500, message: "API error (attempt 1): INTERNAL (code 500): summary failed" } });
+    return;
+  }
+  if (text.includes("[compaction-fallback]") && summaryMode === "quota") {
+    out({ jsonrpc: "2.0", id, error: { code: 429, message: quotaMsg } });
+    return;
+  }
+  if (text.includes("[compaction-fallback]") && summaryMode === "quota-text") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 127h43m16s.\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (
+    !text.includes("[quota-rotation-handoff]") &&
+    (text.includes("[[quota-chunked]]") || mode === "quota-chunked")
+  ) {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Individual " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "quota reached. Please upgrade your subscription to increase your limits. Resets in 127h43m16s.\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (
+    !text.includes("[quota-rotation-handoff]") &&
+    (text.includes("[[validation-chunked]]") || mode === "validation-chunked")
+  ) {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Verification " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Required\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[divergence-chunked]]") || mode === "divergence-chunked") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Note: here is normal answer" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (
+    (text.includes("[compaction-handoff]") || text.includes("[compaction-memo]")) &&
+    seedMode === "quota"
+  ) {
+    if (controlFile !== null) {
+      try {
+        const c = JSON.parse(readFileSync(controlFile, "utf8"));
+        c.seedMode = "ok";
+        writeFileSync(controlFile, JSON.stringify(c));
+      } catch {}
+    }
+    out({ jsonrpc: "2.0", id, error: { code: 429, message: quotaMsg } });
+    return;
+  }
+  if (text.includes("[[quota-followed-by-tool]]") || mode === "quota-followed-by-tool") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached" } });
+    upd({ sessionUpdate: "tool_call", toolCallId: "tc-follow", title: "run_command", kind: "execute", status: "in_progress", rawInput: { command: "echo ok" } });
+    upd({ sessionUpdate: "tool_call_update", toolCallId: "tc-follow", status: "completed", rawOutput: "ok" });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "finished" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[quota-marker-tool-text]]") || mode === "quota-marker-tool-text") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached. Resets in 1h." } });
+    upd({ sessionUpdate: "tool_call", toolCallId: "tc-follow", title: "run_command", kind: "execute", status: "in_progress", rawInput: { command: "echo ok" } });
+    upd({ sessionUpdate: "tool_call_update", toolCallId: "tc-follow", status: "completed", rawOutput: "ok" });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: " AUDIT-FINAL-ANSWER" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[multiline-after-marker]]") || mode === "multiline-after-marker") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached\nHere is line 2 explaining something" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[steer-marker]]") || mode === "steer-marker") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached" } });
+    for (let i = 0; i < 50; i++) {
+      if (cancelled) break;
+      await sleep(100);
+    }
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[stop-marker]]") || mode === "stop-marker") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached" } });
+    for (let i = 0; i < 50; i++) {
+      if (cancelled) break;
+      await sleep(100);
+    }
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[normal-stop]]") || mode === "normal-stop") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "normal partial answer" } });
+    for (let i = 0; i < 50; i++) {
+      if (cancelled) break;
+      await sleep(50);
+    }
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("steered input") || text.includes("STEER-ANSWER")) {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "STEER-ANSWER" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
     return;
   }
   if (text.includes("[[askperm]]")) {
@@ -274,14 +382,19 @@ async function runPrompt(id, text) {
     }
     if (text.includes("[[hold]]")) {
       const deadline = Date.now() + 30_000;
-      for (;;) { if (releaseFile && existsSync(releaseFile)) break; if (Date.now() > deadline) break; await sleep(20); }
+      for (;;) {
+        if (cancelled) break;
+        if (releaseFile && existsSync(releaseFile)) break;
+        if (Date.now() > deadline) break;
+        await sleep(20);
+      }
     }
     if (summaryMode === "empty" && text.startsWith("[compaction-fallback]")) {
       // empty summary reply
     } else {
       upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: " done" } });
     }
-    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
   }
   function usage() {
     usageTotal += 100;
@@ -388,7 +501,10 @@ rlFake.on("line", (line) => {
       return;
     }
     case "session/cancel":
-      out({ jsonrpc: "2.0", id: msg.id, result: {} });
+      cancelled = true;
+      if (msg.id !== undefined) {
+        out({ jsonrpc: "2.0", id: msg.id, result: {} });
+      }
       return;
     case "authenticate":
       out({ jsonrpc: "2.0", id: msg.id, result: {} });
