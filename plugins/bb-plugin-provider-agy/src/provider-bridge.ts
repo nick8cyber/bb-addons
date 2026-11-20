@@ -3125,7 +3125,6 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
       );
       if (account !== null) {
         env.HOME = account.home;
-        Object.assign(env, fileTokenStorageEnv(process.env)); // §2.3 п.14
         if (account.proxy !== null) {
           env.HTTPS_PROXY = account.proxy;
           env.https_proxy = account.proxy;
@@ -3137,6 +3136,7 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
             ledger.accounts[account.label]?.install,
           ),
         );
+        Object.assign(env, fileTokenStorageEnv(process.env)); // §2.3 п.14: applied strictly AFTER install.env
       } else {
         applyResolution(resolveInstall(cliproxyRelayDataDir, undefined));
       }

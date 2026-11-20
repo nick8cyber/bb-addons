@@ -242,12 +242,56 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, error: { code: 401, message: "Authentication required" } });
     return;
   }
-  if (/^\s*\/compact\s*$/u.test(text) && compactMode === "fail") {
+  if (/(?:^|\n)\s*\/compact\s*$/u.test(text) && compactMode === "fail") {
     out({ jsonrpc: "2.0", id, error: { code: 500, message: "API error (attempt 1): INTERNAL (code 500): cannot compact" } });
     return;
   }
-  if (text.startsWith("[compaction-fallback]") && summaryMode === "fail") {
+  if (text.includes("[compaction-fallback]") && summaryMode === "fail") {
     out({ jsonrpc: "2.0", id, error: { code: 500, message: "API error (attempt 1): INTERNAL (code 500): summary failed" } });
+    return;
+  }
+  if (text.includes("[compaction-fallback]") && summaryMode === "quota") {
+    out({ jsonrpc: "2.0", id, error: { code: 429, message: quotaMsg } });
+    return;
+  }
+  if (text.includes("[compaction-fallback]") && summaryMode === "quota-text") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 127h43m16s.\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (
+    !text.includes("[quota-rotation-handoff]") &&
+    (text.includes("[[quota-chunked]]") || mode === "quota-chunked")
+  ) {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Individual " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "quota reached. Please upgrade your subscription to increase your limits. Resets in 127h43m16s.\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (
+    !text.includes("[quota-rotation-handoff]") &&
+    (text.includes("[[validation-chunked]]") || mode === "validation-chunked")
+  ) {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Verification " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Required\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[divergence-chunked]]") || mode === "divergence-chunked") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Note: here is normal answer" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[quota-followed-by-tool]]") || mode === "quota-followed-by-tool") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Individual quota reached" } });
+    upd({ sessionUpdate: "tool_call", toolCallId: "tc-follow", title: "run_command", kind: "execute", status: "in_progress", rawInput: { command: "echo ok" } });
+    upd({ sessionUpdate: "tool_call_update", toolCallId: "tc-follow", status: "completed", rawOutput: "ok" });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "finished" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
     return;
   }
   if (text.includes("[[askperm]]")) {
