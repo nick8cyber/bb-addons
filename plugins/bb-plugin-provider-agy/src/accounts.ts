@@ -914,7 +914,20 @@ export function isAgentQuotaMessage(text: string): boolean {
 }
 
 /**
- * §2.3 п.13 (ревизия 18): prefix patterns for quota and validation markers.
+ * §2.3 п.15 (ревизия 19 — PLUG-354): agy interrupted stream service message.
+ * Emitted by agy on turn/steer when active stream was interrupted.
+ * Only the exact single-line form counts.
+ */
+export const AGENT_INTERRUPTED_MESSAGE_PATTERN =
+  /^\s*⚠\uFE0F?\s*The stream was interrupted\.\s*Please continue the task you were working on\.?\s*$/iu;
+
+export function isAgentInterruptedMessage(text: string): boolean {
+  return AGENT_INTERRUPTED_MESSAGE_PATTERN.test(text.trim());
+}
+
+/**
+ * §2.3 п.13 (ревизия 18) & п.15 (ревизия 19): prefix patterns for quota, validation,
+ * and stream interrupted markers.
  * Matched strictly character-by-character to hold candidate chunks before
  * they leak to the client stream.
  */
@@ -924,13 +937,16 @@ export const AGENT_QUOTA_PREFIX_PATTERN =
 export const AGENT_VALIDATION_PREFIX_PATTERN =
   /^\s*⚠\s*(?:v(?:e(?:r(?:i(?:f(?:i(?:c(?:a(?:t(?:i(?:o(?:n(?:\s+(?:r(?:e(?:q(?:u(?:i(?:r(?:e(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/iu;
 
+export const AGENT_INTERRUPTED_PREFIX_PATTERN =
+  /^\s*⚠\uFE0F?\s*(?:t(?:h(?:e(?:\s+(?:s(?:t(?:r(?:e(?:a(?:m(?:\s+(?:w(?:a(?:s(?:\s+(?:i(?:n(?:t(?:e(?:r(?:r(?:u(?:p(?:t(?:e(?:d(?:\.(?:\s*(?:p(?:l(?:e(?:a(?:s(?:e(?:\s+(?:c(?:o(?:n(?:t(?:i(?:n(?:u(?:e(?:\s+(?:t(?:h(?:e(?:\s+(?:t(?:a(?:s(?:k(?:\s+(?:y(?:o(?:u(?:\s+(?:w(?:e(?:r(?:e(?:\s+(?:w(?:o(?:r(?:k(?:i(?:n(?:g(?:\s+(?:o(?:n(?:\.?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/iu;
+
 /**
- * §2.3 п.13 (ревизия 18): checks whether text accumulated so far in the current
- * text segment is a valid candidate for an agy refusal marker.
+ * §2.3 п.13 (ревизия 18) & п.15 (ревизия 19): checks whether text accumulated so far in the current
+ * text segment is a valid candidate for an agy refusal marker or stream interrupted message.
  * Chunks are buffered while:
  * 1) text after trimStart() is empty (leading whitespace/newlines), OR
- * 2) text matches quota or validation prefix pattern, OR
- * 3) text matches full quota or validation message and stays <= 300 chars.
+ * 2) text matches quota, validation, or interrupted prefix pattern, OR
+ * 3) text matches full quota, validation, or interrupted message and stays <= 300 chars.
  * Any newline followed by a non-whitespace character is a divergence.
  */
 export function isAgentMarkerCandidate(text: string): boolean {
@@ -943,12 +959,15 @@ export function isAgentMarkerCandidate(text: string): boolean {
   }
   if (
     AGENT_QUOTA_PREFIX_PATTERN.test(text) ||
-    AGENT_VALIDATION_PREFIX_PATTERN.test(text)
+    AGENT_VALIDATION_PREFIX_PATTERN.test(text) ||
+    AGENT_INTERRUPTED_PREFIX_PATTERN.test(text)
   ) {
     return true;
   }
   if (
-    (isAgentQuotaMessage(text) || isAgentValidationMessage(text)) &&
+    (isAgentQuotaMessage(text) ||
+      isAgentValidationMessage(text) ||
+      isAgentInterruptedMessage(text)) &&
     text.length <= 300
   ) {
     return true;
