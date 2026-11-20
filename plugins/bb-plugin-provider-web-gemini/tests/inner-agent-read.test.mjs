@@ -1304,3 +1304,214 @@ test("env BB_THREAD_ID that fails verification refuses task turns explicitly (PL
     assert.ok(log.includes("task:error"), "refusal must be logged for env id " + bad);
   }
 });
+
+test("innerAgent.gateways: 503 failover to second gateway continues enrichment and logs answered element (PLUG-364 a)", async (t) => {
+  const repo = setup(t);
+  const gw1 = await gateway(t, () => ({ status: 503, raw: "Gateway Unavailable" }));
+  const gw2 = await gateway(t, (n) => n === 1
+    ? toolReply(toolCall("read", "read_file", { path: "docs/review-only.txt" }))
+    : agentDone);
+  const acp = fixture(t, repo, readAnswer, {
+    settings: {
+      innerAgent: {
+        enabled: true,
+        gateways: [
+          { baseUrl: gw1.baseUrl, model: "fast-gw1" },
+          { baseUrl: gw2.baseUrl, model: "fast-gw2" },
+        ],
+      },
+    },
+  });
+  const session = await acp.newSession();
+  const res = await acp.prompt(session, task("Read failover test.", EN, { ref: repo.sha }));
+  assert.equal(res.result?.stopReason, "end_turn");
+  assert.ok(gw1.requests.length >= 1, "first gateway received request");
+  assert.ok(gw2.requests.length >= 1, "second gateway received failover request");
+  const actual = delivered(acp.requests()[0]);
+  assert.equal(actual.materials.get("добавил быстрый агент: docs/review-only.txt"), "review value match\n");
+  const log = readFileSync(join(acp.state, "acp-server.log"), "utf8");
+  assert.ok(log.includes("gateway[1]"), "log records answered element gateway[1]");
+  assert.ok(log.includes("fast_agent_failover"), "log records fast_agent_failover stage");
+});
+
+test("innerAgent.gateways: all elements fail writes omitted with failure codes and preserves core (PLUG-364 b)", async (t) => {
+  const repo = setup(t);
+  const prompt = task("Read all fail test.", EN, { ref: repo.sha });
+  const baseline = fixture(t, repo, readAnswer);
+  const baseRes = await baseline.prompt(await baseline.newSession(), prompt);
+  assert.equal(baseRes.result?.stopReason, "end_turn");
+  const expectedCoreSha256 = delivered(baseline.requests()[0]).manifest.coreSha256;
+
+  const gw1 = await gateway(t, () => ({ status: 503 }));
+  const gw2 = await gateway(t, () => undefined); // timeout
+  const acp = fixture(t, repo, readAnswer, {
+    settings: {
+      innerAgent: {
+        enabled: true,
+        timeoutMs: 3000,
+        gateways: [
+          { baseUrl: gw1.baseUrl, model: "fast-gw1" },
+          { baseUrl: gw2.baseUrl, model: "fast-gw2", timeoutMs: 50 },
+        ],
+      },
+    },
+  });
+  const session = await acp.newSession();
+  const res = await acp.prompt(session, prompt);
+  assert.equal(res.result?.stopReason, "end_turn");
+  const actual = delivered(acp.requests()[0]);
+  assert.equal(actual.manifest.coreSha256, expectedCoreSha256, "mandatory core must be preserved");
+  const omittedEntry = actual.manifest.omitted.find((item) => item.source === "Fast agent");
+  assert.ok(omittedEntry, "Fast agent must have omitted entry");
+  assert.equal(omittedEntry.reason, "gateway[0] 503, gateway[1] timeout");
+});
+
+test("innerAgent.gateways: 400 and schema errors stop without failover (PLUG-364 c)", async (t) => {
+  const repo = setup(t);
+  const prompt = task("Read 400 and schema test.", EN, { ref: repo.sha });
+  const baseline = fixture(t, repo, readAnswer);
+  await baseline.prompt(await baseline.newSession(), prompt);
+  const expectedCore = delivered(baseline.requests()[0]).manifest.coreSha256;
+
+  // Case 1: HTTP 400 client error
+  const gw1 = await gateway(t, () => ({ status: 400, raw: "Bad Request" }));
+  const gw2 = await gateway(t, () => toolReply(toolCall("read", "read_file", { path: "docs/review-only.txt" })));
+  const acp1 = fixture(t, repo, readAnswer, {
+    settings: {
+      innerAgent: {
+        enabled: true,
+        gateways: [
+          { baseUrl: gw1.baseUrl, model: "fast-gw1" },
+          { baseUrl: gw2.baseUrl, model: "fast-gw2" },
+        ],
+      },
+    },
+  });
+  const res1 = await acp1.prompt(await acp1.newSession(), prompt);
+  assert.equal(res1.result?.stopReason, "end_turn");
+  assert.equal(gw1.requests.length, 1, "gw1 called once");
+  assert.equal(gw2.requests.length, 0, "gw2 must not be called on 400");
+  const actual1 = delivered(acp1.requests()[0]);
+  assert.equal(actual1.manifest.coreSha256, expectedCore, "core preserved");
+  assert.ok(actual1.manifest.omitted.some((item) => /HTTP 400/.test(item.reason)));
+
+  // Case 2: schema error (invalid JSON)
+  const gwSchema = await gateway(t, () => ({ raw: "not json at all" }));
+  const gwUnreached = await gateway(t, () => toolReply(toolCall("read", "read_file", { path: "docs/review-only.txt" })));
+  const acp2 = fixture(t, repo, readAnswer, {
+    settings: {
+      innerAgent: {
+        enabled: true,
+        gateways: [
+          { baseUrl: gwSchema.baseUrl, model: "fast-schema" },
+          { baseUrl: gwUnreached.baseUrl, model: "fast-unreached" },
+        ],
+      },
+    },
+  });
+  const res2 = await acp2.prompt(await acp2.newSession(), prompt);
+  assert.equal(res2.result?.stopReason, "end_turn");
+  assert.equal(gwSchema.requests.length, 1);
+  assert.equal(gwUnreached.requests.length, 0, "gwUnreached must not be called on schema error");
+  const actual2 = delivered(acp2.requests()[0]);
+  assert.equal(actual2.manifest.coreSha256, expectedCore, "core preserved");
+  assert.ok(actual2.manifest.omitted.some((item) => /invalid gateway response/.test(item.reason)));
+});
+
+test("innerAgent.gateway without gateways array preserves legacy failure behavior (PLUG-364 d)", async (t) => {
+  const repo = setup(t);
+  const gw = await gateway(t, () => ({ status: 503, raw: "Gateway Unavailable" }));
+  const acp = fixture(t, repo, readAnswer, {
+    settings: {
+      innerAgent: {
+        enabled: true,
+        gateway: { baseUrl: gw.baseUrl, model: "fast-legacy" },
+      },
+    },
+  });
+  const res = await acp.prompt(await acp.newSession(), task("Read legacy single gateway test.", EN, { ref: repo.sha }));
+  assert.equal(res.result?.stopReason, "end_turn");
+  const actual = delivered(acp.requests()[0]);
+  const omitted = actual.manifest.omitted.find((item) => item.source === "Fast agent");
+  assert.ok(omitted, "must have omitted entry");
+  assert.equal(omitted.reason, "gateway rejected the request (HTTP 503)");
+  assert.doesNotMatch(omitted.reason, /gateway\[0\]/);
+});
+
+test("innerAgent.gateways config validation rejects remote HTTP without loopback (PLUG-364 e)", async (t) => {
+  const repo = setup(t);
+  for (const baseUrl of ["http://example.invalid/v1", "http://127.1/v1", "http://gateway.remote.com/compat"]) {
+    const acp = fixture(t, repo, readAnswer, {
+      settings: {
+        innerAgent: {
+          enabled: true,
+          gateways: [{ baseUrl, model: "fast-remote" }],
+        },
+      },
+    });
+    const res = await acp.prompt(await acp.newSession(), task("Read remote HTTP check.", EN));
+    assert.equal(res.error?.data?.outcome, "not_started");
+    assert.match(res.error.message, /gateway/);
+    assert.equal(acp.requests().length, 0);
+  }
+});
+
+test("agentSettings parsing: chain assembly, deduplication, and single gateway ordering (PLUG-364)", async () => {
+  const { agentSettings } = await import("../src/fast-agent.mjs");
+  const setting = (val, def) => val ?? def;
+
+  // 1. [gateway, ...gateways] deduplicates by (baseUrl, model) with gateway as first
+  const s1 = agentSettings({
+    enabled: true,
+    gateway: { baseUrl: "http://127.0.0.1:8080/v1", model: "m1" },
+    gateways: [
+      { baseUrl: "http://127.0.0.1:8080/v1", model: "m1" },
+      { baseUrl: "http://127.0.0.1:9090/v1", model: "m2", timeoutMs: 500 },
+    ],
+  }, setting);
+  assert.equal(s1.hasChain, true);
+  assert.equal(s1.gateways.length, 2);
+  assert.equal(s1.gateways[0].endpoint, "http://127.0.0.1:8080/v1/chat/completions");
+  assert.equal(s1.gateways[0].model, "m1");
+  assert.equal(s1.gateways[1].endpoint, "http://127.0.0.1:9090/v1/chat/completions");
+  assert.equal(s1.gateways[1].model, "m2");
+  assert.equal(s1.gateways[1].timeoutMs, 500);
+
+  // 2. gateways[] as-is when gateway is absent
+  const s2 = agentSettings({
+    enabled: true,
+    gateways: [
+      { baseUrl: "http://127.0.0.1:9090/v1", model: "m2" },
+      { baseUrl: "http://127.0.0.1:8080/v1", model: "m1" },
+    ],
+  }, setting);
+  assert.equal(s2.hasChain, true);
+  assert.equal(s2.gateways.length, 2);
+  assert.equal(s2.gateways[0].model, "m2");
+  assert.equal(s2.gateways[1].model, "m1");
+
+  // 3. single gateway without gateways -> hasChain is false
+  const s3 = agentSettings({
+    enabled: true,
+    gateway: { baseUrl: "http://127.0.0.1:8080/v1", model: "m1" },
+  }, setting);
+  assert.equal(s3.hasChain, false);
+  assert.equal(s3.gateways.length, 1);
+
+  // 4. model inheritance from innerAgent.model
+  const s4 = agentSettings({
+    enabled: true,
+    model: "shared-model",
+    gateways: [
+      { baseUrl: "http://127.0.0.1:8080/v1" },
+      { baseUrl: "http://127.0.0.1:9090/v1", model: "override-model" },
+    ],
+  }, setting);
+  assert.equal(s4.gateways[0].model, "shared-model");
+  assert.equal(s4.gateways[1].model, "override-model");
+
+  // 5. Invalid gateways: not an array -> throws
+  assert.throws(() => agentSettings({ enabled: true, gateways: "invalid" }, setting), /gateways/);
+  // 6. Invalid entry in gateways -> throws
+  assert.throws(() => agentSettings({ enabled: true, gateways: [null] }, setting), /gateways/);
+});

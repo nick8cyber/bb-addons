@@ -1180,12 +1180,13 @@ function createTaskTurn(sessionId) {
     setDeadline, signal: controller.signal, aborted, stop, ownedFiles: [],
     pinnedSha: null,
     packageSha256: null,
-    ping(next) {
+    ping(next, extra) {
       if (closed || controller.signal.aborted) return;
-      stage = next;
-      slog("task:stage", { sessionId, stage });
-      if (turn.journal && turn.journal.turn.stage !== next) {
-        turn.journal.turn.stage = next;
+      stage = typeof next === "object" ? next.stage : next;
+      const data = typeof next === "object" ? next : (extra ? { stage, ...extra } : { stage });
+      slog("task:stage", { sessionId, ...data });
+      if (turn.journal && turn.journal.turn.stage !== stage) {
+        turn.journal.turn.stage = stage;
         try {
           journal.saveTurn(STATE_DIR, turn.journal.sessKey, turn.journal.turn);
         } catch {}
@@ -1609,7 +1610,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               const agent = await gatherAgentContext(context, collected.core, {
                 signal: task.signal,
                 maxExtraBytes: context.settings.maxTotalBytes - packed.totalBytes - packageOptions.reserveBytes,
-                onStage: (stage) => task.ping(stage),
+                onStage: (stage, extra) => task.ping(stage, extra),
                 onToolStart: (name) => {
                   const toolCallId = "gemini-fast-" + randomUUID();
                   upd({ sessionUpdate: "tool_call", toolCallId, title: "Fast agent · " + name,
@@ -1620,10 +1621,19 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   upd({ sessionUpdate: "tool_call_update", toolCallId, status: ok ? "completed" : "failed" });
                 },
               });
-              if (agent.supplements.length || agent.omitted.length) {
+              if (agent.supplements.length || agent.omitted.length || agent.gateway) {
                 collected = { ...collected, agent };
                 packed = packTask(context, collected, packageOptions);
                 if (packed.agentDeliveryLimited) task.ping("fast_agent_delivery_limit");
+              }
+              if (agent.failover && agent.gateway) {
+                slog("task:fast-agent-failover", { sessionId, gateway: agent.gateway, index: agent.gatewayIndex });
+                if (task.journal) {
+                  task.journal.turn.fastAgentGateway = agent.gateway;
+                  try {
+                    journal.saveTurn(STATE_DIR, task.journal.sessKey, task.journal.turn);
+                  } catch {}
+                }
               }
             }
             task.packageSha256 = packed.packageSha256;

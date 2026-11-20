@@ -27,15 +27,35 @@ const reasons = {
   git: "requested repository history or state relevant to the task",
 };
 
-export function agentSettings(input, setting) {
-  if (input?.enabled === undefined || input.enabled === false) return null;
-  if (input.enabled !== true) throw new Error("invalid innerAgent.enabled");
-  const gateway = input.gateway;
-  const model = gateway?.model ?? input.model;
-  if (!record(gateway) || typeof model !== "string" || !model.trim() ||
-      (input.model !== undefined && input.model !== model)) throw new Error("invalid innerAgent model or gateway");
+class GatewayTransportError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "GatewayTransportError";
+    this.code = code;
+  }
+}
+
+class GatewayClientError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.name = "GatewayClientError";
+    this.statusCode = statusCode;
+  }
+}
+
+class SchemaError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SchemaError";
+  }
+}
+
+function parseGateway(gw, setting, defaultModel) {
+  if (!record(gw)) throw new Error("invalid innerAgent model or gateway");
+  const model = gw.model ?? defaultModel;
+  if (typeof model !== "string" || !model.trim()) throw new Error("invalid innerAgent model or gateway");
   let url;
-  const baseUrl = gateway.baseUrl;
+  const baseUrl = gw.baseUrl;
   try {
     if (typeof baseUrl !== "string" || !/^https?:\/\/[^/?#@\\\s]+(?:\/[^?#\\\s]*)?$/i.test(baseUrl)) throw new Error();
     url = new URL(baseUrl);
@@ -48,8 +68,8 @@ export function agentSettings(input, setting) {
     /^http:\/\/(?:127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(baseUrl);
   if (url.protocol !== "https:" && !localHttp) throw new Error("innerAgent.gateway requires HTTPS or explicit HTTP loopback");
   let authorization;
-  if (gateway.tokenEnv !== undefined || !localHttp) {
-    const key = gateway.tokenEnv;
+  if (gw.tokenEnv !== undefined || !localHttp) {
+    const key = gw.tokenEnv;
     if (typeof key !== "string" || !/^[A-Za-z_][A-Za-z_0-9]*$/.test(key) || !process.env[key]?.trim()) {
       throw new Error("innerAgent.gateway token environment variable is missing or invalid");
     }
@@ -60,31 +80,135 @@ export function agentSettings(input, setting) {
       throw new Error("invalid innerAgent.gateway token");
     }
   }
+  let timeoutMs;
+  if (gw.timeoutMs !== undefined) {
+    timeoutMs = setting(gw.timeoutMs, undefined, 1, "innerAgent.gateway.timeoutMs");
+  }
+  return {
+    endpoint: url.href,
+    baseUrl: gw.baseUrl,
+    model,
+    authorization,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+  };
+}
+
+export function agentSettings(input, setting) {
+  if (input?.enabled === undefined || input.enabled === false) return null;
+  if (input.enabled !== true) throw new Error("invalid innerAgent.enabled");
+  if (input.gateway === undefined && input.gateways === undefined) {
+    throw new Error("invalid innerAgent model or gateway");
+  }
+  if (input.gateways !== undefined && !Array.isArray(input.gateways)) {
+    throw new Error("invalid innerAgent.gateways");
+  }
+  if (input.gateway !== undefined && !record(input.gateway)) {
+    throw new Error("invalid innerAgent model or gateway");
+  }
+  if (input.model !== undefined && (typeof input.model !== "string" || !input.model.trim())) {
+    throw new Error("invalid innerAgent model or gateway");
+  }
+  if (input.gateway !== undefined) {
+    const gwModel = input.gateway.model ?? input.model;
+    if (typeof gwModel !== "string" || !gwModel.trim() ||
+        (input.model !== undefined && input.gateway.model !== undefined && input.model !== input.gateway.model)) {
+      throw new Error("invalid innerAgent model or gateway");
+    }
+  }
+
+  const rawList = [];
+  if (input.gateway) {
+    rawList.push(input.gateway);
+  }
+  if (input.gateways) {
+    for (const item of input.gateways) {
+      if (!record(item)) throw new Error("invalid innerAgent.gateways entry");
+      rawList.push(item);
+    }
+  }
+
+  const seen = new Set();
+  const seenEndpoints = new Set();
+  const chain = [];
+  for (const gw of rawList) {
+    const itemModel = gw.model ?? input.model ?? input.gateway?.model;
+    const rawKey = `${gw.baseUrl}::${itemModel}`;
+    if (seen.has(rawKey)) continue;
+    seen.add(rawKey);
+    const parsed = parseGateway(gw, setting, input.model ?? input.gateway?.model);
+    const endpointKey = `${parsed.endpoint}::${parsed.model}`;
+    if (seenEndpoints.has(endpointKey)) continue;
+    seenEndpoints.add(endpointKey);
+    chain.push(Object.freeze(parsed));
+  }
+  if (!chain.length) throw new Error("invalid innerAgent model or gateway");
+
   const maxCalls = setting(input.maxCalls, 16, 1, "innerAgent.maxCalls");
   return Object.freeze({
-    endpoint: url.href, model, authorization, maxCalls,
+    gateways: Object.freeze(chain),
+    hasChain: Array.isArray(input.gateways),
+    endpoint: chain[0].endpoint,
+    model: chain[0].model,
+    authorization: chain[0].authorization,
+    maxCalls,
     maxRounds: setting(input.maxRounds, maxCalls, 1, "innerAgent.maxRounds"),
     maxBytes: setting(input.maxBytes, 240_000, 1, "innerAgent.maxBytes"),
     timeoutMs: setting(input.timeoutMs, 60_000, 1, "innerAgent.timeoutMs"),
   });
 }
 
-function completion(config, messages, signal) {
-  const body = JSON.stringify({ model: config.model, stream: false, messages, tools });
-  const transport = config.endpoint.startsWith("https:") ? httpsRequest : httpRequest;
+function requestGateway(gw, messages, signal) {
+  const body = JSON.stringify({ model: gw.model, stream: false, messages, tools });
+  const transport = gw.endpoint.startsWith("https:") ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
-    const request = transport(config.endpoint, {
-      method: "POST", agent: false, signal,
+    let timer;
+    const controller = new AbortController();
+    const onParentAbort = () => controller.abort(signal.reason);
+    signal.addEventListener("abort", onParentAbort, { once: true });
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+    } else if (gw.timeoutMs) {
+      timer = setTimeout(() => {
+        controller.abort("element timeout");
+      }, gw.timeoutMs);
+    }
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onParentAbort);
+    };
+    let settled = false;
+    const settle = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(arg);
+    };
+
+    const request = transport(gw.endpoint, {
+      method: "POST", agent: false, signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
         "Content-Length": bytes(body),
-        ...(config.authorization ? { Authorization: config.authorization } : {}),
+        ...(gw.authorization ? { Authorization: gw.authorization } : {}),
       },
     }, (response) => {
-      response.on("error", reject);
+      response.on("error", (err) => {
+        if (signal.aborted) {
+          settle(reject, new Error(signal.reason || "fast agent timed out"));
+        } else if (controller.signal.aborted) {
+          settle(reject, new GatewayTransportError("timeout", "gateway element timed out"));
+        } else {
+          settle(reject, new GatewayTransportError("network", "gateway transport failed"));
+        }
+      });
+      if (response.statusCode === 429 || response.statusCode >= 500) {
+        response.destroy();
+        settle(reject, new GatewayTransportError(String(response.statusCode), "gateway rejected the request (HTTP " + response.statusCode + ")"));
+        return;
+      }
       if (response.statusCode < 200 || response.statusCode >= 300) {
         response.destroy();
-        reject(new Error("gateway rejected the request (HTTP " + response.statusCode + ")"));
+        settle(reject, new GatewayClientError(response.statusCode, "gateway rejected the request (HTTP " + response.statusCode + ")"));
         return;
       }
       let size = 0;
@@ -92,8 +216,8 @@ function completion(config, messages, signal) {
       response.on("data", (chunk) => {
         size += chunk.length;
         if (size > 1_048_576) {
-          reject(new Error("gateway response exceeded its size limit"));
           response.destroy();
+          settle(reject, new SchemaError("gateway response exceeded its size limit"));
         } else {
           chunks.push(chunk);
         }
@@ -104,15 +228,63 @@ function completion(config, messages, signal) {
           if (!record(message) || (message.role !== undefined && message.role !== "assistant") ||
               (message.tool_calls != null && !Array.isArray(message.tool_calls)) ||
               (!message.tool_calls?.length && typeof message.content !== "string")) throw new Error();
-          resolve(message.tool_calls ?? []);
+          settle(resolve, message.tool_calls ?? []);
         } catch {
-          reject(new Error("invalid gateway response"));
+          settle(reject, new SchemaError("invalid gateway response"));
         }
       });
     });
-    request.on("error", () => reject(new Error("gateway transport failed")));
+
+    request.on("error", (err) => {
+      if (signal.aborted) {
+        settle(reject, new Error(signal.reason || "fast agent timed out"));
+      } else if (controller.signal.aborted) {
+        settle(reject, new GatewayTransportError("timeout", "gateway element timed out"));
+      } else {
+        settle(reject, new GatewayTransportError("network", "gateway transport failed"));
+      }
+    });
+
     request.end(body);
   });
+}
+
+export async function callGateway(config, messages, signal) {
+  const gateways = config.gateways ?? [config];
+  const failures = [];
+  for (let i = 0; i < gateways.length; i++) {
+    const gw = gateways[i];
+    signal.throwIfAborted();
+    try {
+      const toolCalls = await requestGateway(gw, messages, signal);
+      return {
+        toolCalls,
+        gateway: `gateway[${i}]`,
+        gatewayIndex: i,
+        failover: i > 0,
+        element: gw,
+      };
+    } catch (error) {
+      if (signal.aborted) throw error;
+      if (error instanceof GatewayClientError || error instanceof SchemaError) {
+        throw error;
+      }
+      if (error instanceof GatewayTransportError) {
+        failures.push({ index: i, code: error.code, error });
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (!config.hasChain) {
+    throw failures[0]?.error ?? new Error("gateway transport failed");
+  }
+  const summary = failures.map((f) => `gateway[${f.index}] ${f.code}`).join(", ");
+  throw new Error(summary);
+}
+
+function completion(config, messages, signal) {
+  return callGateway(config, messages, signal).then((res) => res.toolCalls);
 }
 
 function validateCall(call, ids, mask) {
@@ -167,6 +339,9 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
   const ids = new Set();
   const maxBytes = Math.max(0, Math.min(config.maxBytes, maxExtraBytes));
   let remaining = maxBytes, calls = 0, repository;
+  let hasFailover = false;
+  let lastGateway = null;
+  let lastGatewayIndex = null;
   try {
     local.throwIfAborted();
     if (!remaining) {
@@ -198,7 +373,14 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
         break;
       }
       onStage("fast_agent_gateway");
-      const requested = await completion(config, messages, local);
+      const result = await callGateway(config, messages, local);
+      if (result.failover) {
+        hasFailover = true;
+        lastGateway = result.gateway;
+        lastGatewayIndex = result.gatewayIndex;
+        onStage("fast_agent_failover", { gateway: result.gateway, index: result.gatewayIndex, endpoint: result.element?.endpoint, model: result.element?.model });
+      }
+      const requested = result.toolCalls;
       if (!requested.length) break;
       const assistant = { role: "assistant", content: null, tool_calls: [] };
       const replies = [];
@@ -266,5 +448,16 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
     signal.removeEventListener("abort", abort);
     await repository?.close();
   }
-  return { supplements, omitted };
+  return {
+    supplements,
+    omitted,
+    gateway: lastGateway ?? "gateway[0]",
+    gatewayIndex: lastGatewayIndex ?? 0,
+    failover: hasFailover,
+    stats: {
+      gateway: lastGateway ?? "gateway[0]",
+      gatewayIndex: lastGatewayIndex ?? 0,
+      failover: hasFailover,
+    },
+  };
 }
