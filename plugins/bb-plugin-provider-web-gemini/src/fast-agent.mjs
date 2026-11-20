@@ -348,6 +348,10 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
       omit("Fast agent", "no delivery budget for additional context");
       return { supplements, omitted };
     }
+    if (!context.root && !context.pin) {
+      omit("Fast agent", "a Git repository is required for isolated reads");
+      return { supplements, omitted };
+    }
     onStage("fast_agent_snapshot");
     try {
       repository = await openAgentRepository(context, local);

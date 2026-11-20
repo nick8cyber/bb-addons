@@ -469,8 +469,9 @@ export async function collectTask(context, blocks, materials, options) {
 function renderTaskPackage(context, collected, options, supplements, agentOmissions, compact = false) {
   const { limit, spillDir } = options;
   const pin = context.pin;
+  const repo = Boolean(pin || context.root);
   const header = [
-    tools.toolSystemHeader(undefined, { pinned: Boolean(pin) }),
+    tools.toolSystemHeader(undefined, { pinned: Boolean(pin), repo }),
     pin ? "All repository tools use the pinned review tree: " + pin.sha : "",
     taskInstruction(context),
   ].filter(Boolean).join("\n\n");
