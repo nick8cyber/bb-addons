@@ -982,7 +982,7 @@ export function normalizeThinking(val) {
 }
 
 export const MODELS = [
-  { value: "argon", name: "Gemini 4 Argon" },
+  { value: "neon", name: "Gemini 4 Neon" },
   { value: "carbon", name: "Gemini 4 Carbon" },
   { value: "hydrogen", name: "Gemini 4 Hydrogen" },
   { value: "pro", name: "Gemini 3.1 Pro" },
@@ -994,7 +994,7 @@ export function resolveModelId(val) {
   const v = val.toLowerCase().trim();
   if (v === "fast" || v === "flash" || v === "lite" || v.includes("flash-lite") || v.includes("flash")) return "flash-lite";
   if (v.includes("carbon")) return "carbon";
-  if (v.includes("argon") || v.includes("neon")) return "argon";
+  if (v.includes("argon") || v.includes("neon")) return "neon";
   if (v.includes("hydrogen")) return "hydrogen";
   if (v.includes("pro")) return "pro";
   const exact = MODELS.find((m) => m.value === v || m.name.toLowerCase() === v);
@@ -1031,7 +1031,7 @@ function resetModelForAccount(s, backends = BACKENDS) {
   if (!s.account || s.account === "auto") return;
   const b = backends.find((x) => x.id === s.account);
   if (b && !modelSupportedOnAccount(s.model, b, loadState())) {
-    s.model = "argon";
+    s.model = "neon";
   }
 }
 
@@ -1370,7 +1370,7 @@ let activePromptSessionId = null;
 
 async function runPrompt(id, sessionId, text, attachments = {}) {
   const s = sessions.get(sessionId) ?? {
-    model: "argon",
+    model: "neon",
     thinking: "thinking",
     convId: null,
     account: "auto",
@@ -2546,7 +2546,7 @@ function restoreSessionFromRecord(requestedId, entry, cwd) {
     id: requestedId,
     cwd: cwd || null,
     roots: Array.isArray(entry.record.roots) ? entry.record.roots : [],
-    model: entry.record.model ?? "argon",
+    model: resolveModelId(entry.record.model) ?? "neon",
     thinking: entry.record.thinking ?? "medium",
     convId: entry.record.convId ?? null,
     account: entry.record.account ?? "auto",
@@ -2629,7 +2629,7 @@ async function handleSessionNew(msg, p) {
     id: sessionId,
     cwd: p.cwd || null,
     roots: dirRootsFrom(p),
-    model: "argon",
+    model: "neon",
     thinking: "medium",
     convId: null,
     account: "auto",
@@ -2670,7 +2670,7 @@ async function handleSessionLoad(msg, p) {
     id: newId,
     cwd: p.cwd || null,
     roots: dirRootsFrom(p),
-    model: "argon",
+    model: "neon",
     thinking: "medium",
     convId: null,
     account: "auto",

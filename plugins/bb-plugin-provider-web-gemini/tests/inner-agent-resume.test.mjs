@@ -206,7 +206,7 @@ test("fresh task turn writes session record, package, exchanges and outcome into
   assert.ok(turn.record.convId);
   assert.equal(turn.record.pin.sha, repo.sha);
   assert.equal(turn.record.expected, "verdict");
-  assert.deepEqual(turn.record.profile, { model: "argon", thinking: "medium", account: "auto" });
+  assert.deepEqual(turn.record.profile, { model: "neon", thinking: "medium", account: "auto" });
   assert.ok(turn.record.deadlineAt > turn.record.createdAt);
   const dir = journalTurnsDir(app.state, recs[0].key, 1);
   const pkg = readFileSync(join(dir, "package.md"), "utf8");
@@ -244,7 +244,7 @@ test("session/load restores an unfinished turn and continues it in the same conv
   const loaded = await app.loadSession(sessionId);
   assert.ok(loaded.result, JSON.stringify(loaded.error));
   assert.equal(loaded.result.sessionId, sessionId);
-  await app.send("session/set_model", { sessionId, modelId: "argon" });
+  await app.send("session/set_model", { sessionId, modelId: "neon" });
   await app.send("session/set_config_option", { sessionId, configId: "thinking", value: "low" });
   await app.send("session/set_config_option", { sessionId, configId: "account", value: "auto" });
 
@@ -266,6 +266,30 @@ test("session/load restores an unfinished turn and continues it in the same conv
   assert.equal(done.budgets.toolRounds, 1);
   assert.equal(done.packageSha256, turn.packageSha256);
   assert.equal(readFileSync(join(journalTurnsDir(first.state, recs[0].key, 1), "answer.txt"), "utf8"), FINAL);
+});
+
+test("session/load resolves a legacy argon model in the saved session record to neon", async (t) => {
+  const repo = setup(t);
+  const first = fixture(t, repo, `(request) => ({ text: ${JSON.stringify(FINAL)} })`);
+  const sessionId = await first.newSession();
+  await first.send("session/set_model", { sessionId, modelId: "neon" });
+  const response = await first.prompt(sessionId, task("Review the change", { ref: "review" }));
+  assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response.error));
+
+  const [rec] = records(first.state);
+  assert.equal(rec.record.model, "neon");
+  journal.saveSessionRecord(first.state, rec, { model: "argon" });
+  first.kill();
+  await waitFor(() => first.child.exitCode !== null || first.child.signalCode !== null);
+
+  const app = fixture(t, repo, () => ({ text: FINAL }), { stateDir: first.state });
+  const loaded = await app.loadSession(sessionId);
+  assert.ok(loaded.result, JSON.stringify(loaded.error));
+  assert.equal(loaded.result.models.currentModelId, "neon", "legacy saved model must resolve to neon");
+  assert.equal(
+    loaded.result.configOptions.find((option) => option.id === "model")?.currentValue,
+    "neon"
+  );
 });
 
 test("session/load resumes by redelivering the saved package when the conversation is gone", async (t) => {

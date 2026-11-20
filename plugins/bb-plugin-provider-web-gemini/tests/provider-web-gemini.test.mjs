@@ -506,10 +506,10 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
 
   // Test resolveModelId for aliases and official labels
   const { resolveModelId } = await import("../acp-server.mjs");
-  assert.equal(resolveModelId("argon"), "argon");
-  assert.equal(resolveModelId("Gemini 4 Argon"), "argon");
-  assert.equal(resolveModelId("neon"), "argon");
-  assert.equal(resolveModelId("Gemini 4 Neon"), "argon");
+  assert.equal(resolveModelId("neon"), "neon");
+  assert.equal(resolveModelId("Gemini 4 Neon"), "neon");
+  assert.equal(resolveModelId("argon"), "neon");
+  assert.equal(resolveModelId("Gemini 4 Argon"), "neon");
   assert.equal(resolveModelId("carbon"), "carbon");
   assert.equal(resolveModelId("Gemini 4 Carbon"), "carbon");
   assert.equal(resolveModelId("hydrogen"), "hydrogen");
@@ -522,7 +522,7 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   assert.equal(resolveModelId("flash"), "flash-lite");
   assert.equal(resolveModelId("unknown-xyz"), null);
 
-  // Test successful selection of argon in Russian UI
+  // Test successful selection of neon with the legacy Russian UI label "4 Argon"
   let clickedArgon = false;
   const mockPageArgon = {
     $: async () => null,
@@ -542,10 +542,10 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
     waitForTimeout: async () => {},
     keyboard: { press: async () => {} },
   };
-  await selectModelAndThinking(mockPageArgon, "argon", null, true);
-  assert.equal(clickedArgon, true, "Argon in Russian UI must be clicked when requested");
+  await selectModelAndThinking(mockPageArgon, "neon", null, true);
+  assert.equal(clickedArgon, true, "Legacy Argon in Russian UI must be clicked when neon is requested");
 
-  // PLUG-324: Test successful selection of argon with renamed picker item "Deeper analysis | 4 Neon"
+  // PLUG-324: Test successful selection of neon with picker item "Deeper analysis | 4 Neon"
   let clickedNeon = false;
   const mockPageNeon = {
     $: async () => null,
@@ -565,10 +565,10 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
     waitForTimeout: async () => {},
     keyboard: { press: async () => {} },
   };
-  await selectModelAndThinking(mockPageNeon, "argon", null, true);
-  assert.equal(clickedNeon, true, "Picker item 'Deeper analysis | 4 Neon' must be clicked when requested model is argon");
+  await selectModelAndThinking(mockPageNeon, "neon", null, true);
+  assert.equal(clickedNeon, true, "Picker item 'Deeper analysis | 4 Neon' must be clicked when requested model is neon");
 
-  // PLUG-324: Test Russian variant "Глубокий анализ | 4 Neon"
+  // PLUG-324: legacy argon alias still reaches the driver and selects Neon in the Russian UI
   let clickedNeonRu = false;
   const mockPageNeonRu = {
     $: async () => null,
@@ -589,7 +589,7 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
     keyboard: { press: async () => {} },
   };
   await selectModelAndThinking(mockPageNeonRu, "argon", null, true);
-  assert.equal(clickedNeonRu, true, "Picker item 'Глубокий анализ | 4 Neon' must be clicked when requested model is argon");
+  assert.equal(clickedNeonRu, true, "Legacy argon alias must select picker item 'Глубокий анализ | 4 Neon'");
 
   // PLUG-324: Test fallback path of getPickerButton when primary selector is not found
   // (a) Mock page whose waitForSelector returns null and evaluateHandle runs the regex
@@ -639,8 +639,8 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
     keyboard: { press: async () => {} },
   };
 
-  // When fallback button already shows Neon / Deeper analysis, selectModelAndThinking recognizes argon is selected
-  await selectModelAndThinking(mockPageFallbackNeon, "argon", null, true);
+  // When fallback button already shows Neon / Deeper analysis, selectModelAndThinking recognizes neon is selected
+  await selectModelAndThinking(mockPageFallbackNeon, "neon", null, true);
 
   // Test fallback button showing another model (Hydrogen) opening menu to select Neon
   let clickedMenuNeonFromFallback = false;
@@ -688,7 +688,7 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
     keyboard: { press: async () => {} },
   };
 
-  await selectModelAndThinking(mockPageFallbackHydrogen, "argon", null, true);
+  await selectModelAndThinking(mockPageFallbackHydrogen, "neon", null, true);
   assert.equal(clickedMenuNeonFromFallback, true, "Menu item Neon must be clicked after opening menu from fallback Hydrogen button");
 
   // Test fallback button failure when no button matches known model regex
@@ -721,7 +721,7 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   };
 
   await assert.rejects(
-    async () => selectModelAndThinking(mockPageFallbackFail, "argon", null, true),
+    async () => selectModelAndThinking(mockPageFallbackFail, "neon", null, true),
     /Model picker button not found/,
     "When fallback button does not match known models regex, getPickerButton must throw"
   );
@@ -1033,14 +1033,15 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
     assert.ok(m.name.length > 0);
   }
   const modelIds = r2.result.models.availableModels.map((m) => m.modelId);
-  assert.ok(modelIds.includes("argon"));
+  assert.ok(modelIds.includes("neon"));
+  assert.ok(!modelIds.includes("argon"), "argon is an alias, not an available model id");
   assert.ok(modelIds.includes("carbon"));
   assert.ok(modelIds.includes("hydrogen"));
   assert.ok(modelIds.includes("pro"));
   assert.ok(modelIds.includes("flash-lite"));
   assert.equal(
-    r2.result.models.availableModels.find((m) => m.modelId === "argon")?.name,
-    "Gemini 4 Argon"
+    r2.result.models.availableModels.find((m) => m.modelId === "neon")?.name,
+    "Gemini 4 Neon"
   );
   assert.equal(
     r2.result.models.availableModels.find((m) => m.modelId === "carbon")?.name,
@@ -1075,7 +1076,7 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
     assert.ok(m.name.length > 0);
   }
   const loadModelIds = r21.result.models.availableModels.map((m) => m.modelId);
-  assert.ok(loadModelIds.includes("argon"));
+  assert.ok(loadModelIds.includes("neon"));
   assert.ok(loadModelIds.includes("pro"));
 
   // 3. session/set_model
@@ -1087,6 +1088,11 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   });
   const r3 = await waitForResponse(3);
   assert.ok(r3.result.configOptions);
+  assert.equal(
+    r3.result.configOptions.find((o) => o.id === "model")?.currentValue,
+    "neon",
+    "legacy argon modelId must resolve to neon"
+  );
 
   // 4. session/set_config_option
   sendReq({
@@ -1098,9 +1104,9 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const r4 = await waitForResponse(4);
   assert.ok(r4.result.configOptions);
   const modelOpt4 = r4.result.configOptions.find((o) => o.id === "model");
-  assert.equal(modelOpt4?.currentValue, "argon", "Model must remain 'argon' when thought_level changes on argon model");
+  assert.equal(modelOpt4?.currentValue, "neon", "Model must remain 'neon' when thought_level changes on neon model");
 
-  // Verify non-argon/non-carbon model updates thought_level to high cleanly
+  // Verify non-neon/non-carbon model updates thought_level to high cleanly
   sendReq({
     jsonrpc: "2.0",
     id: 401,
@@ -1142,12 +1148,12 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   assert.equal(modelOpt404?.currentValue, "carbon", "Carbon model must be preserved when thought_level changes");
   assert.equal(thoughtOpt404?.currentValue, "low", "Carbon thought_level must update to low");
 
-  // Reset back to argon for the rest of the test
+  // Reset back to neon for the rest of the test
   sendReq({
     jsonrpc: "2.0",
     id: 405,
     method: "session/set_model",
-    params: { sessionId, modelId: "argon" },
+    params: { sessionId, modelId: "neon" },
   });
   await waitForResponse(405);
 
@@ -1760,7 +1766,7 @@ test("9. Backward compatibility and web-gemini naming convention", async () => {
   await new Promise((resolve) => serverProc.on("exit", resolve));
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
-test("10. Smart model routing: pickBackendFromState prioritizes pro accounts for argon and ultra for carbon", () => {
+test("10. Smart model routing: pickBackendFromState prioritizes pro accounts for neon and ultra for carbon", () => {
   const testBackends = [
     { id: "pro-1", priority: 10, tier: "pro", cdp: "9222" },
     { id: "pro-2", priority: 10, tier: "pro", cdp: "9223" },
@@ -1790,25 +1796,25 @@ test("10. Smart model routing: pickBackendFromState prioritizes pro accounts for
     leases: {},
   };
 
-  // For argon: pro accounts (pro-1, pro-2) are prioritized over ultra (ultra-1) to reserve ultra for carbon!
+  // For neon: pro accounts (pro-1, pro-2) are prioritized over ultra (ultra-1) to reserve ultra for carbon!
   // Between pro-1 (100) and pro-2 (200), pro-1 is least recently used
-  const argonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
-  assert.ok(argonPick.backend, "Should pick a backend for argon");
-  assert.equal(argonPick.backend.id, "pro-1", "Argon should pick pro tier account first");
+  const neonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "neon", testBackends);
+  assert.ok(neonPick.backend, "Should pick a backend for neon");
+  assert.equal(neonPick.backend.id, "pro-1", "Neon should pick pro tier account first");
 
-  // When pro-1 is busy, argon picks pro-2 (the remaining pro account)
+  // When pro-1 is busy, neon picks pro-2 (the remaining pro account)
   fakeState.accounts["pro-1"].inUseUntilMs = Date.now() + 60000;
   fakeState.accounts["pro-1"].owner = "other-process";
-  const argonPick2 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
-  assert.ok(argonPick2.backend, "Should pick pro-2 for argon when pro-1 is busy");
-  assert.equal(argonPick2.backend.id, "pro-2");
+  const neonPick2 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "neon", testBackends);
+  assert.ok(neonPick2.backend, "Should pick pro-2 for neon when pro-1 is busy");
+  assert.equal(neonPick2.backend.id, "pro-2");
 
-  // When both pro accounts are busy, argon falls back to ultra (ultra-1)
+  // When both pro accounts are busy, neon falls back to ultra (ultra-1)
   fakeState.accounts["pro-2"].inUseUntilMs = Date.now() + 60000;
   fakeState.accounts["pro-2"].owner = "other-process";
-  const argonPick3 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
-  assert.ok(argonPick3.backend, "Should fall back to ultra account for argon when all pro accounts are busy");
-  assert.equal(argonPick3.backend.id, "ultra-1");
+  const neonPick3 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "neon", testBackends);
+  assert.ok(neonPick3.backend, "Should fall back to ultra account for neon when all pro accounts are busy");
+  assert.equal(neonPick3.backend.id, "ultra-1");
 
   // Reset pro accounts
   fakeState.accounts["pro-1"].inUseUntilMs = 0;
@@ -1837,7 +1843,7 @@ test("10. Smart model routing: pickBackendFromState prioritizes pro accounts for
   assert.equal(nonePick.none, true, "Must return none when all candidates have carbon locked");
 
   // Priority tests:
-  // 1. Equal priority (all 10): "при прочих равных" Pro accounts are preferred for Argon over Ultra (Ultra in end)
+  // 1. Equal priority (all 10): "при прочих равных" Pro accounts are preferred for neon over Ultra (Ultra in end)
   fakeState.accounts["ultra-1"].lockedModels = [];
   fakeState.accounts["ultra-1"].priority = 10;
   fakeState.accounts["pro-1"].priority = 10;
@@ -1845,23 +1851,23 @@ test("10. Smart model routing: pickBackendFromState prioritizes pro accounts for
   fakeState.accounts["ultra-1"].lastUsedMs = 10; // ultra-1 has lowest lastUsedMs
   fakeState.accounts["pro-1"].lastUsedMs = 100;
   fakeState.accounts["pro-2"].lastUsedMs = 200;
-  const equalPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
-  assert.equal(equalPrioPick.backend.id, "pro-1", "Equal priority should still prioritize pro account over ultra for argon");
+  const equalPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "neon", testBackends);
+  assert.equal(equalPrioPick.backend.id, "pro-1", "Equal priority should still prioritize pro account over ultra for neon");
 
   // 2. Explicit priority ladder: higher priority picked first regardless of lastUsedMs
   fakeState.accounts["pro-2"].priority = 20; // pro-2 has priority 20
-  const higherPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  const higherPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "neon", testBackends);
   assert.equal(higherPrioPick.backend.id, "pro-2", "Priority 20 must beat priority 10");
 
   // 3. Priority 0: account is disabled and never picked
   fakeState.accounts["pro-2"].priority = 0;
   fakeState.accounts["pro-1"].priority = 0;
   // Now only ultra-1 is left (> 0)
-  const onlyUltraPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  const onlyUltraPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "neon", testBackends);
   assert.equal(onlyUltraPick.backend.id, "ultra-1", "Priority 0 accounts must be ignored, picking remaining account");
 
   fakeState.accounts["ultra-1"].priority = 0;
-  const zeroPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  const zeroPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "neon", testBackends);
   assert.equal(zeroPick.none, true, "When all accounts have priority 0, pickBackendFromState returns none");
 });
 
@@ -2366,10 +2372,10 @@ test("16. PLUG-280 model↔account selector filtering and incompatibility resets
   const r2 = await waitForResponse(2);
   const sessionId = r2.result.sessionId;
 
-  // Baseline: model argon is supported everywhere — all accounts listed, all 5 models.
+  // Baseline: model neon is supported everywhere — all accounts listed, all 5 models.
   assert.deepEqual(values(optById(r2, "account")), ["auto", "pro-1", "ultra-1", "ultra-2"]);
   assert.equal(optById(r2, "account").currentValue, "auto");
-  assert.deepEqual(values(optById(r2, "model")), ["argon", "carbon", "hydrogen", "pro", "flash-lite"]);
+  assert.deepEqual(values(optById(r2, "model")), ["neon", "carbon", "hydrogen", "pro", "flash-lite"]);
 
   // Case 1: carbon + exactly one capable ultra (ultra-2 has carbon locked)
   // → account list [auto, ultra-1], currentValue "ultra-1" (single-capable rule).
@@ -2388,21 +2394,21 @@ test("16. PLUG-280 model↔account selector filtering and incompatibility resets
   assert.equal(optById(r4, "account").currentValue, "auto");
 
   // Case 5 (runs before 3 to observe the reset): picking a pro account while
-  // the model is carbon resets s.model to the "argon" default.
+  // the model is carbon resets s.model to the "neon" default.
   sendReq({ jsonrpc: "2.0", id: 5, method: "session/set_config_option", params: { sessionId, configId: "account", value: "pro-1" } });
   const r5 = await waitForResponse(5);
-  assert.equal(optById(r5, "model").currentValue, "argon", "Incompatible model must reset to argon on account change");
+  assert.equal(optById(r5, "model").currentValue, "neon", "Incompatible model must reset to neon on account change");
   assert.equal(optById(r5, "account").currentValue, "pro-1");
   assert.deepEqual(values(optById(r5, "account")), ["auto", "pro-1", "ultra-1", "ultra-2"]);
 
   // Case 3: with a pro account selected, carbon is gone from the model list.
   assert.ok(!values(optById(r5, "model")).includes("carbon"), "carbon must be filtered out on a pro account");
-  assert.ok(values(optById(r5, "model")).includes("argon"));
+  assert.ok(values(optById(r5, "model")).includes("neon"));
 
   // Case 6: ultra account selected → all 5 models visible.
   sendReq({ jsonrpc: "2.0", id: 6, method: "session/set_config_option", params: { sessionId, configId: "account", value: "ultra-1" } });
   const r6 = await waitForResponse(6);
-  assert.deepEqual(values(optById(r6, "model")), ["argon", "carbon", "hydrogen", "pro", "flash-lite"], "Ultra account must see all models");
+  assert.deepEqual(values(optById(r6, "model")), ["neon", "carbon", "hydrogen", "pro", "flash-lite"], "Ultra account must see all models");
   assert.equal(optById(r6, "account").currentValue, "ultra-1");
 
   // Case 4: switching to carbon while a pro account is explicitly selected
@@ -2425,7 +2431,7 @@ test("16. PLUG-280 model↔account selector filtering and incompatibility resets
   assert.deepEqual(values(optById(r9, "account")), ["auto", "ultra-1", "ultra-2"]);
   sendReq({ jsonrpc: "2.0", id: 10, method: "session/set_config_option", params: { sessionId, configId: "account", value: "pro-1" } });
   const r10 = await waitForResponse(10);
-  assert.equal(optById(r10, "model").currentValue, "argon", "Locked model must reset to argon");
+  assert.equal(optById(r10, "model").currentValue, "neon", "Locked model must reset to neon");
   assert.ok(!values(optById(r10, "model")).includes("hydrogen"), "lockedModels entry must hide the model");
   assert.ok(!values(optById(r10, "model")).includes("carbon"), "pro tier must still hide carbon");
 
@@ -2646,7 +2652,7 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
     waitForTimeout: async () => {},
     keyboard: { press: async () => {} },
   };
-  await selectModelAndThinking(mockPageUnlock, "argon", null, true);
+  await selectModelAndThinking(mockPageUnlock, "neon", null, true);
   assert.equal(clickedUnlock, true, "Item with an 'unlock' class icon must be clicked, not locked");
 
   // Promo dialog after a click, model not reflected in the picker yet →
@@ -2681,7 +2687,7 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   };
   globalThis.document = promoDoc;
   try {
-    await selectModelAndThinking(mockPagePromo, "argon", null, true);
+    await selectModelAndThinking(mockPagePromo, "neon", null, true);
   } finally {
     delete globalThis.document;
   }
@@ -2713,11 +2719,11 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   globalThis.document = upsellDoc;
   try {
     await assert.rejects(
-      async () => selectModelAndThinking(mockPageUpsell, "argon", null, true),
+      async () => selectModelAndThinking(mockPageUpsell, "neon", null, true),
       (err) => {
         assert.ok(err instanceof ModelUnavailable);
         assert.equal(err.isLocked, true);
-        assert.equal(err.lockedModel, "argon");
+        assert.equal(err.lockedModel, "neon");
         return true;
       }
     );
@@ -2747,7 +2753,7 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   };
   globalThis.document = doc(preDialogs);
   try {
-    await selectModelAndThinking(mockPagePre, "argon", null, true);
+    await selectModelAndThinking(mockPagePre, "neon", null, true);
   } finally {
     delete globalThis.document;
   }
@@ -2776,7 +2782,7 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   };
   globalThis.document = upsellDoc;
   try {
-    await selectModelAndThinking(mockPageSelected, "argon", null, true);
+    await selectModelAndThinking(mockPageSelected, "neon", null, true);
   } finally {
     delete globalThis.document;
   }
@@ -2798,7 +2804,7 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
             tier: "pro",
             parkedReason: "model-unavailable",
           },
-          "pro-1": { cooldownUntilMs: 0, lastUsedMs: 2, lastError: null, lockedModels: ["argon", "hydrogen"] },
+          "pro-1": { cooldownUntilMs: 0, lastUsedMs: 2, lastError: null, lockedModels: ["neon", "hydrogen"] },
         },
         leases: {},
       }) + "\n"
@@ -2809,7 +2815,7 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   const readState = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
 
   writeUnlockState();
-  runUnlock("pro-1 argon");
+  runUnlock("pro-1 neon");
   let st = readState();
   assert.deepEqual(st.accounts["pro-1"].lockedModels, ["hydrogen"], "unlock <id> <model> removes only that model");
   assert.deepEqual(st.accounts["ultra-1"].lockedModels, ["carbon"], "unlock <id> leaves other accounts untouched");
@@ -3018,14 +3024,14 @@ test("19. PLUG-286: driver/page failures are transient — never model-unavailab
 
   // DOM-proven signs still classify as before: upsell/lock → model-locked
   // (no park, lockedModels entry); missing item → model-unavailable + 6h.
-  const locked = new ModelUnavailable("model", "argon locked: paid upgrade required");
+  const locked = new ModelUnavailable("model", "neon locked: paid upgrade required");
   locked.isLocked = true;
-  locked.lockedModel = "argon";
+  locked.lockedModel = "neon";
   const cLocked = classifyFailure(locked);
   assert.equal(cLocked.category, "model-locked");
   assert.equal(cLocked.parkedReason, null);
 
-  const missing = new ModelUnavailable("model", "argon not in picker");
+  const missing = new ModelUnavailable("model", "neon not in picker");
   const cMissing = classifyFailure(missing);
   assert.equal(cMissing.category, "model-unavailable");
   assert.equal(cMissing.parkedReason, "model-unavailable");

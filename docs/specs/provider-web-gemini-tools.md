@@ -3,7 +3,7 @@ title: provider-web-gemini-tools — Инструменты чтения для 
 status: approved
 owner: coordinator
 date: 2026-11-18
-revision: 6
+revision: 7 (r7 — каноническое имя модели `neon`, `argon` — псевдоним; слово владельца 20.11)
 tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini, tools]
 ---
 
@@ -30,7 +30,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini, tools]
 ## 1. Модели и уровни рассуждений
 
 Список моделей провайдера в ACP (`models.availableModels`) строго соответствует официальному меню Gemini:
-- `'argon'` — «Gemini 4 Argon» (Код и анализ, модель по умолчанию)
+- `'neon'` — «Gemini 4 Neon» (Глубокий анализ, модель по умолчанию; `argon` — псевдоним обратной совместимости)
 - `'carbon'` — «Gemini 4 Carbon» (Самые сложные задачи, тариф Ultra)
 - `'hydrogen'` — «Gemini 4 Hydrogen» (Повседневные дела)
 - `'pro'` — «Gemini 3.1 Pro» (Исследования)
