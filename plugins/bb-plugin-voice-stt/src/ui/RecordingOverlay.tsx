@@ -414,6 +414,13 @@ export function RecordingOverlay() {
     return () => clearInterval(t);
   }, [active]);
 
+  // Ошибка не должна вечно висеть поверх ввода — уходит сама через 8 с.
+  useEffect(() => {
+    if (view.phase !== "error") return;
+    const t = setTimeout(() => voiceRecorder.dismiss(), 8000);
+    return () => clearTimeout(t);
+  }, [view.phase]);
+
   const recording = view.phase === "recording" || view.phase === "reconnecting";
   const hint = cardHint(view);
   const body = recording
@@ -437,7 +444,14 @@ export function RecordingOverlay() {
           role="status"
           aria-live="polite"
           // Над клавиатурой: базовый отступ 96px + закрытая снизу часть окна.
-          style={area.keyboard > 0 ? { bottom: 96 + area.keyboard } : undefined}
+          // Ошибка — вверху видимой области: не перекрывает поле ввода.
+          style={
+            view.phase === "error"
+              ? { top: area.y + 12, bottom: "auto" }
+              : area.keyboard > 0
+                ? { bottom: 96 + area.keyboard }
+                : undefined
+          }
         >
           <button
             type="button"

@@ -9,7 +9,9 @@
   left: 50%;
   bottom: 96px;
   transform: translateX(-50%);
-  z-index: 60;
+  /* Над хромой BB (композер/шапка до ~71 — замерено live-call): иначе
+     плашка просвечивает под прозрачными элементами, а тапы съедаются. */
+  z-index: 80;
   width: 420px;
   max-width: calc(100vw - 32px);
   font-family: var(--font-sans);
@@ -155,7 +157,8 @@
   position: fixed;
   right: 12px;
   top: calc(50% - 26px);
-  z-index: 61;
+  /* Выше .vsl-overlay (80): стоп-кнопка доступна и поверх плашки. */
+  z-index: 81;
   display: inline-flex;
   align-items: center;
   justify-content: center;
