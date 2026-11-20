@@ -1,0 +1,1221 @@
+/**
+ * Regression harness for PLUG-357: fixes 5 blockers from Codex review.
+ * 
+ * Blocker 1: Compaction fallback refusal handling during summary (429 / quota text).
+ * Blocker 2: Prefix buffering, held textClose, marker confirmation on turn.boundary.
+ * Blocker 3: Direct mode 429 rate limit clamping (30m max) & immediate rejection of queued/incoming turns.
+ * Blocker 4: SSH_CONNECTION filtering (pool drops user SSH_CONNECTION, direct preserves, AGY_KEYRING=1 preserves).
+ * Blocker 5: listAgyModels install.env does not override pool file token marker.
+ *
+ * Usage: node harness-plug357.mjs
+ */
+import { mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+
+installTeardown();
+
+const {
+  AGENT_QUOTA_PREFIX_PATTERN,
+  AGENT_VALIDATION_PREFIX_PATTERN,
+  isAgentMarkerCandidate,
+} = await import(new URL("./src/accounts.ts", import.meta.url).href);
+
+const checks = [];
+const check = (name, ok, detail = "") => {
+  checks.push([name, Boolean(ok), detail]);
+  const status = ok ? "pass" : "FAIL";
+  process.stderr.write(`${status} ${name} ${detail}\n`);
+};
+
+// ============================================================================
+// PART 1: Unit tests for regex & marker candidate patterns
+// ============================================================================
+{
+  // Quota regex
+  check("regex/quota-prefix-compiled", AGENT_QUOTA_PREFIX_PATTERN instanceof RegExp);
+  check("regex/quota-prefix-matches-start", AGENT_QUOTA_PREFIX_PATTERN.test("⚠ "));
+  check("regex/quota-prefix-matches-partial", AGENT_QUOTA_PREFIX_PATTERN.test("⚠ Individual qu"));
+  check("regex/quota-prefix-matches-full", AGENT_QUOTA_PREFIX_PATTERN.test("⚠ Individual quota reached"));
+  check("regex/quota-prefix-diverges-note", !AGENT_QUOTA_PREFIX_PATTERN.test("⚠ Note:"));
+
+  // Validation regex
+  check("regex/val-prefix-compiled", AGENT_VALIDATION_PREFIX_PATTERN instanceof RegExp);
+  check("regex/val-prefix-matches-start", AGENT_VALIDATION_PREFIX_PATTERN.test("⚠ "));
+  check("regex/val-prefix-matches-partial", AGENT_VALIDATION_PREFIX_PATTERN.test("⚠ Verification Re"));
+  check("regex/val-prefix-matches-full", AGENT_VALIDATION_PREFIX_PATTERN.test("⚠ Verification Required"));
+  check("regex/val-prefix-diverges-note", !AGENT_VALIDATION_PREFIX_PATTERN.test("⚠ Note:"));
+
+  // isAgentMarkerCandidate
+  check("candidate/empty-or-ws", isAgentMarkerCandidate("  \n  ") === true);
+  check("candidate/quota-prefix", isAgentMarkerCandidate("⚠ Individ") === true);
+  check("candidate/quota-full", isAgentMarkerCandidate("⚠ Individual quota reached. Resets in 12h.") === true);
+  check("candidate/val-prefix", isAgentMarkerCandidate("⚠ Verif") === true);
+  check("candidate/val-full", isAgentMarkerCandidate("⚠ Verification Required") === true);
+  check("candidate/diverged", isAgentMarkerCandidate("⚠ Note: hello") === false);
+  check("candidate/multiline-diverged", isAgentMarkerCandidate("⚠ Individual quota\nhello") === false);
+}
+
+// ============================================================================
+// PART 2: Integration tests driving ACP bridge
+// ============================================================================
+const root = trackedMkdtemp(join(tmpdir(), "agy-plug357-"));
+const workspace = join(root, "ws");
+mkdirSync(workspace, { recursive: true });
+const shim = join(root, "agy-bin");
+const fake = new URL("./fake-agy-acp.mjs", import.meta.url).pathname;
+writeFileSync(shim, `#!/bin/sh\nexec /usr/bin/node ${fake} "$@"\n`);
+chmodSync(shim, 0o755);
+process.env.AGY_PATH = shim;
+process.env.AGY_CLIPROXY = "0";
+process.env.AGY_FAKE_TRANSCRIPT = join(root, "transcript.ndjson");
+process.env.AGY_FAKE_RECORD_ENV = "HOME,HTTPS_PROXY,SSH_CONNECTION";
+process.env.AGY_FAKE_QUOTA_MSG = "Quota exhausted; retry later. Resets in 127h43m16s.";
+process.env.AGY_FAKE_CONTROL = join(root, "control.json");
+writeFileSync(process.env.AGY_FAKE_CONTROL, "{}\n");
+const setControl = (obj) => {
+  const c = JSON.parse(readFileSync(process.env.AGY_FAKE_CONTROL, "utf8"));
+  Object.assign(c, obj);
+  writeFileSync(process.env.AGY_FAKE_CONTROL, JSON.stringify(c));
+};
+
+// Create pool accounts a1..a3
+for (const label of ["a1", "a2", "a3"]) {
+  const cli = join(root, "accounts", label, ".gemini", "antigravity-cli");
+  mkdirSync(cli, { recursive: true });
+  writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
+}
+
+const transcriptLines = () =>
+  existsSync(join(root, "transcript.ndjson"))
+    ? readFileSync(join(root, "transcript.ndjson"), "utf8")
+        .split("\n")
+        .filter((l) => l.trim())
+        .map((l) => {
+          try {
+            return JSON.parse(l);
+          } catch {
+            return {};
+          }
+        })
+    : [];
+const prompts = (home) => transcriptLines().filter((l) => l.method === "session/prompt" && l.home === home);
+const ptxt = (p) => (p?.params?.prompt ?? []).map((b) => b.text ?? "").join("\n");
+const ledger = () => {
+  let shared = { accounts: {}, conversations: {} };
+  try {
+    shared = JSON.parse(readFileSync(join(root, "accounts-state.json"), "utf8"));
+  } catch {}
+  let local = {};
+  try {
+    local = JSON.parse(readFileSync(join(root, "conversations-state.json"), "utf8")).conversations ?? {};
+  } catch {}
+  return { ...shared, accounts: shared.accounts ?? {}, conversations: { ...(shared.conversations ?? {}), ...local } };
+};
+const writeShared = (l) => {
+  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(l));
+  try { unlinkSync(join(root, "accounts-overlay.json")); } catch {}
+  try { unlinkSync(join(root, "conversations-state.json")); } catch {}
+};
+const resetAcpPool = () => {
+  const l = ledger();
+  for (const a of ["a1", "a2", "a3"]) {
+    l.accounts[a] = { cooldownUntilMs: 0, lastUsedMs: a === "a1" ? 0 : 1_700_000_000_000, lastError: null };
+    delete l.accounts[a].parkedReason;
+    delete l.accounts[a].ineligibleAtMs;
+  }
+  writeShared(l);
+};
+
+const messages = [];
+const originalWrite = process.stdout.write.bind(process.stdout);
+let tail = "";
+process.stdout.write = (chunk) => {
+  tail += typeof chunk === "string" ? chunk : chunk.toString();
+  for (;;) {
+    const nl = tail.indexOf("\n");
+    if (nl === -1) break;
+    const line = tail.slice(0, nl);
+    tail = tail.slice(nl + 1);
+    if (line.trim().length === 0) continue;
+    try {
+      messages.push(JSON.parse(line));
+    } catch {
+      messages.push({ __nonJson: line });
+    }
+  }
+  return true;
+};
+
+const { experimental_providerBridge: bridge } = await import(new URL("./dist/host.js", import.meta.url).href);
+bridge.start?.({ pluginId: "provider-agy", dataDir: root, tempDir: root });
+const send = (m) => bridge.handleLine(JSON.stringify(m));
+
+const options = {
+  model: "fake-model",
+  permissionMode: "full",
+  permissionScope: "full",
+  approvalReviewer: null,
+  permissionEscalation: null,
+};
+const ALPHABET = "23456789abcdefghijkmnpqrstuvwxyz";
+let creqN = 0;
+const creq = () => {
+  let n = ++creqN;
+  let s = "";
+  for (let i = 0; i < 10; i++) {
+    s += ALPHABET[n % ALPHABET.length];
+    n = Math.floor(n / ALPHABET.length) + (i + 1);
+  }
+  return `creq_${s}`;
+};
+const deltas = (tid) => messages.filter((m) => m.method === "thread/delta" && m.params.threadId === tid).flatMap((m) => m.params.deltas);
+const boundaries = (tid) => deltas(tid).filter((d) => d.kind === "turn.boundary");
+const lastPtid = (tid) =>
+  messages
+    .filter((m) => m.method === "thread/identity" && m.params.threadId === tid)
+    .at(-1)?.params?.providerThreadId;
+const perrors = (tid) => deltas(tid).filter((d) => d.kind === "provider.error");
+const rateLimits = (tid) => deltas(tid).filter((d) => d.kind === "provider.rateLimits");
+const replies = (id) => messages.filter((m) => m.id === id && (m.result !== undefined || m.error !== undefined));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(pred, ms, label) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    if (pred()) return;
+    if (Date.now() > deadline) {
+      process.stderr.write(`!!! timeout: ${label}\n`);
+      for (const m of messages.slice(-30)) process.stderr.write(JSON.stringify(m).slice(0, 300) + "\n");
+      process.exit(2);
+    }
+    await sleep(40);
+  }
+}
+const start = (id, tid, customOpts = options) =>
+  send({ jsonrpc: "2.0", id, method: "thread/start", params: { threadId: tid, cwd: workspace, options: customOpts, instructionMode: "append" } });
+
+// ----------------------------------------------------------------------------
+// BLOCKER 1: Compaction fallback refusal handling during summary
+// ----------------------------------------------------------------------------
+// Test 1a: summaryMode: "quota" (HTTP 429 during summary)
+{
+  resetAcpPool();
+  start(100, "t-b1-quota");
+  await waitFor(() => replies(100).length === 1, 20000, "t-b1-quota start");
+  const ptid = replies(100)[0].result.providerThreadId;
+
+  // Initial turn so session has context to compact
+  send({
+    jsonrpc: "2.0",
+    id: 99,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-quota",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "initial turn text", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-quota").length >= 1, 20000, "t-b1-quota initial turn");
+
+  // Run /compact with fallback summary failing with quota 429
+  setControl({ compactMode: "fail", summaryMode: "quota" });
+  const compactMention = {
+    start: 0,
+    end: 8,
+    resource: { kind: "command", trigger: "/", name: "compact", source: "command", origin: "builtin", label: "/compact", argumentHint: null },
+  };
+  send({
+    jsonrpc: "2.0",
+    id: 101,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-quota",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "/compact", mentions: [compactMention] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b1-quota").length >= 3, 30000, "t-b1-quota compact finished");
+  const l = ledger();
+  const a1Cooled = (l.accounts.a1?.cooldownUntilMs ?? 0) > Date.now();
+  const transcript = transcriptLines();
+  const phantomTurns = transcript.filter((t) => ptxt(t).includes("[quota-rotation-handoff]"));
+
+  check("blocker1/summary-quota-429-cools-owner", a1Cooled, `cooldownUntilMs=${l.accounts.a1?.cooldownUntilMs}`);
+  check("blocker1/summary-quota-429-no-phantom-turn", phantomTurns.length === 0, `phantomTurns=${phantomTurns.length}`);
+  check("blocker1/summary-quota-429-compact-completed", boundaries("t-b1-quota").at(-1)?.status === "completed");
+  setControl({ compactMode: "ok", summaryMode: "ok" });
+
+  // Next turn/start after quota on compact-summary must succeed cleanly
+  send({
+    jsonrpc: "2.0",
+    id: 102,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-quota",
+      providerThreadId: lastPtid("t-b1-quota"),
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "next turn after compact", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-quota").length >= 4, 30000, "t-b1-quota next turn");
+  check("blocker1/summary-quota-next-turn-succeeds", boundaries("t-b1-quota").at(-1)?.status === "completed");
+}
+
+// Test 1b: summaryMode: "quota-text" (refusal marker in text during summary)
+{
+  resetAcpPool();
+  start(110, "t-b1-quotatext");
+  await waitFor(() => replies(110).length === 1, 20000, "t-b1-quotatext start");
+  const ptid = replies(110)[0].result.providerThreadId;
+
+  // Initial turn so session has context to compact
+  send({
+    jsonrpc: "2.0",
+    id: 109,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-quotatext",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "initial turn text", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-quotatext").length >= 1, 20000, "t-b1-quotatext initial turn");
+
+  setControl({ compactMode: "fail", summaryMode: "quota-text" });
+  const compactMention = {
+    start: 0,
+    end: 8,
+    resource: { kind: "command", trigger: "/", name: "compact", source: "command", origin: "builtin", label: "/compact", argumentHint: null },
+  };
+  send({
+    jsonrpc: "2.0",
+    id: 111,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-quotatext",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "/compact", mentions: [compactMention] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b1-quotatext").length >= 3, 30000, "t-b1-quotatext compact finished");
+  const l = ledger();
+  const a1Cooled = (l.accounts.a1?.cooldownUntilMs ?? 0) > Date.now();
+  const transcript = transcriptLines();
+  const phantomTurns = transcript.filter((t) => ptxt(t).includes("[quota-rotation-handoff]"));
+
+  check("blocker1/summary-quota-text-cools-owner", a1Cooled, `cooldownUntilMs=${l.accounts.a1?.cooldownUntilMs}`);
+  check("blocker1/summary-quota-text-no-phantom-turn", phantomTurns.length === 0, `phantomTurns=${phantomTurns.length}`);
+  check("blocker1/summary-quota-text-compact-completed", boundaries("t-b1-quotatext").at(-1)?.status === "completed");
+  setControl({ compactMode: "ok", summaryMode: "ok" });
+
+  // Next turn/start after quota-text on compact-summary
+  send({
+    jsonrpc: "2.0",
+    id: 112,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-quotatext",
+      providerThreadId: lastPtid("t-b1-quotatext"),
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "next turn after compact text", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-quotatext").length >= 4, 30000, "t-b1-quotatext next turn");
+  check("blocker1/summary-quotatext-next-turn-succeeds", boundaries("t-b1-quotatext").at(-1)?.status === "completed");
+}
+
+// Test 1c: seedMode: "quota" (HTTP 429 during compact-seed)
+{
+  resetAcpPool();
+  start(120, "t-b1-seedquota");
+  await waitFor(() => replies(120).length === 1, 20000, "t-b1-seedquota start");
+  const ptid = replies(120)[0].result.providerThreadId;
+
+  // Initial turn so session has context to compact
+  send({
+    jsonrpc: "2.0",
+    id: 119,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-seedquota",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "initial turn text", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-seedquota").length >= 1, 20000, "t-b1-seedquota initial turn");
+
+  setControl({ compactMode: "fail", summaryMode: "ok", seedMode: "quota" });
+  const compactMention = {
+    start: 0,
+    end: 8,
+    resource: { kind: "command", trigger: "/", name: "compact", source: "command", origin: "builtin", label: "/compact", argumentHint: null },
+  };
+  send({
+    jsonrpc: "2.0",
+    id: 121,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-seedquota",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "/compact", mentions: [compactMention] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b1-seedquota").length >= 4, 30000, "t-b1-seedquota compact finished");
+  const l = ledger();
+  const a1Cooled = (l.accounts.a1?.cooldownUntilMs ?? 0) > Date.now();
+  const transcript = transcriptLines();
+  const phantomTurns = transcript.filter((t) => ptxt(t).includes("[quota-rotation-handoff]"));
+
+  check("blocker1/seed-quota-cools-owner", a1Cooled, `cooldownUntilMs=${l.accounts.a1?.cooldownUntilMs}`);
+  check("blocker1/seed-quota-no-phantom-turn", phantomTurns.length === 0, `phantomTurns=${phantomTurns.length}`);
+  check("blocker1/seed-quota-compact-completed", boundaries("t-b1-seedquota").at(-1)?.status === "completed");
+  setControl({ compactMode: "ok", summaryMode: "ok", seedMode: "ok" });
+
+  // Next turn after seed quota
+  send({
+    jsonrpc: "2.0",
+    id: 122,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-seedquota",
+      providerThreadId: lastPtid("t-b1-seedquota"),
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "next turn after seed compact", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-seedquota").length >= 5, 30000, "t-b1-seedquota next turn");
+  check("blocker1/seed-quota-next-turn-succeeds", boundaries("t-b1-seedquota").at(-1)?.status === "completed");
+}
+
+// Test 1d: model update during compaction queues and runs with new model
+{
+  resetAcpPool();
+  start(130, "t-b1-model-compact");
+  await waitFor(() => replies(130).length === 1, 20000, "t-b1-model-compact start");
+  const ptid = replies(130)[0].result.providerThreadId;
+
+  // Initial turn
+  send({
+    jsonrpc: "2.0",
+    id: 131,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-model-compact",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "initial turn text", mentions: [] }],
+    },
+  });
+  await waitFor(() => boundaries("t-b1-model-compact").length >= 1, 20000, "t-b1-model-compact initial");
+
+  setControl({ compactMode: "fail", summaryMode: "ok", seedMode: "ok" });
+  const compactMention = {
+    start: 0,
+    end: 8,
+    resource: { kind: "command", trigger: "/", name: "compact", source: "command", origin: "builtin", label: "/compact", argumentHint: null },
+  };
+  // Start compaction
+  send({
+    jsonrpc: "2.0",
+    id: 132,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-model-compact",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "/compact", mentions: [compactMention] }],
+    },
+  });
+
+  // While compaction is running, send turn with updated model
+  const newModelOpts = { ...options, model: "custom-model" };
+  send({
+    jsonrpc: "2.0",
+    id: 133,
+    method: "turn/start",
+    params: {
+      threadId: "t-b1-model-compact",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options: newModelOpts,
+      input: [{ type: "text", text: "queued turn with new model", mentions: [] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b1-model-compact").length >= 5, 30000, "t-b1-model-compact all finished");
+  check("blocker1/model-update-during-compaction-succeeds", boundaries("t-b1-model-compact").at(-1)?.status === "completed");
+  const modelLines = transcriptLines().filter((l) => JSON.stringify(l).includes("custom-model"));
+  check("blocker1/model-update-during-compaction-applied", modelLines.length > 0, `modelLines=${modelLines.length}`);
+  setControl({ compactMode: "ok", summaryMode: "ok", seedMode: "ok" });
+}
+
+// ----------------------------------------------------------------------------
+// BLOCKER 2: Prefix buffering & heldTextClose
+// ----------------------------------------------------------------------------
+// Test 2a: [[quota-chunked]] - candidate prefix never leaks to client deltas
+{
+  resetAcpPool();
+  start(200, "t-b2-quota");
+  await waitFor(() => replies(200).length === 1, 20000, "t-b2-quota start");
+  const ptid = replies(200)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 201,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-quota",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[quota-chunked]]", mentions: [] }],
+    },
+  });
+
+  // Wait for retry completion on sibling a2
+  await waitFor(() => boundaries("t-b2-quota").length >= 1, 30000, "t-b2-quota completed");
+  const dList = deltas("t-b2-quota");
+  const leakedQuotaText = dList.some(
+    (d) =>
+      d.kind === "text" ||
+      (d.kind === "item.textDelta" && typeof d.text === "string" && (d.text.includes("Individual quota reached") || d.text.trim() === "⚠"))
+  );
+  check("blocker2/quota-chunked-no-leak", !leakedQuotaText, `deltas=${JSON.stringify(dList.map((d) => d.kind))}`);
+  check("blocker2/quota-chunked-rotated", ledger().accounts.a1?.cooldownUntilMs > Date.now());
+}
+
+// Test 2b: [[validation-chunked]] - marker never leaks, account parked
+{
+  resetAcpPool();
+  start(210, "t-b2-val");
+  await waitFor(() => replies(210).length === 1, 20000, "t-b2-val start");
+  const ptid = replies(210)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 211,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-val",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[validation-chunked]]", mentions: [] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b2-val").length >= 1, 30000, "t-b2-val completed");
+  const dList = deltas("t-b2-val");
+  const leakedValText = dList.some(
+    (d) =>
+      d.kind === "text" ||
+      (d.kind === "item.textDelta" && typeof d.text === "string" && (d.text.includes("Verification Required") || d.text.trim() === "⚠"))
+  );
+  check("blocker2/val-chunked-no-leak", !leakedValText);
+  check("blocker2/val-chunked-parked", ledger().accounts.a1?.parkedReason === "validation-required");
+}
+
+// Test 2c: [[divergence-chunked]] - candidate prefix followed by normal text IS delivered
+{
+  resetAcpPool();
+  start(220, "t-b2-div");
+  await waitFor(() => replies(220).length === 1, 20000, "t-b2-div start");
+  const ptid = replies(220)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 221,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-div",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[divergence-chunked]]", mentions: [] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b2-div").length >= 1, 30000, "t-b2-div completed");
+  const textDeltas = deltas("t-b2-div").filter((d) => d.kind === "item.textDelta").map((d) => d.text).join("");
+  check("blocker2/divergence-flushed", textDeltas.includes("⚠ ") && textDeltas.includes("Note: here is normal answer"), `text=${textDeltas}`);
+  check("blocker2/divergence-no-rotation", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+}
+
+// Test 2d: [[quota-followed-by-tool]] - tool call flushes candidate buffer with textClose
+{
+  resetAcpPool();
+  start(230, "t-b2-tool");
+  await waitFor(() => replies(230).length === 1, 20000, "t-b2-tool start");
+  const ptid = replies(230)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 231,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-tool",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[quota-followed-by-tool]]", mentions: [] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b2-tool").length >= 1, 30000, "t-b2-tool completed");
+  const dList = deltas("t-b2-tool");
+  const hasToolCall = dList.some((d) => d.kind === "toolCall" || (d.kind === "item.open" && d.item?.type === "command"));
+  const hasTextClose = dList.some((d) => d.kind === "item.textClose");
+  check("blocker2/followed-by-tool-has-toolcall", hasToolCall && hasTextClose, `kinds=${dList.map((d) => d.kind).join(",")}`);
+  check("blocker2/followed-by-tool-no-refusal", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+}
+
+// Test 2e: [[quota-marker-tool-text]] - full marker with Resets in... -> tool -> text without leading \n
+{
+  resetAcpPool();
+  start(240, "t-b2-marker-tool-text");
+  await waitFor(() => replies(240).length === 1, 20000, "t-b2-marker-tool-text start");
+  const ptid = replies(240)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 241,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-marker-tool-text",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[quota-marker-tool-text]]", mentions: [] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b2-marker-tool-text").length >= 1, 30000, "t-b2-marker-tool-text completed");
+  const dList = deltas("t-b2-marker-tool-text");
+  const textDeltas = dList.filter((d) => d.kind === "item.textDelta").map((d) => d.text).join("");
+  check(
+    "blocker2/marker-tool-text-both-delivered",
+    textDeltas.includes("Individual quota reached") && textDeltas.includes("AUDIT-FINAL-ANSWER"),
+    `text=${textDeltas}`
+  );
+  check("blocker2/marker-tool-text-no-rotation", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+  check("blocker2/marker-tool-text-turn-completed", boundaries("t-b2-marker-tool-text").at(-1)?.status === "completed");
+}
+
+// Test 2f: [[multiline-after-marker]] - newline with non-whitespace diverged, delivered, no rotation
+{
+  resetAcpPool();
+  start(250, "t-b2-multiline");
+  await waitFor(() => replies(250).length === 1, 20000, "t-b2-multiline start");
+  const ptid = replies(250)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 251,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-multiline",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[multiline-after-marker]]", mentions: [] }],
+    },
+  });
+
+  await waitFor(() => boundaries("t-b2-multiline").length >= 1, 30000, "t-b2-multiline completed");
+  const dList = deltas("t-b2-multiline");
+  const textDeltas = dList.filter((d) => d.kind === "item.textDelta").map((d) => d.text).join("");
+  check(
+    "blocker2/multiline-marker-delivered",
+    textDeltas.includes("Individual quota reached") && textDeltas.includes("Here is line 2"),
+    `text=${textDeltas}`
+  );
+  check("blocker2/multiline-marker-no-rotation", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+}
+
+// Test 2g: turn/steer - unconfirmed candidate buffer flushed, detector state reset
+{
+  resetAcpPool();
+  start(260, "t-b2-steer");
+  await waitFor(() => replies(260).length === 1, 20000, "t-b2-steer start");
+  const ptid = replies(260)[0].result.providerThreadId;
+
+  // Turn with [[steer-marker]] — outputs quota candidate prefix and pauses
+  send({
+    jsonrpc: "2.0",
+    id: 261,
+    method: "turn/start",
+    params: { threadId: "t-b2-steer", providerThreadId: ptid, clientRequestId: creq(), options, input: [{ type: "text", text: "[[steer-marker]]", mentions: [] }] },
+  });
+  await waitFor(() => deltas("t-b2-steer").some((d) => d.kind === "turn.open"), 10000, "t-b2-steer turn.open");
+  const to = deltas("t-b2-steer").find((d) => d.kind === "turn.open");
+  const liveTurnId = to?.turnId ?? to?.providerTurnId ?? "turn-1";
+  await sleep(200);
+
+  // Send turn/steer while candidate is buffered
+  send({
+    jsonrpc: "2.0",
+    id: 262,
+    method: "turn/steer",
+    params: {
+      threadId: "t-b2-steer",
+      providerThreadId: ptid,
+      expectedTurnId: liveTurnId,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "steered input", mentions: [] }],
+    },
+  });
+  await waitFor(() => replies(262).length >= 1, 20000, "t-b2-steer replied");
+  await waitFor(
+    () => deltas("t-b2-steer").map((d) => d.text ?? "").join("").includes("STEER-ANSWER"),
+    20000,
+    "t-b2-steer STEER-ANSWER arrived"
+  );
+  await waitFor(() => boundaries("t-b2-steer").length >= 1, 20000, "t-b2-steer finished");
+  const steerTexts = deltas("t-b2-steer").map((d) => d.text ?? "").join("");
+  check("blocker2/steer-processed", steerTexts.includes("STEER-ANSWER"), `steerTexts=${steerTexts}`);
+  check("blocker2/steer-flushed-candidate", steerTexts.includes("⚠ Individual quota reached"), `steerTexts=${steerTexts}`);
+  check("blocker2/steer-no-rotation", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+  check("blocker2/steer-turn-completed", boundaries("t-b2-steer").at(-1)?.status === "completed");
+}
+
+// Test 2h: thread/stop clears state while candidate is in buffer
+{
+  resetAcpPool();
+  start(270, "t-b2-stop");
+  await waitFor(() => replies(270).length === 1, 20000, "t-b2-stop start");
+  const ptid = replies(270)[0].result.providerThreadId;
+
+  // Turn with [[stop-marker]] — outputs quota candidate prefix and pauses
+  send({
+    jsonrpc: "2.0",
+    id: 271,
+    method: "turn/start",
+    params: { threadId: "t-b2-stop", providerThreadId: ptid, clientRequestId: creq(), options, input: [{ type: "text", text: "[[stop-marker]]", mentions: [] }] },
+  });
+  await sleep(200);
+
+  send({
+    jsonrpc: "2.0",
+    id: 272,
+    method: "thread/stop",
+    params: { threadId: "t-b2-stop", providerThreadId: ptid, intent: "interrupt", activeTurnId: "turn-1" },
+  });
+  await waitFor(() => replies(272).length === 1, 20000, "t-b2-stop replied");
+  await sleep(200);
+
+  const stopTexts = deltas("t-b2-stop").map((d) => d.text ?? "").join("");
+  const closes = deltas("t-b2-stop").filter((d) => d.kind === "item.textClose" && d.channel === "agentMessage");
+  check("blocker2/stop-discards-session", replies(272).length === 1);
+  check("blocker2/stop-no-marker-leak", !stopTexts.includes("⚠"));
+  check("blocker2/stop-no-held-close-leak", closes.length === 0, `closes=${JSON.stringify(closes)}`);
+  check("blocker2/stop-no-cooldown", (ledger().accounts.a1?.cooldownUntilMs ?? 0) <= Date.now());
+  check("blocker2/stop-no-rotation", !messages.some((m) => m.method === "session/replaced" && m.params.threadId === "t-b2-stop"));
+}
+
+// Test 2i: thread/stop on normal streaming answer preserves textClose
+{
+  resetAcpPool();
+  start(280, "t-b2-normal-stop");
+  await waitFor(() => replies(280).length === 1, 20000, "t-b2-normal-stop start");
+  const ptid = replies(280)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 281,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-normal-stop",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[normal-stop]]", mentions: [] }],
+    },
+  });
+  await waitFor(
+    () => deltas("t-b2-normal-stop").some((d) => d.kind === "item.textDelta" && (d.text ?? "").includes("normal")),
+    20000,
+    "t-b2-normal-stop partial answer arrived"
+  );
+
+  const liveTurnId = deltas("t-b2-normal-stop").find((d) => d.kind === "turn.open")?.providerTurnId ?? "turn-1";
+  send({
+    jsonrpc: "2.0",
+    id: 282,
+    method: "thread/stop",
+    params: { threadId: "t-b2-normal-stop", providerThreadId: ptid, intent: "interrupt", activeTurnId: liveTurnId },
+  });
+  await waitFor(() => replies(282).length === 1, 20000, "t-b2-normal-stop replied");
+  await waitFor(() => boundaries("t-b2-normal-stop").length >= 1, 20000, "t-b2-normal-stop boundary");
+
+  const normalTexts = deltas("t-b2-normal-stop").filter((d) => d.kind === "item.textDelta").map((d) => d.text ?? "").join("");
+  const closes = deltas("t-b2-normal-stop").filter((d) => d.kind === "item.textClose" && d.channel === "agentMessage");
+  check("blocker2/normal-stop-streamed-text", normalTexts.includes("normal partial answer"), `normalTexts=${normalTexts}`);
+  check("blocker2/normal-stop-has-text-close", closes.length >= 1, `closes=${JSON.stringify(closes)}`);
+  check("blocker2/normal-stop-boundary-interrupted", boundaries("t-b2-normal-stop").at(-1)?.status === "interrupted");
+}
+
+// Test 2j: thread/discard mid-turn followed by turn/start fails fast with -32000
+{
+  resetAcpPool();
+  start(290, "t-b2-discard-turn");
+  await waitFor(() => replies(290).length === 1, 20000, "t-b2-discard-turn start");
+  const ptid = replies(290)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 291,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-discard-turn",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "[[normal-stop]]", mentions: [] }],
+    },
+  });
+  await waitFor(
+    () => deltas("t-b2-discard-turn").some((d) => d.kind === "item.textDelta" && (d.text ?? "").includes("normal")),
+    20000,
+    "t-b2-discard-turn partial answer arrived"
+  );
+
+  // Send thread/discard mid-turn
+  send({
+    jsonrpc: "2.0",
+    id: 292,
+    method: "thread/discard",
+    params: { threadId: "t-b2-discard-turn" },
+  });
+  await waitFor(() => replies(292).length === 1, 20000, "t-b2-discard-turn discard replied");
+
+  // Subsequent turn/start must fail fast (-32000), NOT hang in queue
+  send({
+    jsonrpc: "2.0",
+    id: 293,
+    method: "turn/start",
+    params: {
+      threadId: "t-b2-discard-turn",
+      providerThreadId: ptid,
+      clientRequestId: creq(),
+      options,
+      input: [{ type: "text", text: "after discard", mentions: [] }],
+    },
+  });
+  await waitFor(() => replies(293).length === 1, 20000, "t-b2-discard-turn after-discard turn/start replied");
+  const reply293 = replies(293)[0];
+  check(
+    "blocker2/discard-midturn-turn-start-fails-fast",
+    reply293?.error?.code === -32000,
+    `reply=${JSON.stringify(reply293)}`
+  );
+}
+
+// ----------------------------------------------------------------------------
+// BLOCKER 4: SSH_CONNECTION filtering
+// ----------------------------------------------------------------------------
+// Test 4a: Pool account drops options.envVars.SSH_CONNECTION
+{
+  resetAcpPool();
+  const poolOpts = {
+    ...options,
+    envVars: { SSH_CONNECTION: "malicious-pool-ssh-conn" },
+  };
+  start(400, "t-b4-pool", poolOpts);
+  await waitFor(() => replies(400).length === 1, 20000, "t-b4-pool start");
+  const ptid = replies(400)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 401,
+    method: "turn/start",
+    params: { threadId: "t-b4-pool", providerThreadId: ptid, clientRequestId: creq(), options: poolOpts, input: [{ type: "text", text: "hello", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b4-pool").length >= 1, 20000, "t-b4-pool completed");
+
+  const lines = transcriptLines().filter((l) => l.home === "a1");
+  const sshConns = lines.map((l) => l.__env?.SSH_CONNECTION);
+  const dropped = sshConns.length > 0 && sshConns.every((c) => c !== "malicious-pool-ssh-conn");
+  check("blocker4/pool-drops-ssh-connection", dropped, `sshConns=${JSON.stringify(sshConns)}`);
+}
+
+// ----------------------------------------------------------------------------
+// BLOCKER 5: listAgyModels install.env does not override pool token marker
+// ----------------------------------------------------------------------------
+{
+  const probeDir = trackedMkdtemp(join(tmpdir(), "agy-probe5-"));
+  const cli = join(probeDir, "accounts", "p1", ".gemini", "antigravity-cli");
+  mkdirSync(cli, { recursive: true });
+  writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
+
+  // Configure agy-installs.json with an install trying to override SSH_CONNECTION
+  writeFileSync(
+    join(probeDir, "agy-installs.json"),
+    JSON.stringify({
+      installs: {
+        "p1-install": {
+          bin: shim,
+          env: { SSH_CONNECTION: "install-ssh-override" },
+        },
+      },
+      default: "p1-install",
+    })
+  );
+  writeFileSync(
+    join(probeDir, "accounts-state.json"),
+    JSON.stringify({
+      accounts: {
+        p1: { install: "p1-install", cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+      },
+    })
+  );
+
+  const probeBridge = (await import(new URL("./dist/host.js?plug357-probe5", import.meta.url).href)).experimental_providerBridge;
+  probeBridge.start?.({ pluginId: "provider-agy", dataDir: probeDir, tempDir: probeDir });
+  probeBridge.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 500, method: "model/list", params: {} }));
+  await waitFor(() => messages.some((m) => m.id === 500), 20000, "probe model/list finished");
+
+  const probeTranscript = transcriptLines();
+  // Filter for launches in probeDir
+  const probeLaunches = probeTranscript.filter((l) => l.home === "p1");
+  const probeSsh = probeLaunches.map((l) => l.__env?.SSH_CONNECTION);
+  check(
+    "blocker5/list-models-install-env-marker-wins",
+    probeSsh.length > 0 && probeSsh.every((s) => s === "127.0.0.1 0 127.0.0.1 0"),
+    `probeSsh=${JSON.stringify(probeSsh)}`
+  );
+}
+
+// ----------------------------------------------------------------------------
+// BLOCKER 3: Direct mode 429 clamping to 30m max and rejection
+// ----------------------------------------------------------------------------
+{
+  const directDir = trackedMkdtemp(join(tmpdir(), "agy-direct-"));
+  const directWs = join(directDir, "ws");
+  mkdirSync(directWs, { recursive: true });
+  const directTranscript = join(directDir, "transcript.ndjson");
+
+  // Run in direct mode (no accounts directory)
+  const savedTranscript = process.env.AGY_FAKE_TRANSCRIPT;
+  process.env.AGY_FAKE_TRANSCRIPT = directTranscript;
+  process.env.AGY_ACCOUNTS = "0";
+
+  const directBridge = (await import(new URL("./dist/host.js?plug357-direct", import.meta.url).href)).experimental_providerBridge;
+  directBridge.start?.({ pluginId: "provider-agy", dataDir: directDir, tempDir: directDir });
+
+  const directSend = (m) => directBridge.handleLine(JSON.stringify(m));
+
+  const directOpts = {
+    ...options,
+    envVars: { SSH_CONNECTION: "direct-preserved-ssh" },
+  };
+
+  directSend({
+    jsonrpc: "2.0",
+    id: 300,
+    method: "thread/start",
+    params: { threadId: "t-b3-dir", cwd: directWs, options: directOpts, instructionMode: "append" },
+  });
+  await waitFor(() => replies(300).length === 1, 20000, "direct start");
+  const ptid = replies(300)[0]?.result?.providerThreadId;
+
+  // Initial turn so instructions are consumed and direct env is recorded
+  directSend({
+    jsonrpc: "2.0",
+    id: 3001,
+    method: "turn/start",
+    params: { threadId: "t-b3-dir", providerThreadId: ptid, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "initial direct turn", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b3-dir").length >= 1, 20000, "direct initial turn");
+
+  // Blocker 4b: Check that direct mode preserves options.envVars.SSH_CONNECTION
+  const directLines = existsSync(directTranscript)
+    ? readFileSync(directTranscript, "utf8").split("\n").filter((l) => l.trim()).map(JSON.parse)
+    : [];
+  const directSsh = directLines[0]?.__env?.SSH_CONNECTION;
+  check("blocker4/direct-preserves-ssh-connection", directSsh === "direct-preserved-ssh", `directSsh=${directSsh}`);
+
+  // Send turn with quota failure (returns 127h countdown)
+  directSend({
+    jsonrpc: "2.0",
+    id: 301,
+    method: "turn/start",
+    params: { threadId: "t-b3-dir", providerThreadId: ptid, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "[[quota]]", mentions: [] }] },
+  });
+
+  await waitFor(
+    () => rateLimits("t-b3-dir").length >= 1,
+    20000,
+    "rateLimits emitted"
+  );
+
+  const rlDelta = rateLimits("t-b3-dir")[0];
+
+  // Clamped to at most 30 minutes (1800000 ms) from now
+  const resetsAt = rlDelta?.rateLimits?.windows?.[0]?.resetsAtMs;
+  const now = Date.now();
+  const maxAllowed = now + 30 * 60 * 1000 + 5000;
+  const isClamped = typeof resetsAt === "number" && resetsAt <= maxAllowed && resetsAt > now;
+  check("blocker3/direct-rate-limits-clamped-30m", isClamped, `resetsAt=${resetsAt} diffMs=${resetsAt - now}`);
+
+  // Immediate rejection of incoming turn before resetsAt with 429
+  directSend({
+    jsonrpc: "2.0",
+    id: 302,
+    method: "turn/start",
+    params: { threadId: "t-b3-dir", providerThreadId: ptid, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "second turn", mentions: [] }] },
+  });
+  await waitFor(() => replies(302).length === 1, 10000, "direct second turn rejected");
+  const reply302 = replies(302)[0];
+  check("blocker3/direct-incoming-rejected-429", reply302?.error?.message?.includes("Rate limit reached (429)"), reply302?.error?.message ?? "no error");
+
+  // Queued turn rejected immediately on 429 in direct mode
+  directSend({
+    jsonrpc: "2.0",
+    id: 310,
+    method: "thread/start",
+    params: { threadId: "t-b3-queued", cwd: directWs, options: directOpts, instructionMode: "append" },
+  });
+  await waitFor(() => replies(310).length === 1, 20000, "direct queued start");
+  const ptidQueued = replies(310)[0]?.result?.providerThreadId;
+
+  // Initial turn
+  directSend({
+    jsonrpc: "2.0",
+    id: 3101,
+    method: "turn/start",
+    params: { threadId: "t-b3-queued", providerThreadId: ptidQueued, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "init", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b3-queued").length >= 1, 20000, "direct queued init");
+
+  // Turn 1 fails with quota
+  directSend({
+    jsonrpc: "2.0",
+    id: 311,
+    method: "turn/start",
+    params: { threadId: "t-b3-queued", providerThreadId: ptidQueued, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "[[quota]]", mentions: [] }] },
+  });
+  // Turn 2 is sent while Turn 1 is processing, so Turn 2 queues
+  directSend({
+    jsonrpc: "2.0",
+    id: 312,
+    method: "turn/start",
+    params: { threadId: "t-b3-queued", providerThreadId: ptidQueued, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "queued turn", mentions: [] }] },
+  });
+
+  await waitFor(() => replies(312).length === 1, 20000, "queued turn settled");
+  const reply312 = replies(312)[0];
+  const dListQueued = deltas("t-b3-queued");
+  const settledErrors = perrors("t-b3-queued").filter((d) => d.settlesTurn === true);
+  check(
+    "blocker3/direct-queued-turn-fails-429",
+    reply312?.error && settledErrors.some((d) => d.errorInfo?.httpStatusCode === 429),
+    `reply=${JSON.stringify(reply312)} settledErrors=${settledErrors.length}`
+  );
+
+  // Unblock timer cancelled on thread/stop: quota with Resets in 1s -> thread/stop -> wait > 1s -> verify allowed never arrives
+  directSend({
+    jsonrpc: "2.0",
+    id: 315,
+    method: "thread/start",
+    params: { threadId: "t-b3-timer-stop", cwd: directWs, options: directOpts, instructionMode: "append" },
+  });
+  await waitFor(() => replies(315).length === 1, 20000, "direct timer-stop start");
+  const ptidTimerStop = replies(315)[0]?.result?.providerThreadId;
+
+  // Initial turn
+  directSend({
+    jsonrpc: "2.0",
+    id: 3151,
+    method: "turn/start",
+    params: { threadId: "t-b3-timer-stop", providerThreadId: ptidTimerStop, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "init", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b3-timer-stop").length >= 1, 20000, "direct timer-stop init");
+
+  // Send turn with quota failure (returns 1s countdown)
+  setControl({ quotaMsg: "Quota exhausted; retry later. Resets in 1s." });
+  directSend({
+    jsonrpc: "2.0",
+    id: 316,
+    method: "turn/start",
+    params: { threadId: "t-b3-timer-stop", providerThreadId: ptidTimerStop, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "[[quota]]", mentions: [] }] },
+  });
+  await waitFor(() => rateLimits("t-b3-timer-stop").some((r) => r.rateLimits?.status === "blocked"), 20000, "rateLimits blocked for timer-stop");
+
+  // Stop thread immediately while timer is armed
+  directSend({
+    jsonrpc: "2.0",
+    id: 317,
+    method: "thread/stop",
+    params: {
+      threadId: "t-b3-timer-stop",
+      providerThreadId: ptidTimerStop,
+      intent: "interrupt",
+      activeTurnId: "turn-1",
+    },
+  });
+  await waitFor(() => replies(317).length === 1, 10000, "direct timer-stop replied");
+
+  // Wait > 1s to verify unblock timer was cancelled and does not emit allowed
+  await sleep(1500);
+  const rlTimerStop = rateLimits("t-b3-timer-stop");
+  const unblockFiredAfterStop = rlTimerStop.some((r) => r.rateLimits?.status === "allowed");
+  check("blocker3/direct-thread-stop-unblock-timer", !unblockFiredAfterStop, `unblockFiredAfterStop=${unblockFiredAfterStop}`);
+
+  // Unblock timer expiration in direct mode
+  directSend({
+    jsonrpc: "2.0",
+    id: 320,
+    method: "thread/start",
+    params: { threadId: "t-b3-timer", cwd: directWs, options: directOpts, instructionMode: "append" },
+  });
+  await waitFor(() => replies(320).length === 1, 20000, "direct timer start");
+  const ptidTimer = replies(320)[0]?.result?.providerThreadId;
+
+  // Initial turn
+  directSend({
+    jsonrpc: "2.0",
+    id: 3201,
+    method: "turn/start",
+    params: { threadId: "t-b3-timer", providerThreadId: ptidTimer, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "initial", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b3-timer").length >= 1, 20000, "direct timer initial");
+
+  // Send turn that returns quota with 1s reset via control file
+  setControl({ quotaMsg: "Quota exhausted; retry later. Resets in 1s." });
+  directSend({
+    jsonrpc: "2.0",
+    id: 321,
+    method: "turn/start",
+    params: { threadId: "t-b3-timer", providerThreadId: ptidTimer, clientRequestId: creq(), options: directOpts, input: [{ type: "text", text: "[[quota]]", mentions: [] }] },
+  });
+  await waitFor(() => rateLimits("t-b3-timer").some((r) => r.rateLimits?.status === "blocked"), 20000, "rateLimits blocked");
+  check("blocker3/direct-rate-limits-blocked", true);
+
+  // Wait for unblock timer to fire allowed
+  await waitFor(() => rateLimits("t-b3-timer").some((r) => r.rateLimits?.status === "allowed"), 15000, "rateLimits unblocked");
+  check("blocker3/direct-timer-unblocks-allowed", rateLimits("t-b3-timer").some((r) => r.rateLimits?.status === "allowed"));
+  setControl({ quotaMsg: undefined });
+
+  process.env.AGY_FAKE_TRANSCRIPT = savedTranscript;
+  delete process.env.AGY_ACCOUNTS;
+}
+
+// ----------------------------------------------------------------------------
+// BLOCKER 4 (continued): session/load, AGY_KEYRING=1, add-account.mjs
+// ----------------------------------------------------------------------------
+// Test 4c: session/load (thread/resume) drops custom SSH_CONNECTION for pool account
+{
+  resetAcpPool();
+  const poolOpts = {
+    ...options,
+    envVars: { SSH_CONNECTION: "malicious-resume-ssh" },
+  };
+  start(410, "t-b4-resume-orig", poolOpts);
+  await waitFor(() => replies(410).length === 1, 20000, "t-b4-resume-orig start");
+  const origPtid = replies(410)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 411,
+    method: "turn/start",
+    params: { threadId: "t-b4-resume-orig", providerThreadId: origPtid, clientRequestId: creq(), options: poolOpts, input: [{ type: "text", text: "orig turn", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b4-resume-orig").length >= 1, 20000, "t-b4-resume-orig turn");
+
+  // Resume into a new thread
+  send({
+    jsonrpc: "2.0",
+    id: 412,
+    method: "thread/resume",
+    params: { threadId: "t-b4-resumed", providerThreadId: origPtid, cwd: workspace, options: poolOpts, instructionMode: "append" },
+  });
+  await waitFor(() => replies(412).length === 1, 20000, "t-b4-resumed reply");
+  send({
+    jsonrpc: "2.0",
+    id: 413,
+    method: "turn/start",
+    params: { threadId: "t-b4-resumed", providerThreadId: origPtid, clientRequestId: creq(), options: poolOpts, input: [{ type: "text", text: "resumed turn", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b4-resumed").length >= 1, 20000, "t-b4-resumed turn");
+
+  const resumedLines = transcriptLines().filter((l) => l.home === "a1");
+  const resumedSsh = resumedLines.map((l) => l.__env?.SSH_CONNECTION);
+  check(
+    "blocker4/session-load-drops-ssh-connection",
+    resumedSsh.length > 0 && resumedSsh.every((s) => s !== "malicious-resume-ssh"),
+    `resumedSsh=${JSON.stringify(resumedSsh)}`
+  );
+}
+
+// Test 4d: AGY_KEYRING=1 preserves user's SSH_CONNECTION even for pool account
+{
+  resetAcpPool();
+  process.env.AGY_KEYRING = "1";
+  const keyringOpts = {
+    ...options,
+    envVars: { SSH_CONNECTION: "keyring-custom-ssh" },
+  };
+  start(420, "t-b4-keyring", keyringOpts);
+  await waitFor(() => replies(420).length === 1, 20000, "t-b4-keyring start");
+  const ptid = replies(420)[0].result.providerThreadId;
+
+  send({
+    jsonrpc: "2.0",
+    id: 421,
+    method: "turn/start",
+    params: { threadId: "t-b4-keyring", providerThreadId: ptid, clientRequestId: creq(), options: keyringOpts, input: [{ type: "text", text: "keyring turn", mentions: [] }] },
+  });
+  await waitFor(() => boundaries("t-b4-keyring").length >= 1, 20000, "t-b4-keyring turn");
+
+  const keyringLines = transcriptLines().filter((l) => l.home === "a1");
+  const keyringSsh = keyringLines.map((l) => l.__env?.SSH_CONNECTION);
+  check(
+    "blocker4/keyring-1-preserves-ssh-connection",
+    keyringSsh.includes("keyring-custom-ssh"),
+    `keyringSsh=${JSON.stringify(keyringSsh)}`
+  );
+  delete process.env.AGY_KEYRING;
+}
+
+// Test 4e: scripts/add-account.mjs env logic
+{
+  const addAccountSrc = readFileSync(new URL("./scripts/add-account.mjs", import.meta.url).pathname, "utf8");
+  const hasKeyringCheck = addAccountSrc.includes('process.env.AGY_KEYRING === "1"');
+  const hasFallback = addAccountSrc.includes('process.env.SSH_CONNECTION || "127.0.0.1 0 127.0.0.1 0"');
+  const installBeforeSsh = addAccountSrc.indexOf("...installEnv") < addAccountSrc.indexOf("SSH_CONNECTION:");
+  check(
+    "blocker4/add-account-script-ssh-env",
+    hasKeyringCheck && hasFallback && installBeforeSsh,
+    `keyring=${hasKeyringCheck} fallback=${hasFallback} installBefore=${installBeforeSsh}`
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Summary
+// ----------------------------------------------------------------------------
+process.stdout.write = originalWrite;
+const passed = checks.filter(([, ok]) => ok).length;
+process.stderr.write(`\n${passed}/${checks.length} passed\n`);
+process.exit(checks.every(([, ok]) => ok) ? 0 : 1);

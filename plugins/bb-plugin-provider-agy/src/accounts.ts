@@ -914,6 +914,49 @@ export function isAgentQuotaMessage(text: string): boolean {
 }
 
 /**
+ * §2.3 п.13 (ревизия 18): prefix patterns for quota and validation markers.
+ * Matched strictly character-by-character to hold candidate chunks before
+ * they leak to the client stream.
+ */
+export const AGENT_QUOTA_PREFIX_PATTERN =
+  /^\s*⚠\s*(?:i(?:n(?:d(?:i(?:v(?:i(?:d(?:u(?:a(?:l(?:\s+(?:q(?:u(?:o(?:t(?:a(?:\s+(?:r(?:e(?:a(?:c(?:h(?:e(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/iu;
+
+export const AGENT_VALIDATION_PREFIX_PATTERN =
+  /^\s*⚠\s*(?:v(?:e(?:r(?:i(?:f(?:i(?:c(?:a(?:t(?:i(?:o(?:n(?:\s+(?:r(?:e(?:q(?:u(?:i(?:r(?:e(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/iu;
+
+/**
+ * §2.3 п.13 (ревизия 18): checks whether text accumulated so far in the current
+ * text segment is a valid candidate for an agy refusal marker.
+ * Chunks are buffered while:
+ * 1) text after trimStart() is empty (leading whitespace/newlines), OR
+ * 2) text matches quota or validation prefix pattern, OR
+ * 3) text matches full quota or validation message and stays <= 300 chars.
+ * Any newline followed by a non-whitespace character is a divergence.
+ */
+export function isAgentMarkerCandidate(text: string): boolean {
+  const trimmedLeading = text.trimStart();
+  if (trimmedLeading === "") {
+    return true;
+  }
+  if (/\n\S/.test(trimmedLeading)) {
+    return false;
+  }
+  if (
+    AGENT_QUOTA_PREFIX_PATTERN.test(text) ||
+    AGENT_VALIDATION_PREFIX_PATTERN.test(text)
+  ) {
+    return true;
+  }
+  if (
+    (isAgentQuotaMessage(text) || isAgentValidationMessage(text)) &&
+    text.length <= 300
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * The far-future stamp a tos-disabled parking puts on cooldownUntilMs:
  * effectively permanent, but still readable by every "is this account in
  * cooldown" check that predates the mark.

@@ -61,6 +61,7 @@ import {
   isAccountIneligible,
   isAgentQuotaMessage,
   isAgentValidationMessage,
+  isAgentMarkerCandidate,
   isAuthDead,
   isModelRefusal,
   isTosDisabled,
@@ -756,9 +757,20 @@ interface WSession {
   /** §2.3 п.10: families this session already moved once for — a second
    * refusal for the same family fails honestly instead of chaining. */
   modelRefusalMoved: Set<string>;
+  /** §2.3 п.13 (ревизия 18): candidate buffer holding agentMessage deltas while matching prefix/marker */
+  candidateBuffer: Record<string, unknown>[];
+  /** §2.3 п.13 (ревизия 18): held item.textClose event awaiting turn.boundary confirmation */
+  heldTextClose: Record<string, unknown> | null;
+  /** §2.3 п.13 (ревизия 18): effective resetsAtMs for rateLimitsBlocked */
+  blockedResetsAtMs: number | null;
+  /** §2.3 п.13 (ревизия 18): unblock timer for direct/relay mode rateLimitsBlocked */
+  unblockTimer: NodeJS.Timeout | null;
+  /** §2.3 п.13 (ревизия 18): true if at least one agentMessage text delta has been sent to client in current segment */
+  streamedAgentMessage: boolean;
 }
 
 const sessions = new Map<string, WSession>();
+const stoppingSessions = new Map<string, WSession>();
 
 function newSession(threadId: string, cwd: string): WSession {
   return {
@@ -806,6 +818,11 @@ function newSession(threadId: string, cwd: string): WSession {
     quotaRefusalText: null,
     agentMessageText: "",
     modelRefusalMoved: new Set<string>(),
+    candidateBuffer: [],
+    heldTextClose: null,
+    blockedResetsAtMs: null,
+    unblockTimer: null,
+    streamedAgentMessage: false,
   };
 }
 
@@ -1827,10 +1844,16 @@ function providerOptionsFor(session: WSession): Record<string, unknown> {
 
 function filterEnvVars(
   envVars: unknown,
+  isPoolAccount = false,
 ): Record<string, string> {
   const out: Record<string, string> = {};
+  const dropSsh = isPoolAccount && process.env.AGY_KEYRING !== "1";
   for (const [key, value] of Object.entries(optionsRecord(envVars))) {
-    if (PROTECTED_CHILD_ENV.has(key) || typeof value !== "string") {
+    if (
+      PROTECTED_CHILD_ENV.has(key) ||
+      (dropSsh && key === "SSH_CONNECTION") ||
+      typeof value !== "string"
+    ) {
       continue;
     }
     out[key] = value;
@@ -1907,7 +1930,10 @@ function rewriteOptions(
     instructions: instructions.includes(WRITE_GUARDRAIL)
       ? instructions
       : `${instructions}${instructions.length > 0 ? "\n\n" : ""}${WRITE_GUARDRAIL}`,
-    envVars: filterEnvVars(options.envVars ?? session.envVars),
+    envVars: filterEnvVars(
+      options.envVars ?? session.envVars,
+      session.accountLabel !== null,
+    ),
   };
 }
 
@@ -2799,6 +2825,15 @@ function emitRateLimits(
   resetsAtMs: number | null,
   reason: string | null,
 ): void {
+  let effectiveResetsAtMs = resetsAtMs;
+  if (status === "blocked" && session.accountLabel === null) {
+    // §2.3 п.13 (ревизия 18): direct mode & relay: clamp to DEFAULT_QUOTA_COOLDOWN_MS
+    const maxResetsAt = Date.now() + DEFAULT_QUOTA_COOLDOWN_MS;
+    effectiveResetsAtMs =
+      resetsAtMs !== null
+        ? Math.min(resetsAtMs, maxResetsAt)
+        : maxResetsAt;
+  }
   emitDeltas(session.threadId, {
     kind: "provider.rateLimits",
     rateLimits: {
@@ -2810,7 +2845,7 @@ function emitRateLimits(
           providerKey: null,
           label: "Gemini individual quota",
           status,
-          resetsAtMs,
+          resetsAtMs: effectiveResetsAtMs,
         },
       ],
       reachedReason: reason,
@@ -2819,10 +2854,71 @@ function emitRateLimits(
     },
   });
   session.rateLimitsBlocked = status === "blocked";
+  session.blockedResetsAtMs = status === "blocked" ? effectiveResetsAtMs : null;
+
+  if (status === "blocked" && session.accountLabel === null) {
+    // §2.3 п.13 (ревизия 18): all daemon turns currently in session.queue
+    // immediately fail with honest rate-limit refusal (HTTP 429, settlesTurn: true)
+    const retryMsg =
+      reason ?? "⚠ Rate limit reached (429): slow down and try again later.";
+    const info = {
+      category: "rate-limit" as const,
+      providerCode: null,
+      httpStatusCode: 429,
+    };
+    const remaining: QueuedTurn[] = [];
+    for (const item of session.queue) {
+      if (item.kind === "daemon") {
+        emitDeltas(session.threadId, {
+          kind: "provider.error",
+          message: retryMsg,
+          errorInfo: info,
+          category: info.category,
+          settlesTurn: true,
+        });
+        sendError(item.requestId, -32000, retryMsg);
+      } else {
+        remaining.push(item);
+      }
+    }
+    session.queue = remaining;
+
+    if (session.unblockTimer !== null) {
+      clearTimeout(session.unblockTimer);
+      session.unblockTimer = null;
+    }
+    const delay = Math.max(
+      0,
+      (effectiveResetsAtMs ?? Date.now() + DEFAULT_QUOTA_COOLDOWN_MS) -
+        Date.now(),
+    );
+    session.unblockTimer = setTimeout(() => {
+      session.unblockTimer = null;
+      if (session.stopped || sessions.get(session.threadId) !== session) {
+        return;
+      }
+      session.rateLimitsBlocked = false;
+      session.blockedResetsAtMs = null;
+      emitRateLimits(session, "allowed", null, null);
+      drainQueue(session);
+    }, delay);
+    session.unblockTimer.unref?.();
+  } else if (status === "allowed") {
+    if (session.unblockTimer !== null) {
+      clearTimeout(session.unblockTimer);
+      session.unblockTimer = null;
+    }
+  }
 }
 
 function clearRateLimit(session: WSession): void {
   if (session.rateLimitsBlocked) {
+    if (session.unblockTimer !== null) {
+      clearTimeout(session.unblockTimer);
+      session.unblockTimer = null;
+    }
+    session.rateLimitsBlocked = false;
+    session.blockedResetsAtMs = null;
     emitRateLimits(session, "allowed", null, null);
   }
 }
@@ -3318,6 +3414,10 @@ function startRotation(
   }
   const movedFrom = session.accountLabel;
   session.accountLabel = account.label;
+  session.envVars = filterEnvVars(
+    session.baseOptions.envVars,
+    session.accountLabel !== null,
+  );
   if (dataDir !== "") {
     const ledger = loadLedger(dataDir);
     markAccountUse(ledger, account.label);
@@ -3424,11 +3524,120 @@ function poolExhaustedText(cause: RotationCause, message: string): string {
     : message;
 }
 
+function handleCompactClassifiedError(
+  session: WSession,
+  cause: RotationCause,
+  message: string,
+): void {
+  const compact = session.compact;
+  if (compact === null) {
+    return;
+  }
+  // §2.3 п.13 (ревизия 18): if refusal hits at compact-summary stage,
+  // prepare seed prompt from partial summaryBuf (if non-empty) or memo prompt.
+  if (compact.stage === "summary") {
+    const summary = compact.summaryBuf.trim();
+    const usable = summary.length > 0;
+    compact.collecting = false;
+    compact.seedPromptText = usable
+      ? compactSeedPrompt(summary, session.threadId)
+      : compactMemoPrompt({
+          recentAssistantText: session.recentAssistantText,
+          cwd: session.cwd,
+          threadId: session.threadId,
+        });
+  }
+
+  const plan = planRotation(session, cause, message);
+  switch (plan) {
+    case "rotate": {
+      if (compact.seedAttempts >= COMPACT_SEED_MAX_ATTEMPTS) {
+        session.compact = null;
+        session.settledInternal = null;
+        failOut(session, poolExhaustedText(cause, message));
+        return;
+      }
+      const { account } = freeSibling(session, session.accountLabel);
+      if (account !== null) {
+        const movedFrom = session.accountLabel;
+        session.accountLabel = account.label;
+        session.envVars = filterEnvVars(
+          session.baseOptions.envVars,
+          session.accountLabel !== null,
+        );
+        if (dataDir !== "") {
+          const ledger = loadLedger(dataDir);
+          markAccountUse(ledger, account.label);
+          saveLedger(dataDir, ledger);
+        }
+        buildLaunch(session);
+        log(
+          `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (compaction ${cause})`,
+        );
+        runCompactSeed(session);
+      } else {
+        session.compact = null;
+        session.settledInternal = null;
+        failOut(
+          session,
+          cause === "validation-required"
+            ? `account ${session.accountLabel ?? "?"} needs Google account verification and no free pool account can take over the compaction fallback`
+            : cause === "tos-disabled"
+              ? `account ${session.accountLabel ?? "?"} was disabled by Google (Terms of Service) and no free pool account can take over the compaction fallback`
+              : poolExhaustedText(cause, message),
+        );
+      }
+      return;
+    }
+    case "wait": {
+      session.settledInternal = null;
+      const waitMs = session.waitUntilMs;
+      session.waitTimer = setTimeout(() => {
+        session.waitTimer = null;
+        if (session.stopped || sessions.get(session.threadId) !== session) {
+          return;
+        }
+        log(
+          `thread ${session.threadId}: compaction wait elapsed; running compact seed on cooled account`,
+        );
+        if (session.compact !== null) {
+          buildLaunch(session);
+          runCompactSeed(session);
+        } else {
+          drainQueue(session);
+        }
+      }, waitMs);
+      session.waitTimer.unref?.();
+      log(
+        `thread ${session.threadId}: whole pool cooling during compaction; seed retry in ${Math.round(waitMs / 1000)}s (attempt ${session.autoRetryCount}/${quotaRetryMaxAttempts()})`,
+      );
+      return;
+    }
+    case "fail": {
+      session.compact = null;
+      session.settledInternal = null;
+      failOut(
+        session,
+        cause === "validation-required"
+          ? `account ${session.accountLabel ?? "?"} needs Google account verification and no free pool account can take over the compaction fallback`
+          : cause === "tos-disabled"
+            ? `account ${session.accountLabel ?? "?"} was disabled by Google (Terms of Service) and no free pool account can take over the compaction fallback`
+            : poolExhaustedText(cause, message),
+      );
+      return;
+    }
+  }
+}
+
 function handleClassifiedError(
   session: WSession,
   cause: RotationCause,
   message: string,
 ): void {
+  if (session.compact !== null) {
+    handleCompactClassifiedError(session, cause, message);
+    return;
+  }
   const plan = planRotation(session, cause, message);
   switch (plan) {
     case "rotate":
@@ -3562,6 +3771,10 @@ function runCompactSeed(session: WSession): void {
         compactParked(session, parkedCause, errorText);
         return;
       }
+      if (classifyError(errorText) === "rate-limit") {
+        handleCompactClassifiedError(session, "quota", errorText);
+        return;
+      }
       compactRestore(session);
       return;
     }
@@ -3575,6 +3788,20 @@ function runCompactSeed(session: WSession): void {
         if (status === "completed") {
           s.compact = null;
           drainQueue(s);
+          return;
+        }
+        const armed = s.armedError;
+        const errText = armed !== null && !armed.handled ? armed.message : "";
+        const parkedCause = parkedCauseOf(errText);
+        if (parkedCause !== null) {
+          compactParked(s, parkedCause, errText);
+          return;
+        }
+        if (
+          classifyError(errText) === "rate-limit" ||
+          isAgentQuotaMessage(s.agentMessageText)
+        ) {
+          handleCompactClassifiedError(s, "quota", errText);
           return;
         }
         if (
@@ -3629,6 +3856,10 @@ function compactRestore(session: WSession): void {
         compactParked(session, parkedCause, errorText);
         return;
       }
+      if (classifyError(errorText) === "rate-limit") {
+        handleCompactClassifiedError(session, "quota", errorText);
+        return;
+      }
       log(
         `thread ${session.threadId}: compaction restore failed: ${errorText.slice(0, 300)}`,
       );
@@ -3670,6 +3901,10 @@ function compactParked(
   }
   const movedFrom = session.accountLabel;
   session.accountLabel = account.label;
+  session.envVars = filterEnvVars(
+    session.baseOptions.envVars,
+    session.accountLabel !== null,
+  );
   const ledger = loadLedger(dataDir);
   markAccountUse(ledger, account.label);
   saveLedger(dataDir, ledger);
@@ -3964,11 +4199,36 @@ function onTurnBoundary(session: WSession, delta: Record<string, unknown>): void
   });
 }
 
+function flushCandidateBuffer(
+  session: WSession,
+  out: Record<string, unknown>[],
+): void {
+  for (const b of session.candidateBuffer) {
+    if (session.compact?.collecting && typeof b.text === "string") {
+      session.compact.summaryBuf += b.text;
+    }
+    if (typeof b.text === "string") {
+      session.recentAssistantText = (
+        session.recentAssistantText + b.text
+      ).slice(-HANDOFF_STREAMED_TEXT_CAP);
+    }
+    out.push(b);
+    session.streamedAgentMessage = true;
+  }
+  session.candidateBuffer = [];
+  if (session.heldTextClose !== null) {
+    out.push(session.heldTextClose);
+    session.heldTextClose = null;
+    session.agentMessageText = "";
+    session.streamedAgentMessage = false;
+  }
+}
+
 function processDeltaLine(
   threadId: string,
   deltas: Record<string, unknown>[],
 ): Record<string, unknown>[] {
-  const session = sessions.get(threadId);
+  const session = sessions.get(threadId) ?? stoppingSessions.get(threadId);
   if (session === undefined) {
     return deltas;
   }
@@ -3978,8 +4238,12 @@ function processDeltaLine(
     switch (delta.kind) {
       case "turn.open": {
         session.bridgeTurnBusy = true;
+        session.streamedAgentMessage = false;
         session.agentMessageText = "";
         session.quotaRefusalText = null;
+        session.validationRefusal = false;
+        session.candidateBuffer = [];
+        session.heldTextClose = null;
         if (session.suppressOpenNext) {
           session.suppressOpenNext = false;
           continue;
@@ -3989,22 +4253,31 @@ function processDeltaLine(
         continue;
       }
       case "turn.boundary": {
-        if (session.validationRefusal) {
-          // §2.3 п.11: the "⚠ Verification Required" turn never completes —
-          // its boundary becomes the same parking + rotation/failure a
-          // classified error drives.
-          session.validationRefusal = false;
+        // §2.3 п.11 & п.13 (ревизия 18): if candidate buffer or current text matched
+        // a full validation or quota refusal, the marker is confirmed at boundary
+        const isVal = isAgentValidationMessage(session.agentMessageText);
+        const isQuota = isAgentQuotaMessage(session.agentMessageText);
+        if (isVal) {
+          session.candidateBuffer = [];
+          session.heldTextClose = null;
+          session.agentMessageText = "";
           onValidationRefusalBoundary(session);
           continue;
         }
-        if (session.quotaRefusalText !== null) {
-          // §2.3 п.13: the "⚠ Individual quota reached…" turn never
-          // completes either — its boundary drives the quota rotation.
-          const refusal = session.quotaRefusalText.trim();
-          session.quotaRefusalText = null;
+        if (isQuota) {
+          const refusal = session.agentMessageText.trim();
+          session.candidateBuffer = [];
+          session.heldTextClose = null;
+          session.agentMessageText = "";
           onQuotaRefusalBoundary(session, refusal);
           continue;
         }
+        session.streamedAgentMessage = false;
+        if (session.stopped) {
+          stoppingSessions.delete(session.threadId);
+        }
+        flushCandidateBuffer(session, out);
+        session.agentMessageText = "";
         out.push(delta);
         onTurnBoundary(session, delta);
         continue;
@@ -4022,32 +4295,20 @@ function processDeltaLine(
           delta.channel === "agentMessage" &&
           typeof delta.text === "string"
         ) {
-          // §2.3 п.11 (ревизия 13.1): agy reports VALIDATION_REQUIRED as
-          // the whole agent message "⚠ Verification Required" — only that
-          // exact shape of the CURRENT message is a refusal; prose that
-          // merely mentions the words must reach the user.
-          if (session.validationRefusal) {
+          if (session.heldTextClose !== null) {
+            flushCandidateBuffer(session, out);
+            session.agentMessageText = "";
+          }
+          const candidateText = session.agentMessageText + delta.text;
+          if (isAgentMarkerCandidate(candidateText)) {
+            session.agentMessageText = candidateText;
+            session.candidateBuffer.push(delta);
             continue;
           }
-          if (session.quotaRefusalText !== null) {
-            // The rest of the refusal line (its "Resets in …" tail) is
-            // kept for the cooldown clock, never shown.
-            session.quotaRefusalText += delta.text;
-            continue;
-          }
-          session.agentMessageText += delta.text;
-          if (isAgentValidationMessage(session.agentMessageText)) {
-            session.validationRefusal = true;
-            session.recentAssistantText = "";
-            continue;
-          }
-          // §2.3 п.13: the quota window reported as the whole agent
-          // message — swallowed like the verification marker. Earlier
-          // streamed prose stays in recentAssistantText for the handoff.
-          if (isAgentQuotaMessage(session.agentMessageText)) {
-            session.quotaRefusalText = session.agentMessageText;
-            continue;
-          }
+          // Divergence: flush buffered candidate chunks and process normally
+          flushCandidateBuffer(session, out);
+          session.agentMessageText = candidateText;
+          session.streamedAgentMessage = true;
           if (session.compact?.collecting) {
             session.compact.summaryBuf += delta.text;
           }
@@ -4063,18 +4324,60 @@ function processDeltaLine(
         if (item.type === "compaction") {
           session.compactInFlight = true;
         }
-        if (item.type === "agentMessage") {
-          session.agentMessageText = "";
+        if (
+          session.heldTextClose !== null ||
+          session.candidateBuffer.length > 0
+        ) {
+          flushCandidateBuffer(session, out);
         }
+        session.agentMessageText = "";
         out.push(delta);
         continue;
       }
       case "item.textClose": {
         if (delta.channel === "agentMessage") {
-          // A closed text segment ends the current-message buffer too:
-          // prose + item.textClose + a "⚠ Verification Required" segment
-          // must still match the exact agy form, not "prose + marker"
-          // (§2.3 п.11, ревизия 13.1).
+          if (session.stopped && !session.streamedAgentMessage) {
+            session.heldTextClose = null;
+            continue;
+          }
+          if (
+            isAgentQuotaMessage(session.agentMessageText) ||
+            isAgentValidationMessage(session.agentMessageText)
+          ) {
+            session.heldTextClose = delta;
+            continue;
+          }
+          flushCandidateBuffer(session, out);
+          session.agentMessageText = "";
+          session.streamedAgentMessage = false;
+        }
+        out.push(delta);
+        continue;
+      }
+      case "item.close": {
+        const item = optionsRecord(delta.item);
+        if (item.type === "agentMessage") {
+          if (session.stopped && !session.streamedAgentMessage) {
+            session.heldTextClose = null;
+            continue;
+          }
+          if (
+            isAgentQuotaMessage(session.agentMessageText) ||
+            isAgentValidationMessage(session.agentMessageText)
+          ) {
+            session.heldTextClose = delta;
+            continue;
+          }
+          flushCandidateBuffer(session, out);
+          session.agentMessageText = "";
+          session.streamedAgentMessage = false;
+        } else {
+          if (
+            session.heldTextClose !== null ||
+            session.candidateBuffer.length > 0
+          ) {
+            flushCandidateBuffer(session, out);
+          }
           session.agentMessageText = "";
         }
         out.push(delta);
@@ -4082,6 +4385,8 @@ function processDeltaLine(
       }
       case "session.reset": {
         session.recentAssistantText = "";
+        session.candidateBuffer = [];
+        session.heldTextClose = null;
         out.push(delta);
         continue;
       }
@@ -4091,19 +4396,21 @@ function processDeltaLine(
         }
         // A pass-through quota error carries the native errorInfo the
         // generic bridge never sets (spec §3).
-        const info = nativeErrorInfo(
-          typeof delta.message === "string" ? delta.message : "",
-        );
+        const errText =
+          typeof delta.detail === "string" && delta.detail.length > 0
+            ? delta.detail
+            : typeof delta.message === "string"
+              ? delta.message
+              : "";
+        const info = nativeErrorInfo(errText);
         if (info !== undefined && delta.errorInfo === undefined) {
           out.push({ ...delta, errorInfo: info, category: info.category });
           if (info.category === "rate-limit") {
             emitRateLimits(
               session,
               "blocked",
-              quotaResetAtMs(
-                typeof delta.message === "string" ? delta.message : "",
-              ) ?? nearestCooldownEnd(session),
-              typeof delta.message === "string" ? delta.message : null,
+              quotaResetAtMs(errText) ?? nearestCooldownEnd(session),
+              errText,
             );
           }
         } else {
@@ -4112,6 +4419,15 @@ function processDeltaLine(
         continue;
       }
       default: {
+        if (delta.kind === "toolCall" || delta.kind === "commandExecution") {
+          if (
+            session.heldTextClose !== null ||
+            session.candidateBuffer.length > 0
+          ) {
+            flushCandidateBuffer(session, out);
+          }
+          session.agentMessageText = "";
+        }
         out.push(delta);
         continue;
       }
@@ -4250,6 +4566,48 @@ function interceptOutbound(line: string): void {
         session.suppressErrorNotify = false;
         return;
       }
+      const message = typeof params.message === "string" ? params.message : "";
+      const category = classifyError(message);
+      if (
+        session !== undefined &&
+        (session.daemonTurnOpen ||
+          session.bridgeTurnBusy ||
+          session.compact !== null) &&
+        (category === "rate-limit" ||
+          isTosDisabled(message) ||
+          isValidationRequired(message) ||
+          isAuthDead(message) ||
+          isAccountIneligible(message) ||
+          isModelRefusal(message))
+      ) {
+        session.bridgeTurnBusy = false;
+        session.settledInternal = null;
+        const cause: RotationCause = isTosDisabled(message)
+          ? "tos-disabled"
+          : category === "rate-limit"
+            ? "quota"
+            : isValidationRequired(message)
+              ? "validation-required"
+              : isAuthDead(message)
+                ? "auth-dead"
+                : isModelRefusal(message)
+                  ? "model"
+                  : "ineligible";
+        if (
+          cause === "model" &&
+          dataDir !== "" &&
+          session.accountLabel !== null &&
+          session.model !== undefined
+        ) {
+          markAccountModelUnsupported(
+            dataDir,
+            session.accountLabel,
+            session.model,
+          );
+        }
+        handleClassifiedError(session, cause, message);
+        return;
+      }
       rawWrite(`${line}\n`);
       return;
     }
@@ -4349,6 +4707,10 @@ function resumeOnSibling(
     `thread ${session.threadId}: move ${session.accountLabel ?? "none"} → ${account.label} (resume on sibling${siblingInstall !== null ? `, install=${siblingInstall}` : ""})`,
   );
   session.accountLabel = account.label;
+  session.envVars = filterEnvVars(
+    session.baseOptions.envVars,
+    session.accountLabel !== null,
+  );
   const ledger = loadLedger(dataDir);
   markAccountUse(ledger, account.label);
   saveLedger(dataDir, ledger);
@@ -4746,6 +5108,15 @@ function discardSession(session: WSession): void {
     clearTimeout(session.waitTimer);
     session.waitTimer = null;
   }
+  if (session.unblockTimer !== null) {
+    clearTimeout(session.unblockTimer);
+    session.unblockTimer = null;
+  }
+  session.candidateBuffer = [];
+  session.heldTextClose = null;
+  session.agentMessageText = "";
+  session.quotaRefusalText = null;
+  session.validationRefusal = false;
   for (const queued of session.queue.splice(0)) {
     if (queued.kind === "daemon") {
       sendError(queued.requestId, -32000, "thread stopped");
@@ -4758,6 +5129,13 @@ function discardSession(session: WSession): void {
   }
   resolveInteractions(session.threadId);
   sessions.delete(session.threadId);
+  stoppingSessions.set(session.threadId, session);
+  const timer = setTimeout(() => {
+    if (stoppingSessions.get(session.threadId) === session) {
+      stoppingSessions.delete(session.threadId);
+    }
+  }, 10000);
+  timer.unref?.();
   // The thread record survives discard: it is the rebuild source for
   // unknown-session turns after a wrapper restart or a transient resume
   // failure. Only an explicit thread/discard forgets it.
@@ -4770,6 +5148,7 @@ function handleThreadStart(id: JsonRpcId, params: Record<string, unknown>): void
     feedLine({ jsonrpc: "2.0", id, method: "thread/start", params });
     return;
   }
+  stoppingSessions.delete(threadId);
   const existing = sessions.get(threadId);
   if (existing !== undefined) {
     discardSession(existing);
@@ -4831,6 +5210,10 @@ function finishThreadStart(
     discardSession(session);
     return;
   }
+  session.envVars = filterEnvVars(
+    session.baseOptions.envVars,
+    session.accountLabel !== null,
+  );
   const declared =
     typeof session.baseOptions.permissionMode === "string"
       ? session.baseOptions.permissionMode
@@ -4863,6 +5246,7 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
     feedLine({ jsonrpc: "2.0", id, method: "thread/resume", params });
     return;
   }
+  stoppingSessions.delete(threadId);
   const existing = sessions.get(threadId);
   if (existing !== undefined) {
     discardSession(existing);
@@ -4942,6 +5326,10 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
     dataDir === "" ||
     !accountsEnabled(process.env)
   ) {
+    session.envVars = filterEnvVars(
+      session.baseOptions.envVars,
+      session.accountLabel !== null,
+    );
     const launchError = buildLaunch(session);
     if (launchError !== null) {
       sendError(id, -32000, `agy cannot launch: ${launchError}`);
@@ -5142,30 +5530,67 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
     return;
   }
   const session = sessions.get(threadId);
-  if (session === undefined) {
+  if (session === undefined || session.stopped) {
     restoreUnknownSession(id, "turn/start", params);
     return;
   }
   drainShimEvents();
+  if (session.rateLimitsBlocked) {
+    const resetsAt = session.blockedResetsAtMs ?? nearestCooldownEnd(session);
+    if (resetsAt !== null && Date.now() >= resetsAt) {
+      session.rateLimitsBlocked = false;
+      session.blockedResetsAtMs = null;
+      if (session.unblockTimer !== null) {
+        clearTimeout(session.unblockTimer);
+        session.unblockTimer = null;
+      }
+      emitRateLimits(session, "allowed", null, null);
+      drainQueue(session);
+    }
+  }
+  if (session.rateLimitsBlocked && session.accountLabel === null) {
+    // §2.3 п.13 (ревизия 18): incoming turn in direct/relay mode before resetsAt is immediately rejected with 429
+    const retryMsg =
+      "⚠ Rate limit reached (429): slow down and try again later.";
+    const info = {
+      category: "rate-limit" as const,
+      providerCode: null,
+      httpStatusCode: 429,
+    };
+    emitDeltas(session.threadId, {
+      kind: "provider.error",
+      message: retryMsg,
+      errorInfo: info,
+      category: info.category,
+      settlesTurn: true,
+    });
+    sendError(id, -32000, retryMsg);
+    return;
+  }
+  const turnOptions = optionsRecord(params.options);
+  const incoming = resolveModelSelection(
+    typeof turnOptions.model === "string" ? turnOptions.model : undefined,
+    typeof turnOptions.reasoningLevel === "string"
+      ? turnOptions.reasoningLevel
+      : undefined,
+  );
+  if (incoming.modelId !== undefined && incoming.modelId !== session.model) {
+    // The new model rides every later session build (rotation included)
+    // via baseOptions — the generic bridge only applies it at session
+    // construction.
+    session.model = incoming.modelId;
+    session.baseOptions = { ...session.baseOptions, model: turnOptions.model };
+  }
   // §7: a turn on a cooled account rotates first, then replays as handoff;
   // §2.3: a turn whose options name a model the session's account does not
   // offer rotates the same way, with the "model" cause. A restoring session
   // already ran those checks inside its rebuild — turns just queue on it.
-  if (!session.rotating && !session.stopped && !session.restoring) {
-    const turnOptions = optionsRecord(params.options);
-    const incoming = resolveModelSelection(
-      typeof turnOptions.model === "string" ? turnOptions.model : undefined,
-      typeof turnOptions.reasoningLevel === "string"
-        ? turnOptions.reasoningLevel
-        : undefined,
-    );
-    if (incoming.modelId !== undefined && incoming.modelId !== session.model) {
-      // The new model rides every later session build (rotation included)
-      // via baseOptions — the generic bridge only applies it at session
-      // construction.
-      session.model = incoming.modelId;
-      session.baseOptions = { ...session.baseOptions, model: turnOptions.model };
-    }
+  if (
+    !session.rotating &&
+    !session.stopped &&
+    !session.restoring &&
+    session.compact === null
+  ) {
     const { cooled } = sessionAccountCooled(session);
     // §2.3 п.7: parked counts on parkedReason alone — an expired cooldown
     // must not let a turn through to a banned home.
@@ -5249,7 +5674,7 @@ function handleTurnSteer(id: JsonRpcId, params: Record<string, unknown>): void {
   const threadId = params.threadId;
   const session =
     typeof threadId === "string" ? sessions.get(threadId) : undefined;
-  if (session === undefined) {
+  if (session === undefined || session.stopped) {
     if (typeof threadId === "string") {
       restoreUnknownSession(id, "turn/steer", params);
       return;
@@ -5257,6 +5682,30 @@ function handleTurnSteer(id: JsonRpcId, params: Record<string, unknown>): void {
     feedLine({ jsonrpc: "2.0", id, method: "turn/steer", params });
     return;
   }
+  // §2.3 п.13 (ревизия 18): on turn/steer, any unconfirmed candidate buffer
+  // is immediately flushed to client, and detector state is reset to pristine.
+  if (session.candidateBuffer.length > 0) {
+    for (const b of session.candidateBuffer) {
+      if (session.compact?.collecting && typeof b.text === "string") {
+        session.compact.summaryBuf += b.text;
+      }
+      if (typeof b.text === "string") {
+        session.recentAssistantText = (
+          session.recentAssistantText + b.text
+        ).slice(-HANDOFF_STREAMED_TEXT_CAP);
+      }
+      emitDeltas(session.threadId, b);
+      session.streamedAgentMessage = true;
+    }
+    session.candidateBuffer = [];
+  }
+  if (session.heldTextClose !== null) {
+    emitDeltas(session.threadId, session.heldTextClose);
+    session.heldTextClose = null;
+  }
+  session.agentMessageText = "";
+  session.quotaRefusalText = null;
+  session.validationRefusal = false;
   if (session.restoring) {
     // The rebuild lands the steered input as a fresh turn afterwards.
     enqueueDaemonTurn(session, id, params);
@@ -5351,12 +5800,13 @@ function handleLine(line: string): void {
     case "thread/discard": {
       const session =
         typeof params.threadId === "string"
-          ? sessions.get(params.threadId)
+          ? (sessions.get(params.threadId) ?? stoppingSessions.get(params.threadId))
           : undefined;
       if (session !== undefined) {
         discardSession(session);
       }
       if (typeof params.threadId === "string") {
+        stoppingSessions.delete(params.threadId);
         forgetThreadRecord(params.threadId);
       }
       acpBridge.handleLine(line);
@@ -5409,9 +5859,12 @@ export const experimental_providerBridge = {
   },
   handleLine,
   onClose: () => {
-    for (const session of sessions.values()) {
+    for (const session of [...sessions.values(), ...stoppingSessions.values()]) {
       if (session.waitTimer !== null) {
         clearTimeout(session.waitTimer);
+      }
+      if (session.unblockTimer !== null) {
+        clearTimeout(session.unblockTimer);
       }
     }
     reapOrphanShims();
