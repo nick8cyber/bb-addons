@@ -353,6 +353,57 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
     return;
   }
+  // §2.3 п. 15 (ревизия 19 — PLUG-354): agy interrupted stream modes
+  if (text.includes("[[interrupted-chunked-tool]]") || mode === "interrupted-chunked-tool") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The stream was interrupted. " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Please continue the task you were working on.\n" } });
+    upd({ sessionUpdate: "tool_call", toolCallId: "tc-int1", title: "run_command", kind: "execute", status: "in_progress", rawInput: { command: "echo ok" } });
+    upd({ sessionUpdate: "tool_call_update", toolCallId: "tc-int1", status: "completed", rawOutput: "ok" });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "All done after tool." } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[interrupted-same-segment-prose]]") || mode === "interrupted-same-segment-prose") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ The stream was interrupted. Please continue the task you were working on.\n" } });
+    upd({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking after interruption" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Continuing with task execution now." } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[interrupted-glued-chunk]]") || mode === "interrupted-glued-chunk") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ The stream was " } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "interrupted. Please continue the task you were working on.\nAnd here is the actual response glued directly." } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[interrupted-steer-buffered]]") || mode === "interrupted-steer-buffered") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ The stream was interrupted. Please continue the task you were working on." } });
+    for (let i = 0; i < 50; i++) {
+      if (cancelled) break;
+      await sleep(50);
+    }
+    out({ jsonrpc: "2.0", id, result: { stopReason: cancelled ? "cancelled" : "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[interrupted-no-continuation]]") || mode === "interrupted-no-continuation") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ The stream was interrupted. Please continue the task you were working on.\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[interrupted-prose-visible]]") || mode === "interrupted-prose-visible") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Analysis:\n⚠ The stream was interrupted. Please continue the task you were working on.\nThis was a quote from the log." } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
+  if (text.includes("[[interrupted-preserve-prior-text]]") || mode === "interrupted-preserve-prior-text") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Prior text before steer.\n" } });
+    upd({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "re-thinking" } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ The stream was interrupted. Please continue the task you were working on.\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
   if (text.includes("steered input") || text.includes("STEER-ANSWER")) {
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "STEER-ANSWER" } });
     out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });

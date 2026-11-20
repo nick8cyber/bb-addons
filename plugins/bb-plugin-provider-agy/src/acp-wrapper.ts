@@ -59,6 +59,7 @@ import {
   hasVerificationRequest,
   ineligibleCooldownMs,
   isAccountIneligible,
+  isAgentInterruptedMessage,
   isAgentQuotaMessage,
   isAgentValidationMessage,
   isAgentMarkerCandidate,
@@ -767,6 +768,8 @@ interface WSession {
   unblockTimer: NodeJS.Timeout | null;
   /** §2.3 п.13 (ревизия 18): true if at least one agentMessage text delta has been sent to client in current segment */
   streamedAgentMessage: boolean;
+  /** §2.3 п.15 (ревизия 19): true if agy interrupted stream message was suppressed and continuation is pending */
+  interruptedPending: boolean;
 }
 
 const sessions = new Map<string, WSession>();
@@ -823,6 +826,7 @@ function newSession(threadId: string, cwd: string): WSession {
     blockedResetsAtMs: null,
     unblockTimer: null,
     streamedAgentMessage: false,
+    interruptedPending: false,
   };
 }
 
@@ -4199,10 +4203,30 @@ function onTurnBoundary(session: WSession, delta: Record<string, unknown>): void
   });
 }
 
+function resolveInterruptedPending(
+  session: WSession,
+  continued: "yes" | "no" | "aborted",
+): void {
+  if (!session.interruptedPending) {
+    return;
+  }
+  session.interruptedPending = false;
+  log(
+    `suppress interrupted stream: thread=${session.threadId} continued=${continued}`,
+  );
+}
+
 function flushCandidateBuffer(
   session: WSession,
   out: Record<string, unknown>[],
 ): void {
+  if (isAgentInterruptedMessage(session.agentMessageText)) {
+    session.candidateBuffer = [];
+    session.heldTextClose = null;
+    session.agentMessageText = "";
+    session.interruptedPending = true;
+    return;
+  }
   for (const b of session.candidateBuffer) {
     if (session.compact?.collecting && typeof b.text === "string") {
       session.compact.summaryBuf += b.text;
@@ -4237,6 +4261,9 @@ function processDeltaLine(
   for (const delta of deltas) {
     switch (delta.kind) {
       case "turn.open": {
+        if (session.interruptedPending) {
+          resolveInterruptedPending(session, "aborted");
+        }
         session.bridgeTurnBusy = true;
         session.streamedAgentMessage = false;
         session.agentMessageText = "";
@@ -4253,6 +4280,15 @@ function processDeltaLine(
         continue;
       }
       case "turn.boundary": {
+        if (isAgentInterruptedMessage(session.agentMessageText)) {
+          session.candidateBuffer = [];
+          session.heldTextClose = null;
+          session.agentMessageText = "";
+          session.interruptedPending = true;
+        }
+        if (session.interruptedPending) {
+          resolveInterruptedPending(session, "no");
+        }
         // §2.3 п.11 & п.13 (ревизия 18): if candidate buffer or current text matched
         // a full validation or quota refusal, the marker is confirmed at boundary
         const isVal = isAgentValidationMessage(session.agentMessageText);
@@ -4292,6 +4328,14 @@ function processDeltaLine(
       }
       case "item.textDelta": {
         if (
+          session.interruptedPending &&
+          delta.channel !== "agentMessage" &&
+          typeof delta.text === "string" &&
+          /\S/.test(delta.text)
+        ) {
+          resolveInterruptedPending(session, "yes");
+        }
+        if (
           delta.channel === "agentMessage" &&
           typeof delta.text === "string"
         ) {
@@ -4305,9 +4349,62 @@ function processDeltaLine(
             session.candidateBuffer.push(delta);
             continue;
           }
-          // Divergence: flush buffered candidate chunks and process normally
+          // Point 0: divergence (§2.3 п. 15, ревизия 19)
+          const trimmedLeading = candidateText.trimStart();
+          const firstNl = trimmedLeading.indexOf("\n");
+          if (
+            firstNl !== -1 &&
+            isAgentInterruptedMessage(trimmedLeading.slice(0, firstNl))
+          ) {
+            session.candidateBuffer = [];
+            session.heldTextClose = null;
+            session.interruptedPending = true;
+            const rest = trimmedLeading.slice(firstNl + 1);
+            if (rest.length > 0) {
+              const restDelta = { ...delta, text: rest };
+              session.agentMessageText = rest;
+              out.push(restDelta);
+              session.streamedAgentMessage = true;
+              if (session.compact?.collecting) {
+                session.compact.summaryBuf += rest;
+              }
+              session.recentAssistantText = (
+                session.recentAssistantText + rest
+              ).slice(-HANDOFF_STREAMED_TEXT_CAP);
+              if (session.interruptedPending && /\S/.test(rest)) {
+                resolveInterruptedPending(session, "yes");
+              }
+            } else {
+              session.agentMessageText = "";
+            }
+            continue;
+          } else if (isAgentInterruptedMessage(session.agentMessageText)) {
+            session.candidateBuffer = [];
+            session.heldTextClose = null;
+            session.agentMessageText = "";
+            session.interruptedPending = true;
+            if (isAgentMarkerCandidate(delta.text)) {
+              session.agentMessageText = delta.text;
+              session.candidateBuffer.push(delta);
+              continue;
+            }
+            session.agentMessageText = delta.text;
+            session.streamedAgentMessage = true;
+            if (session.compact?.collecting) {
+              session.compact.summaryBuf += delta.text;
+            }
+            session.recentAssistantText = (
+              session.recentAssistantText + delta.text
+            ).slice(-HANDOFF_STREAMED_TEXT_CAP);
+            out.push(delta);
+            if (session.interruptedPending && /\S/.test(delta.text)) {
+              resolveInterruptedPending(session, "yes");
+            }
+            continue;
+          }
+          // Default divergence: flush buffered candidate chunks and process normally
           flushCandidateBuffer(session, out);
-          session.agentMessageText = candidateText;
+          session.agentMessageText = "";
           session.streamedAgentMessage = true;
           if (session.compact?.collecting) {
             session.compact.summaryBuf += delta.text;
@@ -4315,6 +4412,9 @@ function processDeltaLine(
           session.recentAssistantText = (
             session.recentAssistantText + delta.text
           ).slice(-HANDOFF_STREAMED_TEXT_CAP);
+          if (session.interruptedPending && /\S/.test(delta.text)) {
+            resolveInterruptedPending(session, "yes");
+          }
         }
         out.push(delta);
         continue;
@@ -4324,11 +4424,19 @@ function processDeltaLine(
         if (item.type === "compaction") {
           session.compactInFlight = true;
         }
-        if (
+        if (isAgentInterruptedMessage(session.agentMessageText)) {
+          session.candidateBuffer = [];
+          session.heldTextClose = null;
+          session.agentMessageText = "";
+          session.interruptedPending = true;
+        } else if (
           session.heldTextClose !== null ||
           session.candidateBuffer.length > 0
         ) {
           flushCandidateBuffer(session, out);
+        }
+        if (session.interruptedPending && item.type !== "agentMessage") {
+          resolveInterruptedPending(session, "yes");
         }
         session.agentMessageText = "";
         out.push(delta);
@@ -4338,6 +4446,15 @@ function processDeltaLine(
         if (delta.channel === "agentMessage") {
           if (session.stopped && !session.streamedAgentMessage) {
             session.heldTextClose = null;
+            continue;
+          }
+          if (isAgentInterruptedMessage(session.agentMessageText)) {
+            session.candidateBuffer = [];
+            session.heldTextClose = null;
+            session.agentMessageText = "";
+            session.streamedAgentMessage = false;
+            session.interruptedPending = true;
+            out.push(delta);
             continue;
           }
           if (
@@ -4361,6 +4478,15 @@ function processDeltaLine(
             session.heldTextClose = null;
             continue;
           }
+          if (isAgentInterruptedMessage(session.agentMessageText)) {
+            session.candidateBuffer = [];
+            session.heldTextClose = null;
+            session.agentMessageText = "";
+            session.streamedAgentMessage = false;
+            session.interruptedPending = true;
+            out.push(delta);
+            continue;
+          }
           if (
             isAgentQuotaMessage(session.agentMessageText) ||
             isAgentValidationMessage(session.agentMessageText)
@@ -4372,11 +4498,19 @@ function processDeltaLine(
           session.agentMessageText = "";
           session.streamedAgentMessage = false;
         } else {
-          if (
+          if (isAgentInterruptedMessage(session.agentMessageText)) {
+            session.candidateBuffer = [];
+            session.heldTextClose = null;
+            session.agentMessageText = "";
+            session.interruptedPending = true;
+          } else if (
             session.heldTextClose !== null ||
             session.candidateBuffer.length > 0
           ) {
             flushCandidateBuffer(session, out);
+          }
+          if (session.interruptedPending && item.type !== "agentMessage") {
+            resolveInterruptedPending(session, "yes");
           }
           session.agentMessageText = "";
         }
@@ -4384,6 +4518,9 @@ function processDeltaLine(
         continue;
       }
       case "session.reset": {
+        if (session.interruptedPending) {
+          resolveInterruptedPending(session, "aborted");
+        }
         session.recentAssistantText = "";
         session.candidateBuffer = [];
         session.heldTextClose = null;
@@ -4420,11 +4557,19 @@ function processDeltaLine(
       }
       default: {
         if (delta.kind === "toolCall" || delta.kind === "commandExecution") {
-          if (
+          if (isAgentInterruptedMessage(session.agentMessageText)) {
+            session.candidateBuffer = [];
+            session.heldTextClose = null;
+            session.agentMessageText = "";
+            session.interruptedPending = true;
+          } else if (
             session.heldTextClose !== null ||
             session.candidateBuffer.length > 0
           ) {
             flushCandidateBuffer(session, out);
+          }
+          if (session.interruptedPending) {
+            resolveInterruptedPending(session, "yes");
           }
           session.agentMessageText = "";
         }
@@ -5112,6 +5257,9 @@ function discardSession(session: WSession): void {
     clearTimeout(session.unblockTimer);
     session.unblockTimer = null;
   }
+  if (session.interruptedPending) {
+    resolveInterruptedPending(session, "aborted");
+  }
   session.candidateBuffer = [];
   session.heldTextClose = null;
   session.agentMessageText = "";
@@ -5682,9 +5830,16 @@ function handleTurnSteer(id: JsonRpcId, params: Record<string, unknown>): void {
     feedLine({ jsonrpc: "2.0", id, method: "turn/steer", params });
     return;
   }
-  // §2.3 п.13 (ревизия 18): on turn/steer, any unconfirmed candidate buffer
+  // §2.3 п.13 (ревизия 18) & п.15 (ревизия 19): on turn/steer, any unconfirmed candidate buffer
   // is immediately flushed to client, and detector state is reset to pristine.
-  if (session.candidateBuffer.length > 0) {
+  // Full interrupted message is absorbed without leaking to client.
+  if (isAgentInterruptedMessage(session.agentMessageText)) {
+    session.candidateBuffer = [];
+    session.heldTextClose = null;
+    session.agentMessageText = "";
+    session.interruptedPending = true;
+    resolveInterruptedPending(session, "aborted");
+  } else if (session.candidateBuffer.length > 0) {
     for (const b of session.candidateBuffer) {
       if (session.compact?.collecting && typeof b.text === "string") {
         session.compact.summaryBuf += b.text;
@@ -5702,6 +5857,9 @@ function handleTurnSteer(id: JsonRpcId, params: Record<string, unknown>): void {
   if (session.heldTextClose !== null) {
     emitDeltas(session.threadId, session.heldTextClose);
     session.heldTextClose = null;
+  }
+  if (session.interruptedPending) {
+    resolveInterruptedPending(session, "aborted");
   }
   session.agentMessageText = "";
   session.quotaRefusalText = null;
