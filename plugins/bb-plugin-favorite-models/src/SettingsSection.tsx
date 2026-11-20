@@ -12,6 +12,8 @@ import {
   exportFavoritesJson,
   importFavoritesJson,
   getFavoritesCount,
+  isFavorite,
+  cleanModelText,
   normalizeProviderId,
 } from "./favorites-manager.js";
 import { StarFilledIcon, TrashIcon, PlusIcon } from "./icons.js";
@@ -40,7 +42,14 @@ export function SettingsSection() {
       if (ok) {
         toast.success(`Модель ${mod} добавлена в избранное для ${prov}`);
       } else {
-        toast.error("Добавлено локально, но сервер не подтвердил запись");
+        // On failure runMutation already reconciled to the server snapshot:
+        // if the model is still there the app is offline and the optimistic
+        // record stands; if it vanished, the change was rolled back.
+        toast.error(
+          isFavorite(prov, cleanModelText(mod))
+            ? "Сервер недоступен — сохранено локально, синхронизируется позже"
+            : "Сервер не подтвердил запись — изменение отменено"
+        );
       }
     });
     setNewModel("");
@@ -51,7 +60,11 @@ export function SettingsSection() {
       if (ok) {
         toast.success(`Модель ${modelId} удалена из избранного`);
       } else {
-        toast.error("Удалено локально, но сервер не подтвердил запись");
+        toast.error(
+          isFavorite(providerId, modelId)
+            ? "Сервер не подтвердил удаление — модель осталась в избранном"
+            : "Сервер недоступен — удалено локально, синхронизируется позже"
+        );
       }
     });
   };
@@ -62,10 +75,16 @@ export function SettingsSection() {
         if (ok) {
           toast.success("Все избранные модели очищены");
         } else {
-          toast.error("Очищено локально, но сервер не подтвердил запись");
+          toast.error("Сервер не подтвердил очистку — проверьте список");
         }
       });
     }
+  };
+
+  const handleConfigToggle = (key: "pinToTop" | "showQuickBar") => (e: React.ChangeEvent<HTMLInputElement>) => {
+    void updateConfig({ [key]: e.target.checked }).then((ok) => {
+      if (!ok) toast.error("Не удалось сохранить настройку");
+    });
   };
 
   const handleExport = async () => {
@@ -112,7 +131,7 @@ export function SettingsSection() {
             <input
               type="checkbox"
               checked={state.pinToTop}
-              onChange={(e) => updateConfig({ pinToTop: e.target.checked })}
+              onChange={handleConfigToggle("pinToTop")}
               className="size-4 rounded border-border text-amber-500 focus:ring-amber-500"
             />
             <span className="text-xs text-foreground font-medium">
@@ -124,7 +143,7 @@ export function SettingsSection() {
             <input
               type="checkbox"
               checked={state.showQuickBar}
-              onChange={(e) => updateConfig({ showQuickBar: e.target.checked })}
+              onChange={handleConfigToggle("showQuickBar")}
               className="size-4 rounded border-border text-amber-500 focus:ring-amber-500"
             />
             <span className="text-xs text-foreground font-medium">

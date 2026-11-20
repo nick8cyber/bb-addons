@@ -197,3 +197,92 @@ describe("restricted storage (m5)", () => {
     }
   });
 });
+
+describe("boot sync races a mutation (review minor)", () => {
+  it("a raced mutation triggers one re-read instead of dropping server favorites", async () => {
+    const mgr = await freshManager();
+    const calls: string[] = [];
+    let resolveGet: ((v: unknown) => void) | null = null;
+    let getCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        const method = url.split("/").pop()!;
+        calls.push(method);
+        if (method === "getFavorites") {
+          getCount++;
+          if (getCount === 1) {
+            return { json: () => new Promise((r) => (resolveGet = r)) };
+          }
+          return rpcResponse(snapshot(8, { codex: ["new-star", "from-other-device"] }));
+        }
+        return rpcResponse(snapshot(7, { codex: ["new-star"] }));
+      })
+    );
+    const cancel = mgr.initBackendSync();
+    // The local star lands while the boot read is still in flight.
+    await mgr.addFavorite("codex", "new-star");
+    resolveGet!({ ok: true, result: snapshot(1) });
+    await vi.waitFor(() =>
+      expect(mgr.getState().favorites.codex).toEqual(["new-star", "from-other-device"])
+    );
+    expect(calls.filter((c) => c === "getFavorites").length).toBe(2);
+    cancel();
+  });
+});
+
+describe("updateConfig honest result (review minor)", () => {
+  it("returns false and snaps the value back when the server refuses", async () => {
+    const mgr = await freshManager();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        rpcResponse({ success: false, config: { pinToTop: true, showQuickBar: true } })
+      )
+    );
+    const ok = await mgr.updateConfig({ pinToTop: false });
+    expect(ok).toBe(false);
+    expect(mgr.getState().pinToTop).toBe(true);
+  });
+
+  it("returns true and applies the echoed config on success", async () => {
+    const mgr = await freshManager();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        rpcResponse({ success: true, config: { pinToTop: false, showQuickBar: true } })
+      )
+    );
+    const ok = await mgr.updateConfig({ pinToTop: false });
+    expect(ok).toBe(true);
+    expect(mgr.getState().pinToTop).toBe(false);
+  });
+});
+
+describe("legacy bare-modelId entries (review minor)", () => {
+  it("toggleFavorite('M · route') removes the stored 'M'", async () => {
+    const mgr = await freshManager();
+    const bodies: { modelId?: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: { body?: string }) => {
+        const method = url.split("/").pop()!;
+        if (method === "getFavorites") {
+          return rpcResponse(snapshot(5, { codex: ["M"] }));
+        }
+        if (method === "removeFavorite") {
+          bodies.push(init?.body ? JSON.parse(init.body) : {});
+          return rpcResponse(snapshot(6, {}));
+        }
+        return rpcResponse(snapshot(7));
+      })
+    );
+    const cancel = mgr.initBackendSync();
+    await vi.waitFor(() => expect(mgr.isFavorite("codex", "M")).toBe(true));
+    const added = await mgr.toggleFavorite("codex", "M · route");
+    expect(added).toBe(false);
+    expect(bodies.length).toBe(1);
+    expect(bodies[0].modelId).toBe("M");
+    cancel();
+  });
+});

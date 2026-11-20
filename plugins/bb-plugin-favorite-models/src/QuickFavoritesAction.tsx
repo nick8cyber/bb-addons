@@ -100,9 +100,11 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
 
   // A pending programmatic switch must not survive a context change or this
   // composer's unmount — its polls would then click into a menu that no
-  // longer belongs to the user's intent (B3).
+  // longer belongs to the user's intent (B3). Scoped to THIS composer's
+  // trigger: another composer unmounting cancels nothing of ours.
   useEffect(() => {
-    return () => cancelPendingSwitch();
+    const btn = buttonRef.current;
+    return () => cancelPendingSwitch(btn);
   }, [threadId]);
 
   // Pin the menu to the button edge: upward opens get their BOTTOM edge fixed

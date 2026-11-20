@@ -6,6 +6,7 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
+  cleanModelText,
   dropLabels,
   labelKey,
   normalizeProviderId,
@@ -108,37 +109,46 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * Read the store. Migrates legacy split keys (`favorites:map`,
+   * Load the store, migrating legacy split keys (`favorites:map`,
    * `favorites:labels`) into the single versioned record on first access.
-   * Migration runs inside the lock so two readers cannot double-write it.
+   * Call ONLY inside withStoreLock — every reader and every writer (incl.
+   * CLI paths that never call readStore first) goes through this, so a
+   * first-write after upgrade can never overwrite the old split keys with
+   * an empty snapshot.
    */
-  const readStore = (): Promise<FavoritesSnapshot> =>
-    withStoreLock(async () => {
-      const existing = await bb.storage.kv.get<FavoritesSnapshot>(STORE_KEY);
-      if (existing && typeof existing === "object" && typeof existing.version === "number") {
-        return existing;
-      }
-      const legacyMap =
-        (await bb.storage.kv.get<FavoritesMap>(LEGACY_MAP_KEY)) ?? {};
-      const legacyLabels =
-        (await bb.storage.kv.get<ModelLabels>(LEGACY_LABELS_KEY)) ?? {};
-      const { favorites, modelLabels } = sanitizeStore(legacyMap, legacyLabels);
-      const snapshot: FavoritesSnapshot = { version: 1, favorites, modelLabels };
-      await bb.storage.kv.set(STORE_KEY, snapshot);
-      await bb.storage.kv.delete(LEGACY_MAP_KEY);
-      await bb.storage.kv.delete(LEGACY_LABELS_KEY);
-      return snapshot;
-    });
+  const loadOrMigrate = async (): Promise<FavoritesSnapshot> => {
+    const existing = await bb.storage.kv.get<FavoritesSnapshot>(STORE_KEY);
+    if (existing && typeof existing === "object" && typeof existing.version === "number") {
+      return existing;
+    }
+    const legacyMap = await bb.storage.kv.get<FavoritesMap>(LEGACY_MAP_KEY);
+    const legacyLabels = await bb.storage.kv.get<ModelLabels>(LEGACY_LABELS_KEY);
+    // Nothing stored anywhere: hand back an empty v0 without persisting —
+    // the first real write becomes version 1 and no stray record appears
+    // on fresh installs.
+    if (legacyMap === undefined && legacyLabels === undefined) {
+      return { version: 0, favorites: {}, modelLabels: {} };
+    }
+    const { favorites, modelLabels } = sanitizeStore(legacyMap ?? {}, legacyLabels ?? {});
+    const snapshot: FavoritesSnapshot = { version: 1, favorites, modelLabels };
+    await bb.storage.kv.set(STORE_KEY, snapshot);
+    await bb.storage.kv.delete(LEGACY_MAP_KEY);
+    await bb.storage.kv.delete(LEGACY_LABELS_KEY);
+    return snapshot;
+  };
+
+  const readStore = (): Promise<FavoritesSnapshot> => withStoreLock(loadOrMigrate);
 
   const writeStore = (
     mutate: (snapshot: FavoritesSnapshot) => void
   ): Promise<FavoritesSnapshot> =>
     withStoreLock(async () => {
-      const existing = await bb.storage.kv.get<FavoritesSnapshot>(STORE_KEY);
-      const snapshot: FavoritesSnapshot =
-        existing && typeof existing === "object" && typeof existing.version === "number"
-          ? { ...existing, favorites: { ...existing.favorites }, modelLabels: { ...existing.modelLabels } }
-          : { version: 0, favorites: {}, modelLabels: {} };
+      const existing = await loadOrMigrate();
+      const snapshot: FavoritesSnapshot = {
+        ...existing,
+        favorites: { ...existing.favorites },
+        modelLabels: { ...existing.modelLabels },
+      };
       mutate(snapshot);
       const { favorites, modelLabels } = sanitizeStore(snapshot.favorites, snapshot.modelLabels);
       const next: FavoritesSnapshot = {
@@ -202,7 +212,10 @@ export default async function plugin(bb: BbPluginApi) {
 
     removeFavorite: async ({ providerId, modelId }) => {
       const prov = normalizeProviderId(providerId);
-      const id = modelId.trim();
+      // Stored ids are sanitized on write; the lookup key must go through
+      // the same cleaning or "model ⌘M"-style residue makes records
+      // unremovable.
+      const id = cleanModelText(modelId.trim());
       const next = await writeStore((s) => {
         const list = s.favorites[prov] || [];
         const rest = list.filter((m) => m !== id);
@@ -321,9 +334,10 @@ export default async function plugin(bb: BbPluginApi) {
           };
         }
         // Same canonical key the store is written under — a raw alias like
-        // "openai" must resolve to "codex" before the lookup (m1).
+        // "openai" must resolve to "codex" before the lookup (m1), and the
+        // model id gets the same cleaning the write path applies (m3).
         const prov = normalizeProviderId(arg1);
-        const id = arg2.trim();
+        const id = cleanModelText(arg2.trim());
         const before = await readStore();
         const list = before.favorites[prov] || [];
         if (!list.includes(id)) {

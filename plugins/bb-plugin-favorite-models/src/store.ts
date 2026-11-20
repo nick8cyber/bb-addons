@@ -65,7 +65,9 @@ export function normalizeProviderId(name: string): string {
 export function cleanModelText(text: string): string {
   let out = (text || "")
     .replace(/\s*(⇧|⌘|⌥|⌃)([+\s\-]*(⇧|⌘|⌥|⌃|[a-zа-я0-9]))*/gi, "")
-    .replace(/\s*\b(ctrl|control|alt|option|shift|cmd|meta)\b([+\-][a-z0-9]+)+/gi, "")
+    // Word-modifier chords (" Alt+M", "Ctrl+Shift+P") only count at a token
+    // boundary — mid-id hyphens like "foo-alt-2" are part of the model name.
+    .replace(/(^|\s)(ctrl|control|alt|option|shift|cmd|meta)\b([+\-][a-z0-9]+)+/gi, "$1")
     .replace(/\s{2,}/g, " ")
     .trim();
   // Drop trailing dangling separators like "-" or "·"

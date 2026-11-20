@@ -296,9 +296,16 @@ export function toggleFavorite(providerId: string, modelId: string, label?: stri
   const prov = normalizeProviderId(providerId);
   const id = cleanModelText(modelId.trim());
   if (!prov || prov === "default" || !id) return Promise.resolve(false);
-  return isFavorite(prov, id)
-    ? removeFavorite(prov, id).then(() => false)
-    : addFavorite(prov, id, label).then(() => true);
+  if (isFavorite(prov, id)) return removeFavorite(prov, id).then(() => false);
+  // A pre-B2 entry stores the bare modelId ("M") while today's row keys are
+  // "M · route" — the star already shows favorited via that match, so the
+  // same click must REMOVE the legacy record, not stack "M · route" next
+  // to an unstarrable "M".
+  const head = id.split(" · ")[0];
+  const list = currentState.favorites[prov] || [];
+  const legacy = head !== id ? list.find((m) => m === head) : undefined;
+  if (legacy) return removeFavorite(prov, legacy).then(() => false);
+  return addFavorite(prov, id, label).then(() => true);
 }
 
 export function clearFavorites(providerId?: string): Promise<boolean> {
@@ -324,12 +331,16 @@ export function clearFavorites(providerId?: string): Promise<boolean> {
 export function updateConfig(
   updates: Partial<Pick<FavoritesState, "pinToTop" | "showQuickBar">>
 ): Promise<boolean> {
+  const prev = {
+    pinToTop: currentState.pinToTop,
+    showQuickBar: currentState.showQuickBar,
+  };
   commitLocal({ ...currentState, ...updates });
   return callRpc<{ success: boolean; config: { pinToTop: boolean; showQuickBar: boolean } }>(
     "updateConfig",
     updates
   ).then((res) => {
-    if (res?.config) {
+    if (res?.success && res.config) {
       currentState = {
         ...currentState,
         pinToTop: res.config.pinToTop,
@@ -338,6 +349,14 @@ export function updateConfig(
       persistState(currentState);
       notify();
       return true;
+    }
+    // The server explicitly refused (success:false): the checkbox must snap
+    // back instead of silently staying flipped (M13). A network-level null
+    // keeps the optimistic value — nothing was persisted either way.
+    if (res && res.success === false) {
+      currentState = { ...currentState, ...prev };
+      persistState(currentState);
+      notify();
     }
     return false;
   });
@@ -396,10 +415,16 @@ let syncGen = 0;
 export function initBackendSync(): () => void {
   const gen = ++syncGen;
   const mutationsAtStart = mutationCounter;
-  void callRpc<ServerSnapshot>("getFavorites", null).then((res) => {
-    if (!res || gen !== syncGen) return;
-    if (mutationCounter !== mutationsAtStart) return;
-    if (typeof res.version === "number" && res.version < serverVersion) return;
+  void callRpc<ServerSnapshot>("getFavorites", null).then(async (res) => {
+    if (gen !== syncGen) return;
+    if (mutationCounter !== mutationsAtStart || !res) {
+      // A local mutation (or a dropped read) raced the boot fetch — pull the
+      // authoritative snapshot once more instead of discarding every
+      // cross-device favorite until the next remount.
+      const fresh = await callRpc<ServerSnapshot>("getFavorites", null);
+      if (fresh && gen === syncGen) applyServerSnapshot(fresh);
+      return;
+    }
     applyServerSnapshot(res);
   });
   return () => {

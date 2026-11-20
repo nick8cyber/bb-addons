@@ -37,7 +37,7 @@ const COMPOSER_ROOT_SELECTOR = "[data-app-composer-role]";
 /** BB's trigger carries aria-label "Provider, model and reasoning (<shortcut>)". */
 const MODEL_TRIGGER_SELECTOR = 'button[aria-label*="Provider, model" i]';
 const POPOVER_SELECTOR =
-  '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]';
+  '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper], [role="dialog"][data-state]';
 const OPTION_SELECTOR = 'button[role="option"], button[id*="-opt-"]';
 const MODEL_SEARCH_SELECTOR =
   'input[placeholder*="model" i], input[aria-label*="model" i]';
@@ -199,7 +199,31 @@ function restoreDom(): void {
 function isModelPickerContainer(el: HTMLElement): boolean {
   if (el.closest(".bb-fav-pin-section")) return false;
   if (el.querySelector(MODEL_SEARCH_SELECTOR)) return true;
-  return !!el.querySelector('button[role="option"][id*="-opt-"]');
+  // BB only stamps role="option" on rows when the search box is rendered
+  // (>5 models); short pickers carry bare `…-opt-N` ids, so the id — not
+  // the role — is the reliable marker.
+  return !!el.querySelector('button[id*="-opt-"]');
+}
+
+/**
+ * The element we treat as "the popover" is the whole content node — the
+ * thing aria-controls points at — so provider tabs and the search field
+ * (which sit OUTSIDE the inner listbox) stay reachable. A bare inner
+ * listbox is never the container.
+ */
+function popoverRoot(el: HTMLElement): HTMLElement {
+  const wrapper = el.matches?.("[data-radix-popper-content-wrapper]")
+    ? el
+    : el.closest<HTMLElement>("[data-radix-popper-content-wrapper]");
+  if (wrapper) {
+    for (const child of wrapper.children) {
+      if (child instanceof HTMLElement && (child === el || child.contains(el))) {
+        return child;
+      }
+    }
+    return wrapper;
+  }
+  return el.closest<HTMLElement>("[data-radix-popover-content]") ?? el;
 }
 
 /** Deepest qualifying containers only — no wrapper+inner double-processing. */
@@ -211,9 +235,15 @@ function pickPickerContainers(root: HTMLElement): HTMLElement[] {
   for (const el of root.querySelectorAll<HTMLElement>(POPOVER_SELECTOR)) {
     if (isModelPickerContainer(el)) candidates.push(el);
   }
-  return candidates.filter(
+  const deepest = candidates.filter(
     (c) => !candidates.some((other) => other !== c && c.contains(other))
   );
+  const roots: HTMLElement[] = [];
+  for (const c of deepest) {
+    const r = popoverRoot(c);
+    if (!roots.includes(r)) roots.push(r);
+  }
+  return roots;
 }
 
 function refreshAllOpenPickers(): void {
@@ -267,11 +297,38 @@ function providerFromTrigger(trigger: HTMLButtonElement): string {
   return "default";
 }
 
+/**
+ * The trigger that opened THIS popover: Radix wires it via
+ * `aria-controls="<content id>"`. The id can sit on the container itself,
+ * an ancestor wrapper, or the content element inside it — all get checked.
+ */
+function findOwnerTrigger(container: HTMLElement): HTMLButtonElement | null {
+  const ids: string[] = [];
+  let up: HTMLElement | null = container;
+  while (up && up !== document.body) {
+    if (up.id) ids.push(up.id);
+    up = up.parentElement;
+  }
+  for (const el of container.querySelectorAll<HTMLElement>("[id]")) {
+    ids.push(el.id);
+  }
+  for (const id of ids) {
+    try {
+      const t = document.querySelector<HTMLButtonElement>(
+        `button[aria-controls="${id.replace(/"/g, '\\"')}"]`
+      );
+      if (t?.isConnected) return t;
+    } catch {
+      // Unusual id characters: skip instead of breaking the whole lookup.
+    }
+  }
+  return null;
+}
+
 export function detectActiveProvider(container?: HTMLElement, anchor?: HTMLElement | null): string {
   // 1. Active provider tab inside THIS popover (scoped — never global).
   if (container) {
-    const popover = container.closest<HTMLElement>("[data-radix-popover-content]") || container;
-    const tabs = providerTabs(popover);
+    const tabs = providerTabs(container);
     const activeTab = tabs.find(tabIsActive) || tabs.find((b) => b.className.includes("text-foreground"));
     if (activeTab) {
       const title = activeTab.getAttribute("title") || activeTab.textContent?.trim();
@@ -282,7 +339,15 @@ export function detectActiveProvider(container?: HTMLElement, anchor?: HTMLEleme
     }
   }
 
-  // 2. The trigger of OUR composer only — a document-wide lookup reads the
+  // 2. The trigger that opened THIS popover — its title names the provider
+  // even when no tab strip is rendered (single-provider pickers).
+  const owner = container ? findOwnerTrigger(container) : null;
+  if (owner) {
+    const prov = providerFromTrigger(owner);
+    if (prov !== "default") return prov;
+  }
+
+  // 3. The trigger of OUR composer only — a document-wide lookup reads the
   // provider off whichever composer happens to come first (M4/B1).
   const triggerBtn = findModelTrigger(anchor);
   if (triggerBtn) {
@@ -588,18 +653,15 @@ function buildCloneRow(
   return clone;
 }
 
-/** Popover owned by THIS trigger via Radix's aria-controls wiring (B1). */
+/** Popover owned by THIS trigger via Radix's aria-controls wiring (B1).
+ * The controlled element IS the popover — descending into an inner listbox
+ * would cut off the provider tabs and the search field that live next to
+ * it (review: tabs/search unreachable at >5 models). */
 function findOwnedPopover(trigger: HTMLButtonElement): HTMLElement | null {
   const id = trigger.getAttribute("aria-controls");
   if (!id) return null;
   const el = document.getElementById(id);
-  if (!(el instanceof HTMLElement) || !el.isConnected) return null;
-  // The controlled element may be the popper wrapper or the content itself;
-  // either way it must look like an overlay, not some other controlled part.
-  if (el.matches(POPOVER_SELECTOR) || el.querySelector(POPOVER_SELECTOR)) {
-    return el.matches(POPOVER_SELECTOR) ? el : el.querySelector<HTMLElement>(POPOVER_SELECTOR);
-  }
-  return el;
+  return el instanceof HTMLElement && el.isConnected ? el : null;
 }
 
 function findModelTrigger(anchor?: HTMLElement | null): HTMLButtonElement | null {
@@ -645,14 +707,22 @@ export interface SwitchResult {
 }
 
 /**
- * Generation guard (B3): every new switch invalidates the polls of the
- * previous one, and `cancelPendingSwitch()` does the same on unmount or a
- * context change, so a stale loop can never click into a menu that appeared
- * after the user's intent changed.
+ * Cancellation (B3): tokens are PER TRIGGER. A new switch on the same
+ * composer cancels the previous one, and `cancelPendingSwitch(anchor)`
+ * cancels only that composer's loop — another composer unmounting must not
+ * abort a switch the user started elsewhere. Tokens also die with their
+ * trigger (`isConnected`), so a removed composer frees itself.
  */
-let switchGen = 0;
-export function cancelPendingSwitch(): void {
-  switchGen++;
+const pendingSwitches = new Map<HTMLElement, { cancelled: boolean }>();
+
+export function cancelPendingSwitch(anchor?: HTMLElement | null): void {
+  if (anchor === undefined || anchor === null) {
+    for (const token of pendingSwitches.values()) token.cancelled = true;
+    return;
+  }
+  const trigger = findModelTrigger(anchor);
+  const token = trigger ? pendingSwitches.get(trigger) : undefined;
+  if (token) token.cancelled = true;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -662,7 +732,6 @@ export async function switchComposerModel(
   providerId?: string,
   anchor?: HTMLElement | null
 ): Promise<SwitchResult> {
-  const gen = ++switchGen;
   const triggerBtn = findModelTrigger(anchor);
   if (!triggerBtn) return { ok: false, reason: "no-trigger" };
   // BB disables the trigger while the model is locked (e.g. mid-run); a click
@@ -671,8 +740,25 @@ export async function switchComposerModel(
     return { ok: false, reason: "trigger-disabled" };
   }
 
-  const alive = () => gen === switchGen && triggerBtn.isConnected;
+  const token = { cancelled: false };
+  const prev = pendingSwitches.get(triggerBtn);
+  if (prev) prev.cancelled = true;
+  pendingSwitches.set(triggerBtn, token);
+  const alive = () => !token.cancelled && triggerBtn.isConnected;
 
+  try {
+    return await runSwitch(modelId, providerId, triggerBtn, alive);
+  } finally {
+    if (pendingSwitches.get(triggerBtn) === token) pendingSwitches.delete(triggerBtn);
+  }
+}
+
+async function runSwitch(
+  modelId: string,
+  providerId: string | undefined,
+  triggerBtn: HTMLButtonElement,
+  alive: () => boolean
+): Promise<SwitchResult> {
   if (!findOwnedPopover(triggerBtn)) {
     triggerBtn.click();
   }
@@ -727,16 +813,21 @@ export async function switchComposerModel(
   // Find the option. Poll: the list itself may still be loading, the tab
   // switch re-renders it, and "More models"/search may have to reveal it (M3).
   let expandedMore = false;
-  let searched = false;
+  let searchedInput: HTMLInputElement | null = null;
+  const fail = (reason: SwitchFailure): SwitchResult => {
+    cleanupSwitchRemnants(popover, searchedInput);
+    return { ok: false, reason };
+  };
   for (let i = 0; i < 40 && alive(); i++) {
     const live = findOwnedPopover(triggerBtn);
     if (!live) {
-      await sleep(25);
-      continue;
+      // The popover was open and is gone (Escape, outside click): abort —
+      // a menu the USER reopens later must not receive our click.
+      return fail("cancelled");
     }
     popover = live;
 
-    for (const opt of scanOptions(popover)) {
+    for (const opt of [...scanOptions(popover), ...scanSubmenuOptions(popover)]) {
       const ex = extractModelOption(opt);
       if (ex.key !== modelId && ex.modelId !== modelId) continue;
       if (opt.disabled || opt.getAttribute("aria-disabled") === "true") {
@@ -763,10 +854,10 @@ export async function switchComposerModel(
       }
     }
 
-    if (!searched) {
+    if (!searchedInput) {
       const input = popover.querySelector<HTMLInputElement>(MODEL_SEARCH_SELECTOR);
       if (input) {
-        searched = true;
+        searchedInput = input;
         setNativeInputValue(input, modelId.split(" · ")[0]);
         continue;
       }
@@ -775,8 +866,53 @@ export async function switchComposerModel(
     await sleep(25);
   }
 
-  if (!alive()) return { ok: false, reason: "cancelled" };
-  return { ok: false, reason: "model-not-found" };
+  if (!alive()) return fail("cancelled");
+  return fail("model-not-found");
+}
+
+/**
+ * "More models" on short lists opens a Radix SUBMENU: its content is
+ * portaled outside our popover and its rows carry neither `-opt-` ids nor
+ * role="option". The sub-trigger's own aria-controls names it — follow
+ * that link instead of scanning the whole document (still scoped, B1).
+ */
+function scanSubmenuOptions(popover: HTMLElement): HTMLButtonElement[] {
+  const rows: HTMLButtonElement[] = [];
+  for (const trig of popover.querySelectorAll<HTMLElement>("[aria-controls]")) {
+    const id = trig.getAttribute("aria-controls");
+    if (!id) continue;
+    const sub = document.getElementById(id);
+    if (!(sub instanceof HTMLElement) || !sub.isConnected || popover.contains(sub)) continue;
+    for (const b of sub.querySelectorAll<HTMLButtonElement>("button")) {
+      if (!b.hasAttribute("data-bb-fav-clone") && !b.closest(".bb-fav-pin-section") && !isToggleRow(b)) {
+        rows.push(b);
+      }
+    }
+  }
+  return rows;
+}
+
+/**
+ * Undo whatever the failed scan left behind: the search text WE typed and
+ * any menu surface we opened (the popover plus portal submenus it spawned).
+ */
+function cleanupSwitchRemnants(
+  popover: HTMLElement | null,
+  searchedInput: HTMLInputElement | null
+): void {
+  if (searchedInput?.isConnected && searchedInput.value) {
+    setNativeInputValue(searchedInput, "");
+  }
+  if (!popover?.isConnected) return;
+  for (const trig of popover.querySelectorAll<HTMLElement>("[aria-controls]")) {
+    const id = trig.getAttribute("aria-controls");
+    if (!id) continue;
+    const sub = document.getElementById(id);
+    if (sub instanceof HTMLElement && sub.isConnected && !popover.contains(sub)) {
+      sub.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    }
+  }
+  popover.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
 }
 
 /**

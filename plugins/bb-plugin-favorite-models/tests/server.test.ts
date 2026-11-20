@@ -204,3 +204,35 @@ describe("cli favorites (m1, m2)", () => {
     expect(parsed).toHaveProperty("version");
   });
 });
+
+describe("first-write legacy migration (review blocker 3)", () => {
+  it("CLI add does not wipe a legacy favorites:map", async () => {
+    const ctx = await loadPlugin({ "favorites:map": { codex: ["gpt-old"] } });
+    await ctx.cli(["add", "codex", "gpt-new"]);
+    const res = await call(ctx, "getFavorites", null);
+    expect(res.favorites.codex).toContain("gpt-old");
+    expect(res.favorites.codex).toContain("gpt-new");
+    expect(ctx.kv.has("favorites:map")).toBe(false);
+  });
+
+  it("full clear migrates before wiping, so labels do not resurrect", async () => {
+    const ctx = await loadPlugin({
+      "favorites:map": { codex: ["gpt-old"] },
+      "favorites:labels": { "codex:gpt-old": "OLD" },
+    });
+    await ctx.cli(["clear"]);
+    const res = await call(ctx, "getFavorites", null);
+    expect(res.favorites).toEqual({});
+    expect(res.modelLabels).toEqual({});
+  });
+});
+
+describe("model ids containing modifier words (review minor)", () => {
+  it("add and remove round-trip 'foo-alt-2' unmangled", async () => {
+    const ctx = await loadPlugin();
+    const add = await call(ctx, "addFavorite", { providerId: "codex", modelId: "foo-alt-2" });
+    expect(add.favorites.codex).toEqual(["foo-alt-2"]);
+    const rm = await call(ctx, "removeFavorite", { providerId: "codex", modelId: "foo-alt-2" });
+    expect(rm.favorites.codex).toBeUndefined();
+  });
+});

@@ -5,71 +5,116 @@ type Dom = typeof import("../src/dom-observer.js");
 type Manager = typeof import("../src/favorites-manager.js");
 
 let rowSeq = 0;
+let popSeq = 0;
 
-function optionRow(title: string, opts: { disabled?: boolean } = {}): HTMLButtonElement {
+/**
+ * Fixtures replicate BB 0.49.0's ModelReasoningMenu (Radix popover):
+ * - wrapper[data-radix-popper-content-wrapper] > content[role=dialog][id][data-state]
+ * - provider tabs AND the search field live inside content but OUTSIDE the
+ *   inner option list — narrowing to `[role=listbox]` loses both.
+ * - rows are `button[id="…-opt-N"]`; role="option" exists ONLY while the
+ *   search box is rendered (>5 models), never on short pickers.
+ * - trigger ↔ content link is `aria-controls`; there is NO
+ *   `data-radix-popover-content` attribute anywhere in the tree.
+ */
+function optionRow(
+  title: string,
+  opts: { disabled?: boolean; withRole?: boolean } = {}
+): HTMLButtonElement {
   const b = document.createElement("button");
-  b.setAttribute("role", "option");
-  b.id = `row-opt-${rowSeq++}`;
+  b.type = "button";
+  b.id = `:r5:-opt-${rowSeq++}`;
+  if (opts.withRole) b.setAttribute("role", "option");
   if (opts.disabled) b.setAttribute("aria-disabled", "true");
   const s = document.createElement("span");
   s.className = "truncate";
   s.title = title;
   s.textContent = title.split(" · ")[0];
-  b.appendChild(s);
+  const chk = document.createElement("span");
+  chk.className = "flex shrink-0 items-center gap-1.5";
+  b.append(s, chk);
   return b;
 }
 
-function popover(opts: {
+function nativePicker(opts: {
   tabs?: { title: string; active?: boolean }[];
   rows?: HTMLElement[];
   search?: boolean;
-}): { pop: HTMLElement; list: HTMLElement } {
-  const pop = document.createElement("div");
-  pop.setAttribute("data-radix-popover-content", "");
-  if (opts.search) {
-    const input = document.createElement("input");
-    input.setAttribute("placeholder", "Search models");
-    pop.appendChild(input);
-  }
+}): { wrapper: HTMLElement; content: HTMLElement; list: HTMLElement } {
+  const wrapper = document.createElement("div");
+  wrapper.setAttribute("data-radix-popper-content-wrapper", "");
+  const content = document.createElement("div");
+  content.setAttribute("role", "dialog");
+  content.setAttribute("data-state", "open");
+  content.id = `radix-:rp${popSeq++}:`;
+
   if (opts.tabs?.length) {
     const strip = document.createElement("div");
-    strip.className = "border-b flex items-center";
+    strip.className =
+      "flex shrink-0 items-center gap-0.5 border-b border-border bg-background px-2.5 pt-1";
     for (const t of opts.tabs) {
-      const b = document.createElement("button");
-      b.title = t.title;
-      if (t.active) b.className = "border-foreground";
-      strip.appendChild(b);
+      const tb = document.createElement("button");
+      tb.title = t.title;
+      tb.className = t.active
+        ? "flex border-b-2 border-foreground text-foreground"
+        : "flex border-b-2 border-transparent text-muted-foreground hover:text-foreground";
+      strip.append(tb);
     }
-    pop.appendChild(strip);
+    content.append(strip);
+  }
+  if (opts.search) {
+    const sd = document.createElement("div");
+    const input = document.createElement("input");
+    input.placeholder = "Search models";
+    input.setAttribute("aria-label", "Search models");
+    sd.append(input);
+    content.append(sd);
   }
   const list = document.createElement("div");
-  list.setAttribute("role", "listbox");
-  for (const r of opts.rows ?? []) list.appendChild(r);
-  pop.appendChild(list);
-  return { pop, list };
+  if (opts.search) {
+    list.setAttribute("role", "listbox");
+    list.id = `:r5:-listbox-${popSeq}`;
+  }
+  const hdr = document.createElement("div");
+  hdr.className = "sticky top-0";
+  hdr.textContent = "Model";
+  list.append(hdr, ...(opts.rows ?? []));
+  content.append(list);
+  wrapper.append(content);
+  return { wrapper, content, list };
 }
 
-function composer(role = "primary", triggerTitle = "Codex: gpt-5.4") {
+type Picker = ReturnType<typeof nativePicker>;
+
+function composer(role = "primary", triggerTitle = "Codex: gpt-5 · high reasoning") {
   const root = document.createElement("div");
+  root.setAttribute("data-app-composer", "");
   root.setAttribute("data-app-composer-role", role);
   const anchor = document.createElement("span");
   const trigger = document.createElement("button");
-  trigger.setAttribute("aria-label", "Provider, model and reasoning (⇧-⌘-m)");
-  trigger.title = triggerTitle;
+  trigger.setAttribute("aria-label", "Provider, model and reasoning (⇧⌘M)");
+  const ts = document.createElement("span");
+  ts.title = triggerTitle;
+  trigger.append(ts);
   root.append(anchor, trigger);
   document.body.append(root);
   return { root, anchor, trigger };
 }
 
-/** Wire the trigger like Radix does: click opens a popover via aria-controls. */
-function openOnClick(trigger: HTMLButtonElement, pop: HTMLElement, id = "pop-a"): void {
-  trigger.addEventListener("click", () => {
-    pop.id = id;
-    trigger.setAttribute("aria-controls", id);
-    trigger.setAttribute("aria-expanded", "true");
-    document.body.append(pop);
-  });
+/** What BB does when the popover is already open: aria-controls + portal. */
+function openPicker(trigger: HTMLButtonElement, picker: Picker): void {
+  trigger.setAttribute("aria-controls", picker.content.id);
+  trigger.setAttribute("aria-expanded", "true");
+  document.body.append(picker.wrapper);
 }
+
+/** Wire the trigger like Radix does: a click opens the popover. */
+function openOnClick(trigger: HTMLButtonElement, picker: Picker): void {
+  trigger.addEventListener("click", () => openPicker(trigger, picker));
+}
+
+const rowButtons = (root: HTMLElement | Document = document) =>
+  Array.from(root.querySelectorAll<HTMLButtonElement>('button[id*="-opt-"]'));
 
 async function freshModules(): Promise<{ dom: Dom; mgr: Manager }> {
   vi.resetModules();
@@ -93,12 +138,77 @@ function stubRpc(handler: (method: string, body: unknown) => unknown) {
 beforeEach(() => {
   vi.useFakeTimers();
   rowSeq = 0;
+  popSeq = 0;
 });
 
 afterEach(() => {
   document.body.replaceChildren();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+describe("native BB 0.49.0 markup — stars (blocker 1)", () => {
+  it("short picker (<=5 models): rows have no role/listbox, stars still inject", async () => {
+    const { dom } = await freshModules();
+    const A = composer();
+    const picker = nativePicker({
+      rows: [optionRow("m0"), optionRow("m1"), optionRow("m2")],
+    });
+    openPicker(A.trigger, picker);
+
+    const dispose = dom.initDomObserver();
+    expect(document.querySelectorAll(".bb-fav-star-btn").length).toBe(3);
+    dispose();
+  });
+
+  it("thread picker (no tabs): star click reaches addFavorite with the trigger's provider", async () => {
+    const { dom } = await freshModules();
+    const bodies: { providerId?: string; modelId?: string }[] = [];
+    stubRpc((method, body) => {
+      if (method === "addFavorite") bodies.push(body as never);
+      return { version: 1, favorites: {}, modelLabels: {}, config: {} };
+    });
+    const A = composer(); // trigger title says Codex
+    const picker = nativePicker({
+      search: true,
+      rows: Array.from({ length: 7 }, (_, i) => optionRow(`m${i}`, { withRole: true })),
+    });
+    openPicker(A.trigger, picker);
+
+    const dispose = dom.initDomObserver();
+    const star = document.querySelector<HTMLButtonElement>(".bb-fav-star-btn")!;
+    star.click();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(bodies.length).toBe(1);
+    expect(bodies[0].providerId).toBe("codex");
+    expect(bodies[0].modelId).toBe("m0");
+    dispose();
+  });
+
+  it("new-thread picker with tabs: provider comes from the ACTIVE tab inside content", async () => {
+    const { dom } = await freshModules();
+    const bodies: { providerId?: string }[] = [];
+    stubRpc((method, body) => {
+      if (method === "addFavorite") bodies.push(body as never);
+      return { version: 1, favorites: {}, modelLabels: {}, config: {} };
+    });
+    const A = composer();
+    const picker = nativePicker({
+      search: true,
+      tabs: [{ title: "Claude Code" }, { title: "Codex", active: true }],
+      rows: Array.from({ length: 7 }, (_, i) => optionRow(`m${i}`, { withRole: true })),
+    });
+    openPicker(A.trigger, picker);
+
+    const dispose = dom.initDomObserver();
+    document.querySelector<HTMLButtonElement>(".bb-fav-star-btn")!.click();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(bodies.length).toBe(1);
+    expect(bodies[0].providerId).toBe("codex");
+    dispose();
+  });
 });
 
 describe("composer scoping (B1)", () => {
@@ -108,16 +218,14 @@ describe("composer scoping (B1)", () => {
     const B = composer("secondary");
 
     // B already has an open popover containing a matching row.
-    const { pop: popB } = popover({ rows: [optionRow("target-model")] });
-    popB.id = "pop-b";
-    B.trigger.setAttribute("aria-controls", "pop-b");
-    document.body.append(popB);
+    const pickerB = nativePicker({ rows: [optionRow("target-model", { withRole: true })] });
+    openPicker(B.trigger, pickerB);
     const bClicked = vi.fn();
-    popB.querySelector("button[role=option]")!.addEventListener("click", bClicked);
+    rowButtons(pickerB.content)[0].addEventListener("click", bClicked);
 
     // A opens its own popover — without the requested model.
-    const { pop: popA } = popover({ rows: [optionRow("other-model")] });
-    openOnClick(A.trigger, popA, "pop-a");
+    const pickerA = nativePicker({ rows: [optionRow("other-model")] });
+    openOnClick(A.trigger, pickerA);
 
     const p = dom.switchComposerModel("target-model", undefined, A.anchor);
     await vi.advanceTimersByTimeAsync(2000);
@@ -127,7 +235,7 @@ describe("composer scoping (B1)", () => {
     expect(res.reason).toBe("model-not-found");
     expect(bClicked).not.toHaveBeenCalled();
     // A's trigger got its OWN popover — the foreign one was never adopted.
-    expect(A.trigger.getAttribute("aria-controls")).toBe("pop-a");
+    expect(A.trigger.getAttribute("aria-controls")).toBe(pickerA.content.id);
   });
 
   it("reports no-trigger instead of hijacking another composer", async () => {
@@ -139,12 +247,10 @@ describe("composer scoping (B1)", () => {
     document.body.append(rootA);
 
     const B = composer("secondary");
-    const { pop: popB } = popover({ rows: [optionRow("target-model")] });
-    popB.id = "pop-b";
-    B.trigger.setAttribute("aria-controls", "pop-b");
-    document.body.append(popB);
+    const pickerB = nativePicker({ rows: [optionRow("target-model", { withRole: true })] });
+    openPicker(B.trigger, pickerB);
     const bClicked = vi.fn();
-    popB.querySelector("button[role=option]")!.addEventListener("click", bClicked);
+    rowButtons(pickerB.content)[0].addEventListener("click", bClicked);
 
     const res = await dom.switchComposerModel("target-model", undefined, anchor);
     expect(res).toEqual({ ok: false, reason: "no-trigger" });
@@ -155,16 +261,16 @@ describe("composer scoping (B1)", () => {
     const { dom } = await freshModules();
     const A = composer();
     const B = composer("secondary");
-    const { pop: popA } = popover({ rows: [] });
-    const { pop: popB } = popover({ rows: [] });
-    openOnClick(A.trigger, popA, "pop-a");
-    openOnClick(B.trigger, popB, "pop-b");
+    const pickerA = nativePicker({ rows: [] });
+    const pickerB = nativePicker({ rows: [] });
+    openOnClick(A.trigger, pickerA);
+    openOnClick(B.trigger, pickerB);
 
     dom.openNativeModelPicker(B.anchor);
-    expect(B.trigger.getAttribute("aria-controls")).toBe("pop-b");
+    expect(B.trigger.getAttribute("aria-controls")).toBe(pickerB.content.id);
     expect(A.trigger.getAttribute("aria-controls")).toBeNull();
-    expect(document.getElementById("pop-b")).toBeTruthy();
-    expect(document.getElementById("pop-a")).toBeNull();
+    expect(document.getElementById(pickerB.content.id)).toBeTruthy();
+    expect(document.getElementById(pickerA.content.id)).toBeNull();
   });
 });
 
@@ -174,12 +280,12 @@ describe("full model key incl. route (B2)", () => {
     const A = composer();
     const r1 = optionRow("M · RouteA");
     const r2 = optionRow("M · RouteB");
-    const { pop } = popover({ rows: [r1, r2] });
+    const picker = nativePicker({ rows: [r1, r2] });
     const c1 = vi.fn();
-    const c2 = vi.fn(() => pop.remove());
+    const c2 = vi.fn(() => picker.wrapper.remove());
     r1.addEventListener("click", c1);
     r2.addEventListener("click", c2);
-    openOnClick(A.trigger, pop);
+    openOnClick(A.trigger, picker);
 
     const p = dom.switchComposerModel("M · RouteB", undefined, A.anchor);
     await vi.advanceTimersByTimeAsync(500);
@@ -192,7 +298,7 @@ describe("full model key incl. route (B2)", () => {
 });
 
 describe("cancellable polling (B3)", () => {
-  it("a newer switch cancels the previous one's polls", async () => {
+  it("a newer switch on the same composer cancels the previous one's polls", async () => {
     const { dom } = await freshModules();
     const A = composer();
     const p1 = dom.switchComposerModel("x", undefined, A.anchor);
@@ -204,6 +310,18 @@ describe("cancellable polling (B3)", () => {
     expect(r2).toEqual({ ok: false, reason: "no-popover" });
   });
 
+  it("cancelling ANOTHER composer leaves this switch running", async () => {
+    const { dom } = await freshModules();
+    const A = composer();
+    const B = composer("secondary");
+    const p = dom.switchComposerModel("x", undefined, A.anchor);
+    await vi.advanceTimersByTimeAsync(50);
+    dom.cancelPendingSwitch(B.anchor); // B has no pending switch — must be a no-op
+    await vi.advanceTimersByTimeAsync(1500);
+    const res = await p;
+    expect(res).toEqual({ ok: false, reason: "no-popover" });
+  });
+
   it("a cancelled poll cannot click into a menu that appears later", async () => {
     const { dom } = await freshModules();
     const A = composer();
@@ -212,12 +330,10 @@ describe("cancellable polling (B3)", () => {
     dom.cancelPendingSwitch();
 
     // A matching menu shows up only AFTER the cancellation.
-    const { pop } = popover({ rows: [optionRow("target")] });
-    pop.id = "pop-a";
-    A.trigger.setAttribute("aria-controls", "pop-a");
-    document.body.append(pop);
+    const picker = nativePicker({ rows: [optionRow("target", { withRole: true })] });
+    openPicker(A.trigger, picker);
     const clicked = vi.fn();
-    pop.querySelector("button[role=option]")!.addEventListener("click", clicked);
+    rowButtons(picker.content)[0].addEventListener("click", clicked);
 
     await vi.advanceTimersByTimeAsync(1500);
     const res = await p;
@@ -225,35 +341,52 @@ describe("cancellable polling (B3)", () => {
     expect(clicked).not.toHaveBeenCalled();
   });
 
+  it("aborts when the popover closes mid-scan instead of clicking a reopened one", async () => {
+    const { dom } = await freshModules();
+    const A = composer();
+    const picker = nativePicker({ rows: [optionRow("other-model")] });
+    openOnClick(A.trigger, picker);
+
+    const p = dom.switchComposerModel("target", undefined, A.anchor);
+    await vi.advanceTimersByTimeAsync(100);
+    // User closes the menu before the model shows up.
+    picker.wrapper.remove();
+    A.trigger.removeAttribute("aria-controls");
+    await vi.advanceTimersByTimeAsync(100);
+    const res = await p;
+    expect(res.reason).toBe("cancelled");
+  });
+
   it("waits for the new provider tab before matching rows", async () => {
     const { dom } = await freshModules();
     const A = composer();
     // The OLD provider's list already shows a same-named row; a premature
     // match would click it — the exact B3 reproduction.
-    const oldRow = optionRow("target-model");
+    const oldRow = optionRow("target-model", { withRole: true });
     const oldClicked = vi.fn();
     oldRow.addEventListener("click", oldClicked);
-    const { pop, list } = popover({
+    const picker = nativePicker({
+      search: true,
       tabs: [
         { title: "Codex", active: true },
         { title: "Antigravity" },
       ],
       rows: [oldRow],
     });
-    const newRow = optionRow("target-model");
-    const newClicked = vi.fn(() => pop.remove());
+    const newRow = optionRow("target-model", { withRole: true });
+    const newClicked = vi.fn(() => picker.wrapper.remove());
     newRow.addEventListener("click", newClicked);
 
-    const tabs = pop.querySelectorAll<HTMLButtonElement>("div.border-b button[title]");
+    const tabs = picker.content.querySelectorAll<HTMLButtonElement>("div.border-b button[title]");
     tabs[1].addEventListener("click", () => {
       setTimeout(() => {
-        tabs[0].className = "";
-        tabs[1].className = "border-foreground";
+        tabs[0].className = "flex border-b-2 border-transparent text-muted-foreground";
+        tabs[1].className = "flex border-b-2 border-foreground text-foreground";
         oldRow.remove();
-        list.appendChild(newRow);
+        picker.list.appendChild(newRow);
       }, 75);
     });
-    openOnClick(A.trigger, pop);
+    openOnClick(A.trigger, picker);
 
     const p = dom.switchComposerModel("target-model", "agy", A.anchor);
     await vi.advanceTimersByTimeAsync(2000);
@@ -269,11 +402,11 @@ describe("verified application (M1)", () => {
   it("does not report success for a disabled option", async () => {
     const { dom } = await freshModules();
     const A = composer();
-    const row = optionRow("target", { disabled: true });
+    const row = optionRow("target", { disabled: true, withRole: true });
     const clicked = vi.fn();
     row.addEventListener("click", clicked);
-    const { pop } = popover({ rows: [row] });
-    openOnClick(A.trigger, pop);
+    const picker = nativePicker({ rows: [row] });
+    openOnClick(A.trigger, picker);
 
     const p = dom.switchComposerModel("target", undefined, A.anchor);
     await vi.advanceTimersByTimeAsync(2000);
@@ -288,11 +421,11 @@ describe("verified application (M1)", () => {
     const { dom } = await freshModules();
     const A = composer();
     const row = optionRow("target");
-    const { pop } = popover({ rows: [row] });
+    const picker = nativePicker({ rows: [row] });
     // Native handler does nothing: menu stays open, trigger unchanged.
-    openOnClick(A.trigger, pop);
+    openOnClick(A.trigger, picker);
     const escSpy = vi.fn();
-    pop.addEventListener("keydown", escSpy);
+    picker.content.addEventListener("keydown", escSpy);
 
     const p = dom.switchComposerModel("target", undefined, A.anchor);
     await vi.advanceTimersByTimeAsync(2000);
@@ -315,9 +448,9 @@ describe("provider tab handling (M2)", () => {
     star.className = "bb-fav-star-btn";
     star.title = "Добавить в избранное";
     row.appendChild(star);
-    const { pop } = popover({ rows: [row] });
-    row.addEventListener("click", () => pop.remove());
-    openOnClick(A.trigger, pop);
+    const picker = nativePicker({ rows: [row] });
+    row.addEventListener("click", () => picker.wrapper.remove());
+    openOnClick(A.trigger, picker);
 
     const p = dom.switchComposerModel("target-model", "codex", A.anchor);
     await vi.advanceTimersByTimeAsync(500);
@@ -331,8 +464,8 @@ describe("provider tab handling (M2)", () => {
     const row = optionRow("target-model");
     const clicked = vi.fn();
     row.addEventListener("click", clicked);
-    const { pop } = popover({ rows: [row] });
-    openOnClick(A.trigger, pop);
+    const picker = nativePicker({ rows: [row] });
+    openOnClick(A.trigger, picker);
 
     const p = dom.switchComposerModel("target-model", "agy", A.anchor);
     await vi.advanceTimersByTimeAsync(500);
@@ -340,21 +473,47 @@ describe("provider tab handling (M2)", () => {
     expect(res).toEqual({ ok: false, reason: "provider-tab-missing" });
     expect(clicked).not.toHaveBeenCalled();
   });
+
+  it("cross-provider switch works with tabs outside the listbox (blocker 2)", async () => {
+    const { dom } = await freshModules();
+    const A = composer();
+    const claudeRow = optionRow("m2", { withRole: true });
+    const clicked = vi.fn(() => picker.wrapper.remove());
+    claudeRow.addEventListener("click", clicked);
+    const picker = nativePicker({
+      search: true,
+      tabs: [{ title: "Claude Code" }, { title: "Codex", active: true }],
+      rows: Array.from({ length: 7 }, (_, i) => optionRow(`codex-m${i}`, { withRole: true })),
+    });
+    const strip = picker.content.querySelector<HTMLElement>("div.border-b")!;
+    const claudeTab = strip.querySelector<HTMLButtonElement>('button[title="Claude Code"]')!;
+    claudeTab.addEventListener("click", () => {
+      claudeTab.className = "flex border-b-2 border-foreground text-foreground";
+      picker.list.replaceChildren(claudeRow);
+    });
+    openOnClick(A.trigger, picker);
+
+    const p = dom.switchComposerModel("m2", "provider-claude-code", A.anchor);
+    await vi.advanceTimersByTimeAsync(2000);
+    const res = await p;
+    expect(res.ok).toBe(true);
+    expect(clicked).toHaveBeenCalled();
+  });
 });
 
 describe("hidden models (M3)", () => {
   it("expands 'More models' to find the row", async () => {
     const { dom } = await freshModules();
     const A = composer();
-    const { pop, list } = popover({ rows: [optionRow("other-model")] });
+    const picker = nativePicker({ rows: [optionRow("other-model")] });
     const more = document.createElement("button");
     more.textContent = "More models";
     more.id = "x-more-toggle";
-    pop.appendChild(more);
+    picker.content.appendChild(more);
     const target = optionRow("deep-model");
-    target.addEventListener("click", () => pop.remove());
-    more.addEventListener("click", () => list.appendChild(target));
-    openOnClick(A.trigger, pop);
+    target.addEventListener("click", () => picker.wrapper.remove());
+    more.addEventListener("click", () => picker.list.appendChild(target));
+    openOnClick(A.trigger, picker);
 
     const p = dom.switchComposerModel("deep-model", undefined, A.anchor);
     await vi.advanceTimersByTimeAsync(1000);
@@ -362,21 +521,72 @@ describe("hidden models (M3)", () => {
     expect(res.ok).toBe(true);
   });
 
-  it("fills the search box when the row is not rendered", async () => {
+  it("follows 'More models' into a portal submenu (desktop short list)", async () => {
     const { dom } = await freshModules();
     const A = composer();
-    const { pop, list } = popover({ rows: [optionRow("other-model")], search: true });
-    const input = pop.querySelector("input")!;
-    const target = optionRow("deep-model");
-    target.addEventListener("click", () => pop.remove());
-    input.addEventListener("input", () => list.appendChild(target));
-    openOnClick(A.trigger, pop);
+    const picker = nativePicker({ rows: [optionRow("other-model")] });
+    const more = document.createElement("button");
+    more.textContent = "More models";
+    picker.content.appendChild(more);
+    // Radix submenu: content portaled to body, linked via the trigger's
+    // aria-controls; submenu rows carry neither -opt- ids nor roles.
+    more.addEventListener("click", () => {
+      const sub = document.createElement("div");
+      sub.setAttribute("role", "menu");
+      sub.id = "radix-:sub1:";
+      const row = document.createElement("button");
+      const s = document.createElement("span");
+      s.className = "truncate";
+      s.title = "deep-model";
+      s.textContent = "deep-model";
+      row.appendChild(s);
+      row.addEventListener("click", () => {
+        sub.remove();
+        picker.wrapper.remove();
+      });
+      sub.appendChild(row);
+      document.body.append(sub);
+      more.setAttribute("aria-controls", sub.id);
+    });
+    openOnClick(A.trigger, picker);
 
     const p = dom.switchComposerModel("deep-model", undefined, A.anchor);
     await vi.advanceTimersByTimeAsync(1000);
     const res = await p;
     expect(res.ok).toBe(true);
-    expect(input.value).toBe("deep-model");
+  });
+
+  it("fills the search box when the row is not rendered, then clears it on failure", async () => {
+    const { dom } = await freshModules();
+    const A = composer();
+    const picker = nativePicker({ rows: [optionRow("other-model")], search: true });
+    const input = picker.content.querySelector("input")!;
+    const typedValues: string[] = [];
+    input.addEventListener("input", () => typedValues.push(input.value));
+    openOnClick(A.trigger, picker);
+
+    const p = dom.switchComposerModel("deep-model", undefined, A.anchor);
+    await vi.advanceTimersByTimeAsync(2000);
+    const res = await p;
+    expect(res.reason).toBe("model-not-found");
+    expect(typedValues).toContain("deep-model"); // the M3 fallback did type the query
+    expect(input.value).toBe(""); // and the failed attempt left no residue
+  });
+
+  it("finds the row via search when it appears after filtering", async () => {
+    const { dom } = await freshModules();
+    const A = composer();
+    const picker = nativePicker({ rows: [optionRow("other-model")], search: true });
+    const input = picker.content.querySelector("input")!;
+    const target = optionRow("deep-model", { withRole: true });
+    target.addEventListener("click", () => picker.wrapper.remove());
+    input.addEventListener("input", () => picker.list.appendChild(target));
+    openOnClick(A.trigger, picker);
+
+    const p = dom.switchComposerModel("deep-model", undefined, A.anchor);
+    await vi.advanceTimersByTimeAsync(1000);
+    const res = await p;
+    expect(res.ok).toBe(true);
   });
 });
 
@@ -399,10 +609,15 @@ describe("pin section + observer (M5, M6, M7)", () => {
     );
     await mgr.addFavorite("codex", "fav-model");
 
-    const r1 = optionRow("fav-model");
-    const r2 = optionRow("other-model");
-    const { pop, list } = popover({ tabs: [{ title: "Codex", active: true }], rows: [r1, r2] });
-    document.body.append(pop);
+    const A = composer();
+    const r1 = optionRow("fav-model", { withRole: true });
+    const r2 = optionRow("other-model", { withRole: true });
+    const picker = nativePicker({
+      search: true,
+      tabs: [{ title: "Codex", active: true }],
+      rows: [r1, r2],
+    });
+    openPicker(A.trigger, picker);
 
     const cleanup = dom.initDomObserver();
 
@@ -411,7 +626,7 @@ describe("pin section + observer (M5, M6, M7)", () => {
     const clones = document.querySelectorAll("button[data-bb-fav-clone]");
     expect(clones.length).toBe(1);
     // Originals never moved — BB keyboard order stays intact.
-    expect([...list.children].filter((e) => e.getAttribute("role") === "option")).toEqual([r1, r2]);
+    expect([...picker.list.children].filter((e) => e.id.includes("-opt-"))).toEqual([r1, r2]);
     // The clone forwards the click to its original row.
     const origClick = vi.fn();
     r1.addEventListener("click", origClick);
@@ -428,17 +643,21 @@ describe("pin section + observer (M5, M6, M7)", () => {
   });
 
   it("rebinds the star handler when a row is reused for another model (M7)", async () => {
-    const { dom, mgr } = await freshModules();
-    void mgr;
+    const { dom } = await freshModules();
     const bodies: { providerId?: string; modelId?: string }[] = [];
     stubRpc((method, body) => {
       if (method === "addFavorite") bodies.push(body as never);
       return { version: 1, favorites: {}, modelLabels: {}, config: {} };
     });
 
-    const row = optionRow("old-model");
-    const { pop } = popover({ tabs: [{ title: "Codex", active: true }], rows: [row] });
-    document.body.append(pop);
+    const A = composer();
+    const row = optionRow("old-model", { withRole: true });
+    const picker = nativePicker({
+      search: true,
+      tabs: [{ title: "Codex", active: true }],
+      rows: [row],
+    });
+    openPicker(A.trigger, picker);
     const cleanup = dom.initDomObserver();
     const star = row.querySelector<HTMLButtonElement>(".bb-fav-star-btn")!;
     expect(star).toBeTruthy();
@@ -453,6 +672,52 @@ describe("pin section + observer (M5, M6, M7)", () => {
     expect(bodies.length).toBe(1);
     expect(bodies[0].providerId).toBe("codex");
     expect(bodies[0].modelId).toBe("new-model");
+    cleanup();
+  });
+});
+
+describe("legacy favorites stored as bare modelId", () => {
+  it("star click on 'M · route' removes the stored 'M' instead of stacking a twin", async () => {
+    const { dom, mgr } = await freshModules();
+    const calls: { method: string; modelId?: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: { body?: string }) => {
+        const method = url.split("/").pop()!;
+        const body = init?.body ? (JSON.parse(init.body) as { modelId?: string } | null) : null;
+        calls.push({ method, modelId: body?.modelId });
+        const favorites = method === "getFavorites" ? { codex: ["M"] } : {};
+        return {
+          json: async () => ({
+            ok: true,
+            result: { version: 1, favorites, modelLabels: {}, config: {} },
+          }),
+        };
+      })
+    );
+    // Seed the legacy "M" entry from the server snapshot.
+    const stopSync = mgr.initBackendSync();
+    await vi.waitFor(() => expect(mgr.isFavorite("codex", "M")).toBe(true));
+    stopSync();
+
+    const A = composer();
+    const row = optionRow("M · route", { withRole: true });
+    const picker = nativePicker({
+      search: true,
+      tabs: [{ title: "Codex", active: true }],
+      rows: [row],
+    });
+    openPicker(A.trigger, picker);
+    const cleanup = dom.initDomObserver();
+
+    const star = row.querySelector<HTMLButtonElement>(".bb-fav-star-btn")!;
+    star.click();
+    await vi.advanceTimersByTimeAsync(50);
+
+    const rm = calls.filter((c) => c.method === "removeFavorite");
+    expect(rm.length).toBe(1);
+    expect(rm[0].modelId).toBe("M");
+    expect(calls.filter((c) => c.method === "addFavorite").length).toBe(0);
     cleanup();
   });
 });
