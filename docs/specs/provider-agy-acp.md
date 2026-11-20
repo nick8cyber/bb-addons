@@ -139,8 +139,8 @@ Merge в `loadLedger` стирает происхождение меток: по
     - **Подавление и точки сброса буфера (`processDeltaLine`):**
       - На всех точках возможного сброса буфера:
         0) **Расхождение кандидата в `item.textDelta`** (`acp-wrapper.ts:4302–4309`): если `candidateText` перестал быть префиксом:
-           - если накопленный `session.agentMessageText` уже удовлетворяет `isAgentInterruptedMessage`: буфер кандидата поглощается и очищается (`session.candidateBuffer = []`), `session.agentMessageText = ""`, а входящий чанк `delta.text` обрабатывается с чистого листа (снова через проверку кандидата `isAgentMarkerCandidate`);
-           - иначе, если голова `candidateText.trimStart()` до первого символа `\n` совпадает с `isAgentInterruptedMessage`: буфер кандидата и служебная голова поглощаются, а остаток чанка `rest = candidateText.slice(...)` после `\n` передаётся клиенту как `{ ...delta, text: rest }` и записывается в `session.agentMessageText = rest`, `recentAssistantText`;
+           - если голова `candidateText.trimStart()` до первого символа `\n` совпадает с `isAgentInterruptedMessage`: буфер кандидата и служебная голова поглощаются, а остаток чанка `rest` после `\n` передаётся клиенту как `{ ...delta, text: rest }` и обрабатывается по штатному пути текстовой дельты (`session.agentMessageText = rest`, `recentAssistantText`, `compact.summaryBuf`, `streamedAgentMessage = true`);
+           - иначе, если накопленный `session.agentMessageText` уже удовлетворяет `isAgentInterruptedMessage`: буфер кандидата поглощается и очищается (`session.candidateBuffer = []`), `session.agentMessageText = ""`, а входящий чанк `delta.text` обрабатывается с чистого листа (снова через проверку кандидата `isAgentMarkerCandidate`);
         1) `item.textClose` и `item.close` (как по каналу `agentMessage`, так и по другим элементам);
         2) `turn.boundary`;
         3) `item.open` любого типа;
@@ -161,8 +161,8 @@ Merge в `loadLedger` стирает происхождение меток: по
       - Граница хода (`turn.boundary`) не модифицируется и завершается естественным статусом хода.
       - Если ход закрылся сразу после строки без продолжения от модели — строка всё равно скрывается от клиента, а граница завершается штатно со статусом завершения.
       - **Аудит продолжения (`session.interruptedPending`):** при каждом поглощении строки обёртка выставляет флаг ожидания исхода `session.interruptedPending = true`:
-        - Исход `continued=yes`: при поступлении первого последующего действия модели — `toolCall`, `commandExecution`, `item.open` другого типа (рассуждения `reasoning`, компакция), непустого `item.textDelta` канала `agentMessage` или `reasoningText`. Пишется лог: `suppress interrupted stream: thread=<threadId> continued=yes`, флаг сбрасывается `session.interruptedPending = false`.
-        - Исход `continued=no`: если наступает `turn.boundary`, а флаг `session.interruptedPending` всё ещё взведён (продолжения не было). Пишется лог: `suppress interrupted stream: thread=<threadId> continued=no`, флаг сбрасывается. Запись `continued=no` в боевом логе служит явным индикатором непредвиденного сценария для архитектора (п. 3 задачи).
+        - Исход `continued=yes`: при поступлении первого последующего действия модели — `toolCall`, `commandExecution`, `item.open` другого типа (рассуждения `reasoning`, компакция), непробельного `item.textDelta` канала `agentMessage` (`/\S/.test(delta.text)`) или `reasoningText`. Пишется лог: `suppress interrupted stream: thread=<threadId> continued=yes`, флаг сбрасывается `session.interruptedPending = false`.
+        - Исход `continued=no`: проверка флага выполняется до веток отказа на любой границе (`turn.boundary`); сброс флага также выполняется на `turn.open`. Если наступает `turn.boundary`, а флаг `session.interruptedPending` всё ещё взведён (продолжения не было), пишется лог: `suppress interrupted stream: thread=<threadId> continued=no`, флаг сбрасывается. Запись `continued=no` в боевом логе служит явным индикатором непредвиденного сценария для архитектора (п. 3 задачи).
         - Исход `continued=aborted`: если до исхода ход был прерван внешними событиями `thread/stop`, новым `turn/steer` или `session.reset`. Пишется лог: `suppress interrupted stream: thread=<threadId> continued=aborted`, флаг сбрасывается.
 
 Привязка аккаунта к установке (`accounts[label].install`, [provider-agy-installs](provider-agy-installs.md), ADR-0033) — отдельный фильтр выбора, не зависящий от модели: аккаунт, чья установка не объявлена в локальном реестре `agy-installs.json` или чей бинарник отсутствует/не исполняем, локально недоступен и исключается из кандидатов `pickAccount` на всех точках выбора (п. 4), из проб каталога и из сводного `model/list` — подмены бинарником другой установки нет (там же §5 п. 2). Строки журнала п. 12 несут суффикс `install=<имя>` (provider-agy-installs §9 п. 2).
@@ -265,7 +265,7 @@ Merge в `loadLedger` стирает происхождение меток: по
      - Строка с продолжением текста модели в том же сегменте отдельными чанками (включая `agent_thought_chunk` между ними): служебная строка поглощается в точке 0 расхождения, последующий текст доходит до клиента;
      - Строка, начатая в буфере и законченная в склеенном чанке с продолжением прозы: голова отсекается, хвост прозы доходит до клиента;
      - Текст модели до steer в том же сегменте сохраняется и получает корректное закрытие `item.textClose` после поглощения строки;
-     - Steer, поступивший в момент буферизации строки: буфер строки не выплёскивается наружу;
+     - Steer, поступивший в момент, когда полная строка находится в буфере (ожидает хвостовой `\n`): буфер строки не выплёскивается наружу (неполный префикс сбрасывается клиенту по п. 13);
      - Строка с немедленным закрытием хода без продолжения (`continued=no`): строка скрыта, boundary со статусом `completed`, запись в логе с `continued=no`;
      - Внешняя отмена (stop/steer/reset) при взведённом флаге пишет `continued=aborted`;
      - `recentAssistantText` и `summaryBuf` остаются чистыми от служебной строки; состояние пула (`accounts-state.json`) и кулдауны не изменяются.
