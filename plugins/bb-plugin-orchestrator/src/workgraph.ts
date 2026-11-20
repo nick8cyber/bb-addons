@@ -7,6 +7,7 @@
 import fs, { existsSync, readFileSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { OrchestratorError } from "./errors.js";
 import type { CmdRunner } from "./cmd.js";
 import type { BbCli } from "./bb-cli.js";
@@ -72,6 +73,52 @@ export function normalizeWorkGraphMode(mode: string | undefined): WorkGraphMode 
   const m = (mode ?? "off").toLowerCase().trim();
   if (m === "shadow" || m === "strict") return m;
   return "off";
+}
+
+/** §32.2 (PLUG-361): Safely parses workGraphProjects setting (string or object) into normalized modes map. */
+export function parseWorkGraphProjects(raw: unknown): Record<string, WorkGraphMode> {
+  if (!raw) return {};
+  let obj: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return {};
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+    return {};
+  }
+  const result: Record<string, WorkGraphMode> = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (!key || typeof key !== "string") continue;
+    if (typeof val === "string") {
+      const normalized = val.trim().toLowerCase();
+      if (normalized === "off" || normalized === "shadow" || normalized === "strict") {
+        result[key.trim()] = normalized;
+      }
+    }
+  }
+  return result;
+}
+
+/** §32.2 (PLUG-361): Resolves effective workGraph mode: project override if valid, else global mode (defaulting to 'off'). */
+export function resolveWorkGraphMode(
+  projectId?: string | null,
+  globalMode?: WorkGraphMode,
+  projectsMap?: Record<string, WorkGraphMode>,
+): WorkGraphMode {
+  const normGlobal = normalizeWorkGraphMode(globalMode);
+  if (projectId && typeof projectId === "string" && projectsMap) {
+    const key = projectId.trim();
+    const mode = projectsMap[key];
+    if (mode === "off" || mode === "shadow" || mode === "strict") {
+      return mode;
+    }
+  }
+  return normGlobal;
 }
 
 /** §27.1: Computes deterministic branch name `bb/<KEY>-<slug>`. */
@@ -290,55 +337,189 @@ export function recordShadowAction(
   }
 }
 
-/** §32 п.1: In strict mode, blocks direct delegate, merge, release. In shadow mode, logs mirror audit. */
+export interface TaskTrackerLike {
+  getTask(taskKey: string): {
+    projectId?: string | null;
+    project?: { id?: string | null; linkedBbProjectId?: string | null };
+  } | null;
+}
+
+/**
+ * §32.2 п.2 (PLUG-361): Task Project Resolution strictly in order:
+ * 1) task_queue: project_id column (or payload.project_id);
+ * 2) delegations: project_id column from active or latest completed delegation;
+ * 3) tracker: metadata query via tracker API bb tasks / tracker.getTask(taskKey) -> task.projectId.
+ */
+export function resolveTaskProjectId(
+  store: DelegationStore,
+  taskKey: string,
+  tracker?: TaskTrackerLike | null,
+): string | null {
+  const key = normalizeTaskKey(taskKey);
+
+  // 1) task_queue: project_id column or payload.project_id
+  const task = store.getTask(key);
+  if (task) {
+    if (task.project_id && task.project_id.trim()) {
+      return task.project_id.trim();
+    }
+    const payload = parsePayload(task.payload);
+    if (typeof payload.project_id === "string" && payload.project_id.trim()) {
+      return payload.project_id.trim();
+    }
+  }
+
+  // 2) delegations: project_id column from active or latest completed delegation
+  const active = store.activeByTaskKey?.(key);
+  if (active?.project_id && active.project_id.trim()) {
+    return active.project_id.trim();
+  }
+  const done = store.latestDoneResultByTask?.(key);
+  if (done?.project_id && done.project_id.trim()) {
+    return done.project_id.trim();
+  }
+  const all = store.delegationsByTask?.(key);
+  if (all && all.length > 0) {
+    for (const d of all) {
+      if (d.status === "done" && d.project_id && d.project_id.trim()) {
+        return d.project_id.trim();
+      }
+    }
+  }
+
+  // 3) tracker: metadata via tracker API bb tasks / tracker.getTask(taskKey)
+  if (tracker) {
+    try {
+      const res = tracker.getTask(key);
+      if (res) {
+        const pid =
+          res.projectId ??
+          res.project?.linkedBbProjectId ??
+          res.project?.id;
+        if (typeof pid === "string" && pid.trim()) {
+          return pid.trim();
+        }
+      }
+    } catch {}
+  } else if (typeof process !== "undefined" && process.env?.PATH) {
+    try {
+      const out = execFileSync("bb", ["tasks", "show", key, "--json"], {
+        encoding: "utf-8",
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const parsed = JSON.parse(out);
+      const pid =
+        parsed.project?.linkedBbProjectId ??
+        parsed.task?.projectId ??
+        parsed.project?.id;
+      if (typeof pid === "string" && pid.trim()) {
+        return pid.trim();
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+export interface DirectActionOptions {
+  command?: "delegate" | "merge" | "release";
+  level?: string;
+  route?: string;
+  actor?: string;
+  policy?: Policy | null;
+  projectId?: string | null;
+  projectsMap?: Record<string, WorkGraphMode>;
+  getWorkGraphMode?: (projectId?: string | null) => WorkGraphMode;
+  tracker?: TaskTrackerLike | null;
+  log?: { warn?: (msg: string) => void; info?: (msg: string) => void };
+}
+
+/** §32 п.1 + §32.2 (PLUG-361): In strict mode, blocks direct delegate, merge, release. In shadow mode, logs mirror audit. In off mode, silent. */
 export function assertGraphAllowsDirectAction(
   store: DelegationStore,
   taskKey: string,
-  mode: WorkGraphMode,
-  action?: {
-    command: "delegate" | "merge" | "release";
-    level?: string;
-    route?: string;
-    actor?: string;
-    policy?: Policy | null;
-  },
+  mode: WorkGraphMode | ((projectId?: string | null) => WorkGraphMode),
+  action?: DirectActionOptions,
 ): void {
-  if (mode === "shadow") {
+  const key = normalizeTaskKey(taskKey);
+
+  // 1. Determine global mode
+  const globalMode: WorkGraphMode =
+    typeof mode === "function" ? mode(undefined) : normalizeWorkGraphMode(mode);
+
+  // 2. Resolve task projectId using 3-step order
+  const projectId = resolveTaskProjectId(store, key, action?.tracker);
+
+  let effectiveMode: WorkGraphMode;
+  if (!projectId) {
+    effectiveMode = globalMode;
+    const warnMsg = `orchestrator: task ${key} project undetermined; falling back to global workGraph mode (${globalMode})`;
+    if (action?.log?.warn) {
+      action.log.warn(warnMsg);
+    } else {
+      console.warn(warnMsg);
+    }
+  } else {
+    if (typeof mode === "function") {
+      effectiveMode = mode(projectId);
+    } else if (action?.getWorkGraphMode) {
+      effectiveMode = action.getWorkGraphMode(projectId);
+    } else if (action?.projectsMap) {
+      effectiveMode = resolveWorkGraphMode(
+        projectId,
+        globalMode,
+        action.projectsMap,
+      );
+    } else {
+      effectiveMode = globalMode;
+    }
+  }
+
+  // 3. Complete silence for 'off' mode: 0 transitions, recordShadowAction not called
+  if (effectiveMode === "off") {
+    return;
+  }
+
+  // 4. In shadow mode, mirror coordinator manual action
+  if (effectiveMode === "shadow") {
     try {
       recordShadowAction(
         store,
         {
           command: action?.command ?? "delegate",
-          taskKey,
+          taskKey: key,
           level: action?.level,
           route: action?.route,
           actor: action?.actor ?? "shadow:coordinator",
           policy: action?.policy,
         },
-        mode,
+        effectiveMode,
       );
     } catch {}
     return;
   }
-  if (mode !== "strict") return;
-  const key = normalizeTaskKey(taskKey);
-  const task = store.getTask(key);
-  if (!task) {
-    throw new OrchestratorError(
-      "graph-required",
-      `задача ${key} не зарегистрирована в очереди графа; поставь задачу через bb orchestrator enqueue ${key}`,
-    );
-  }
-  if (task.status === "done") {
+
+  // 5. In strict mode, block direct delegate, merge, release outside queue
+  if (effectiveMode === "strict") {
+    const task = store.getTask(key);
+    if (!task) {
+      throw new OrchestratorError(
+        "graph-required",
+        `задача ${key} не зарегистрирована в очереди графа; поставь задачу через bb orchestrator enqueue ${key}`,
+      );
+    }
+    if (task.status === "done") {
+      throw new OrchestratorError(
+        "graph-managed",
+        `задача ${key} завершена (done); для повторной доработки выполни bb orchestrator enqueue ${key}`,
+      );
+    }
     throw new OrchestratorError(
       "graph-managed",
-      `задача ${key} завершена (done); для повторной доработки выполни bb orchestrator enqueue ${key}`,
+      `задача ${key} управляется графом (текущее состояние: node=${task.node}, status=${task.status}). Прямой вызов запрещён; продвижение выполняется конвейером run-queue`,
     );
   }
-  throw new OrchestratorError(
-    "graph-managed",
-    `задача ${key} управляется графом (текущее состояние: node=${task.node}, status=${task.status}). Прямой вызов запрещён; продвижение выполняется конвейером run-queue`,
-  );
 }
 
 /** §32 п.2: Checks branch clean / merged state, or archives on force reset. */
@@ -3520,6 +3701,8 @@ function parsePayload(raw: string | null | undefined): Record<string, unknown> {
 export interface RunQueueDeps {
   store: DelegationStore;
   workGraphMode: WorkGraphMode;
+  workGraphProjects?: Record<string, WorkGraphMode>;
+  getWorkGraphMode?: (projectId?: string | null) => WorkGraphMode;
   autoAdvance?: boolean;
   maxActiveTasks?: number;
   repoRoot?: string;
@@ -3708,7 +3891,19 @@ async function advancePrOpenTask(
 export async function runRunQueue(
   deps: RunQueueDeps,
 ): Promise<RunQueueResult> {
-  if (deps.workGraphMode === "off") {
+  const getTaskMode = (projectId?: string | null): WorkGraphMode => {
+    if (deps.getWorkGraphMode) return deps.getWorkGraphMode(projectId);
+    return resolveWorkGraphMode(
+      projectId,
+      deps.workGraphMode,
+      deps.workGraphProjects,
+    );
+  };
+
+  const hasActiveProject = Object.values(deps.workGraphProjects ?? {}).some(
+    (m) => m === "shadow" || m === "strict",
+  );
+  if (deps.workGraphMode === "off" && !hasActiveProject) {
     throw new OrchestratorError(
       "graph-disabled",
       "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
@@ -3722,7 +3917,9 @@ export async function runRunQueue(
   let advancedCount = 0;
 
   const shouldAdvance =
-    deps.workGraphMode === "strict" || deps.autoAdvance === true;
+    deps.workGraphMode === "strict" ||
+    deps.autoAdvance === true ||
+    Object.values(deps.workGraphProjects ?? {}).some((m) => m === "strict");
   let progressed = true;
   let iterations = 0;
 
@@ -3735,6 +3932,9 @@ export async function runRunQueue(
       // ── 1. Advance active running tasks ───────────────────────────────
       const activeTasks = deps.store.listActiveTasks();
       for (const task of activeTasks) {
+        const taskMode = getTaskMode(task.project_id);
+        if (taskMode === "off") continue;
+        if (taskMode === "shadow" && !deps.autoAdvance) continue;
         try {
           const advanced = await advanceActiveTask(
             task,
@@ -3754,6 +3954,7 @@ export async function runRunQueue(
       if (deps.requestOwnerGateInteraction) {
         const waitingTasks = deps.store.listWaitingApprovalTasks();
         for (const task of waitingTasks) {
+          if (getTaskMode(task.project_id) === "off") continue;
           if (!task.interaction_id) {
             try {
               const payload = parsePayload(task.payload);
@@ -3789,6 +3990,7 @@ export async function runRunQueue(
       const queueStallMinutes =
         deps.policy?.timing?.queueStallMinutes ?? 30;
       for (const qt of allQueued) {
+        if (getTaskMode(qt.project_id) === "off") continue;
         if (qt.node_alarm_at !== null && now >= qt.node_alarm_at) {
           const elapsedSeconds = Math.max(
             0,
@@ -3831,6 +4033,9 @@ export async function runRunQueue(
       // ── 1d. Advance tasks waiting in release (pr_open) ─────────
       const prOpenTasks = deps.store.listPrOpenTasks ? deps.store.listPrOpenTasks() : [];
       for (const pt of prOpenTasks) {
+        const taskMode = getTaskMode(pt.project_id);
+        if (taskMode === "off") continue;
+        if (taskMode === "shadow" && !deps.autoAdvance) continue;
         try {
           const advanced = await advancePrOpenTask(
             pt,
@@ -3846,13 +4051,18 @@ export async function runRunQueue(
       }
 
       // ── 2. Take queued tasks ──────────────────────────────────────────
-      const currentActive = deps.store.listActiveTasks().length;
+      const currentActive = deps.store.listActiveTasks().filter(
+        (t) => getTaskMode(t.project_id) !== "off",
+      ).length;
       let availableSlots = maxActiveTasks - currentActive;
 
       if (availableSlots > 0) {
         const queuedTasks = deps.store.listQueuedTasks();
         for (const t of queuedTasks) {
           if (availableSlots <= 0) break;
+          const taskMode = getTaskMode(t.project_id);
+          if (taskMode === "off") continue;
+          if (taskMode === "shadow" && !deps.autoAdvance) continue;
 
           let depsSatisfied = true;
           if (t.depends_on) {
@@ -3893,8 +4103,15 @@ export async function runRunQueue(
   const finalQueued = deps.store.listQueuedTasks();
   const finalActive = deps.store.listActiveTasks();
 
+  const nonOffQueued = finalQueued.filter(
+    (t) => getTaskMode(t.project_id) !== "off",
+  );
+  const nonOffActive = finalActive.filter(
+    (t) => getTaskMode(t.project_id) !== "off",
+  );
+
   let readyCount = 0;
-  for (const t of finalQueued) {
+  for (const t of nonOffQueued) {
     let depsSatisfied = true;
     if (t.depends_on) {
       try {
@@ -3916,9 +4133,13 @@ export async function runRunQueue(
   }
 
   // §32 (Б4 / 5в): In shadow mode without autoAdvance, record simulated evaluation
-  if (deps.workGraphMode === "shadow" && !shouldAdvance) {
+  const hasShadowTasks =
+    deps.workGraphMode === "shadow" ||
+    Object.values(deps.workGraphProjects ?? {}).some((m) => m === "shadow");
+  if (hasShadowTasks && !shouldAdvance) {
     // 1. Evaluate queued tasks: start -> <target_node>
     for (const t of finalQueued) {
+      if (getTaskMode(t.project_id) !== "shadow") continue;
       try {
         const payload = parsePayload(t.payload);
         const res = resolveTransition({
@@ -3955,6 +4176,7 @@ export async function runRunQueue(
 
     // 2. Evaluate active tasks: would advance based on completed delegations or state
     for (const t of finalActive) {
+      if (getTaskMode(t.project_id) !== "shadow") continue;
       try {
         const payload = parsePayload(t.payload);
         const delegations = deps.store.delegationsByTask(t.task_key);
@@ -4090,11 +4312,11 @@ export async function runRunQueue(
 
   return {
     ok: true,
-    activeCount: finalActive.length,
-    queuedCount: finalQueued.length,
+    activeCount: nonOffActive.length,
+    queuedCount: nonOffQueued.length,
     readyCount,
     advancedCount,
-    tasks: finalQueued,
+    tasks: nonOffQueued,
     transitions,
   };
 }
