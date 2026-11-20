@@ -5,46 +5,63 @@
  */
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import {
+  dropLabels,
+  labelKey,
+  normalizeProviderId,
+  sanitizeStore,
+  type FavoritesMap,
+  type FavoritesSnapshot,
+  type ModelLabels,
+} from "./src/store.js";
+
+const STORE_KEY = "favorites:store";
+const LEGACY_MAP_KEY = "favorites:map";
+const LEGACY_LABELS_KEY = "favorites:labels";
+const LEGACY_CONFIG_KEY = "favorites:config";
+
+const snapshotOutput = z.object({
+  version: z.number(),
+  favorites: z.record(z.string(), z.array(z.string())),
+  modelLabels: z.record(z.string(), z.string()),
+  config: z.object({
+    pinToTop: z.boolean(),
+    showQuickBar: z.boolean(),
+  }),
+});
 
 export const rpcContract = defineRpcContract({
   getFavorites: {
     input: z.null(),
-    output: z.object({
-      favorites: z.record(z.string(), z.array(z.string())),
-      modelLabels: z.record(z.string(), z.string()),
-      config: z.object({
-        pinToTop: z.boolean(),
-        showQuickBar: z.boolean(),
-      }),
-    }),
+    output: snapshotOutput,
   },
-  toggleFavorite: {
+  addFavorite: {
     input: z.object({
       providerId: z.string(),
       modelId: z.string(),
       label: z.string().optional(),
     }),
-    output: z.object({
-      isFavorite: z.boolean(),
-      favorites: z.record(z.string(), z.array(z.string())),
+    output: snapshotOutput,
+  },
+  removeFavorite: {
+    input: z.object({
+      providerId: z.string(),
+      modelId: z.string(),
     }),
+    output: snapshotOutput,
   },
   setFavorites: {
     input: z.object({
       favorites: z.record(z.string(), z.array(z.string())),
       modelLabels: z.record(z.string(), z.string()).optional(),
     }),
-    output: z.object({
-      success: z.boolean(),
-    }),
+    output: snapshotOutput,
   },
   clearFavorites: {
     input: z.object({
       providerId: z.string().nullable().optional(),
     }),
-    output: z.object({
-      success: z.boolean(),
-    }),
+    output: snapshotOutput,
   },
   updateConfig: {
     input: z.object({
@@ -53,6 +70,10 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({
       success: z.boolean(),
+      config: z.object({
+        pinToTop: z.boolean(),
+        showQuickBar: z.boolean(),
+      }),
     }),
   },
 });
@@ -73,128 +94,173 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  function cleanProviderId(providerId: string): string {
-    let clean = (providerId || "").toLowerCase().trim();
-    if (
-      clean.includes("⌘") ||
-      clean.includes("⇧") ||
-      clean.includes("alt") ||
-      clean.includes("ctrl") ||
-      clean.includes("shift")
-    ) {
-      return "provider-claude-code";
-    }
-    if (clean.includes("codex") || clean === "openai") return "codex";
-    if (clean.includes("claude") || clean === "anthropic") return "provider-claude-code";
-    if (clean.includes("antigravity") || clean === "agy" || clean.includes("gemini")) return "agy";
-    if (clean === "pi" || clean === "provider-pi" || clean.startsWith("pi-") || clean.includes("inflection"))
-      return "provider-pi";
-    return clean.replace(/\s+/g, "-");
+  // Mutations serialize through this chain: BB's KV upserts single keys, so a
+  // read-modify-write under the lock plus a version counter makes concurrent
+  // writers (RPC tabs, CLI) merge instead of losing each other's updates (M10).
+  let writeQueue: Promise<unknown> = Promise.resolve();
+  function withStoreLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = writeQueue.then(fn, fn);
+    writeQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
   }
 
-  function sanitizeFavoritesStore(raw: Record<string, string[]>): Record<string, string[]> {
-    const result: Record<string, string[]> = {};
-    for (const [key, models] of Object.entries(raw || {})) {
-      if (!Array.isArray(models) || models.length === 0) continue;
-      const cleanProv = cleanProviderId(key);
-      const existing = result[cleanProv] || [];
-      for (const m of models) {
-        if (typeof m === "string" && m.trim() && !existing.includes(m.trim())) {
-          existing.push(m.trim());
-        }
+  /**
+   * Read the store. Migrates legacy split keys (`favorites:map`,
+   * `favorites:labels`) into the single versioned record on first access.
+   * Migration runs inside the lock so two readers cannot double-write it.
+   */
+  const readStore = (): Promise<FavoritesSnapshot> =>
+    withStoreLock(async () => {
+      const existing = await bb.storage.kv.get<FavoritesSnapshot>(STORE_KEY);
+      if (existing && typeof existing === "object" && typeof existing.version === "number") {
+        return existing;
       }
-      result[cleanProv] = existing;
-    }
-    return result;
-  }
+      const legacyMap =
+        (await bb.storage.kv.get<FavoritesMap>(LEGACY_MAP_KEY)) ?? {};
+      const legacyLabels =
+        (await bb.storage.kv.get<ModelLabels>(LEGACY_LABELS_KEY)) ?? {};
+      const { favorites, modelLabels } = sanitizeStore(legacyMap, legacyLabels);
+      const snapshot: FavoritesSnapshot = { version: 1, favorites, modelLabels };
+      await bb.storage.kv.set(STORE_KEY, snapshot);
+      await bb.storage.kv.delete(LEGACY_MAP_KEY);
+      await bb.storage.kv.delete(LEGACY_LABELS_KEY);
+      return snapshot;
+    });
 
-  const getFavoritesStore = async (): Promise<Record<string, string[]>> => {
-    const raw = (await bb.storage.kv.get<Record<string, string[]>>("favorites:map")) ?? {};
-    const sanitized = sanitizeFavoritesStore(raw);
-    if (JSON.stringify(raw) !== JSON.stringify(sanitized)) {
-      await bb.storage.kv.set("favorites:map", sanitized);
-    }
-    return sanitized;
-  };
+  const writeStore = (
+    mutate: (snapshot: FavoritesSnapshot) => void
+  ): Promise<FavoritesSnapshot> =>
+    withStoreLock(async () => {
+      const existing = await bb.storage.kv.get<FavoritesSnapshot>(STORE_KEY);
+      const snapshot: FavoritesSnapshot =
+        existing && typeof existing === "object" && typeof existing.version === "number"
+          ? { ...existing, favorites: { ...existing.favorites }, modelLabels: { ...existing.modelLabels } }
+          : { version: 0, favorites: {}, modelLabels: {} };
+      mutate(snapshot);
+      const { favorites, modelLabels } = sanitizeStore(snapshot.favorites, snapshot.modelLabels);
+      const next: FavoritesSnapshot = {
+        version: snapshot.version + 1,
+        favorites,
+        modelLabels,
+      };
+      await bb.storage.kv.set(STORE_KEY, next);
+      return next;
+    });
 
-  const getConfigStore = async () => {
+  const getConfig = async () => {
     const s = await settings.get();
-    const kvConfig = (await bb.storage.kv.get<{ pinToTop?: boolean; showQuickBar?: boolean }>("favorites:config")) ?? {};
     return {
-      pinToTop: kvConfig.pinToTop ?? s.pinToTop ?? true,
-      showQuickBar: kvConfig.showQuickBar ?? s.showQuickBar ?? true,
+      pinToTop: s.pinToTop ?? true,
+      showQuickBar: s.showQuickBar ?? true,
     };
   };
 
+  const withConfig = async (snapshot: FavoritesSnapshot) => ({
+    ...snapshot,
+    config: await getConfig(),
+  });
+
+  // One-off migration of the pre-refactor KV config override into real BB
+  // settings: after it ran once, `favorites:config` is gone and bb.settings
+  // alone governs pinToTop/showQuickBar (M13).
+  const legacyConfig = await bb.storage.kv.get<{ pinToTop?: boolean; showQuickBar?: boolean }>(
+    LEGACY_CONFIG_KEY
+  );
+  if (legacyConfig && typeof legacyConfig === "object") {
+    const updates: { pinToTop?: boolean; showQuickBar?: boolean } = {};
+    if (typeof legacyConfig.pinToTop === "boolean") updates.pinToTop = legacyConfig.pinToTop;
+    if (typeof legacyConfig.showQuickBar === "boolean") updates.showQuickBar = legacyConfig.showQuickBar;
+    if (Object.keys(updates).length > 0) {
+      try {
+        await settings.experimental_set(updates);
+      } catch (err) {
+        bb.log.info(`Could not migrate legacy config into settings: ${String(err)}`);
+      }
+    }
+    await bb.storage.kv.delete(LEGACY_CONFIG_KEY);
+  }
+
   // Register RPC Handlers
   bb.rpc.register(rpcContract, {
-    getFavorites: async () => {
-      const favorites = await getFavoritesStore();
-      const modelLabels = (await bb.storage.kv.get<Record<string, string>>("favorites:labels")) ?? {};
-      const config = await getConfigStore();
-      return { favorites, modelLabels, config };
+    getFavorites: async () => withConfig(await readStore()),
+
+    addFavorite: async ({ providerId, modelId, label }) => {
+      const prov = normalizeProviderId(providerId);
+      const id = modelId.trim();
+      if (!prov || prov === "default" || !id) return withConfig(await readStore());
+      const next = await writeStore((s) => {
+        const list = s.favorites[prov] || [];
+        s.favorites[prov] = list.includes(id) ? list : [id, ...list];
+        if (label) s.modelLabels[labelKey(prov, id)] = label;
+      });
+      bb.log.info(`Favorite added: ${prov}/${id}`);
+      return withConfig(next);
     },
 
-    toggleFavorite: async ({ providerId, modelId, label }) => {
-      const cleanProv = cleanProviderId(providerId);
-      const favorites = await getFavoritesStore();
-      const modelLabels = (await bb.storage.kv.get<Record<string, string>>("favorites:labels")) ?? {};
-
-      const list = favorites[cleanProv] || [];
-      const exists = list.includes(modelId);
-
-      let nextList: string[];
-      if (exists) {
-        nextList = list.filter((id) => id !== modelId);
-      } else {
-        nextList = [modelId, ...list.filter((id) => id !== modelId)];
-      }
-
-      if (nextList.length === 0) {
-        delete favorites[cleanProv];
-      } else {
-        favorites[cleanProv] = nextList;
-      }
-
-      if (label) {
-        modelLabels[`${cleanProv}:${modelId}`] = label;
-        await bb.storage.kv.set("favorites:labels", modelLabels);
-      }
-
-      await bb.storage.kv.set("favorites:map", favorites);
-      bb.log.info(`Favorite toggled: ${cleanProv}/${modelId} -> ${!exists}`);
-
-      return {
-        isFavorite: !exists,
-        favorites,
-      };
+    removeFavorite: async ({ providerId, modelId }) => {
+      const prov = normalizeProviderId(providerId);
+      const id = modelId.trim();
+      const next = await writeStore((s) => {
+        const list = s.favorites[prov] || [];
+        const rest = list.filter((m) => m !== id);
+        if (rest.length === 0) delete s.favorites[prov];
+        else s.favorites[prov] = rest;
+        s.modelLabels = dropLabels(s.modelLabels, prov, id);
+      });
+      bb.log.info(`Favorite removed: ${prov}/${id}`);
+      return withConfig(next);
     },
 
     setFavorites: async ({ favorites, modelLabels }) => {
-      const sanitized = sanitizeFavoritesStore(favorites);
-      await bb.storage.kv.set("favorites:map", sanitized);
-      if (modelLabels) {
-        await bb.storage.kv.set("favorites:labels", modelLabels);
-      }
-      return { success: true };
+      const sanitized = sanitizeStore(favorites, modelLabels ?? {});
+      const next = await writeStore((s) => {
+        s.favorites = sanitized.favorites;
+        if (modelLabels !== undefined) {
+          s.modelLabels = sanitized.modelLabels;
+        } else {
+          // Keep only labels that still point at a favorited model.
+          s.modelLabels = Object.fromEntries(
+            Object.entries(s.modelLabels).filter(([key]) => {
+              const idx = key.indexOf(":");
+              const list = sanitized.favorites[key.slice(0, idx)];
+              return Array.isArray(list) && list.includes(key.slice(idx + 1));
+            })
+          );
+        }
+      });
+      return withConfig(next);
     },
 
     clearFavorites: async ({ providerId }) => {
-      if (providerId) {
-        const favorites = await getFavoritesStore();
-        delete favorites[providerId];
-        await bb.storage.kv.set("favorites:map", favorites);
-      } else {
-        await bb.storage.kv.set("favorites:map", {});
-      }
-      return { success: true };
+      const prov = providerId ? normalizeProviderId(providerId) : null;
+      const next = await writeStore((s) => {
+        if (prov) {
+          delete s.favorites[prov];
+          s.modelLabels = dropLabels(s.modelLabels, prov);
+        } else {
+          s.favorites = {};
+          s.modelLabels = {};
+        }
+      });
+      return withConfig(next);
     },
 
     updateConfig: async (updates) => {
-      const current = await getConfigStore();
-      const next = { ...current, ...updates };
-      await bb.storage.kv.set("favorites:config", next);
-      return { success: true };
+      const clean: { pinToTop?: boolean; showQuickBar?: boolean } = {};
+      if (typeof updates.pinToTop === "boolean") clean.pinToTop = updates.pinToTop;
+      if (typeof updates.showQuickBar === "boolean") clean.showQuickBar = updates.showQuickBar;
+      if (Object.keys(clean).length > 0) {
+        try {
+          await settings.experimental_set(clean);
+        } catch (err) {
+          bb.log.info(`settings write failed: ${String(err)}`);
+          return { success: false, config: await getConfig() };
+        }
+      }
+      return { success: true, config: await getConfig() };
     },
   });
 
@@ -206,7 +272,7 @@ export default async function plugin(bb: BbPluginApi) {
       const [cmd, arg1, arg2] = argv;
 
       if (!cmd || cmd === "list" || cmd === "ls") {
-        const favorites = await getFavoritesStore();
+        const { favorites } = await readStore();
         const entries = Object.entries(favorites);
         if (entries.length === 0) {
           return {
@@ -232,15 +298,18 @@ export default async function plugin(bb: BbPluginApi) {
             stderr: "Usage: bb favorites add <provider> <model>\n",
           };
         }
-        const favorites = await getFavoritesStore();
-        const list = favorites[arg1] || [];
-        if (!list.includes(arg2)) {
-          favorites[arg1] = [arg2, ...list];
-          await bb.storage.kv.set("favorites:map", favorites);
+        const prov = normalizeProviderId(arg1);
+        const id = arg2.trim();
+        if (prov === "default" || !id) {
+          return { exitCode: 1, stderr: `Could not resolve provider '${arg1}'.\n` };
         }
+        await writeStore((s) => {
+          const list = s.favorites[prov] || [];
+          if (!list.includes(id)) s.favorites[prov] = [id, ...list];
+        });
         return {
           exitCode: 0,
-          stdout: `Added ${arg2} to favorites for provider '${arg1}'.\n`,
+          stdout: `Added ${id} to favorites for provider '${prov}'.\n`,
         };
       }
 
@@ -251,42 +320,76 @@ export default async function plugin(bb: BbPluginApi) {
             stderr: "Usage: bb favorites remove <provider> <model>\n",
           };
         }
-        const favorites = await getFavoritesStore();
-        const list = favorites[arg1] || [];
-        favorites[arg1] = list.filter((m) => m !== arg2);
-        if (favorites[arg1].length === 0) {
-          delete favorites[arg1];
+        // Same canonical key the store is written under — a raw alias like
+        // "openai" must resolve to "codex" before the lookup (m1).
+        const prov = normalizeProviderId(arg1);
+        const id = arg2.trim();
+        const before = await readStore();
+        const list = before.favorites[prov] || [];
+        if (!list.includes(id)) {
+          return {
+            exitCode: 1,
+            stderr: `Model '${id}' is not in favorites for provider '${prov}'.\n`,
+          };
         }
-        await bb.storage.kv.set("favorites:map", favorites);
+        await writeStore((s) => {
+          const rest = (s.favorites[prov] || []).filter((m) => m !== id);
+          if (rest.length === 0) delete s.favorites[prov];
+          else s.favorites[prov] = rest;
+          s.modelLabels = dropLabels(s.modelLabels, prov, id);
+        });
         return {
           exitCode: 0,
-          stdout: `Removed ${arg2} from favorites for provider '${arg1}'.\n`,
+          stdout: `Removed ${id} from favorites for provider '${prov}'.\n`,
         };
       }
 
       if (cmd === "clear") {
         if (arg1) {
-          const favorites = await getFavoritesStore();
-          delete favorites[arg1];
-          await bb.storage.kv.set("favorites:map", favorites);
+          const prov = normalizeProviderId(arg1);
+          const before = await readStore();
+          if (!before.favorites[prov]?.length) {
+            return {
+              exitCode: 1,
+              stderr: `No favorites saved for provider '${prov}'.\n`,
+            };
+          }
+          await writeStore((s) => {
+            delete s.favorites[prov];
+            s.modelLabels = dropLabels(s.modelLabels, prov);
+          });
           return {
             exitCode: 0,
-            stdout: `Cleared favorites for provider '${arg1}'.\n`,
-          };
-        } else {
-          await bb.storage.kv.set("favorites:map", {});
-          return {
-            exitCode: 0,
-            stdout: "Cleared all favorite models.\n",
+            stdout: `Cleared favorites for provider '${prov}'.\n`,
           };
         }
+        await writeStore((s) => {
+          s.favorites = {};
+          s.modelLabels = {};
+        });
+        return {
+          exitCode: 0,
+          stdout: "Cleared all favorite models.\n",
+        };
       }
 
       if (cmd === "export" || cmd === "json") {
-        const favorites = await getFavoritesStore();
+        const snapshot = await readStore();
+        // Same wrapper shape the UI importer validates, so `bb favorites
+        // export` output can be pasted straight into the settings field (m2).
         return {
           exitCode: 0,
-          stdout: JSON.stringify(favorites, null, 2) + "\n",
+          stdout:
+            JSON.stringify(
+              {
+                version: snapshot.version,
+                exportedAt: new Date().toISOString(),
+                favorites: snapshot.favorites,
+                modelLabels: snapshot.modelLabels,
+              },
+              null,
+              2
+            ) + "\n",
         };
       }
 

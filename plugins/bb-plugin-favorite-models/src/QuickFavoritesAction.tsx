@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useLayoutEffect } from "react";
+import React, { useState, useEffect, useRef, useLayoutEffect, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
 import {
   useComposerView,
@@ -13,12 +13,12 @@ import {
   getFavoritesForProvider,
   getModelLabel,
   getProviderDisplayName,
-  type FavoritesState,
 } from "./favorites-manager.js";
 import {
   switchComposerModel,
   openNativeModelPicker,
   detectActiveProvider,
+  cancelPendingSwitch,
   normalizeProviderId,
   type SwitchFailure,
 } from "./dom-observer.js";
@@ -47,10 +47,18 @@ class ComposerViewBoundary extends React.Component<
   }
 }
 
+let toastSeq = 0;
+
 function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: boolean }) {
-  const [state, setState] = useState<FavoritesState>(getState());
+  // useSyncExternalStore: the snapshot is read at render time, so an update
+  // landing between mount and a passive-effect subscribe can no longer be
+  // missed (m4).
+  const state = useSyncExternalStore(subscribe, getState, getState);
   const [isOpen, setIsOpen] = useState(false);
   const [domProvider, setDomProvider] = useState<string>("default");
+  // Provider resolved when the menu was opened; frozen so a late SDK answer
+  // cannot reshuffle groups under the user's finger (M4).
+  const [menuProvider, setMenuProvider] = useState<string | null>(null);
 
   // New-thread composer shows favorites of all providers; a session (thread,
   // queued message, side chat) composer shows only the active provider's.
@@ -90,11 +98,12 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
   const measuredHRef = useRef(0);
   const placeRetryRef = useRef(0);
 
+  // A pending programmatic switch must not survive a context change or this
+  // composer's unmount — its polls would then click into a menu that no
+  // longer belongs to the user's intent (B3).
   useEffect(() => {
-    return subscribe((next) => {
-      setState(next);
-    });
-  }, []);
+    return () => cancelPendingSwitch();
+  }, [threadId]);
 
   // Pin the menu to the button edge: upward opens get their BOTTOM edge fixed
   // just above the button, downward opens get their TOP edge just below it.
@@ -171,11 +180,13 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
         return;
       }
       setIsOpen(false);
+      setMenuProvider(null);
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setIsOpen(false);
+        setMenuProvider(null);
       }
     };
 
@@ -201,7 +212,9 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
     e.stopPropagation();
 
     // Only consult the DOM when the host could not tell us (new-thread screen).
-    const prov = sdkProvider ?? detectActiveProvider();
+    // Scoped to OUR composer's trigger — a document-wide lookup reads whatever
+    // composer comes first (M4/B1).
+    const prov = sdkProvider ?? detectActiveProvider(undefined, buttonRef.current);
     setDomProvider(prov);
 
     const providerFavs = getFavoritesForProvider(prov);
@@ -220,6 +233,9 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
       if (next) {
         placeRetryRef.current = 0;
         setCoords(null); // re-measure and place on open
+        setMenuProvider(prov); // freeze provider for this menu session
+      } else {
+        setMenuProvider(null);
       }
       return next;
     });
@@ -227,55 +243,50 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
 
   const handleSelectModel = async (modelId: string, provId?: string) => {
     setIsOpen(false);
+    setMenuProvider(null);
     const targetProv = provId || activeProvider;
     const label = getModelLabel(targetProv, modelId);
-    toast.loading(`Переключение на ${label}...`, { id: "fav-switch" });
+    // Unique toast id per attempt: a stale switch can no longer overwrite the
+    // status of the selection that replaced it (B3).
+    const toastId = `fav-switch-${++toastSeq}`;
+
+    toast.loading(`Переключение на ${label}...`, { id: toastId });
 
     const result = await switchComposerModel(modelId, targetProv, buttonRef.current);
     if (result.ok) {
-      toast.success(`Выбрана модель: ${label}`, { id: "fav-switch" });
+      toast.success(`Выбрана модель: ${label}`, { id: toastId });
       return;
     }
     toast.info(describeSwitchFailure(result.reason, label, targetProv), {
-      id: "fav-switch",
+      id: toastId,
     });
   };
 
   const handleOpenAllModels = () => {
     setIsOpen(false);
+    setMenuProvider(null);
     openNativeModelPicker(buttonRef.current);
   };
 
   // Inside a thread the provider is fixed, so the menu stays scoped to it.
   // Only the new-thread screen, where no thread exists yet, lists every provider.
   const isSession = threadId !== null;
-  const activeProvider = sdkProvider ?? domProvider;
+  const activeProvider = isOpen && menuProvider ? menuProvider : (sdkProvider ?? domProvider);
   // "default" is not a provider — it means neither the host nor the DOM could
-  // name one (thread archived, from another project, or simply absent from the
-  // sidebar's list). Scoping the menu to that key would blank it while
-  // favorites exist, so the unresolved case lists everything instead.
+  // name one. In a session that case must NOT dump every provider's models:
+  // cross-provider picks may be unavailable or route into BB's handoff (M4).
   const sidebarLoading = sidebar.status === "loading";
   const providerUnknown = activeProvider === "default";
   const providerFavs = getFavoritesForProvider(activeProvider);
-  // Trigger on the source of the resolution, not on the result being empty:
-  // every host provider id normalises onto an existing store key, so a
-  // non-null sdkProvider is trustworthy and an empty list there genuinely
-  // means "nothing starred for this provider" — say so instead of dumping
-  // every other provider. Skip while the sidebar loads, or a menu opened in
-  // that window would flash the full list before snapping back.
-  const needsFallback = !sidebarLoading && sdkProvider === null;
-  const otherProviders =
-    needsFallback || (!isSession && isNewThread)
-      ? Object.entries(state.favorites).filter(
-          ([p, list]) => p !== activeProvider && list.length > 0
-        )
-      : [];
 
-  // Active provider first, then the remaining ones.
-  // Headers only appear once more than one provider is on screen.
   const groups: Array<[string, string[]]> = [];
-  if (providerFavs.length > 0) groups.push([activeProvider, providerFavs]);
-  groups.push(...otherProviders);
+  if (isSession) {
+    if (providerFavs.length > 0) groups.push([activeProvider, providerFavs]);
+  } else {
+    for (const [p, list] of Object.entries(state.favorites)) {
+      if (list.length > 0) groups.push([p, list]);
+    }
+  }
   const showGroupHeaders = groups.length > 1;
 
   const totalFavs = Object.values(state.favorites).reduce((acc, list) => acc + list.length, 0);
@@ -353,6 +364,9 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
     document.body
   ) : null;
 
+  // The setting is real now: unchecked means no composer button at all (M13).
+  if (!state.showQuickBar) return null;
+
   return (
     <div className="inline-flex items-center">
       <button
@@ -394,6 +408,10 @@ function describeSwitchFailure(
       return `Провайдер «${getProviderDisplayName(providerId)}» недоступен в этом треде`;
     case "model-not-found":
       return `Модель ${label} не найдена в списке провайдера`;
+    case "unconfirmed":
+      return `Модель ${label} могла не примениться — проверьте переключатель или выберите её вручную`;
+    case "cancelled":
+      return `Переключение на ${label} отменено`;
     default:
       return `Откройте список моделей и выберите ${label}`;
   }

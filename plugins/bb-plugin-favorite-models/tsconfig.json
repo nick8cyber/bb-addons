@@ -27,6 +27,8 @@
     "src",
     "components",
     "lib",
-    "hooks"
+    "hooks",
+    "tests",
+    "vitest.config.ts"
   ]
 }

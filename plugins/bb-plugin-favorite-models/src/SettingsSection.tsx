@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,48 +12,59 @@ import {
   exportFavoritesJson,
   importFavoritesJson,
   getFavoritesCount,
-  type FavoritesState,
+  normalizeProviderId,
 } from "./favorites-manager.js";
 import { StarFilledIcon, TrashIcon, PlusIcon } from "./icons.js";
 
 export function SettingsSection() {
-  const [state, setState] = useState<FavoritesState>(getState());
+  const state = useSyncExternalStore(subscribe, getState, getState);
   const [newProvider, setNewProvider] = useState("");
   const [newModel, setNewModel] = useState("");
   const [importJsonText, setImportJsonText] = useState("");
   const [showImport, setShowImport] = useState(false);
-
-  useEffect(() => {
-    return subscribe((next) => {
-      setState(next);
-    });
-  }, []);
 
   const totalCount = getFavoritesCount();
   const providerEntries = Object.entries(state.favorites).filter(([_, list]) => list.length > 0);
 
   const handleAddManual = (e: React.FormEvent) => {
     e.preventDefault();
-    const prov = newProvider.trim().toLowerCase();
+    // Same canonical key the rest of the store is written under — manual
+    // input must not mint its own provider spelling (M11).
+    const prov = normalizeProviderId(newProvider);
     const mod = newModel.trim();
-    if (!prov || !mod) {
+    if (!prov || prov === "default" || !mod) {
       toast.error("Укажите провайдера и название модели");
       return;
     }
-    addFavorite(prov, mod);
+    void addFavorite(prov, mod).then((ok) => {
+      if (ok) {
+        toast.success(`Модель ${mod} добавлена в избранное для ${prov}`);
+      } else {
+        toast.error("Добавлено локально, но сервер не подтвердил запись");
+      }
+    });
     setNewModel("");
-    toast.success(`Модель ${mod} добавлена в избранное для ${prov}`);
   };
 
   const handleRemove = (providerId: string, modelId: string) => {
-    removeFavorite(providerId, modelId);
-    toast.success(`Модель ${modelId} удалена из избранного`);
+    void removeFavorite(providerId, modelId).then((ok) => {
+      if (ok) {
+        toast.success(`Модель ${modelId} удалена из избранного`);
+      } else {
+        toast.error("Удалено локально, но сервер не подтвердил запись");
+      }
+    });
   };
 
   const handleClearAll = () => {
     if (confirm("Вы уверены, что хотите очистить весь список избранных моделей?")) {
-      clearFavorites();
-      toast.success("Все избранные модели очищены");
+      void clearFavorites().then((ok) => {
+        if (ok) {
+          toast.success("Все избранные модели очищены");
+        } else {
+          toast.error("Очищено локально, но сервер не подтвердил запись");
+        }
+      });
     }
   };
 
@@ -72,14 +83,15 @@ export function SettingsSection() {
       toast.error("Вставьте JSON в поле ввода");
       return;
     }
-    const success = importFavoritesJson(importJsonText.trim());
-    if (success) {
-      toast.success("Избранные модели успешно импортированы!");
-      setShowImport(false);
-      setImportJsonText("");
-    } else {
-      toast.error("Неверный формат JSON");
-    }
+    void importFavoritesJson(importJsonText.trim()).then((success) => {
+      if (success) {
+        toast.success("Избранные модели успешно импортированы!");
+        setShowImport(false);
+        setImportJsonText("");
+      } else {
+        toast.error("Неверный формат JSON");
+      }
+    });
   };
 
   return (

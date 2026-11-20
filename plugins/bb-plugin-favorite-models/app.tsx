@@ -15,9 +15,10 @@ export default definePluginApp((app) => {
   app.contentScripts.register({
     id: "model-star-favorites",
     mount: () => {
-      initBackendSync();
+      const cancelSync = initBackendSync();
       const cleanupObserver = initDomObserver();
       return () => {
+        cancelSync();
         cleanupObserver();
       };
     },
