@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
+import type { CmdRunner } from "../src/cmd.js";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
   parseWorkGraphProjects,
@@ -9,6 +10,7 @@ import {
   assertGraphAllowsDirectAction,
   runRunQueue,
   runEnqueue,
+  type WorkGraphMode,
 } from "../src/workgraph.js";
 
 function createTestStore(): DelegationStore {
@@ -606,4 +608,136 @@ test("runRunQueue: задачи проектов в режиме 'off' не пр
   const taskOff = store.getTask("TASK-OFF");
   assert.equal(taskOff?.node, "start");
   assert.equal(taskOff?.status, "queued");
+});
+
+test("runRunQueue: изолированный запуск очереди с двумя репозиториями и разными базовыми ветками", async () => {
+  const store = createTestStore();
+  const t0 = 1_000_000;
+
+  store.insertTask(
+    {
+      taskKey: "TASK-REPO-A",
+      projectId: "proj_a",
+      coordinatorThreadId: "thr_coord_a",
+      route: "feature",
+      level: "medium",
+      confirmationMode: "auto",
+    },
+    t0,
+  );
+
+  store.insertTask(
+    {
+      taskKey: "TASK-REPO-B",
+      projectId: "proj_b",
+      coordinatorThreadId: "thr_coord_b",
+      route: "feature",
+      level: "medium",
+      confirmationMode: "auto",
+    },
+    t0,
+  );
+
+  const gitCalls: Array<{ repoRoot?: string; args: string[] }> = [];
+  const mockCmd: CmdRunner = {
+    run: async (_cmd: string, args: string[], opts?: { cwd?: string }) => {
+      gitCalls.push({ repoRoot: opts?.cwd, args });
+      return { exitCode: 1, stdout: "", stderr: "" };
+    },
+  };
+
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    workGraphProjects: {
+      proj_a: "strict",
+      proj_b: "strict",
+    },
+    maxActiveTasks: 5,
+    now: () => t0,
+    cmd: mockCmd,
+    resolveTaskRepoContext: (task) => {
+      if (task.project_id === "proj_a") {
+        return { repoRoot: "/repos/project-a", mergeBaseBranch: "main" };
+      }
+      if (task.project_id === "proj_b") {
+        return { repoRoot: "/repos/project-b", mergeBaseBranch: "master" };
+      }
+      return null;
+    },
+  });
+
+  // Verify git calls for task A ran in /repos/project-a with main/origin/main
+  const aCalls = gitCalls.filter((c) => c.repoRoot === "/repos/project-a");
+  assert.ok(aCalls.length > 0, "Git calls for project A must run in /repos/project-a");
+  assert.ok(
+    aCalls.some((c) => c.args.some((a) => a.includes("task-repo-a"))),
+    "Project A git call must reference task-repo-a branch",
+  );
+  assert.ok(
+    aCalls.some((c) => c.args.some((a) => a.includes("origin/main"))),
+    "Project A git call must reference origin/main base branch",
+  );
+
+  // Verify git calls for task B ran in /repos/project-b with master/origin/master
+  const bCalls = gitCalls.filter((c) => c.repoRoot === "/repos/project-b");
+  assert.ok(bCalls.length > 0, "Git calls for project B must run in /repos/project-b");
+  assert.ok(
+    bCalls.some((c) => c.args.some((a) => a.includes("task-repo-b"))),
+    "Project B git call must reference task-repo-b branch",
+  );
+  assert.ok(
+    bCalls.some((c) => c.args.some((a) => a.includes("origin/master"))),
+    "Project B git call must reference origin/master base branch",
+  );
+
+  // Neither project executed in the other project's repository
+  assert.ok(
+    !aCalls.some((c) => c.args.some((a) => a.includes("task-repo-b") || a.includes("master"))),
+    "Project A repo must not process TASK-REPO-B or master",
+  );
+  assert.ok(
+    !bCalls.some((c) => c.args.some((a) => a.includes("task-repo-a") || a.includes("main"))),
+    "Project B repo must not process TASK-REPO-A or main",
+  );
+});
+
+test("projectApprovalMode: эффективный режим проекта и разрешение projectId по threadId", async () => {
+  const globalMode = "off";
+  const projectsMap: Record<string, WorkGraphMode> = {
+    proj_strict: "strict",
+    proj_off: "off",
+  };
+
+  const getWorkGraphMode = (projectId?: string | null): WorkGraphMode =>
+    resolveWorkGraphMode(projectId, globalMode, projectsMap);
+
+  const mockThreads: Record<string, { projectId: string }> = {
+    thr_in_strict: { projectId: "proj_strict" },
+    thr_in_off: { projectId: "proj_off" },
+  };
+
+  const handler = async (input?: { projectId?: string | null; threadId?: string | null }) => {
+    let pid = input?.projectId;
+    if (!pid && input?.threadId) {
+      pid = mockThreads[input.threadId]?.projectId;
+    }
+    return { mode: "manual", workGraph: getWorkGraphMode(pid) };
+  };
+
+  // Direct projectId
+  const res1 = await handler({ projectId: "proj_strict" });
+  assert.equal(res1.workGraph, "strict", "strict project overrides global off");
+
+  // Open thread without projectId in request (resolves threadId)
+  const res2 = await handler({ threadId: "thr_in_strict" });
+  assert.equal(res2.workGraph, "strict", "thread in strict project resolves to strict");
+
+  // Open thread in off project
+  const res3 = await handler({ threadId: "thr_in_off" });
+  assert.equal(res3.workGraph, "off", "thread in off project resolves to off");
+
+  // Thread in unknown project falls back to global off
+  const res4 = await handler({ threadId: "thr_unknown" });
+  assert.equal(res4.workGraph, "off", "unknown project falls back to global mode");
 });

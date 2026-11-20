@@ -133,7 +133,7 @@ function RoleApprovalMenu() {
     // Mode loading
     if (role === "orchestrator") {
       void rpc
-        .call("projectApprovalMode", { projectId })
+        .call("projectApprovalMode", { projectId, threadId })
         .then((res) => {
           if (!alive) return;
           if (res?.mode) setMode(res.mode);
@@ -158,8 +158,9 @@ function RoleApprovalMenu() {
     };
   }, [projectId, threadId, isThread, role]);
 
-  // Determine if workGraph is active
-  const workGraphVal = (values?.workGraph as string) ?? serverWorkGraph ?? "off";
+  // Determine if workGraph is active: effective project mode from serverWorkGraph takes precedence
+  // over global settings values?.workGraph (§29.2, §32.2)
+  const workGraphVal = serverWorkGraph ?? (values?.workGraph as string) ?? "off";
   const workGraphOn = workGraphVal === "strict" || workGraphVal === "shadow";
   const hasApproval =
     workGraphOn && (role === "orchestrator" || role === "executor");

@@ -197,7 +197,10 @@ export const rpcContract = defineRpcContract({
   },
   // §29.2 (Б2, r34.2): проектная настройка approvalMode (тумблер координатора)
   projectApprovalMode: {
-    input: z.object({ projectId: z.string().nullable().optional() }),
+    input: z.object({
+      projectId: z.string().nullable().optional(),
+      threadId: z.string().nullable().optional(),
+    }),
     output: z.object({
       mode: z.enum(["auto", "manual"]).nullable(),
       workGraph: z.enum(["off", "shadow", "strict"]).optional(),
@@ -1846,6 +1849,17 @@ export async function createPlugin(
       bbCli,
       t,
       requestOwnerGateInteraction,
+      resolveTaskRepoContext: async (task) => {
+        try {
+          return await resolveWorktreeContext(
+            task.coordinator_thread_id || undefined,
+            task.project_id || undefined,
+            process.cwd(),
+          );
+        } catch {
+          return null;
+        }
+      },
     }).catch((e) =>
       bb.log.warn(`orchestrator run-queue: ${describeError(e)}`),
     );
@@ -2349,7 +2363,16 @@ export async function createPlugin(
       log: bb.log,
     }),
     async projectApprovalMode(input) {
-      return { mode: getApprovalMode(), workGraph: getWorkGraphMode(input?.projectId) };
+      let pid = input?.projectId;
+      if (!pid && input?.threadId) {
+        try {
+          const t = (await bb.sdk.threads.get({ threadId: input.threadId })) as {
+            projectId?: string | null;
+          };
+          if (t?.projectId) pid = t.projectId;
+        } catch {}
+      }
+      return { mode: getApprovalMode(), workGraph: getWorkGraphMode(pid) };
     },
     async setProjectApprovalMode(input) {
       const modeVal = input.mode ?? "";
@@ -4390,6 +4413,17 @@ abandoned: ${res.reported
             bbCli,
             t,
             requestOwnerGateInteraction,
+            resolveTaskRepoContext: async (task) => {
+              try {
+                return await resolveWorktreeContext(
+                  task.coordinator_thread_id || undefined,
+                  task.project_id || undefined,
+                  ctx.cwd || process.cwd(),
+                );
+              } catch {
+                return null;
+              }
+            },
           });
           return json
             ? jsonOk(res)
