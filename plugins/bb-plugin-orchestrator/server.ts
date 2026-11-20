@@ -4142,19 +4142,20 @@ abandoned: ${res.reported
           if (!isOwner && flag("--acceptance") !== undefined) {
             throw new OrchestratorError("permission-denied", "owner-only");
           }
+          const targetProjId = taskProjId ?? ctx.projectId;
           const wtCtx = await resolveWorktreeContext(
             ctx.threadId,
-            ctx.projectId,
+            targetProjId,
             ctx.cwd,
           );
           const hasChecks = Boolean(
             (releaseConfig.config?.defaults?.checks &&
               releaseConfig.config.defaults.checks.length > 0) ||
-              (ctx.projectId &&
+              (targetProjId &&
                 releaseConfig.config &&
                 (() => {
                   try {
-                    const p = resolveProject(releaseConfig.config, ctx.projectId);
+                    const p = resolveProject(releaseConfig.config, targetProjId);
                     return Boolean(p?.checks && p.checks.length > 0);
                   } catch {
                     return false;

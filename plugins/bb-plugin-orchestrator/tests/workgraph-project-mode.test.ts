@@ -297,8 +297,8 @@ test("5) Тест на асинхронный resolveTaskProjectId с bbCli/trac
       return {
         exitCode: 0,
         stdout: JSON.stringify({
-          task: { projectId: "proj_bbcli" },
-          project: { linkedBbProjectId: "proj_linked", id: "proj_id" },
+          task: { projectId: "01JTASKULID00000000000000" },
+          project: { linkedBbProjectId: "proj_linked", id: "01JPROJULID0000000000000" },
         }),
         stderr: "",
       };
@@ -306,24 +306,24 @@ test("5) Тест на асинхронный resolveTaskProjectId с bbCli/trac
   };
   assert.equal(
     await resolveTaskProjectId(store, "CLI-1", { bbCli: fakeBbCli }),
-    "proj_bbcli",
+    "proj_linked",
   );
 
-  // C. Unified field priority: task.projectId ?? task.project?.linkedBbProjectId ?? task.project?.id
-  // 1) task.projectId wins over linkedBbProjectId and id
+  // C. Unified field priority: project.linkedBbProjectId ?? task.projectId ?? project.id
+  // 1) project.linkedBbProjectId wins over task.projectId (tracker ULID) and project.id
   const trackerPrio1 = {
     getTask: () => ({
-      task: { projectId: "p1" },
-      project: { linkedBbProjectId: "p2", id: "p3" },
+      task: { projectId: "01JTRACKERULID11111111111" },
+      project: { linkedBbProjectId: "p1", id: "01JPROJULID1111111111111" },
     }),
   };
   assert.equal(await resolveTaskProjectId(store, "PRIO-1", trackerPrio1), "p1");
 
-  // 2) linkedBbProjectId wins over id when task.projectId is absent
+  // 2) task.projectId wins over project.id when linkedBbProjectId is absent
   const trackerPrio2 = {
     getTask: () => ({
-      task: {},
-      project: { linkedBbProjectId: "p2", id: "p3" },
+      task: { projectId: "p2" },
+      project: { id: "p3" },
     }),
   };
   assert.equal(await resolveTaskProjectId(store, "PRIO-2", trackerPrio2), "p2");
@@ -342,8 +342,8 @@ test("6) Тест на enqueue задачи без ctx.projectId (проект �
   const store = createTestStore();
   const tracker = {
     getTask: (k: string) => ({
-      task: { projectId: "proj_tracker_target" },
-      project: { linkedBbProjectId: "proj_tracker_target" },
+      task: { projectId: "01JTRACKERTASKULID123456" },
+      project: { linkedBbProjectId: "proj_tracker_target", id: "01JTRACKERPROJULID12345" },
     }),
   };
 

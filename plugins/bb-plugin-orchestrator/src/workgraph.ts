@@ -336,11 +336,22 @@ export function recordShadowAction(
   }
 }
 
-export interface TaskTrackerLike {
-  getTask(taskKey: string): {
+export interface TaskTrackerResult {
+  task?: {
     projectId?: string | null;
-    project?: { id?: string | null; linkedBbProjectId?: string | null };
+    project?: { id?: string | null; linkedBbProjectId?: string | null } | null;
+    [key: string]: unknown;
   } | null;
+  projectId?: string | null;
+  project?: { id?: string | null; linkedBbProjectId?: string | null } | null;
+  [key: string]: unknown;
+}
+
+export interface TaskTrackerLike {
+  getTask(taskKey: string):
+    | Promise<TaskTrackerResult | null>
+    | TaskTrackerResult
+    | null;
 }
 
 export type TaskTrackerOrOptions =
@@ -357,8 +368,8 @@ function extractProjectIdFromRecord(res: any): string | null {
   const taskObj = res.task ?? res;
   const projObj = res.project ?? taskObj.project;
   const pid =
-    taskObj.projectId ??
     projObj?.linkedBbProjectId ??
+    taskObj.projectId ??
     projObj?.id;
   if (typeof pid === "string" && pid.trim()) {
     return pid.trim();
