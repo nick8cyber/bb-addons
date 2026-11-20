@@ -1270,3 +1270,40 @@ test("BB_THREAD_ID env binding (customAgents launch) runs the task pipeline and 
   const log = readFileSync(join(app.state, "acp-server.log"), "utf8");
   assert.ok(log.includes("task:package"), "env-bound launches must run the task pipeline");
 });
+
+test("argv --bb-thread-id wins over env BB_THREAD_ID (PLUG-353)", async (t) => {
+  const repo = setup(t);
+  // env задан другим валидным id: если бы env победил argv, привязка не
+  // прошла бы верификацию (fixture CLI знает только threadId) и ход
+  // отказал бы на preflight.
+  const app = fixture(t, repo, () => ({ text: "Attachment read" }), {
+    env: { BB_THREAD_ID: "t" + "hr_envshadow1" },
+  });
+  const session = await app.newSession();
+  const response = await app.prompt(session, task("Inspect the attachment", EN, { tracker: true }));
+  assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response.error));
+  const request = app.requests()[0];
+  const actual = delivered(request);
+  const material = actual.manifest.included.find((item) => item.source === "Tracker attachment");
+  assert.ok(material, "argv-bound launch must run the task pipeline");
+  const log = readFileSync(join(app.state, "acp-server.log"), "utf8");
+  assert.ok(log.includes("task:package"), "argv must take priority over env binding");
+});
+
+test("env BB_THREAD_ID that fails verification refuses task turns explicitly (PLUG-353)", async (t) => {
+  for (const bad of ["bogus-not-a-thread", "t" + "hr_unresolvable1"]) {
+    const repo = setup(t);
+    const app = fixture(t, repo, () => ({ text: "unused" }), {
+      bindEnv: true,
+      env: { BB_THREAD_ID: bad },
+    });
+    const session = await app.newSession();
+    const response = await app.prompt(session, task("Inspect the attachment", EN, { tracker: true }));
+    assert.equal(response.result, undefined, "env id " + bad + " must not silently fall back to chat");
+    assert.equal(response.error?.data?.outcome, "not_started");
+    assert.match(response.error?.message ?? "", /could not verify trusted BB thread metadata/);
+    assert.equal(app.requests().length, 0, "refused turn must not reach the web driver");
+    const log = readFileSync(join(app.state, "acp-server.log"), "utf8");
+    assert.ok(log.includes("task:error"), "refusal must be logged for env id " + bad);
+  }
+});
