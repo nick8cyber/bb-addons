@@ -4019,9 +4019,15 @@ export async function runRunQueue(
         try {
           const taskRepo = deps.resolveTaskRepoContext
             ? await deps.resolveTaskRepoContext(task)
-            : null;
-          const taskRepoRoot = taskRepo?.repoRoot ?? repoRoot;
-          const taskMergeBase = taskRepo?.mergeBaseBranch ?? mergeBaseBranch;
+            : { repoRoot, mergeBaseBranch };
+          if (!taskRepo?.repoRoot) {
+            const warnMsg = `orchestrator: task ${task.task_key} repo context unavailable for project ${task.project_id ?? "unknown"}; skipping git steps`;
+            if (deps.log?.warn) deps.log.warn(warnMsg);
+            else console.warn(warnMsg);
+            continue;
+          }
+          const taskRepoRoot = taskRepo.repoRoot;
+          const taskMergeBase = taskRepo.mergeBaseBranch ?? mergeBaseBranch;
           const advanced = await advanceActiveTask(
             task,
             deps,
@@ -4175,9 +4181,15 @@ export async function runRunQueue(
           try {
             const taskRepo = deps.resolveTaskRepoContext
               ? await deps.resolveTaskRepoContext(t)
-              : null;
-            const taskRepoRoot = taskRepo?.repoRoot ?? repoRoot;
-            const taskMergeBase = taskRepo?.mergeBaseBranch ?? mergeBaseBranch;
+              : { repoRoot, mergeBaseBranch };
+            if (!taskRepo?.repoRoot) {
+              const warnMsg = `orchestrator: task ${t.task_key} repo context unavailable for project ${t.project_id ?? "unknown"}; skipping git steps`;
+              if (deps.log?.warn) deps.log.warn(warnMsg);
+              else console.warn(warnMsg);
+              continue;
+            }
+            const taskRepoRoot = taskRepo.repoRoot;
+            const taskMergeBase = taskRepo.mergeBaseBranch ?? mergeBaseBranch;
             const started = await startQueuedTask(
               t,
               deps,
