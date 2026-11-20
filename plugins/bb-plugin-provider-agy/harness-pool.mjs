@@ -25,7 +25,7 @@ const fake = new URL("./fake-agy-errors.mjs", import.meta.url).pathname;
 writeFileSync(shim, `#!/bin/sh\nexec /usr/bin/node ${fake} "$@"\n`);
 chmodSync(shim, 0o755);
 process.env.AGY_PATH = shim;
-process.env.AGY_FAKE_RECORD_ENV = "HOME,HTTPS_PROXY";
+process.env.AGY_FAKE_RECORD_ENV = "HOME,HTTPS_PROXY,SSH_CONNECTION";
 process.env.AGY_FAKE_TRANSCRIPT = join(root, "envlog.ndjson");
 process.env.AGY_CLIPROXY = "0";
 process.env.AGY_AUTO_RETRY_MAX = "1";
@@ -517,6 +517,9 @@ const checks = [
   ...acpChecks,
   ["pool/homes-visited-in-order", envs.length === 5 && ["a1", "a2", "a3", "a3", "a3"].every((l, i) => envs[i]?.__env?.HOME === join(root, "accounts", l)), JSON.stringify(envs.map((e) => e?.__env?.HOME))],
   ["pool/failures-then-completion", bs.length === 5 && bs.slice(0, 3).every((b) => b.status === "failed") && bs[3].status === "completed" && bs[4].status === "completed", JSON.stringify(bs.map((b) => b.status))],
+  // provider-agy-acp §2.3 п.14: every pool launch carries the SSH marker
+  // that makes agy keep the token in the account's file, not the OS keyring.
+  ["pool/file-token-storage-env", envs.length === 5 && envs.every((e) => e.__env?.SSH_CONNECTION === (process.env.SSH_CONNECTION || "127.0.0.1 0 127.0.0.1 0")), JSON.stringify(envs.map((e) => e.__env?.SSH_CONNECTION))],
   ["pool/proxy-follows-account", envs[1]?.__env?.HTTPS_PROXY === "http://proxy-a2:9" && envs[0]?.__env?.HTTPS_PROXY == null && envs[2]?.__env?.HTTPS_PROXY == null && envs[3]?.__env?.HTTPS_PROXY == null, JSON.stringify(envs.map((e) => e?.__env?.HTTPS_PROXY))],
   ["pool/rotations-fresh-resume-last", envs[1]?.__argv?.includes("--conversation") !== true && envs[2]?.__argv?.includes("--conversation") !== true && envs[3]?.__argv?.includes("--conversation") === true, JSON.stringify([envs[1]?.__argv?.includes("--conversation"), envs[2]?.__argv?.includes("--conversation"), envs[3]?.__argv?.includes("--conversation")])],
   ["pool/replaced-announced-four-times", replacedList.length === 4 && replacedList[0].params.contextLost === true && replacedList[1].params.contextLost === true && replacedList[2].params.contextLost === false && replacedList[3].params.contextLost === false, JSON.stringify(replacedList.map((m) => m.params.contextLost))],

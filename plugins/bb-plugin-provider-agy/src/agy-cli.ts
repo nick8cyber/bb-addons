@@ -41,6 +41,39 @@ export function agyEffort(reasoningLevel: string | undefined): string | null {
 }
 
 /**
+ * §2.3 п.14: the value planted in SSH_CONNECTION when the host is not in a
+ * real SSH session — a loopback placeholder, never a real peer.
+ */
+export const FILE_TOKEN_STORAGE_MARKER = "127.0.0.1 0 127.0.0.1 0";
+
+/**
+ * §2.3 п.14: env that makes agy keep the OAuth token in the file under the
+ * account's own `.gemini` instead of the OS keyring. The keyring (macOS
+ * Keychain, Secret Service, Windows Credential Manager) is ONE slot per
+ * machine user, so every pool account launched there would run as whoever
+ * signed in last — the pool needs the per-account file. agy picks the file
+ * store by itself when it detects an SSH session ("Using file-based token
+ * storage because SSH session detected"), and SSH_CONNECTION is the signal
+ * it reads. A real SSH_CONNECTION is kept as is. `AGY_KEYRING=1` opts out.
+ * Only pool-account launches get this: a direct launch on the user's own
+ * HOME keeps the keyring it signed in with.
+ */
+export function fileTokenStorageEnv(
+  base: NodeJS.ProcessEnv,
+): Record<string, string> {
+  if (base.AGY_KEYRING === "1") {
+    return {};
+  }
+  const existing = base.SSH_CONNECTION;
+  return {
+    SSH_CONNECTION:
+      existing !== undefined && existing.length > 0
+        ? existing
+        : FILE_TOKEN_STORAGE_MARKER,
+  };
+}
+
+/**
  * Where the agy binary lives. `AGY_PATH` wins (a host can pin a build), then
  * the installer's own location, then PATH. Returning a bare "agy" as the last
  * resort keeps the failure legible: the spawn error names the command.

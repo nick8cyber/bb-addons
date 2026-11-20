@@ -149,7 +149,18 @@ if (installArg !== undefined) {
 }
 const login = spawnSync(loginBin, [], {
   stdio: "inherit",
-  env: { ...process.env, ...installEnv, HOME: stagingDir },
+  // provider-agy-acp §2.3 п.14: the sign-in must land in the account's own
+  // token file, not in the machine-wide OS keyring (macOS Keychain would
+  // otherwise swallow it and overwrite the owner's personal agy login).
+  // agy picks the file store when it sees an SSH session.
+  env: {
+    ...process.env,
+    ...installEnv,
+    ...(process.env.AGY_KEYRING === "1"
+      ? {}
+      : { SSH_CONNECTION: process.env.SSH_CONNECTION || "127.0.0.1 0 127.0.0.1 0" }),
+    HOME: stagingDir,
+  },
 });
 if (login.status !== 0) {
   cleanup();
