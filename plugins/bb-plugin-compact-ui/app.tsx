@@ -787,6 +787,7 @@ function CollapsedThreadList({
               }
               moveProject(moved, target.projectId, target.edge);
             }}
+            onClick={() => toggleFold(group.projectId)}
             className={cn(
               "group/header flex h-6 cursor-grab items-center gap-1 rounded-md px-1 text-xs font-medium text-sidebar-foreground/75",
               draggingProjectId === group.projectId && "opacity-50",
@@ -808,7 +809,10 @@ function CollapsedThreadList({
                   ? `Expand ${group.projectName}`
                   : `Collapse ${group.projectName}`
               }
-              onClick={() => toggleFold(group.projectId)}
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleFold(group.projectId);
+              }}
               className="flex size-5 shrink-0 cursor-pointer items-center justify-center rounded hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
             >
               <Icon
@@ -818,9 +822,9 @@ function CollapsedThreadList({
             </button>
             <button
               type="button"
-              onClick={() => {
-                navigate.toProject(group.projectId);
-                onNavigate();
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleFold(group.projectId);
               }}
               className="min-w-0 flex-1 cursor-pointer truncate text-left hover:text-foreground"
             >
@@ -837,7 +841,8 @@ function CollapsedThreadList({
                 aria-label={`Call in ${group.projectName}`}
                 title={`Call in ${group.projectName}`}
                 data-sidebar-live-call={group.projectId}
-                onClick={() => {
+                onClick={(e) => {
+                  e.stopPropagation();
                   window.dispatchEvent(new CustomEvent(LIVE_CALL_START_EVENT, { detail: { projectId: group.projectId } }));
                 }}
                 className="flex size-5 shrink-0 cursor-pointer items-center justify-center rounded hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
@@ -849,7 +854,8 @@ function CollapsedThreadList({
               type="button"
               aria-label={`New thread in ${group.projectName}`}
               title={`New thread in ${group.projectName}`}
-              onClick={() => {
+              onClick={(e) => {
+                e.stopPropagation();
                 actions.openNewThread({
                   projectId: group.projectId,
                   focusPrompt: true,
