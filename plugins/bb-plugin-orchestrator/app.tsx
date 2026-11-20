@@ -1,22 +1,21 @@
 /**
  * bb-plugin-orchestrator — Frontend entry (spec §13.2 п.1 + §25 + §29.2):
- * - «Роль» picker in the composer action row (RoleSelect).
- * - Interactive mode toggle [ ✅ Авто ] / [ 👤 Сам ] (ApprovalModeToggle)
- *   in the thread header action row (§29.2, Б2, r34.2):
+ * - Unified «Роль» and interactive mode menu (RoleApprovalMenu)
+ *   in the composer action row (§29.2, PLUG-359):
  *   * In task window (executor): toggles confirmation_mode ONLY for that task.
  *   * In coordinator window (orchestrator): toggles orchestrator.approvalMode for project.
  * - Owner gate interaction card (OwnerGateCard) via PluginInteractionRequest (§29.1, §29.2).
  */
+import "./app.css";
 import {
   definePluginApp,
   useComposerView,
   useRpc,
   useSettings,
   type PluginPendingInteractionProps,
-  type PluginThreadHeaderActionProps,
 } from "@get-bb/plugin-sdk/app";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { useEffect, useState, type ChangeEvent } from "react";
+import { useEffect, useState } from "react";
 import type { rpcContract } from "./server";
 import { createT, resolveLang } from "./src/i18n/index.js";
 
@@ -35,121 +34,6 @@ type RoleId = (typeof ROLE_OPTIONS)[number]["id"];
 const DEFAULT_ROLE: RoleId = "executor";
 const PICKABLE = new Set<string>(ROLE_OPTIONS.map((o) => o.id));
 
-function RoleSelect() {
-  const view = useComposerView();
-  const rpc = useRpc<Contract>();
-  const { values } = useSettings();
-  const t = createT(resolveLang(values?.language));
-  const scope = view.scope;
-  const isThread = scope.kind === "thread";
-  const projectId = scope.kind === "new-thread" ? scope.projectId : null;
-  const threadId = scope.kind === "thread" ? scope.threadId : null;
-  const [role, setRole] = useState<string>(DEFAULT_ROLE);
-  const [lockedLabel, setLockedLabel] = useState<string | null>(null);
-
-  const report = (next: RoleId) => {
-    if (isThread && threadId) {
-      void rpc
-        .call("setThreadRole", { threadId, role: next })
-        .catch(() => undefined);
-      return;
-    }
-    void rpc
-      .call("setPendingRole", { projectId, role: next })
-      .catch(() => undefined);
-  };
-
-  useEffect(() => {
-    let alive = true;
-    let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    const apply = (next: string) => {
-      if (!alive) return;
-      if (PICKABLE.has(next)) {
-        setRole(next);
-        setLockedLabel(null);
-      } else {
-        setLockedLabel(next === "helper" ? t("app.roleHelper") : next);
-      }
-    };
-    const load = () =>
-      isThread && threadId
-        ? rpc
-            .call("threadRole", { threadId })
-            .then((res) => apply(res?.role ?? "none"))
-            .catch(() => {
-              retryTimer = setTimeout(() => {
-                if (!alive) return;
-                void rpc
-                  .call("threadRole", { threadId })
-                  .then((res) => apply(res?.role ?? "none"))
-                  .catch(() => apply("none"));
-              }, 1000);
-            })
-        : rpc
-            .call("pendingRole", { projectId })
-            .then((res) => apply(res?.role ?? DEFAULT_ROLE))
-            .catch(() => {
-              retryTimer = setTimeout(() => {
-                if (!alive) return;
-                void rpc
-                  .call("pendingRole", { projectId })
-                  .then((res) => apply(res?.role ?? DEFAULT_ROLE))
-                  .catch(() => apply(DEFAULT_ROLE));
-              }, 1000);
-            });
-    void load();
-    return () => {
-      alive = false;
-      if (retryTimer !== undefined) clearTimeout(retryTimer);
-    };
-  }, [projectId, threadId, isThread]);
-
-  const onChange = (event: ChangeEvent<HTMLSelectElement>) => {
-    const next = event.target.value as RoleId;
-    setRole(next);
-    report(next);
-  };
-
-  return (
-    <label
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 6,
-        fontSize: 12,
-        opacity: 0.85,
-        whiteSpace: "nowrap",
-      }}
-    >
-      {t("app.role")}
-      <select
-        value={lockedLabel !== null ? "__locked" : role}
-        onChange={onChange}
-        disabled={lockedLabel !== null}
-        style={{
-          font: "inherit",
-          color: "inherit",
-          background: "transparent",
-          border: "1px solid rgba(128,128,128,.4)",
-          borderRadius: 6,
-          padding: "2px 4px",
-          colorScheme: "dark",
-        }}
-      >
-        {lockedLabel !== null ? (
-          <option value="__locked">{lockedLabel}</option>
-        ) : (
-          ROLE_OPTIONS.map((option) => (
-            <option key={option.id} value={option.id}>
-              {t(option.labelKey)}
-            </option>
-          ))
-        )}
-      </select>
-    </label>
-  );
-}
-
 /**
  * §29.2 (20.11 решение владельца, PLUG-359):
  * Единый компактный селектор роли и режима одобрения в строке поля ввода.
@@ -158,7 +42,7 @@ function RoleSelect() {
  * 1) «Роль»: список доступных ролей треда, галочкой отмечена активная роль;
  * 2) Разделитель и «Одобрение»: «✅ Авто» и «👤 Сам», галочкой отмечен текущий режим;
  *    секция отображается ТОЛЬКО если workGraph != off и роль orchestrator или executor.
- * Выбор в одной секции не закрывает меню и не меняет другую.
+ * Выбор в одной части не сбрасывает режим в другой, и наоборот.
  */
 function RoleApprovalMenu() {
   const view = useComposerView();
@@ -328,7 +212,6 @@ function RoleApprovalMenu() {
             <DropdownMenu.Item
               disabled
               className="orch-role-menu-item"
-              onSelect={(e) => e.preventDefault()}
             >
               <span>{lockedLabel}</span>
               <span style={{ color: "#4ade80", fontWeight: 600 }}>✓</span>
@@ -340,8 +223,7 @@ function RoleApprovalMenu() {
                 <DropdownMenu.Item
                   key={opt.id}
                   className="orch-role-menu-item"
-                  onSelect={(e) => {
-                    e.preventDefault();
+                  onSelect={() => {
                     report(opt.id);
                   }}
                 >
@@ -364,8 +246,7 @@ function RoleApprovalMenu() {
               </DropdownMenu.Label>
               <DropdownMenu.Item
                 className="orch-role-menu-item"
-                onSelect={(e) => {
-                  e.preventDefault();
+                onSelect={() => {
                   switchMode("auto");
                 }}
               >
@@ -378,8 +259,7 @@ function RoleApprovalMenu() {
               </DropdownMenu.Item>
               <DropdownMenu.Item
                 className="orch-role-menu-item"
-                onSelect={(e) => {
-                  e.preventDefault();
+                onSelect={() => {
                   switchMode("manual");
                 }}
               >
@@ -395,153 +275,6 @@ function RoleApprovalMenu() {
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
-  );
-}
-
-/**
- * §29.2 (Б2, r34.2): Interactive toggle [ ✅ Авто ] / [ 👤 Сам ]
- * Mounted in thread header action row and/or composer action row.
- */
-function ApprovalModeToggle(props?: Partial<PluginThreadHeaderActionProps>) {
-  const view = useComposerView();
-  const rpc = useRpc<Contract>();
-  const { values } = useSettings();
-  const t = createT(resolveLang(values?.language));
-
-  const scope = view?.scope;
-  const threadId =
-    props?.threadId ?? (scope?.kind === "thread" ? scope.threadId : null);
-  const projectId =
-    props?.projectId ??
-    (scope?.kind === "new-thread" ? scope.projectId : null);
-
-  const [threadRole, setThreadRole] = useState<string | null>(null);
-  const [taskKey, setTaskKey] = useState<string | null>(null);
-  const [mode, setMode] = useState<"auto" | "manual" | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-
-  useEffect(() => {
-    let alive = true;
-    if (!threadId) {
-      setLoading(false);
-      return;
-    }
-
-    rpc
-      .call("threadRole", { threadId })
-      .then(async (res) => {
-        if (!alive) return;
-        const role = res?.role ?? "none";
-        setThreadRole(role);
-
-        if (role === "orchestrator") {
-          const pMode = await rpc
-            .call("projectApprovalMode", { projectId })
-            .catch(() => null);
-          if (!alive) return;
-          setMode(pMode?.mode ?? null);
-          setLoading(false);
-        } else if (role === "executor") {
-          const tMode = await rpc
-            .call("taskConfirmationMode", { threadId })
-            .catch(() => null);
-          if (!alive) return;
-          setTaskKey(tMode?.taskKey ?? null);
-          setMode(tMode?.mode ?? null);
-          setLoading(false);
-        } else {
-          setLoading(false);
-        }
-      })
-      .catch(() => {
-        if (alive) setLoading(false);
-      });
-
-    return () => {
-      alive = false;
-    };
-  }, [threadId, projectId]);
-
-  if (
-    loading ||
-    !threadRole ||
-    (threadRole !== "orchestrator" && threadRole !== "executor")
-  ) {
-    return null;
-  }
-  if (threadRole === "executor" && !taskKey) {
-    return null;
-  }
-
-  const currentMode =
-    threadRole === "orchestrator" ? mode : (mode ?? "auto");
-
-  const switchMode = (nextMode: "auto" | "manual") => {
-    if (nextMode === currentMode) return;
-    setMode(nextMode);
-    if (threadRole === "orchestrator") {
-      void rpc
-        .call("setProjectApprovalMode", { projectId, mode: nextMode })
-        .catch(() => {});
-    } else if (threadRole === "executor" && taskKey) {
-      void rpc
-        .call("setTaskConfirmationMode", { taskKey, mode: nextMode })
-        .catch(() => {});
-    }
-  };
-
-  return (
-    <div
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        borderRadius: 6,
-        border: "1px solid rgba(128,128,128,.4)",
-        overflow: "hidden",
-        fontSize: 11,
-        height: 24,
-        background: "rgba(0,0,0,.2)",
-      }}
-      title={
-        threadRole === "orchestrator"
-          ? t("app.approvalModeProject")
-          : t("app.approvalModeTask", { task: taskKey ?? "" })
-      }
-    >
-      <button
-        type="button"
-        onClick={() => switchMode("auto")}
-        style={{
-          border: "none",
-          padding: "2px 7px",
-          background:
-            currentMode === "auto" ? "rgba(34,197,94,.25)" : "transparent",
-          color: currentMode === "auto" ? "#4ade80" : "inherit",
-          fontWeight: currentMode === "auto" ? 600 : 400,
-          cursor: "pointer",
-          fontSize: 11,
-        }}
-      >
-        ✅ {t("app.modeAuto")}
-      </button>
-      <button
-        type="button"
-        onClick={() => switchMode("manual")}
-        style={{
-          border: "none",
-          borderLeft: "1px solid rgba(128,128,128,.3)",
-          padding: "2px 7px",
-          background:
-            currentMode === "manual" ? "rgba(59,130,246,.25)" : "transparent",
-          color: currentMode === "manual" ? "#60a5fa" : "inherit",
-          fontWeight: currentMode === "manual" ? 600 : 400,
-          cursor: "pointer",
-          fontSize: 11,
-        }}
-      >
-        👤 {t("app.modeManual")}
-      </button>
-    </div>
   );
 }
 
@@ -961,12 +694,6 @@ export default definePluginApp((app) => {
     actions: [
       { id: "role-menu", component: RoleApprovalMenu },
     ],
-  });
-
-  app.slots.experimental_threadHeaderAction({
-    id: "orchestrator-mode-toggle",
-    title: "Режим одобрения",
-    component: ApprovalModeToggle,
   });
 
   app.slots.pendingInteraction({
