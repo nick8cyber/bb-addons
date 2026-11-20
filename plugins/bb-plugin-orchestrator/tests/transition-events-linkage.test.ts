@@ -76,7 +76,7 @@ test("§28.1 / Acceptance: every transition event in TRANSITION_TABLE must have 
     if (Array.isArray(rule.eventType)) {
       for (const e of rule.eventType) allEvents.add(e);
     } else {
-      allEvents.add(rule.eventType);
+      allEvents.add(rule.eventType as string);
     }
   }
 
