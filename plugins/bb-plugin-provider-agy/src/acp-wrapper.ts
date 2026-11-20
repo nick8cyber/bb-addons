@@ -4349,6 +4349,7 @@ function processDeltaLine(
           }
           flushCandidateBuffer(session, out);
           session.agentMessageText = "";
+          session.streamedAgentMessage = false;
         }
         out.push(delta);
         continue;
@@ -5130,7 +5131,9 @@ function discardSession(session: WSession): void {
   sessions.delete(session.threadId);
   stoppingSessions.set(session.threadId, session);
   const timer = setTimeout(() => {
-    stoppingSessions.delete(session.threadId);
+    if (stoppingSessions.get(session.threadId) === session) {
+      stoppingSessions.delete(session.threadId);
+    }
   }, 10000);
   timer.unref?.();
   // The thread record survives discard: it is the rebuild source for
@@ -5692,6 +5695,7 @@ function handleTurnSteer(id: JsonRpcId, params: Record<string, unknown>): void {
         ).slice(-HANDOFF_STREAMED_TEXT_CAP);
       }
       emitDeltas(session.threadId, b);
+      session.streamedAgentMessage = true;
     }
     session.candidateBuffer = [];
   }

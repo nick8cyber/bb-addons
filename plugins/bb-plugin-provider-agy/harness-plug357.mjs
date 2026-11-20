@@ -773,7 +773,7 @@ const start = (id, tid, customOpts = options) =>
   const closes = deltas("t-b2-normal-stop").filter((d) => d.kind === "item.textClose" && d.channel === "agentMessage");
   check("blocker2/normal-stop-streamed-text", normalTexts.includes("normal partial answer"), `normalTexts=${normalTexts}`);
   check("blocker2/normal-stop-has-text-close", closes.length >= 1, `closes=${JSON.stringify(closes)}`);
-  check("blocker2/normal-stop-boundary-interrupted", boundaries("t-b2-normal-stop").at(-1)?.status === "interrupted" || boundaries("t-b2-normal-stop").at(-1)?.status === "completed");
+  check("blocker2/normal-stop-boundary-interrupted", boundaries("t-b2-normal-stop").at(-1)?.status === "interrupted");
 }
 
 // Test 2j: thread/discard mid-turn followed by turn/start fails fast with -32000
