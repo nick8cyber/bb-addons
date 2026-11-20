@@ -2857,8 +2857,14 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   const readState = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
 
   writeUnlockState();
-  runUnlock("pro-1 neon");
+  runUnlock("pro-1 argon");
   let st = readState();
+  assert.deepEqual(st.accounts["pro-1"].lockedModels, ["hydrogen"], "unlock <id> argon resolves alias and removes neon");
+  assert.deepEqual(st.accounts["ultra-1"].lockedModels, ["carbon"], "unlock <id> leaves other accounts untouched");
+
+  writeUnlockState();
+  runUnlock("pro-1 neon");
+  st = readState();
   assert.deepEqual(st.accounts["pro-1"].lockedModels, ["hydrogen"], "unlock <id> <model> removes only that model");
   assert.deepEqual(st.accounts["ultra-1"].lockedModels, ["carbon"], "unlock <id> leaves other accounts untouched");
 

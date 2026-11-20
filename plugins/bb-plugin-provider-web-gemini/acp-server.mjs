@@ -2971,7 +2971,9 @@ if (process.argv[2] === "unpark") {
 // getAccountTier falls back to the pool-configured tier again.
 if (process.argv[2] === "unlock") {
   const target = process.argv[3] || "all";
-  const model = process.argv[4] ? process.argv[4].toLowerCase() : null;
+  const model = process.argv[4]
+    ? resolveModelId(process.argv[4]) || process.argv[4].toLowerCase()
+    : null;
   withStateLock((state) => {
     const ids = target === "all" ? Object.keys(state.accounts) : [target];
     for (const id of ids) {
