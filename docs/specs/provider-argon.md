@@ -461,7 +461,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
     "ownerStartTime": 54000,
     "bootId": "8f3b2c1a-...",
     "mode": "xvfb",
-    "userDataDir": "/home/ubuntu/.config/google-chrome-acc1",
+    "userDataDir": "<profile-user-data-dir>",
     "profileDir": "Default",
     "launchedMs": 1700000000000,
     "adoptedMs": null,
