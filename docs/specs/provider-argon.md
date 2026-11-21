@@ -450,7 +450,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 
 - Каждая группа процессов браузера, запущенная драйвером, получает файл маркера `$STATE_DIR/browser-groups/<port>.json`.
 - Каталог групп: `$STATE_DIR/browser-groups/` (по умолчанию `~/.bb/plugins/provider-web-gemini/browser-groups/`, фолбэк `~/.bb/plugins/provider-argon/browser-groups/`).
-- Маркер содержит проверяемую идентичность группы и владельца:
+- Маркер содержит проверяемую идентичность группы и владельца (поле `mode` отражает реальный режим запуска из `driver.ensureChrome`: `"xvfb"`, `"native"` или `"visible"`; `profileDir` — каталог профиля внутри `userDataDir`):
   ```json
   {
     "version": 1,
@@ -460,8 +460,9 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
     "ownerPid": 12000,
     "ownerStartTime": 54000,
     "bootId": "8f3b2c1a-...",
-    "mode": "headless",
+    "mode": "xvfb",
     "userDataDir": "/home/ubuntu/.config/google-chrome-acc1",
+    "profileDir": "Default",
     "launchedMs": 1700000000000,
     "adoptedMs": null,
     "reaping": null,
@@ -505,13 +506,34 @@ PGID и jiffies старта процессов уникальны только 
 ### 8.4 Проверка идентичности группы (`identifyGroup`)
 
 Перед отправкой любых сигналов и перед усыновлением выполняется строгая проверка живых процессов группы:
-1. Проверка `markerMatchesBoot`: при `null` → `'boot-unknown'`, при `false` → `'stale-boot'`.
-2. Сканирование членов группы: через `/proc/*/stat` отбираются живые процессы с `pgrp === meta.pgid` (состояние не `'Z'`). Если живых членов нет → `'dead'`.
-3. Проверка атрибуции членов группы (`memberLooksOurs`): командная строка каждого процесса должна соответствовать стеку браузера (`chrome`, `chromium`, `xvfb`, `Xvfb`, `xvfb-run` или содержать путь к `userDataDir` / флаг порта).
-4. Проверка окна запуска: самое раннее время старта среди членов группы сверяется с `meta.pgidStartTime`. Если время не было записано или члены группы запустились позже окна запуска (`MEMBER_LAUNCH_WINDOW_JIFFIES = 500`), либо обнаружены неатрибутируемые процессы — группа классифицируется как `'doubtful'` (`unattributed-members`, `members-postdate-launch`, `starttime-unrecorded`). При `'doubtful'` сигналы группе не посылаются, маркер сохраняется и помечается полем `doubt: { reason, sinceMs }`.
-5. Если среди членов группы есть процесс с флагом `--remote-debugging-port=<port>` → статус `'matched'`.
-6. Если лидер группы завершился, но остались только атрибутируемые остатки стека (например, одинокий `Xvfb`) → статус `'leftover'`.
-7. Сигналы (`SIGTERM` / `SIGKILL`) разрешено посылать только группам со статусом `'matched'` или `'leftover'` (`groupAliveMatches`).
+1. **Проверка `markerMatchesBoot`**: выполняется строго до интерпретации PID/PGID/портов. При `false` → `'stale-boot'` (`boot-mismatch` / `boot-unrecorded`), при `null` → `'boot-unknown'` (`boot-unreadable`, fail-closed).
+2. **Сканирование членов группы (`groupMembers`)**: через `/proc/*/stat` отбираются живые не-зомби процессы с `pgrp === meta.pgid` (состояние не `'Z'`). Сохраняются `{ pid, startTime, cmdline }`. Если живых членов нет → `'dead'` (`no-members`).
+3. **Атрибуция процесса браузерному стеку (`memberLooksOurs`)**:
+   - командная строка процесса проверяется регулярным выражением `GROUP_MEMBER_CMDLINE = /xvfb|chrome|chromium|crashpad/i`;
+   - время старта процесса не может предшествовать записанному времени старта лидера группы: `m.startTime >= meta.pgidStartTime` (при известном `pgidStartTime`);
+   - никаких проверок пути `userDataDir` или флага порта в `memberLooksOurs` не выполняется: атрибуция основана строго на принадлежности бинарника к семейству стека и монотонности времени старта.
+4. **Разделение на ветку живого лидера и ветку без лидера (`leader = members.find(m => m.pid === meta.pgid)`)**:
+   - **Ветка живого лидера (`leader` найден)**:
+     - Проверки лидера выполняются **строго ДО** проверки флага `--remote-debugging-port` (защита от переиспользования PGID чужой группой):
+       1. Если `meta.pgidStartTime == null` → статус `'doubtful'` (`leader-starttime-unrecorded`).
+       2. Если `leader.startTime !== meta.pgidStartTime` → статус `'doubtful'` (`leader-starttime-mismatch`).
+     - Если проверки пройдены:
+       - при наличии процесса с флагом `--remote-debugging-port=<port>` (`portFlagInCmdline`) → статус `'matched'` (`port-flag`);
+       - при отсутствии флага порта (например, Chrome упал или ещё не стартовал, но лидер `xvfb-run` жив): если все члены группы атрибутируемы (`members.every(m => memberLooksOurs(m, meta))`) → статус `'leftover'` (`attributable-members`), иначе → `'doubtful'` (`unattributed-members`). Таким образом, `'leftover'` возвращается и при живом лидере без флага порта, когда все оставшиеся члены атрибутируемы.
+     - *(Окно `MEMBER_LAUNCH_WINDOW_JIFFIES` в ветке живого лидера не применяется: подлинность лидера подтверждена точным совпадением `leader.startTime === meta.pgidStartTime`)*.
+   - **Ветка без лидера (leaderless, `leader` завершился)**:
+     - Выжившие процессы должны доказать принадлежность исходному запуску:
+       1. Если `meta.pgidStartTime == null` → статус `'doubtful'` (`starttime-unrecorded`).
+       2. Если хотя бы один член группы не атрибутируем (`!members.every(m => memberLooksOurs(m, meta))`) → статус `'doubtful'` (`unattributed-members`).
+       3. **Окно запуска (`MEMBER_LAUNCH_WINDOW_JIFFIES = 3000`)**: самое раннее время старта выживших членов `earliest = Math.min(...members.map(m => m.startTime ?? Infinity))` должно укладываться в окно запуска: `earliest - meta.pgidStartTime <= 3000` джиффи (~30 с при `USER_HZ = 100`). Если члены запустились позже окна запуска → статус `'doubtful'` (`members-postdate-launch`). Это окно применяется **только** в leaderless-ветке, защищая от чужой группы, переиспользовавшей PGID много позже старта нашего браузера.
+     - Если проверки пройдены:
+       - при наличии процесса с флагом `--remote-debugging-port=<port>` → статус `'matched'` (`port-flag`);
+       - при отсутствии флага порта (например, выжил только осиротевший `Xvfb`) → статус `'leftover'` (`attributable-members`).
+5. **Действия по результатам классификации**:
+   - При `'doubtful'` группе не посылаются никакие сигналы, маркер сохраняется и помечается полем `doubt: { reason, sinceMs }`.
+   - При `'dead'` или `'stale-boot'` удаляется устаревший файл маркера без отправки сигналов процессам.
+   - При `'boot-unknown'` сигналы не посылаются, маркер сохраняется (fail-closed).
+   - Сигналы (`SIGTERM` / `SIGKILL`) разрешено посылать **только** группам со статусом `'matched'` или `'leftover'` (`groupAliveMatches`).
 
 ### 8.5 Усыновление (`adoptGroup`)
 
