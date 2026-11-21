@@ -765,7 +765,7 @@ test("7. packFirstMessage: переполнение — подсказка «М�
   fs.mkdirSync(path.join(cwd, "src"));
   fs.writeFileSync(path.join(cwd, "src", "alpha.md"), "ALPHA-BODY");
   const text = `Проверь src/alpha.md, тред ${THREAD_ID} и задачу PLUG-129.`;
-  const r = withBbStub(() => packFirstMessage({ text, cwd, maxBytes: 1500 }));
+  const r = withBbStub(() => packFirstMessage({ text, cwd, maxBytes: 1400 }));
   assert.match(r.message, /Можно запросить инструментом:/);
   assert.match(r.message, /read_file\("src\/alpha\.md"\)/);
   assert.match(r.message, new RegExp(`bb_thread_output\\("${THREAD_ID}"\\)`));
@@ -858,7 +858,7 @@ test("8. toolSystemHeader: по умолчанию веб-поиск первы�
   const header = toolSystemHeader();
   // PLUG-384: первая строка — указание искать в публичном вебе, а не
   // общесессионное «доступны только».
-  assert.match(header.split("\n")[0], /Для поиска публичных источников используй поиск Gemini и открывай найденные страницы\./);
+  assert.match(header.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini\./);
   assert.doesNotMatch(header, /доступны только/);
   assert.doesNotMatch(header, /В этой сессии доступны/);
   assert.match(header, /Правила XML и доступа на чтение относятся только к ним\./);
@@ -874,7 +874,7 @@ test("8. toolSystemHeader: по умолчанию веб-поиск первы�
 
 test("8. toolSystemHeader: repo: false -> нет read_file/git в тексте, есть bb_* и веб-строка первой (PLUG-370, PLUG-384)", () => {
   const header = toolSystemHeader(8, { repo: false });
-  assert.match(header.split("\n")[0], /Для поиска публичных источников используй поиск Gemini и открывай найденные страницы\./);
+  assert.match(header.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini\./);
   assert.doesNotMatch(header, /доступны только/);
   assert.doesNotMatch(header, /read_file/);
   assert.doesNotMatch(header, /\bgit\b/i);
