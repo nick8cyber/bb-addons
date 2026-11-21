@@ -455,6 +455,14 @@ let eventsFd: number | null = null;
 let eventsOffset = 0;
 let eventsTail = "";
 
+/**
+ * PLUG-373: the side-channel drain also runs on this interval, not only at
+ * the top of an intercepted outbound line — an early shim death emits no
+ * outbound traffic, so without a timer its events sat unread forever.
+ */
+const SHIM_EVENTS_DRAIN_MS = 1_000;
+let eventsDrainTimer: NodeJS.Timeout | null = null;
+
 function shimDir(): string {
   return join(dataDir, "acp-shim");
 }
@@ -480,6 +488,10 @@ interface ShimEvent {
   toolCalls?: number;
   error?: { code: number | null; message: string } | null;
   text?: string;
+  reason?: string;
+  exit?: number | null;
+  spawnError?: string | null;
+  stderr?: string | null;
 }
 
 /**
@@ -577,9 +589,75 @@ function handleShimEvent(event: ShimEvent): void {
       }
       return;
     }
+    case "shim-shutdown": {
+      onShimShutdown(session, event);
+      return;
+    }
     default:
       return;
   }
+}
+
+/**
+ * The shim is down. Orderly reasons (stdin-eof, signals, parent-death) are
+ * the §12.1 lifecycle — journal only. A child that died on its own
+ * (child-close, spawn-error, no-real-bin) before the session init resolved
+ * is the PLUG-373 blind spot: the forwarded thread/start|resume could hang
+ * unanswered, so the pending request gets an honest -32000 carrying the
+ * exit code and the stderr tail; the bridge's own late answer for the same
+ * id is swallowed via PendingDaemonSession.synthesized.
+ */
+function onShimShutdown(session: WSession, event: ShimEvent): void {
+  const reason = event.reason ?? "?";
+  const stderrText =
+    typeof event.stderr === "string" ? event.stderr.trim() : "";
+  const exitText =
+    event.exit !== null && event.exit !== undefined
+      ? ` exit=${event.exit}`
+      : "";
+  const spawnErrorText =
+    typeof event.spawnError === "string" && event.spawnError !== ""
+      ? ` spawnError=${event.spawnError}`
+      : "";
+  log(
+    `shim down on thread ${session.threadId}: ${reason}${exitText}${spawnErrorText}` +
+      `${stderrText !== "" ? ` — ${stderrText.slice(0, 300)}` : ""}` +
+      `${stderrFileHint(session)}`,
+  );
+  if (
+    reason !== "child-close" &&
+    reason !== "spawn-error" &&
+    reason !== "no-real-bin"
+  ) {
+    return;
+  }
+  const detail =
+    spawnErrorText !== ""
+      ? ` (${event.spawnError as string})`
+      : stderrText !== ""
+        ? `: ${stderrText.slice(-400)}`
+        : "";
+  for (const [reqId, pending] of pendingDaemonSessions) {
+    if (pending.session !== session || pending.synthesized === true) {
+      continue;
+    }
+    pending.synthesized = true;
+    log(
+      `thread ${session.threadId}: ${pending.kind} id=${String(reqId)} answered with early-exit error (shim ${reason}${exitText})`,
+    );
+    sendError(
+      reqId,
+      -32000,
+      `agy exited before the session was ready${exitText !== "" ? ` (${reason}${exitText})` : ` (${reason})`}${detail}`,
+    );
+  }
+}
+
+/** Point the journal at the file the shim just died writing to. */
+function stderrFileHint(session: WSession): string {
+  return session.nonce !== ""
+    ? ` [stderr: acp-shim/stderr-${session.threadId}-${session.nonce}.log]`
+    : "";
 }
 
 function emitUsage(session: WSession, usage: AcpUsage, toolCalls = 0): void {
@@ -4621,10 +4699,24 @@ function interceptOutbound(line: string): void {
         sink(!("error" in msg), msg.result, msg.error);
         return;
       }
+      if (swallowedLateAnswers.delete(msg.id as JsonRpcId)) {
+        log(
+          `swallowed late bridge answer id=${String(msg.id)} — the request was already answered by the early-exit synthesis`,
+        );
+        return;
+      }
       rawWrite(`${line}\n`);
       return;
     }
     pendingDaemonSessions.delete(msg.id as JsonRpcId);
+    if (pending.synthesized === true) {
+      // The early-exit error already reached the daemon; this is the
+      // bridge's own answer for a request that no longer waits.
+      log(
+        `thread ${pending.session.threadId}: swallowed duplicate ${pending.kind} answer id=${String(msg.id)} after synthesized early-exit error`,
+      );
+      return;
+    }
     const errorText = "error" in msg ? errorMessageOf(msg.error) : null;
     if (
       errorText !== null &&
@@ -4782,8 +4874,30 @@ interface PendingDaemonSession {
   session: WSession;
   kind: "start" | "resume";
   params: Record<string, unknown>;
+  /** The early-shim-death path already answered this request: the bridge's
+   * own response for the same id is a duplicate — swallow it. */
+  synthesized?: boolean;
 }
 const pendingDaemonSessions = new Map<JsonRpcId, PendingDaemonSession>();
+
+/**
+ * Ids of requests we already answered by synthesis whose pending entry was
+ * later torn down (discardSession clears the map wholesale). The bridge's
+ * late response for such an id must still be swallowed — insertion-ordered
+ * FIFO, capped so it cannot grow without bound.
+ */
+const swallowedLateAnswers = new Set<JsonRpcId>();
+const SWALLOWED_LATE_ANSWERS_CAP = 128;
+
+function rememberSwallowedLateAnswer(id: JsonRpcId): void {
+  swallowedLateAnswers.add(id);
+  if (swallowedLateAnswers.size > SWALLOWED_LATE_ANSWERS_CAP) {
+    const oldest = swallowedLateAnswers.values().next().value;
+    if (oldest !== undefined) {
+      swallowedLateAnswers.delete(oldest);
+    }
+  }
+}
 
 function poolPickAccount(
   session: WSession,
@@ -5276,6 +5390,11 @@ function discardSession(session: WSession): void {
   for (const [id, pending] of pendingDaemonSessions) {
     if (pending.session === session) {
       pendingDaemonSessions.delete(id);
+      if (pending.synthesized === true) {
+        // The bridge may still answer this id — keep swallowing it even
+        // though the map entry is gone.
+        rememberSwallowedLateAnswer(id);
+      }
     }
   }
   resolveInteractions(session.threadId);
@@ -5939,43 +6058,83 @@ function handleLine(line: string): void {
     return;
   }
   const params = optionsRecord(msg.params);
-  switch (msg.method) {
-    case "model/list":
-      handleModelList(msg.id as JsonRpcId);
-      return;
-    case "thread/start":
-      handleThreadStart(msg.id as JsonRpcId, params);
-      return;
-    case "thread/resume":
-      handleThreadResume(msg.id as JsonRpcId, params);
-      return;
-    case "turn/start":
-      handleTurnStart(msg.id as JsonRpcId, params);
-      return;
-    case "turn/steer":
-      handleTurnSteer(msg.id as JsonRpcId, params);
-      return;
-    case "thread/stop":
-      handleThreadStop(msg.id as JsonRpcId, params);
-      return;
-    case "thread/discard": {
-      const session =
-        typeof params.threadId === "string"
-          ? (sessions.get(params.threadId) ?? stoppingSessions.get(params.threadId))
-          : undefined;
-      if (session !== undefined) {
-        discardSession(session);
+  // PLUG-373: journal the receipt BEFORE any handling — the empty-spawn
+  // blind zone showed a request either never reaching handleLine or dying
+  // before the handler's own first log line. One line per lifecycle
+  // request is the boundary marker that tells the two apart.
+  if (
+    msg.method === "thread/start" ||
+    msg.method === "thread/resume" ||
+    msg.method === "turn/start" ||
+    msg.method === "turn/steer"
+  ) {
+    const model = optionsRecord(params.options).model;
+    log(
+      `request ${msg.method} id=${String(msg.id)} thread=${String(params.threadId ?? "?")}` +
+        `${typeof params.providerThreadId === "string" ? ` resume=${params.providerThreadId}` : ""}` +
+        `${typeof model === "string" ? ` model=${model}` : ""}`,
+    );
+  }
+  try {
+    switch (msg.method) {
+      case "model/list":
+        handleModelList(msg.id as JsonRpcId);
+        return;
+      case "thread/start":
+        handleThreadStart(msg.id as JsonRpcId, params);
+        return;
+      case "thread/resume":
+        handleThreadResume(msg.id as JsonRpcId, params);
+        return;
+      case "turn/start":
+        handleTurnStart(msg.id as JsonRpcId, params);
+        return;
+      case "turn/steer":
+        handleTurnSteer(msg.id as JsonRpcId, params);
+        return;
+      case "thread/stop":
+        handleThreadStop(msg.id as JsonRpcId, params);
+        return;
+      case "thread/discard": {
+        const session =
+          typeof params.threadId === "string"
+            ? (sessions.get(params.threadId) ?? stoppingSessions.get(params.threadId))
+            : undefined;
+        if (session !== undefined) {
+          discardSession(session);
+        }
+        if (typeof params.threadId === "string") {
+          stoppingSessions.delete(params.threadId);
+          forgetThreadRecord(params.threadId);
+        }
+        acpBridge.handleLine(line);
+        return;
       }
-      if (typeof params.threadId === "string") {
-        stoppingSessions.delete(params.threadId);
-        forgetThreadRecord(params.threadId);
-      }
-      acpBridge.handleLine(line);
-      return;
+      default:
+        acpBridge.handleLine(line);
+        return;
     }
-    default:
-      acpBridge.handleLine(line);
-      return;
+  } catch (error) {
+    // PLUG-373: a synchronous throw after the receipt log is the other half
+    // of the blind zone — the request would otherwise hang unanswered. The
+    // lifecycle methods get an honest -32000; anything else is journal-only.
+    log(
+      `request ${String(msg.method)} id=${String(msg.id)} handler failed: ${String(error)}`,
+    );
+    if (
+      msg.id !== undefined &&
+      (msg.method === "thread/start" ||
+        msg.method === "thread/resume" ||
+        msg.method === "turn/start" ||
+        msg.method === "turn/steer")
+    ) {
+      sendError(
+        msg.id as JsonRpcId,
+        -32000,
+        `agy wrapper failed while handling ${String(msg.method)}: ${errorMessageOf(error).slice(0, 300)}`,
+      );
+    }
+    return;
   }
 }
 
@@ -6014,12 +6173,25 @@ export const experimental_providerBridge = {
     // §9 п.1 (provider-agy-installs): registry registration at startup —
     // names and binary paths; version reporting waits on §13 п.1.
     log(registryLogLine(dataDir));
+    // PLUG-373: drain the shim side channel on a timer too — a shim that
+    // dies before session init produces no outbound traffic, and the
+    // drain-on-outbound design would never see its shutdown event.
+    eventsDrainTimer = setInterval(() => {
+      try {
+        drainShimEvents();
+      } catch {}
+    }, SHIM_EVENTS_DRAIN_MS);
+    eventsDrainTimer.unref?.();
     // Defense-in-depth sweep (spec §12.3): orphans of dead workers and stale
     // harness tmp roots. Best-effort — never lets a scan failure break start.
     reapOrphanShims();
   },
   handleLine,
   onClose: () => {
+    if (eventsDrainTimer !== null) {
+      clearInterval(eventsDrainTimer);
+      eventsDrainTimer = null;
+    }
     for (const session of [...sessions.values(), ...stoppingSessions.values()]) {
       if (session.waitTimer !== null) {
         clearTimeout(session.waitTimer);

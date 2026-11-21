@@ -41,6 +41,7 @@ import {
   unlinkSync,
   watch,
 } from "node:fs";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 
 const REAL_BIN = process.env.AGY_SHIM_REAL_BIN ?? "";
@@ -81,11 +82,6 @@ const MEMORY_TOOLS_DISABLED = [
 ];
 const DISABLE_MEMORY = process.env.AGY_DISABLE_MEMORY !== "0";
 
-if (REAL_BIN.length === 0) {
-  process.stderr.write("acp-shim: AGY_SHIM_REAL_BIN is not set\n");
-  process.exit(2);
-}
-
 function emitEvent(fields) {
   if (EVENTS_FILE === null) return;
   try {
@@ -98,18 +94,82 @@ function emitEvent(fields) {
   }
 }
 
+// Per-spawn stderr capture (PLUG-373): the child's stderr used to ride
+// "inherit" — whoever spawned the shim (the generic bridge) kept at most a
+// tail for its own exit error, so an agy that died before session init left
+// no readable record. Every stderr byte now lands in a sibling file of the
+// events side channel, and the shutdown event carries the tail.
+const STDERR_FILE =
+  EVENTS_FILE !== null
+    ? join(
+        dirname(EVENTS_FILE),
+        `stderr-${THREAD_ID ?? "unknown"}-${NONCE ?? "nononce"}.log`,
+      )
+    : null;
+const STDERR_FILE_CAP = 256 * 1024;
+const STDERR_TAIL_CAP = 4000;
+let stderrFileBytes = 0;
+let stderrFileCapped = false;
+let stderrTail = "";
+
+function appendStderrFile(chunk) {
+  if (STDERR_FILE === null) return;
+  try {
+    if (stderrFileBytes >= STDERR_FILE_CAP) {
+      if (!stderrFileCapped) {
+        stderrFileCapped = true;
+        appendFileSync(STDERR_FILE, "\n[acp-shim: stderr log capped]\n");
+      }
+      return;
+    }
+    appendFileSync(STDERR_FILE, chunk);
+    stderrFileBytes += chunk.length;
+  } catch {
+    // Diagnostics never take the relay down.
+  }
+}
+
+// The shim's own diagnostics go where the child's stderr goes: the per-spawn
+// file AND our real stderr (a spawning peer may still pipe it).
+function shimDiag(text) {
+  const line = `acp-shim: ${text}\n`;
+  appendStderrFile(line);
+  stderrTail = (stderrTail + line).slice(-STDERR_TAIL_CAP);
+  try {
+    process.stderr.write(line);
+  } catch {}
+}
+
+if (REAL_BIN.length === 0) {
+  shimDiag("AGY_SHIM_REAL_BIN is not set");
+  emitEvent({ t: "shim-shutdown", reason: "no-real-bin" });
+  process.exit(2);
+}
+
 // Desktop bb runs this shim on its Electron binary with ELECTRON_RUN_AS_NODE=1
 // (spec §12.5); agy and its node children must not inherit that mode.
 const childEnv = { ...process.env };
 delete childEnv.ELECTRON_RUN_AS_NODE;
 
 const child = spawn(REAL_BIN, process.argv.slice(2), {
-  stdio: ["pipe", "pipe", "inherit"],
+  stdio: ["pipe", "pipe", "pipe"],
   env: childEnv,
   // Own process group: shutdown kills the whole agy tree with kill(-pid)
   // instead of orphaning agy's node grandchildren on the init system
   // (incident 16.11: 432 shim orphans, 6.1 GB RSS — spec §12.2.2).
   detached: true,
+});
+
+// Child stderr: per-spawn file + bounded tail for the shutdown event +
+// passthrough to our own stderr (what "inherit" used to give the spawner).
+let spawnErrorMessage = null;
+child.stderr?.setEncoding("utf8");
+child.stderr?.on("data", (chunk) => {
+  stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_CAP);
+  appendStderrFile(chunk);
+  try {
+    process.stderr.write(chunk);
+  } catch {}
 });
 
 let sessionId = null;
@@ -468,7 +528,8 @@ process.stdout.on("error", (err) => {
 
 child.on("error", (err) => {
   acceptingClientInput = false;
-  process.stderr.write(`acp-shim: failed to spawn ${REAL_BIN}: ${err.message}\n`);
+  spawnErrorMessage = `failed to spawn ${REAL_BIN}: ${err.message}`;
+  shimDiag(spawnErrorMessage);
 });
 child.on("close", (code, signal) => {
   childClosed = true;
@@ -515,7 +576,14 @@ function shutdown(reason) {
   if (shuttingDown) return;
   shuttingDown = true;
   acceptingClientInput = false;
-  emitEvent({ t: "shim-shutdown", reason });
+  emitEvent({
+    t: "shim-shutdown",
+    reason,
+    exit: reason === "child-close" ? childCloseExitCode : null,
+    sessionId,
+    spawnError: spawnErrorMessage,
+    stderr: stderrTail.trim() !== "" ? stderrTail.slice(-1500) : null,
+  });
   try {
     rlIn.close();
   } catch {}
