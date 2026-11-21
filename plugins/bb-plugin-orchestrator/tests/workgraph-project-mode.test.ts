@@ -9,6 +9,9 @@ import { makeTempDir } from "./helpers/temp.js";
 import {
   parseWorkGraphProjects,
   resolveWorkGraphMode,
+  normalizeWorkGraphMode,
+  computeEffectiveWorkGraphMode,
+  shouldShowApprovalMenu,
   resolveTaskProjectId,
   assertGraphAllowsDirectAction,
   runRunQueue,
@@ -901,10 +904,21 @@ test("connected server run-queue resolver: недоступный контекс
   const mockCmdRunner: CmdRunner = {
     run: async (c: string, args: string[], opts?: { cwd?: string }) => {
       gitCalls.push({ cmd: c, args, cwd: opts?.cwd });
-      return { exitCode: 1, stdout: "", stderr: "" };
+      return { exitCode: 0, stdout: "mock-sha\n", stderr: "" };
     },
   };
 
+  const mockThreads: Record<string, { projectId?: string | null; environmentId?: string; status?: string }> = {
+    thr_null_proj: { projectId: null, environmentId: "env_unconfirmed", status: "running" },
+    thr_valid_proj: { projectId: "proj_valid", environmentId: "env_valid", status: "running" },
+  };
+
+  const mockEnvironments: Record<string, { id: string; path: string; mergeBaseBranch: string }> = {
+    env_unconfirmed: { id: "env_unconfirmed", path: "/repos/unconfirmed-copy", mergeBaseBranch: "main" },
+    env_valid: { id: "env_valid", path: "/repos/valid-copy", mergeBaseBranch: "main" },
+  };
+
+  const warnings: string[] = [];
   const host = createFakePluginHost({
     pluginId: "orchestrator",
     dataDir: makeTempDir("orch-server-resolver-"),
@@ -916,21 +930,258 @@ test("connected server run-queue resolver: недоступный контекс
       projects: {
         list: async () => [], // No projects have configured repo paths
       },
+      threads: {
+        get: async ({ threadId }: { threadId: string }) => {
+          const t = mockThreads[threadId];
+          if (!t) throw new Error(`thread ${threadId} not found`);
+          return t;
+        },
+      },
+    },
+  });
+
+  const origWarn = host.bb.log.warn.bind(host.bb.log);
+  host.bb.log.warn = (msg: string, ...rest: unknown[]) => {
+    warnings.push(msg);
+    (origWarn as any)(msg, ...rest);
+  };
+
+  await createPlugin(host.bb, {
+    bbCli: {
+      run: async (args: string[]) => {
+        if (args[0] === "environment" && args[1] === "show" && args[2]) {
+          const env = mockEnvironments[args[2]];
+          if (env) {
+            return { exitCode: 0, stdout: JSON.stringify(env), stderr: "" };
+          }
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    },
+    cmd: mockCmdRunner,
+  });
+
+  const db = host.bb.storage.database();
+  const store = new DelegationStore(db);
+
+  // 1. Task with known target project but thread's projectId is null (unconfirmed environment)
+  store.insertTask({
+    taskKey: "TASK-NULL-THREAD-PROJ",
+    projectId: "proj_target",
+    coordinatorThreadId: "thr_null_proj",
+    confirmationMode: "auto",
+    route: "fix",
+    level: "simple",
+  });
+
+  // 2. Task with known target project but missing/null coordinator_thread_id
+  store.insertTask({
+    taskKey: "TASK-NO-THREAD",
+    projectId: "proj_target_no_thread",
+    coordinatorThreadId: "",
+    confirmationMode: "auto",
+    route: "fix",
+    level: "simple",
+  });
+
+  // 3. Task with valid matching project & thread environment
+  store.insertTask({
+    taskKey: "TASK-VALID-PROJ",
+    projectId: "proj_valid",
+    coordinatorThreadId: "thr_valid_proj",
+    confirmationMode: "auto",
+    route: "fix",
+    level: "simple",
+  });
+
+  // Call run-queue with a caller cwd pointing to a fake process dir
+  const res = await host.harness.runCli(["run-queue", "--once"], { cwd: "/some/process/dir" });
+  assert.equal(res.exitCode, 0);
+
+  // Verification 1: Neither TASK-NULL-THREAD-PROJ nor TASK-NO-THREAD made git calls in /repos/unconfirmed-copy or /some/process/dir
+  assert.ok(
+    !gitCalls.some((c) => c.cwd === "/repos/unconfirmed-copy"),
+    "Must not make git calls in unconfirmed environment /repos/unconfirmed-copy",
+  );
+  assert.ok(
+    !gitCalls.some((c) => c.cwd === "/some/process/dir"),
+    "Must not make git calls in process/caller cwd /some/process/dir",
+  );
+  assert.ok(
+    !gitCalls.some((c) => c.args.some((a) => a.toLowerCase().includes("task-null-thread-proj"))),
+    "TASK-NULL-THREAD-PROJ must make 0 git calls",
+  );
+  assert.ok(
+    !gitCalls.some((c) => c.args.some((a) => a.toLowerCase().includes("task-no-thread"))),
+    "TASK-NO-THREAD must make 0 git calls",
+  );
+
+  // Verification 2: Warnings logged for unconfirmed tasks
+  assert.ok(
+    warnings.some((w) => w.includes("TASK-NULL-THREAD-PROJ") && w.includes("proj_target")),
+    "Warning logged for TASK-NULL-THREAD-PROJ indicating unconfirmed repo context",
+  );
+  assert.ok(
+    warnings.some((w) => w.includes("TASK-NO-THREAD") && w.includes("proj_target_no_thread")),
+    "Warning logged for TASK-NO-THREAD indicating unconfirmed repo context",
+  );
+
+  // Verification 3: TASK-VALID-PROJ progressed and ran in /repos/valid-copy
+  const validCalls = gitCalls.filter((c) => c.cwd === "/repos/valid-copy");
+  assert.ok(validCalls.length > 0, "TASK-VALID-PROJ must make git calls in /repos/valid-copy");
+  assert.ok(
+    validCalls.some((c) => c.args.some((a) => a.toLowerCase().includes("task-valid-proj"))),
+    "Git calls for valid task must reference task-valid-proj",
+  );
+  assert.equal(store.getTask("TASK-VALID-PROJ")?.status, "running");
+});
+
+test("workgraph-mode helpers: normalizeWorkGraphMode, parseWorkGraphProjects, computeEffectiveWorkGraphMode, shouldShowApprovalMenu", () => {
+  // Normalization
+  assert.equal(normalizeWorkGraphMode(" STRICT "), "strict");
+  assert.equal(normalizeWorkGraphMode(" SHADOW "), "shadow");
+  assert.equal(normalizeWorkGraphMode(" OFF "), "off");
+  assert.equal(normalizeWorkGraphMode("strict"), "strict");
+  assert.equal(normalizeWorkGraphMode("invalid"), "off");
+  assert.equal(normalizeWorkGraphMode(123), "off");
+  assert.equal(normalizeWorkGraphMode(null), "off");
+  assert.equal(normalizeWorkGraphMode(undefined), "off");
+
+  // Project map parsing: trims keys and normalizes values, filters invalid entries
+  const parsed = parseWorkGraphProjects(
+    JSON.stringify({
+      " proj_a ": " STRICT ",
+      "proj_b": " shadow ",
+      "proj_c": " OFF ",
+      "proj_invalid": " not_a_mode ",
+    }),
+  );
+  assert.deepEqual(parsed, {
+    proj_a: "strict",
+    proj_b: "shadow",
+    proj_c: "off",
+  });
+  // Unrecognized value is filtered so it doesn't block inheritance
+  assert.equal(parsed["proj_invalid"], undefined);
+
+  // computeEffectiveWorkGraphMode: server > project override > global
+  // 1. Server mode takes precedence
+  assert.equal(
+    computeEffectiveWorkGraphMode("strict", "off", "shadow"),
+    "strict",
+  );
+  assert.equal(
+    computeEffectiveWorkGraphMode(" OFF ", "strict", "shadow"),
+    "off",
+  );
+
+  // 2. Project override takes precedence when server mode is null/empty
+  assert.equal(
+    computeEffectiveWorkGraphMode(null, " STRICT ", "off"),
+    "strict",
+  );
+  assert.equal(
+    computeEffectiveWorkGraphMode(undefined, "shadow", "off"),
+    "shadow",
+  );
+
+  // 3. Fallback to global mode when server is null and project is invalid/null
+  assert.equal(
+    computeEffectiveWorkGraphMode(null, "invalid", " STRICT "),
+    "strict",
+  );
+  assert.equal(
+    computeEffectiveWorkGraphMode(null, null, "shadow"),
+    "shadow",
+  );
+  assert.equal(
+    computeEffectiveWorkGraphMode(null, null, null),
+    "off",
+  );
+
+  // shouldShowApprovalMenu: only active for strict/shadow and orchestrator/executor
+  assert.equal(shouldShowApprovalMenu("strict", "orchestrator"), true);
+  assert.equal(shouldShowApprovalMenu("strict", "executor"), true);
+  assert.equal(shouldShowApprovalMenu("shadow", "orchestrator"), true);
+  assert.equal(shouldShowApprovalMenu("shadow", "executor"), true);
+
+  assert.equal(shouldShowApprovalMenu("off", "orchestrator"), false);
+  assert.equal(shouldShowApprovalMenu("off", "executor"), false);
+  assert.equal(shouldShowApprovalMenu("strict", "auditor"), false);
+  assert.equal(shouldShowApprovalMenu("strict", "researcher"), false);
+  assert.equal(shouldShowApprovalMenu("strict", "architect"), false);
+  assert.equal(shouldShowApprovalMenu("strict", "none"), false);
+});
+
+test("connected RPC: изоляция состояния при переключении открытых тредов", async () => {
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    dataDir: makeTempDir("orch-thread-switch-"),
+    settings: {
+      workGraph: "off",
+      workGraphProjects: JSON.stringify({
+        " proj_1 ": " STRICT ",
+        "proj_2": "shadow",
+      }),
+      language: "ru",
+    },
+    sdk: {
+      threads: {
+        get: async ({ threadId }: { threadId: string }) => {
+          if (threadId === "thr_1") return { projectId: "proj_1", status: "running" };
+          if (threadId === "thr_2") return { projectId: "proj_2", status: "running" };
+          if (threadId === "thr_3") return { projectId: null, status: "running" };
+          throw new Error(`thread ${threadId} not found`);
+        },
+      },
     },
   });
 
   await createPlugin(host.bb, {
     bbCli: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
-    cmd: mockCmdRunner,
   });
 
-  // Call run-queue with a caller cwd pointing to a fake process dir
-  const res = await host.harness.runCli(["run-queue"], { cwd: "/some/process/dir" });
-  assert.equal(res.exitCode, 0);
+  const db = host.bb.storage.database();
+  const store = new DelegationStore(db);
 
-  // Ensure no git calls were made in /some/process/dir
-  assert.ok(
-    !gitCalls.some((c) => c.cwd === "/some/process/dir" && c.args.some((a) => a.includes("rev-parse") || a.includes("branch"))),
-    "run-queue must not run git commands in caller cwd when task repo context is missing",
-  );
+  // Task in proj_1 associated with thr_1
+  store.insertTask({
+    taskKey: "TASK-PROJ-1",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_1",
+    confirmationMode: "manual",
+    route: "fix",
+    level: "simple",
+  });
+
+  // 1. Thread 1 query: taskConfirmationMode finds TASK-PROJ-1 by threadId without client passing taskKey
+  const res1 = (await host.harness.callRpc("taskConfirmationMode", {
+    threadId: "thr_1",
+  })) as { taskKey: string | null; mode: string | null; workGraph: string; projectId: string | null };
+  assert.equal(res1.taskKey, "TASK-PROJ-1");
+  assert.equal(res1.mode, "manual");
+  assert.equal(res1.workGraph, "strict"); // from " proj_1 ": " STRICT "
+  assert.equal(res1.projectId, "proj_1");
+
+  // 2. User switches to Thread 2: query projectApprovalMode and taskConfirmationMode
+  // Thread 2 has no task and belongs to proj_2 (shadow)
+  const res2Proj = (await host.harness.callRpc("projectApprovalMode", {
+    threadId: "thr_2",
+  })) as { workGraph: string; projectId: string | null };
+  assert.equal(res2Proj.workGraph, "shadow");
+  assert.equal(res2Proj.projectId, "proj_2");
+
+  const res2Task = (await host.harness.callRpc("taskConfirmationMode", {
+    threadId: "thr_2",
+  })) as { taskKey: string | null; mode: string | null; workGraph: string; projectId: string | null };
+  assert.equal(res2Task.taskKey, null, "Thread 2 must NOT inherit taskKey from Thread 1");
+  assert.equal(res2Task.mode, null);
+  assert.equal(res2Task.workGraph, "shadow");
+  assert.equal(res2Task.projectId, "proj_2", "Thread 2 must NOT inherit projectId from Thread 1");
+
+  // 3. Thread 3 with null projectId falls back to global off
+  const res3Proj = (await host.harness.callRpc("projectApprovalMode", {
+    threadId: "thr_3",
+  })) as { workGraph: string; projectId: string | null };
+  assert.equal(res3Proj.workGraph, "off", "Thread 3 with null project falls back to global off");
 });

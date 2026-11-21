@@ -18,6 +18,21 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useEffect, useMemo, useState } from "react";
 import type { rpcContract } from "./server";
 import { createT, resolveLang } from "./src/i18n/index.js";
+import {
+  type WorkGraphMode,
+  normalizeWorkGraphMode,
+  parseWorkGraphProjects,
+  computeEffectiveWorkGraphMode,
+  shouldShowApprovalMenu,
+} from "./src/workgraph-mode.js";
+
+export {
+  type WorkGraphMode,
+  normalizeWorkGraphMode,
+  parseWorkGraphProjects,
+  computeEffectiveWorkGraphMode,
+  shouldShowApprovalMenu,
+};
 
 type Contract = typeof rpcContract;
 
@@ -44,24 +59,6 @@ const PICKABLE = new Set<string>(ROLE_OPTIONS.map((o) => o.id));
  *    секция отображается ТОЛЬКО если workGraph != off и роль orchestrator или executor.
  * Выбор в одной части не сбрасывает режим в другой, и наоборот.
  */
-function parseProjectsMode(raw: unknown): Record<string, string> {
-  if (!raw) return {};
-  if (typeof raw === "string") {
-    try {
-      const parsed = JSON.parse(raw.trim() || "{}");
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as Record<string, string>;
-      }
-    } catch {
-      return {};
-    }
-  }
-  if (typeof raw === "object" && !Array.isArray(raw)) {
-    return raw as Record<string, string>;
-  }
-  return {};
-}
-
 function RoleApprovalMenu() {
   const view = useComposerView();
   const rpc = useRpc<Contract>();
@@ -77,17 +74,27 @@ function RoleApprovalMenu() {
   const [lockedLabel, setLockedLabel] = useState<string | null>(null);
   const [taskKey, setTaskKey] = useState<string | null>(null);
   const [mode, setMode] = useState<"auto" | "manual" | null>(null);
-  const [serverWorkGraph, setServerWorkGraph] = useState<string | null>(null);
+  const [serverWorkGraph, setServerWorkGraph] = useState<"off" | "shadow" | "strict" | null>(null);
   const [resolvedProjectId, setResolvedProjectId] = useState<string | null>(null);
 
+  // Reset per-thread/scope state when threadId or projectId changes (§32.2)
+  useEffect(() => {
+    setRole(DEFAULT_ROLE);
+    setLockedLabel(null);
+    setTaskKey(null);
+    setMode(null);
+    setServerWorkGraph(null);
+    setResolvedProjectId(null);
+  }, [threadId, projectId]);
+
   const effectivePid = projectId || resolvedProjectId;
-  const rawWorkGraph = (values?.workGraph as string) ?? "off";
+  const rawWorkGraph = values?.workGraph;
   const rawWorkGraphProjects = values?.workGraphProjects;
 
   // Client project override directly derived from settings
   const projectOverride = useMemo(() => {
     if (!effectivePid || !rawWorkGraphProjects) return null;
-    const map = parseProjectsMode(rawWorkGraphProjects);
+    const map = parseWorkGraphProjects(rawWorkGraphProjects);
     return map[effectivePid] ?? null;
   }, [effectivePid, rawWorkGraphProjects]);
 
@@ -173,23 +180,22 @@ function RoleApprovalMenu() {
         .then((res) => {
           if (!alive) return;
           if (res?.mode) setMode(res.mode);
-          if (res?.workGraph) setServerWorkGraph(res.workGraph);
-          if (res?.projectId && !resolvedProjectId) setResolvedProjectId(res.projectId);
+          if (res?.workGraph) setServerWorkGraph(normalizeWorkGraphMode(res.workGraph));
+          if (res?.projectId) setResolvedProjectId(res.projectId);
         })
         .catch(() => {});
     } else if (role === "executor") {
       void rpc
         .call("taskConfirmationMode", {
           threadId: threadId ?? undefined,
-          taskKey: taskKey ?? undefined,
           projectId: targetPid,
         })
         .then((res) => {
           if (!alive) return;
-          if (res?.taskKey) setTaskKey(res.taskKey);
+          setTaskKey(res?.taskKey ?? null);
           if (res?.mode) setMode(res.mode);
-          if (res?.workGraph) setServerWorkGraph(res.workGraph);
-          if (res?.projectId && !resolvedProjectId) setResolvedProjectId(res.projectId);
+          if (res?.workGraph) setServerWorkGraph(normalizeWorkGraphMode(res.workGraph));
+          if (res?.projectId) setResolvedProjectId(res.projectId);
         })
         .catch(() => {});
     } else {
@@ -199,8 +205,8 @@ function RoleApprovalMenu() {
           .call("projectApprovalMode", { projectId: targetPid, threadId: threadId ?? undefined })
           .then((res) => {
             if (!alive) return;
-            if (res?.workGraph) setServerWorkGraph(res.workGraph);
-            if (res?.projectId && !resolvedProjectId) setResolvedProjectId(res.projectId);
+            if (res?.workGraph) setServerWorkGraph(normalizeWorkGraphMode(res.workGraph));
+            if (res?.projectId) setResolvedProjectId(res.projectId);
           })
           .catch(() => {});
       }
@@ -212,11 +218,13 @@ function RoleApprovalMenu() {
     };
   }, [projectId, threadId, isThread, role, rawWorkGraph, rawWorkGraphProjects, effectivePid]);
 
-  // Determine if workGraph is active: effective project mode (override or server) takes precedence (§29.2, §32.2)
-  const workGraphVal = projectOverride ?? serverWorkGraph ?? rawWorkGraph;
-  const workGraphOn = workGraphVal === "strict" || workGraphVal === "shadow";
-  const hasApproval =
-    workGraphOn && (role === "orchestrator" || role === "executor");
+  // Determine if workGraph is active: effective project mode (server is canonical source of truth; falls back to client project override and normalized global) (§29.2, §32.2)
+  const workGraphVal = computeEffectiveWorkGraphMode(
+    serverWorkGraph,
+    projectOverride,
+    rawWorkGraph,
+  );
+  const hasApproval = shouldShowApprovalMenu(workGraphVal, role);
 
   const currentMode =
     role === "orchestrator" ? mode : (mode ?? "auto");

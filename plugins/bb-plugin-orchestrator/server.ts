@@ -1899,15 +1899,13 @@ export async function createPlugin(
     callCwd?: string,
   ) => {
     if (threadId) {
-      let matchesProject = true;
+      let matchesProject = !projectId;
       if (projectId) {
         try {
           const t = (await bb.sdk.threads.get({ threadId })) as {
             projectId?: string | null;
           };
-          if (t?.projectId && t.projectId !== projectId) {
-            matchesProject = false;
-          }
+          matchesProject = Boolean(t?.projectId && t.projectId === projectId);
         } catch {
           matchesProject = false;
         }
