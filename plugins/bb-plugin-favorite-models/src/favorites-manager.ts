@@ -1,131 +1,166 @@
-/**
- * Favorites Manager: Durable client-side & RPC-synced store for favorited models.
- */
+/** Optimistic client state derived from a confirmed server snapshot and the pending queue. */
+import { toast } from "sonner";
 import {
   cleanModelText,
   dropLabels,
   isValidFavoritesPayload,
   labelKey,
+  migrateStore,
+  normalizeModelKey,
   normalizeProviderId,
+  resolvePickerProviderId,
   sanitizeStore,
   type FavoritesMap,
+  type FavoritesSnapshot,
   type ModelLabels,
+  type ProviderIdentity,
 } from "./store.js";
 
-export { cleanModelText, normalizeProviderId };
+export { cleanModelText };
 
-export interface FavoritesState {
-  /** Map of providerId -> array of modelIds */
+type Config = { pinToTop: boolean };
+export interface FavoritesState extends Config {
   favorites: FavoritesMap;
-  /** Cache of model display labels: "providerId:modelId" -> string */
   modelLabels: ModelLabels;
-  /** Whether favorite models should be placed at the top of the dropdown */
-  pinToTop: boolean;
-  /** Whether the composer should show quick favorite action */
-  showQuickBar: boolean;
 }
 
-interface ServerSnapshot {
-  version: number;
-  favorites: FavoritesMap;
-  modelLabels: ModelLabels;
-  config?: { pinToTop?: boolean; showQuickBar?: boolean };
+interface ServerSnapshot extends FavoritesSnapshot {
+  config?: Partial<Config>;
+  providers?: ProviderIdentity[];
 }
 
 const STORAGE_KEY = "bb-plugin-favorite-models:v2";
+const QUEUE_KEY = "bb-plugin-favorite-models:pending:v1";
 const RPC_ENDPOINT = "/api/v1/plugins/favorite-models/rpc";
+const REFRESH_INTERVAL = 15_000;
+const RETRY_DELAYS = [1_000, 3_000, 10_000];
 
 const DEFAULT_STATE: FavoritesState = {
   favorites: {},
   modelLabels: {},
   pinToTop: true,
-  showQuickBar: true,
 };
 
-export function getProviderDisplayName(providerId: string): string {
-  const clean = (providerId || "").toLowerCase().trim();
-  switch (clean) {
-    case "codex":
-      return "Codex (OpenAI)";
-    case "provider-claude-code":
-    case "claude-code":
-    case "claude":
-      return "Claude Code (Anthropic)";
-    case "agy":
-    case "provider-agy":
-    case "antigravity":
-      return "Antigravity (AGY)";
-    case "provider-pi":
-    case "pi":
-      return "Pi (Inflection)";
-    case "opencode":
-      return "OpenCode";
-    case "acp-cursor":
-      return "Cursor";
-    case "default":
-      return "Текущий провайдер";
-    default:
-      return providerId.charAt(0).toUpperCase() + providerId.slice(1);
-  }
-}
+type ModelInput = { providerId: string; modelId: string };
+type Mutation =
+  | { method: "addFavorite"; input: ModelInput & { label?: string } }
+  | { method: "removeFavorite"; input: ModelInput }
+  | { method: "clearFavorites"; input: { providerId: string | null } }
+  | { method: "setFavorites"; input: Omit<FavoritesSnapshot, "version"> & { baseVersion: number } }
+  | { method: "updateConfig"; input: Partial<Config> };
 
-/**
- * Reading `window.localStorage` itself can throw in restricted browsing
- * contexts (data: documents, blocked storage) — access it only through this
- * guarded getter so module init never blows up (m5).
- */
-function safeLocalStorage(): Storage | null {
+type Pending = {
+  mutation: Mutation;
+  attempts: number;
+  resolve?: (ok: boolean) => void;
+};
+
+function safeStorage(name: "localStorage" | "sessionStorage"): Storage | null {
   try {
-    return typeof window !== "undefined" ? window.localStorage : null;
+    return typeof window !== "undefined" ? window[name] : null;
   } catch {
     return null;
   }
 }
 
-let currentState: FavoritesState = loadInitialState();
-const listeners = new Set<(state: FavoritesState) => void>();
-
 function loadInitialState(): FavoritesState {
-  const storage = safeLocalStorage();
-  if (!storage) {
-    return { ...DEFAULT_STATE };
-  }
   try {
-    const raw = storage.getItem(STORAGE_KEY);
+    const raw = safeStorage("localStorage")?.getItem(STORAGE_KEY);
     if (!raw) return { ...DEFAULT_STATE };
     const parsed = JSON.parse(raw);
-    const { favorites, modelLabels } = sanitizeStore(
-      typeof parsed.favorites === "object" ? parsed.favorites : {},
-      typeof parsed.modelLabels === "object" ? parsed.modelLabels : {}
-    );
-
-    const nextState: FavoritesState = {
-      favorites,
-      modelLabels,
+    return {
+      ...migrateStore(parsed.favorites ?? {}, parsed.modelLabels ?? {}),
       pinToTop: typeof parsed.pinToTop === "boolean" ? parsed.pinToTop : true,
-      showQuickBar: typeof parsed.showQuickBar === "boolean" ? parsed.showQuickBar : true,
     };
-    if (JSON.stringify(parsed.favorites) !== JSON.stringify(favorites)) {
-      persistState(nextState);
-    }
-    return nextState;
-  } catch (err) {
-    console.warn("[favorite-models] Error reading localStorage:", err);
+  } catch {
     return { ...DEFAULT_STATE };
   }
 }
 
-function persistState(state: FavoritesState): void {
-  const storage = safeLocalStorage();
-  if (!storage) return;
+function loadQueue(): Pending[] {
   try {
-    storage.setItem(STORAGE_KEY, JSON.stringify(state));
-  } catch (err) {
-    console.warn("[favorite-models] Error writing to localStorage:", err);
+    const raw = safeStorage("sessionStorage")?.getItem(QUEUE_KEY);
+    const entries: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(entries)) return [];
+    return entries.filter((entry) =>
+      Number.isInteger(entry?.attempts) && entry.attempts >= 0 &&
+      entry.mutation?.input && ["addFavorite", "removeFavorite", "clearFavorites", "setFavorites", "updateConfig"]
+        .includes(entry.mutation.method)
+    );
+  } catch {
+    return [];
   }
 }
 
-function notify(): void {
+function saveQueue(): void {
+  try {
+    const storage = safeStorage("sessionStorage");
+    if (pending.length) storage?.setItem(QUEUE_KEY, JSON.stringify(pending));
+    else storage?.removeItem(QUEUE_KEY);
+  } catch {
+    // The in-memory queue remains usable when the browser blocks storage.
+  }
+}
+
+let directory: readonly ProviderIdentity[] = [];
+let confirmed = loadInitialState();
+let serverVersion = 0;
+let confirmedWrites = 0;
+const pending = loadQueue();
+const listeners = new Set<(state: FavoritesState) => void>();
+let currentState = pending.reduce((state, entry) => applyMutation(state, entry.mutation), confirmed);
+
+export function resolveProviderKey(provider: string): string {
+  return normalizeProviderId(provider, directory);
+}
+
+export function resolvePickerProvider(label: string): string {
+  return resolvePickerProviderId(label, directory);
+}
+
+export function subscribe(listener: (state: FavoritesState) => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
+export function getState(): FavoritesState {
+  return currentState;
+}
+
+function applyMutation(state: FavoritesState, { method, input }: Mutation): FavoritesState {
+  if (method === "updateConfig") return { ...state, ...input };
+  if (method === "setFavorites") {
+    return { ...state, ...sanitizeStore(input.favorites, input.modelLabels, directory) };
+  }
+
+  const favorites = { ...state.favorites };
+  const provider = resolveProviderKey(input.providerId ?? "");
+  if (method === "clearFavorites") {
+    if (input.providerId === null) return { ...state, favorites: {}, modelLabels: {} };
+    delete favorites[provider];
+    return { ...state, favorites, modelLabels: dropLabels(state.modelLabels, provider) };
+  }
+
+  const id = input.modelId;
+  const list = favorites[provider] ?? [];
+  if (method === "addFavorite") {
+    favorites[provider] = list.includes(id) ? list : [id, ...list];
+    const modelLabels = input.label
+      ? { ...state.modelLabels, [labelKey(provider, id)]: cleanModelText(input.label) }
+      : state.modelLabels;
+    return { ...state, favorites, modelLabels };
+  }
+
+  const rest = list.filter((model) => model !== id);
+  if (rest.length > 0) favorites[provider] = rest;
+  else delete favorites[provider];
+  return { ...state, favorites, modelLabels: dropLabels(state.modelLabels, provider, id) };
+}
+
+function publish(force = false): void {
+  const next = pending.reduce((state, entry) => applyMutation(state, entry.mutation), confirmed);
+  if (!force && JSON.stringify(currentState) === JSON.stringify(next)) return;
+  currentState = next;
   for (const listener of listeners) {
     try {
       listener(currentState);
@@ -135,96 +170,143 @@ function notify(): void {
   }
 }
 
-async function callRpc<T>(method: string, input: unknown): Promise<T | null> {
+function saveConfirmed(): void {
   try {
-    const res = await fetch(`${RPC_ENDPOINT}/${method}`, {
+    safeStorage("localStorage")?.setItem(STORAGE_KEY, JSON.stringify(confirmed));
+  } catch {
+    // Server state is still authoritative when the browser cache is unavailable.
+  }
+}
+
+function acceptSnapshot(snapshot: ServerSnapshot): boolean {
+  if (typeof snapshot.version !== "number" || snapshot.version < serverVersion ||
+      !snapshot.favorites || !snapshot.modelLabels) return false;
+  serverVersion = snapshot.version;
+  const directoryChanged = snapshot.providers !== undefined &&
+    JSON.stringify(directory) !== JSON.stringify(snapshot.providers);
+  if (snapshot.providers) directory = snapshot.providers;
+  confirmed = {
+    ...confirmed,
+    ...sanitizeStore(snapshot.favorites, snapshot.modelLabels, directory),
+    ...snapshot.config,
+  };
+  saveConfirmed();
+  return directoryChanged;
+}
+
+type RpcResult<T> = { ok: true; result: T } | { ok: false; status: number };
+
+async function callRpc<T>(method: string, input: unknown): Promise<RpcResult<T>> {
+  let status = 0;
+  try {
+    const response = await fetch(`${RPC_ENDPOINT}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(input),
+      signal: AbortSignal.timeout(8_000),
     });
-    const data = (await res.json()) as { ok: true; result: T } | { ok: false; error: unknown };
-    return data.ok ? data.result : null;
+    status = response.status ?? 0;
+    const data = await response.json() as RpcResult<T>;
+    return data.ok ? data : { ok: false, status: status || 400 };
   } catch {
-    return null;
+    return { ok: false, status: status >= 400 ? status : 0 };
   }
 }
 
-export function subscribe(listener: (state: FavoritesState) => void): () => void {
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
-  };
+let readGeneration = 0;
+let activeRead: Promise<void> | undefined;
+
+export function refreshFavorites(): Promise<void> {
+  if (activeRead) return activeRead;
+  const gen = readGeneration;
+  const writesAtStart = confirmedWrites;
+  activeRead = (async () => {
+    let result = await callRpc<ServerSnapshot>("getFavorites", null);
+    if (gen !== readGeneration) return;
+    // A newer write may also change config without bumping favorites.version.
+    const writesBeforeRetry = confirmedWrites;
+    if (!result.ok || writesAtStart !== writesBeforeRetry) {
+      result = await callRpc<ServerSnapshot>("getFavorites", null);
+    }
+    if (gen === readGeneration && confirmedWrites === writesBeforeRetry && result.ok) {
+      publish(acceptSnapshot(result.result));
+    }
+  })().finally(() => {
+    if (gen === readGeneration) activeRead = undefined;
+  });
+  return activeRead;
 }
 
-export function getState(): FavoritesState {
-  return currentState;
+let inFlight = false;
+let retryTimer: ReturnType<typeof setTimeout> | undefined;
+let queuePaused = false;
+
+function pumpQueue(force = false): void {
+  if (queuePaused || inFlight || pending.length === 0 || (retryTimer && !force)) return;
+  clearTimeout(retryTimer);
+  retryTimer = undefined;
+  inFlight = true;
+  void sendMutation(pending[0]).finally(() => {
+    inFlight = false;
+    pumpQueue();
+  });
 }
 
-/**
- * Version of the last server snapshot this client applied. A boot-time
- * `getFavorites` response that predates a locally applied mutation must not
- * roll the store back (M8); mutation responses carry the newest version.
- */
-let serverVersion = 0;
-/** Bumped on every optimistic local mutation, in-flight or not. */
-let mutationCounter = 0;
-
-function applyServerSnapshot(res: ServerSnapshot): void {
-  if (typeof res.version === "number" && res.version < serverVersion) return;
-  if (typeof res.version === "number") serverVersion = res.version;
-  const { favorites, modelLabels } = sanitizeStore(res.favorites, res.modelLabels);
-  currentState = {
-    ...currentState,
-    favorites,
-    modelLabels,
-    pinToTop: res.config?.pinToTop ?? currentState.pinToTop,
-    showQuickBar: res.config?.showQuickBar ?? currentState.showQuickBar,
-  };
-  persistState(currentState);
-  notify();
-}
-
-function commitLocal(next: FavoritesState): void {
-  mutationCounter++;
-  currentState = next;
-  persistState(currentState);
-  notify();
-}
-
-/**
- * Run an optimistic mutation, then hand control to the server answer:
- * - ok → the returned authoritative snapshot is applied (M9: callers no
- *   longer fire-and-forget, and add/remove are intent-explicit so a stale
- *   tab can never invert an existing entry);
- * - failed → reconcile by pulling getFavorites once; only if that also fails
- *   do we keep the optimistic state (offline fallback).
- */
-async function runMutation(
-  optimistic: () => void,
-  rpc: () => Promise<ServerSnapshot | null>
-): Promise<boolean> {
-  optimistic();
-  const res = await rpc();
-  if (res) {
-    applyServerSnapshot(res);
-    return true;
+async function sendMutation(entry: Pending): Promise<void> {
+  const { method, input } = entry.mutation;
+  type ConfigResult = { success: boolean; config: Config };
+  const result = await callRpc<ServerSnapshot | ConfigResult>(method, input);
+  const rejected = result.ok && "success" in result.result && !result.result.success;
+  if (!result.ok) {
+    const delay = RETRY_DELAYS[entry.attempts++];
+    if ((result.status === 0 || result.status === 429 || result.status >= 500) && delay !== undefined) {
+      saveQueue();
+      if (!queuePaused) {
+        retryTimer = setTimeout(() => {
+          retryTimer = undefined;
+          pumpQueue();
+        }, delay);
+      }
+      return;
+    }
   }
-  const fresh = await callRpc<ServerSnapshot>("getFavorites", null);
-  if (fresh) applyServerSnapshot(fresh);
-  return false;
+
+  pending.shift();
+  saveQueue();
+  if (result.ok && !rejected) {
+    confirmedWrites++;
+    if ("version" in result.result) {
+      publish(acceptSnapshot(result.result));
+    } else {
+      confirmed = { ...confirmed, ...result.result.config };
+      saveConfirmed();
+      publish();
+    }
+    entry.resolve?.(true);
+    return;
+  }
+
+  // Removing just this intent rolls it back while keeping later queued edits.
+  publish();
+  await refreshFavorites();
+  toast.error(!result.ok && result.status === 409
+    ? "Избранное изменилось на сервере. Проверьте список и повторите импорт."
+    : "Сервер не подтвердил изменение. Список восстановлен по последним данным.");
+  entry.resolve?.(false);
+}
+
+function enqueue(mutation: Mutation): Promise<boolean> {
+  return new Promise((resolve) => {
+    pending.push({ mutation, attempts: 0, resolve });
+    queuePaused = false;
+    saveQueue();
+    publish();
+    pumpQueue();
+  });
 }
 
 export function isFavorite(providerId: string, modelId: string): boolean {
-  if (!providerId || !modelId) return false;
-  const list = currentState.favorites[providerId];
-  if (!list || !Array.isArray(list)) return false;
-  return list.includes(modelId);
-}
-
-export function getFavoritesForProvider(providerId: string): string[] {
-  if (!providerId) return [];
-  const list = currentState.favorites[providerId];
-  return Array.isArray(list) ? [...list] : [];
+  return currentState.favorites[resolveProviderKey(providerId)]?.includes(modelId) ?? false;
 }
 
 export function getAllFavorites(): FavoritesMap {
@@ -232,147 +314,52 @@ export function getAllFavorites(): FavoritesMap {
 }
 
 export function getFavoritesCount(): number {
-  let count = 0;
-  for (const list of Object.values(currentState.favorites)) {
-    if (Array.isArray(list)) count += list.length;
-  }
-  return count;
-}
-
-export function getModelLabel(providerId: string, modelId: string): string {
-  return cleanModelText(currentState.modelLabels[labelKey(providerId, modelId)] || modelId);
+  return Object.values(currentState.favorites).reduce((count, list) => count + list.length, 0);
 }
 
 export function addFavorite(providerId: string, modelId: string, label?: string): Promise<boolean> {
-  const prov = normalizeProviderId(providerId);
-  const id = cleanModelText(modelId.trim());
-  if (!prov || prov === "default" || !id) return Promise.resolve(false);
-  if ((currentState.favorites[prov] || []).includes(id)) return Promise.resolve(true);
-
-  return runMutation(
-    () => {
-      const nextLabels = { ...currentState.modelLabels };
-      if (label) nextLabels[labelKey(prov, id)] = cleanModelText(label);
-      commitLocal({
-        ...currentState,
-        favorites: {
-          ...currentState.favorites,
-          [prov]: [id, ...(currentState.favorites[prov] || [])],
-        },
-        modelLabels: nextLabels,
-      });
-    },
-    () => callRpc<ServerSnapshot>("addFavorite", { providerId: prov, modelId: id, label })
-  );
+  const prov = resolveProviderKey(providerId);
+  const id = normalizeModelKey(modelId);
+  if (prov === "default" || !id) return Promise.resolve(false);
+  return enqueue({ method: "addFavorite", input: { providerId: prov, modelId: id, label } });
 }
 
 export function removeFavorite(providerId: string, modelId: string): Promise<boolean> {
-  const prov = normalizeProviderId(providerId);
-  const id = modelId.trim();
-  const list = currentState.favorites[prov] || [];
-  // Match the stored key directly; also allow callers holding the display
-  // part of a "model · route" key to remove it (star click always passes the
-  // stored key verbatim, so this is only a manual-input convenience).
-  const storedId = list.includes(id) ? id : list.find((m) => m === id || m.startsWith(`${id} · `));
-  if (!storedId) return Promise.resolve(true);
-
-  return runMutation(
-    () => {
-      const rest = list.filter((m) => m !== storedId);
-      const nextFavorites = { ...currentState.favorites };
-      if (rest.length === 0) delete nextFavorites[prov];
-      else nextFavorites[prov] = rest;
-      commitLocal({
-        ...currentState,
-        favorites: nextFavorites,
-        modelLabels: dropLabels(currentState.modelLabels, prov, storedId),
-      });
-    },
-    () => callRpc<ServerSnapshot>("removeFavorite", { providerId: prov, modelId: storedId })
-  );
+  const prov = resolveProviderKey(providerId);
+  const id = normalizeModelKey(modelId);
+  if (prov === "default" || !id) return Promise.resolve(false);
+  const list = currentState.favorites[prov] ?? [];
+  // A manually entered bare key can still remove its routed counterpart.
+  const storedId = list.includes(id) ? id : list.find((m) => m.startsWith(`${id} · `));
+  return enqueue({ method: "removeFavorite", input: { providerId: prov, modelId: storedId ?? id } });
 }
 
 export function toggleFavorite(providerId: string, modelId: string, label?: string): Promise<boolean> {
-  const prov = normalizeProviderId(providerId);
-  const id = cleanModelText(modelId.trim());
-  if (!prov || prov === "default" || !id) return Promise.resolve(false);
-  if (isFavorite(prov, id)) return removeFavorite(prov, id).then(() => false);
-  // A pre-B2 entry stores the bare modelId ("M") while today's row keys are
-  // "M · route" — the star already shows favorited via that match, so the
-  // same click must REMOVE the legacy record, not stack "M · route" next
-  // to an unstarrable "M".
+  const prov = resolveProviderKey(providerId);
+  const id = normalizeModelKey(modelId);
+  if (prov === "default" || !id) return Promise.resolve(false);
   const head = id.split(" · ")[0];
-  const list = currentState.favorites[prov] || [];
-  const legacy = head !== id ? list.find((m) => m === head) : undefined;
-  if (legacy) return removeFavorite(prov, legacy).then(() => false);
-  return addFavorite(prov, id, label).then(() => true);
+  const stored = [id, head].find((key) => isFavorite(prov, key));
+  return stored ? removeFavorite(prov, stored).then(() => false) : addFavorite(prov, id, label);
 }
 
 export function clearFavorites(providerId?: string): Promise<boolean> {
-  const prov = providerId ? normalizeProviderId(providerId) : undefined;
+  const prov = providerId ? resolveProviderKey(providerId) : null;
   if (prov === "default") return Promise.resolve(false);
-  return runMutation(
-    () =>
-      commitLocal(
-        prov
-          ? {
-              ...currentState,
-              favorites: Object.fromEntries(
-                Object.entries(currentState.favorites).filter(([p]) => p !== prov)
-              ),
-              modelLabels: dropLabels(currentState.modelLabels, prov),
-            }
-          : { ...currentState, favorites: {}, modelLabels: {} }
-      ),
-    () => callRpc<ServerSnapshot>("clearFavorites", { providerId: prov ?? null })
-  );
+  return enqueue({ method: "clearFavorites", input: { providerId: prov } });
 }
 
-export function updateConfig(
-  updates: Partial<Pick<FavoritesState, "pinToTop" | "showQuickBar">>
-): Promise<boolean> {
-  const prev = {
-    pinToTop: currentState.pinToTop,
-    showQuickBar: currentState.showQuickBar,
-  };
-  commitLocal({ ...currentState, ...updates });
-  return callRpc<{ success: boolean; config: { pinToTop: boolean; showQuickBar: boolean } }>(
-    "updateConfig",
-    updates
-  ).then((res) => {
-    if (res?.success && res.config) {
-      currentState = {
-        ...currentState,
-        pinToTop: res.config.pinToTop,
-        showQuickBar: res.config.showQuickBar,
-      };
-      persistState(currentState);
-      notify();
-      return true;
-    }
-    // The server explicitly refused (success:false): the checkbox must snap
-    // back instead of silently staying flipped (M13). A network-level null
-    // keeps the optimistic value — nothing was persisted either way.
-    if (res && res.success === false) {
-      currentState = { ...currentState, ...prev };
-      persistState(currentState);
-      notify();
-    }
-    return false;
-  });
+export function updateConfig(updates: Partial<Config>): Promise<boolean> {
+  return enqueue({ method: "updateConfig", input: updates });
 }
 
 export function exportFavoritesJson(): string {
-  return JSON.stringify(
-    {
-      version: serverVersion,
-      exportedAt: new Date().toISOString(),
-      favorites: currentState.favorites,
-      modelLabels: currentState.modelLabels,
-    },
-    null,
-    2
-  );
+  return JSON.stringify({
+    version: serverVersion,
+    exportedAt: new Date().toISOString(),
+    favorites: currentState.favorites,
+    modelLabels: currentState.modelLabels,
+  }, null, 2);
 }
 
 export function importFavoritesJson(jsonStr: string): Promise<boolean> {
@@ -380,54 +367,50 @@ export function importFavoritesJson(jsonStr: string): Promise<boolean> {
   try {
     data = JSON.parse(jsonStr);
   } catch {
+    // The structural check below handles parsing failures as well.
+  }
+  if (!isValidFavoritesPayload(data)) {
+    toast.error("Неверный формат JSON");
     return Promise.resolve(false);
   }
-  // Validate the payload shape BEFORE touching the store or cache (M12).
-  if (!isValidFavoritesPayload(data)) return Promise.resolve(false);
-  const { favorites, modelLabels } = sanitizeStore(data.favorites, data.modelLabels ?? {});
-
-  return runMutation(
-    () =>
-      commitLocal({
-        ...currentState,
-        favorites,
-        modelLabels,
-      }),
-    () => callRpc<ServerSnapshot>("setFavorites", { favorites, modelLabels })
-  );
+  const store = sanitizeStore(data.favorites, data.modelLabels ?? {}, directory);
+  return enqueue({ method: "setFavorites", input: { ...store, baseVersion: serverVersion } });
 }
 
-/**
- * Initialize sync with backend RPC on boot.
- *
- * The server copy is authoritative: every client converges on it, so
- * favorites made on one device appear on the others. localStorage is only
- * a fast-start snapshot and an offline fallback — it never overrides the
- * server state on boot.
- *
- * The returned snapshot is applied only while no local mutation has happened
- * since the request was issued AND its version is not older than the last
- * applied server version — a late answer can never erase a newer star (M8).
- * Returns a disposer: remounts cancel their predecessor instead of stacking
- * another unguarded fetch.
- */
-let syncGen = 0;
+let stopSync: (() => void) | undefined;
 export function initBackendSync(): () => void {
-  const gen = ++syncGen;
-  const mutationsAtStart = mutationCounter;
-  void callRpc<ServerSnapshot>("getFavorites", null).then(async (res) => {
-    if (gen !== syncGen) return;
-    if (mutationCounter !== mutationsAtStart || !res) {
-      // A local mutation (or a dropped read) raced the boot fetch — pull the
-      // authoritative snapshot once more instead of discarding every
-      // cross-device favorite until the next remount.
-      const fresh = await callRpc<ServerSnapshot>("getFavorites", null);
-      if (fresh && gen === syncGen) applyServerSnapshot(fresh);
-      return;
-    }
-    applyServerSnapshot(res);
-  });
-  return () => {
-    if (gen === syncGen) syncGen++;
+  stopSync?.();
+  queuePaused = false;
+  const wake = () => {
+    pumpQueue();
+    void refreshFavorites();
   };
+  const visible = () => {
+    if (document.visibilityState === "visible") wake();
+  };
+  const online = () => {
+    pumpQueue(true);
+    void refreshFavorites();
+  };
+  window.addEventListener("focus", wake);
+  window.addEventListener("online", online);
+  document.addEventListener("visibilitychange", visible);
+  const interval = setInterval(visible, REFRESH_INTERVAL);
+  wake();
+
+  const dispose = () => {
+    if (stopSync !== dispose) return;
+    stopSync = undefined;
+    readGeneration++;
+    activeRead = undefined;
+    queuePaused = true;
+    clearTimeout(retryTimer);
+    retryTimer = undefined;
+    window.removeEventListener("focus", wake);
+    window.removeEventListener("online", online);
+    document.removeEventListener("visibilitychange", visible);
+    clearInterval(interval);
+  };
+  stopSync = dispose;
+  return dispose;
 }

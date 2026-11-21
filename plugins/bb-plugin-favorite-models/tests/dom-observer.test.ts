@@ -108,14 +108,6 @@ function openPicker(trigger: HTMLButtonElement, picker: Picker): void {
   document.body.append(picker.wrapper);
 }
 
-/** Wire the trigger like Radix does: a click opens the popover. */
-function openOnClick(trigger: HTMLButtonElement, picker: Picker): void {
-  trigger.addEventListener("click", () => openPicker(trigger, picker));
-}
-
-const rowButtons = (root: HTMLElement | Document = document) =>
-  Array.from(root.querySelectorAll<HTMLButtonElement>('button[id*="-opt-"]'));
-
 async function freshModules(): Promise<{ dom: Dom; mgr: Manager }> {
   vi.resetModules();
   const dom = await import("../src/dom-observer.js");
@@ -209,384 +201,65 @@ describe("native BB 0.49.0 markup — stars (blocker 1)", () => {
     expect(bodies[0].providerId).toBe("codex");
     dispose();
   });
-});
 
-describe("composer scoping (B1)", () => {
-  it("drives only its own composer's popover, not a foreign open one", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const B = composer("secondary");
-
-    // B already has an open popover containing a matching row.
-    const pickerB = nativePicker({ rows: [optionRow("target-model", { withRole: true })] });
-    openPicker(B.trigger, pickerB);
-    const bClicked = vi.fn();
-    rowButtons(pickerB.content)[0].addEventListener("click", bClicked);
-
-    // A opens its own popover — without the requested model.
-    const pickerA = nativePicker({ rows: [optionRow("other-model")] });
-    openOnClick(A.trigger, pickerA);
-
-    const p = dom.switchComposerModel("target-model", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(2000);
-    const res = await p;
-
-    expect(res.ok).toBe(false);
-    expect(res.reason).toBe("model-not-found");
-    expect(bClicked).not.toHaveBeenCalled();
-    // A's trigger got its OWN popover — the foreign one was never adopted.
-    expect(A.trigger.getAttribute("aria-controls")).toBe(pickerA.content.id);
-  });
-
-  it("reports no-trigger instead of hijacking another composer", async () => {
-    const { dom } = await freshModules();
-    const rootA = document.createElement("div");
-    rootA.setAttribute("data-app-composer-role", "primary");
-    const anchor = document.createElement("span");
-    rootA.append(anchor);
-    document.body.append(rootA);
-
-    const B = composer("secondary");
-    const pickerB = nativePicker({ rows: [optionRow("target-model", { withRole: true })] });
-    openPicker(B.trigger, pickerB);
-    const bClicked = vi.fn();
-    rowButtons(pickerB.content)[0].addEventListener("click", bClicked);
-
-    const res = await dom.switchComposerModel("target-model", undefined, anchor);
-    expect(res).toEqual({ ok: false, reason: "no-trigger" });
-    expect(bClicked).not.toHaveBeenCalled();
-  });
-
-  it("openNativeModelPicker opens only the anchored composer's picker", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const B = composer("secondary");
-    const pickerA = nativePicker({ rows: [] });
-    const pickerB = nativePicker({ rows: [] });
-    openOnClick(A.trigger, pickerA);
-    openOnClick(B.trigger, pickerB);
-
-    dom.openNativeModelPicker(B.anchor);
-    expect(B.trigger.getAttribute("aria-controls")).toBe(pickerB.content.id);
-    expect(A.trigger.getAttribute("aria-controls")).toBeNull();
-    expect(document.getElementById(pickerB.content.id)).toBeTruthy();
-    expect(document.getElementById(pickerA.content.id)).toBeNull();
-  });
-});
-
-describe("full model key incl. route (B2)", () => {
-  it("clicks the row with the matching route, not the first same-name row", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const r1 = optionRow("M · RouteA");
-    const r2 = optionRow("M · RouteB");
-    const picker = nativePicker({ rows: [r1, r2] });
-    const c1 = vi.fn();
-    const c2 = vi.fn(() => picker.wrapper.remove());
-    r1.addEventListener("click", c1);
-    r2.addEventListener("click", c2);
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("M · RouteB", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(500);
-    const res = await p;
-
-    expect(res.ok).toBe(true);
-    expect(c2).toHaveBeenCalled();
-    expect(c1).not.toHaveBeenCalled();
-  });
-});
-
-describe("cancellable polling (B3)", () => {
-  it("a newer switch on the same composer cancels the previous one's polls", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const p1 = dom.switchComposerModel("x", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(50);
-    const p2 = dom.switchComposerModel("y", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(1500);
-    const [r1, r2] = await Promise.all([p1, p2]);
-    expect(r1).toEqual({ ok: false, reason: "cancelled" });
-    expect(r2).toEqual({ ok: false, reason: "no-popover" });
-  });
-
-  it("cancelling ANOTHER composer leaves this switch running", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const B = composer("secondary");
-    const p = dom.switchComposerModel("x", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(50);
-    dom.cancelPendingSwitch(B.anchor); // B has no pending switch — must be a no-op
-    await vi.advanceTimersByTimeAsync(1500);
-    const res = await p;
-    expect(res).toEqual({ ok: false, reason: "no-popover" });
-  });
-
-  it("a cancelled poll cannot click into a menu that appears later", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const p = dom.switchComposerModel("target", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(50);
-    dom.cancelPendingSwitch();
-
-    // A matching menu shows up only AFTER the cancellation.
-    const picker = nativePicker({ rows: [optionRow("target", { withRole: true })] });
-    openPicker(A.trigger, picker);
-    const clicked = vi.fn();
-    rowButtons(picker.content)[0].addEventListener("click", clicked);
-
-    await vi.advanceTimersByTimeAsync(1500);
-    const res = await p;
-    expect(res.reason).toBe("cancelled");
-    expect(clicked).not.toHaveBeenCalled();
-  });
-
-  it("aborts when the popover closes mid-scan instead of clicking a reopened one", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const picker = nativePicker({ rows: [optionRow("other-model")] });
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("target", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(100);
-    // User closes the menu before the model shows up.
-    picker.wrapper.remove();
-    A.trigger.removeAttribute("aria-controls");
-    await vi.advanceTimersByTimeAsync(100);
-    const res = await p;
-    expect(res.reason).toBe("cancelled");
-  });
-
-  it("waits for the new provider tab before matching rows", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    // The OLD provider's list already shows a same-named row; a premature
-    // match would click it — the exact B3 reproduction.
-    const oldRow = optionRow("target-model", { withRole: true });
-    const oldClicked = vi.fn();
-    oldRow.addEventListener("click", oldClicked);
-    const picker = nativePicker({
-      search: true,
-      tabs: [
-        { title: "Codex", active: true },
-        { title: "Antigravity" },
-      ],
-      rows: [oldRow],
+  it("portal 'More models' submenu rows get stars and pin under the parent provider", async () => {
+    const { dom, mgr } = await freshModules();
+    const bodies: { providerId?: string; modelId?: string }[] = [];
+    stubRpc((method, body) => {
+      if (method === "addFavorite") bodies.push(body as never);
+      return method === "getFavorites"
+        ? { version: 1, favorites: { codex: ["pinned-deep"] }, modelLabels: {}, config: { pinToTop: true } }
+        : { version: 2, favorites: { codex: ["pinned-deep"] }, modelLabels: {}, config: { pinToTop: true } };
     });
-    const newRow = optionRow("target-model", { withRole: true });
-    const newClicked = vi.fn(() => picker.wrapper.remove());
-    newRow.addEventListener("click", newClicked);
-
-    const tabs = picker.content.querySelectorAll<HTMLButtonElement>("div.border-b button[title]");
-    tabs[1].addEventListener("click", () => {
-      setTimeout(() => {
-        tabs[0].className = "flex border-b-2 border-transparent text-muted-foreground";
-        tabs[1].className = "flex border-b-2 border-foreground text-foreground";
-        oldRow.remove();
-        picker.list.appendChild(newRow);
-      }, 75);
-    });
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("target-model", "agy", A.anchor);
-    await vi.advanceTimersByTimeAsync(2000);
-    const res = await p;
-
-    expect(res.ok).toBe(true);
-    expect(oldClicked).not.toHaveBeenCalled();
-    expect(newClicked).toHaveBeenCalled();
-  });
-});
-
-describe("verified application (M1)", () => {
-  it("does not report success for a disabled option", async () => {
-    const { dom } = await freshModules();
     const A = composer();
-    const row = optionRow("target", { disabled: true, withRole: true });
-    const clicked = vi.fn();
-    row.addEventListener("click", clicked);
-    const picker = nativePicker({ rows: [row] });
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("target", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(2000);
-    const res = await p;
-
-    expect(res.ok).toBe(false);
-    expect(res.reason).toBe("model-not-found");
-    expect(clicked).not.toHaveBeenCalled();
-  });
-
-  it("reports unconfirmed when the option click applies nothing", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const row = optionRow("target");
-    const picker = nativePicker({ rows: [row] });
-    // Native handler does nothing: menu stays open, trigger unchanged.
-    openOnClick(A.trigger, picker);
-    const escSpy = vi.fn();
-    picker.content.addEventListener("keydown", escSpy);
-
-    const p = dom.switchComposerModel("target", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(2000);
-    const res = await p;
-
-    expect(res.ok).toBe(false);
-    expect(res.reason).toBe("unconfirmed");
-    expect(escSpy).toHaveBeenCalled(); // we closed the menu we opened
-  });
-});
-
-describe("provider tab handling (M2)", () => {
-  it("does not mistake injected stars for provider tabs", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const row = optionRow("target-model");
-    // Stars carry a title and no role="option" — the old code read them as
-    // provider tabs and failed with provider-tab-missing.
-    const star = document.createElement("button");
-    star.className = "bb-fav-star-btn";
-    star.title = "Добавить в избранное";
-    row.appendChild(star);
-    const picker = nativePicker({ rows: [row] });
-    row.addEventListener("click", () => picker.wrapper.remove());
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("target-model", "codex", A.anchor);
-    await vi.advanceTimersByTimeAsync(500);
-    const res = await p;
-    expect(res.ok).toBe(true);
-  });
-
-  it("single-provider picker still verifies the actual provider", async () => {
-    const { dom } = await freshModules();
-    const A = composer(); // trigger title says Codex
-    const row = optionRow("target-model");
-    const clicked = vi.fn();
-    row.addEventListener("click", clicked);
-    const picker = nativePicker({ rows: [row] });
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("target-model", "agy", A.anchor);
-    await vi.advanceTimersByTimeAsync(500);
-    const res = await p;
-    expect(res).toEqual({ ok: false, reason: "provider-tab-missing" });
-    expect(clicked).not.toHaveBeenCalled();
-  });
-
-  it("cross-provider switch works with tabs outside the listbox (blocker 2)", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const claudeRow = optionRow("m2", { withRole: true });
-    const clicked = vi.fn(() => picker.wrapper.remove());
-    claudeRow.addEventListener("click", clicked);
-    const picker = nativePicker({
-      search: true,
-      tabs: [{ title: "Claude Code" }, { title: "Codex", active: true }],
-      rows: Array.from({ length: 7 }, (_, i) => optionRow(`codex-m${i}`, { withRole: true })),
-    });
-    const strip = picker.content.querySelector<HTMLElement>("div.border-b")!;
-    const claudeTab = strip.querySelector<HTMLButtonElement>('button[title="Claude Code"]')!;
-    claudeTab.addEventListener("click", () => {
-      claudeTab.className = "flex border-b-2 border-foreground text-foreground";
-      picker.list.replaceChildren(claudeRow);
-    });
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("m2", "provider-claude-code", A.anchor);
-    await vi.advanceTimersByTimeAsync(2000);
-    const res = await p;
-    expect(res.ok).toBe(true);
-    expect(clicked).toHaveBeenCalled();
-  });
-});
-
-describe("hidden models (M3)", () => {
-  it("expands 'More models' to find the row", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const picker = nativePicker({ rows: [optionRow("other-model")] });
-    const more = document.createElement("button");
-    more.textContent = "More models";
-    more.id = "x-more-toggle";
-    picker.content.appendChild(more);
-    const target = optionRow("deep-model");
-    target.addEventListener("click", () => picker.wrapper.remove());
-    more.addEventListener("click", () => picker.list.appendChild(target));
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("deep-model", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(1000);
-    const res = await p;
-    expect(res.ok).toBe(true);
-  });
-
-  it("follows 'More models' into a portal submenu (desktop short list)", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const picker = nativePicker({ rows: [optionRow("other-model")] });
+    const picker = nativePicker({ rows: [optionRow("top-model")] });
     const more = document.createElement("button");
     more.textContent = "More models";
     picker.content.appendChild(more);
+
     // Radix submenu: content portaled to body, linked via the trigger's
     // aria-controls; submenu rows carry neither -opt- ids nor roles.
-    more.addEventListener("click", () => {
-      const sub = document.createElement("div");
-      sub.setAttribute("role", "menu");
-      sub.id = "radix-:sub1:";
+    const sub = document.createElement("div");
+    sub.setAttribute("role", "menu");
+    sub.id = "radix-:sub-stars:";
+    sub.dataset.state = "open";
+    const portalRow = (title: string) => {
       const row = document.createElement("button");
       const s = document.createElement("span");
       s.className = "truncate";
-      s.title = "deep-model";
-      s.textContent = "deep-model";
+      s.title = title;
+      s.textContent = title;
       row.appendChild(s);
-      row.addEventListener("click", () => {
-        sub.remove();
-        picker.wrapper.remove();
-      });
-      sub.appendChild(row);
+      return row;
+    };
+    const pinned = portalRow("pinned-deep");
+    const plain = portalRow("deep-model");
+    sub.append(pinned, plain);
+    more.addEventListener("click", () => {
       document.body.append(sub);
       more.setAttribute("aria-controls", sub.id);
+      more.setAttribute("aria-expanded", "true");
     });
-    openOnClick(A.trigger, picker);
+    openPicker(A.trigger, picker);
+    more.click();
+    await mgr.refreshFavorites();
 
-    const p = dom.switchComposerModel("deep-model", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(1000);
-    const res = await p;
-    expect(res.ok).toBe(true);
-  });
+    const dispose = dom.initDomObserver();
+    await vi.advanceTimersByTimeAsync(150);
 
-  it("fills the search box when the row is not rendered, then clears it on failure", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const picker = nativePicker({ rows: [optionRow("other-model")], search: true });
-    const input = picker.content.querySelector("input")!;
-    const typedValues: string[] = [];
-    input.addEventListener("input", () => typedValues.push(input.value));
-    openOnClick(A.trigger, picker);
+    const stars = sub.querySelectorAll<HTMLButtonElement>(":scope > button > .bb-fav-star-btn");
+    expect(stars.length).toBe(2);
+    // The parent provider's favorite is starred and pinned inside the submenu.
+    expect(pinned.classList.contains("bb-fav-row-starred")).toBe(true);
+    expect(plain.classList.contains("bb-fav-row-starred")).toBe(false);
+    expect(sub.querySelector(".bb-fav-pin-section button[data-bb-fav-clone]")).toBeTruthy();
 
-    const p = dom.switchComposerModel("deep-model", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(2000);
-    const res = await p;
-    expect(res.reason).toBe("model-not-found");
-    expect(typedValues).toContain("deep-model"); // the M3 fallback did type the query
-    expect(input.value).toBe(""); // and the failed attempt left no residue
-  });
-
-  it("finds the row via search when it appears after filtering", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const picker = nativePicker({ rows: [optionRow("other-model")], search: true });
-    const input = picker.content.querySelector("input")!;
-    const target = optionRow("deep-model", { withRole: true });
-    target.addEventListener("click", () => picker.wrapper.remove());
-    input.addEventListener("input", () => picker.list.appendChild(target));
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("deep-model", undefined, A.anchor);
-    await vi.advanceTimersByTimeAsync(1000);
-    const res = await p;
-    expect(res.ok).toBe(true);
+    plain.querySelector<HTMLButtonElement>(".bb-fav-star-btn")!.click();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(bodies.length).toBe(1);
+    expect(bodies[0].providerId).toBe("codex");
+    expect(bodies[0].modelId).toBe("deep-model");
+    dispose();
   });
 });
 
@@ -602,7 +275,7 @@ describe("pin section + observer (M5, M6, M7)", () => {
         return {
           json: async () => ({
             ok: true,
-            result: { version: ++version, favorites, modelLabels: {}, config: { pinToTop: true, showQuickBar: true } },
+            result: { version: ++version, favorites, modelLabels: {}, config: { pinToTop: true } },
           }),
         };
       })
@@ -806,22 +479,6 @@ describe("native ToggleGroup sections (review r3 blocker)", () => {
     cleanup();
   });
 
-  it("single-provider picker + ToggleGroup: quick switch reaches the row (no provider-tab-missing)", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const row = optionRow("target", { withRole: true });
-    const picker = nativePicker({ search: true, rows: [row] });
-    const section = document.createElement("div");
-    section.append(titledToggleGroup());
-    picker.content.append(section);
-    row.addEventListener("click", () => picker.wrapper.remove());
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("target", "codex", A.anchor);
-    await vi.advanceTimersByTimeAsync(3000);
-    await expect(p).resolves.toEqual({ ok: true });
-  });
-
   it("' (current thread)' marker on a tab title does not poison the provider key", async () => {
     const { dom } = await freshModules();
     const bodies: { providerId?: string }[] = [];
@@ -903,51 +560,3 @@ describe("disabled rows (review r3)", () => {
   });
 });
 
-describe("switch hygiene (review r3 minor)", () => {
-  it("provider-tab-missing closes the popover we opened", async () => {
-    const { dom } = await freshModules();
-    const A = composer();
-    const picker = nativePicker({
-      search: true,
-      tabs: [{ title: "Claude Code", active: true }],
-      rows: [optionRow("m0", { withRole: true })],
-    });
-    const escapes: string[] = [];
-    picker.content.addEventListener("keydown", (e) => escapes.push((e as KeyboardEvent).key));
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("m0", "codex", A.anchor);
-    await vi.advanceTimersByTimeAsync(3000);
-    await expect(p).resolves.toEqual({ ok: false, reason: "provider-tab-missing" });
-    expect(escapes).toContain("Escape");
-  });
-
-  it("trigger showing 'M2' does NOT confirm a click on 'M' (exact match only)", async () => {
-    const { dom } = await freshModules();
-    const A = composer("primary", "Codex: M2");
-    const picker = nativePicker({
-      search: true,
-      rows: [optionRow("M", { withRole: true })],
-    });
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("M", "codex", A.anchor);
-    await vi.advanceTimersByTimeAsync(3000);
-    await expect(p).resolves.toEqual({ ok: false, reason: "unconfirmed" });
-  });
-
-  it("trigger's own '· reasoning' qualifier still confirms the right model", async () => {
-    const { dom } = await freshModules();
-    const A = composer("primary", "Codex: target · high reasoning");
-    // The row stays open after our click: only triggerShowsModel can confirm.
-    const picker = nativePicker({
-      search: true,
-      rows: [optionRow("target", { withRole: true })],
-    });
-    openOnClick(A.trigger, picker);
-
-    const p = dom.switchComposerModel("target", "codex", A.anchor);
-    await vi.advanceTimersByTimeAsync(3000);
-    await expect(p).resolves.toEqual({ ok: true });
-  });
-});

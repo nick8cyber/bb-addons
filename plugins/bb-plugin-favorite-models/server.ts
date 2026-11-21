@@ -6,28 +6,33 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
-  cleanModelText,
   dropLabels,
   labelKey,
+  migrateStore,
+  normalizeModelKey,
   normalizeProviderId,
   sanitizeStore,
   type FavoritesMap,
   type FavoritesSnapshot,
   type ModelLabels,
+  type ProviderIdentity,
 } from "./src/store.js";
+import { inspectFavorites } from "./src/doctor.js";
 
 const STORE_KEY = "favorites:store";
 const LEGACY_MAP_KEY = "favorites:map";
 const LEGACY_LABELS_KEY = "favorites:labels";
 const LEGACY_CONFIG_KEY = "favorites:config";
 
+const providerDirectory = z.array(z.object({ id: z.string(), displayName: z.string() }));
+
 const snapshotOutput = z.object({
   version: z.number(),
+  providers: providerDirectory.optional(),
   favorites: z.record(z.string(), z.array(z.string())),
   modelLabels: z.record(z.string(), z.string()),
   config: z.object({
     pinToTop: z.boolean(),
-    showQuickBar: z.boolean(),
   }),
 });
 
@@ -51,8 +56,18 @@ export const rpcContract = defineRpcContract({
     }),
     output: snapshotOutput,
   },
+  // Compatibility with tabs opened before the intent-explicit RPCs.
+  toggleFavorite: {
+    input: z.object({
+      providerId: z.string(),
+      modelId: z.string(),
+      label: z.string().optional(),
+    }),
+    output: snapshotOutput.extend({ isFavorite: z.boolean() }),
+  },
   setFavorites: {
     input: z.object({
+      baseVersion: z.number().int().nonnegative(),
       favorites: z.record(z.string(), z.array(z.string())),
       modelLabels: z.record(z.string(), z.string()).optional(),
     }),
@@ -67,13 +82,11 @@ export const rpcContract = defineRpcContract({
   updateConfig: {
     input: z.object({
       pinToTop: z.boolean().optional(),
-      showQuickBar: z.boolean().optional(),
     }),
     output: z.object({
       success: z.boolean(),
       config: z.object({
         pinToTop: z.boolean(),
-        showQuickBar: z.boolean(),
       }),
     }),
   },
@@ -86,11 +99,6 @@ export default async function plugin(bb: BbPluginApi) {
     pinToTop: {
       type: "boolean",
       label: "Pin favorites to top of model dropdown",
-      default: true,
-    },
-    showQuickBar: {
-      type: "boolean",
-      label: "Show quick favorites in composer",
       default: true,
     },
   });
@@ -108,138 +116,186 @@ export default async function plugin(bb: BbPluginApi) {
     return run;
   }
 
-  /**
-   * Load the store, migrating legacy split keys (`favorites:map`,
-   * `favorites:labels`) into the single versioned record on first access.
-   * Call ONLY inside withStoreLock — every reader and every writer (incl.
-   * CLI paths that never call readStore first) goes through this, so a
-   * first-write after upgrade can never overwrite the old split keys with
-   * an empty snapshot.
-   */
-  const loadOrMigrate = async (): Promise<FavoritesSnapshot> => {
+  let providers: ProviderIdentity[] | undefined;
+  let directoryFetchedAt = -Infinity;
+  let directoryRequest: Promise<ProviderIdentity[]> | undefined;
+
+  const fetchProviderCatalog = async () => {
+    // The picker SDK list is scoped to a host and omits disabled providers.
+    // The full BB catalog also lists providers that can be enabled again.
+    const url = new URL("/api/v1/system/providers/catalog", bb.server.loopbackBaseUrl);
+    const response = await fetch(url, { signal: AbortSignal.timeout(4_000) });
+    if (!response.ok) throw new Error(`Provider catalog returned HTTP ${response.status}`);
+    return providerDirectory.parse(await response.json());
+  };
+
+  const loadProviders = async (): Promise<ProviderIdentity[]> => {
+    if (Date.now() - directoryFetchedAt < 15_000) return providers ?? [];
+    if (!directoryRequest) {
+      directoryRequest = fetchProviderCatalog()
+        .catch(async () => providerDirectory.parse(await bb.sdk.providers.list()))
+        .then((found) => (providers = found))
+        .catch((err) => {
+          bb.log.info(`Could not load provider directory: ${String(err)}`);
+          return providers ?? [];
+        })
+        .finally(() => {
+          directoryFetchedAt = Date.now();
+          directoryRequest = undefined;
+        });
+    }
+    return directoryRequest;
+  };
+
+  /** Run inside withStoreLock, including the migration of already versioned keys. */
+  const loadOrMigrate = async (
+    directory: readonly ProviderIdentity[],
+    persist = true
+  ): Promise<FavoritesSnapshot> => {
     const existing = await bb.storage.kv.get<FavoritesSnapshot>(STORE_KEY);
-    if (existing && typeof existing === "object" && typeof existing.version === "number") {
-      return existing;
+    if (existing && typeof existing.version === "number") {
+      const migrated = migrateStore(existing.favorites, existing.modelLabels, directory);
+      if (JSON.stringify(existing.favorites) === JSON.stringify(migrated.favorites) &&
+          JSON.stringify(existing.modelLabels) === JSON.stringify(migrated.modelLabels)) {
+        return existing;
+      }
+      const snapshot = { ...migrated, version: existing.version + 1 };
+      if (persist) await bb.storage.kv.set(STORE_KEY, snapshot);
+      return snapshot;
     }
     const legacyMap = await bb.storage.kv.get<FavoritesMap>(LEGACY_MAP_KEY);
     const legacyLabels = await bb.storage.kv.get<ModelLabels>(LEGACY_LABELS_KEY);
-    // Nothing stored anywhere: hand back an empty v0 without persisting —
-    // the first real write becomes version 1 and no stray record appears
-    // on fresh installs.
     if (legacyMap === undefined && legacyLabels === undefined) {
       return { version: 0, favorites: {}, modelLabels: {} };
     }
-    const { favorites, modelLabels } = sanitizeStore(legacyMap ?? {}, legacyLabels ?? {});
-    const snapshot: FavoritesSnapshot = { version: 1, favorites, modelLabels };
-    await bb.storage.kv.set(STORE_KEY, snapshot);
-    await bb.storage.kv.delete(LEGACY_MAP_KEY);
-    await bb.storage.kv.delete(LEGACY_LABELS_KEY);
+    const snapshot = { ...migrateStore(legacyMap ?? {}, legacyLabels ?? {}, directory), version: 1 };
+    if (persist) {
+      await bb.storage.kv.set(STORE_KEY, snapshot);
+      await bb.storage.kv.delete(LEGACY_MAP_KEY);
+      await bb.storage.kv.delete(LEGACY_LABELS_KEY);
+    }
     return snapshot;
   };
 
-  const readStore = (): Promise<FavoritesSnapshot> => withStoreLock(loadOrMigrate);
+  const readStore = (directory: readonly ProviderIdentity[]): Promise<FavoritesSnapshot> =>
+    withStoreLock(() => loadOrMigrate(directory));
 
   const writeStore = (
+    directory: readonly ProviderIdentity[],
     mutate: (snapshot: FavoritesSnapshot) => void
   ): Promise<FavoritesSnapshot> =>
     withStoreLock(async () => {
-      const existing = await loadOrMigrate();
+      const existing = await loadOrMigrate(directory);
       const snapshot: FavoritesSnapshot = {
         ...existing,
         favorites: { ...existing.favorites },
         modelLabels: { ...existing.modelLabels },
       };
       mutate(snapshot);
-      const { favorites, modelLabels } = sanitizeStore(snapshot.favorites, snapshot.modelLabels);
-      const next: FavoritesSnapshot = {
-        version: snapshot.version + 1,
-        favorites,
-        modelLabels,
-      };
+      const { favorites, modelLabels } = sanitizeStore(snapshot.favorites, snapshot.modelLabels, directory);
+      const next = { version: snapshot.version + 1, favorites, modelLabels };
       await bb.storage.kv.set(STORE_KEY, next);
       return next;
     });
+
+  function addModel(s: FavoritesSnapshot, provider: string, model: string, label?: string): void {
+    const list = s.favorites[provider] ?? [];
+    if (!list.includes(model)) s.favorites[provider] = [model, ...list];
+    if (label) s.modelLabels[labelKey(provider, model)] = label;
+  }
+
+  function removeModel(s: FavoritesSnapshot, provider: string, model: string): void {
+    const rest = (s.favorites[provider] ?? []).filter((id) => id !== model);
+    if (rest.length === 0) delete s.favorites[provider];
+    else s.favorites[provider] = rest;
+    delete s.modelLabels[labelKey(provider, model)];
+  }
 
   const getConfig = async () => {
     const s = await settings.get();
     return {
       pinToTop: s.pinToTop ?? true,
-      showQuickBar: s.showQuickBar ?? true,
     };
   };
 
   const withConfig = async (snapshot: FavoritesSnapshot) => ({
     ...snapshot,
+    ...(providers ? { providers } : {}),
     config: await getConfig(),
   });
 
   // One-off migration of the pre-refactor KV config override into real BB
   // settings: after it ran once, `favorites:config` is gone and bb.settings
-  // alone governs pinToTop/showQuickBar (M13).
-  const legacyConfig = await bb.storage.kv.get<{ pinToTop?: boolean; showQuickBar?: boolean }>(
+  // alone governs pinToTop (M13).
+  const legacyConfig = await bb.storage.kv.get<{ pinToTop?: boolean }>(
     LEGACY_CONFIG_KEY
   );
   if (legacyConfig && typeof legacyConfig === "object") {
-    const updates: { pinToTop?: boolean; showQuickBar?: boolean } = {};
+    const updates: { pinToTop?: boolean } = {};
     if (typeof legacyConfig.pinToTop === "boolean") updates.pinToTop = legacyConfig.pinToTop;
-    if (typeof legacyConfig.showQuickBar === "boolean") updates.showQuickBar = legacyConfig.showQuickBar;
     if (Object.keys(updates).length > 0) {
       try {
         await settings.experimental_set(updates);
+        await bb.storage.kv.delete(LEGACY_CONFIG_KEY);
       } catch (err) {
         bb.log.info(`Could not migrate legacy config into settings: ${String(err)}`);
       }
     }
-    await bb.storage.kv.delete(LEGACY_CONFIG_KEY);
   }
 
   // Register RPC Handlers
   bb.rpc.register(rpcContract, {
-    getFavorites: async () => withConfig(await readStore()),
+    getFavorites: async () => withConfig(await readStore(await loadProviders())),
 
     addFavorite: async ({ providerId, modelId, label }) => {
-      const prov = normalizeProviderId(providerId);
-      const id = modelId.trim();
-      if (!prov || prov === "default" || !id) return withConfig(await readStore());
-      const next = await writeStore((s) => {
-        const list = s.favorites[prov] || [];
-        s.favorites[prov] = list.includes(id) ? list : [id, ...list];
-        if (label) s.modelLabels[labelKey(prov, id)] = label;
-      });
-      bb.log.info(`Favorite added: ${prov}/${id}`);
-      return withConfig(next);
+      const directory = await loadProviders();
+      const prov = normalizeProviderId(providerId, directory);
+      const id = normalizeModelKey(modelId);
+      if (prov === "default" || !id) return withConfig(await readStore(directory));
+      return withConfig(await writeStore(directory, (s) => addModel(s, prov, id, label)));
     },
 
     removeFavorite: async ({ providerId, modelId }) => {
-      const prov = normalizeProviderId(providerId);
-      // Stored ids are sanitized on write; the lookup key must go through
-      // the same cleaning or "model ⌘M"-style residue makes records
-      // unremovable.
-      const id = cleanModelText(modelId.trim());
-      const next = await writeStore((s) => {
-        const list = s.favorites[prov] || [];
-        const rest = list.filter((m) => m !== id);
-        if (rest.length === 0) delete s.favorites[prov];
-        else s.favorites[prov] = rest;
-        s.modelLabels = dropLabels(s.modelLabels, prov, id);
-      });
-      bb.log.info(`Favorite removed: ${prov}/${id}`);
-      return withConfig(next);
+      const directory = await loadProviders();
+      const prov = normalizeProviderId(providerId, directory);
+      const id = normalizeModelKey(modelId);
+      return withConfig(await writeStore(directory, (s) => removeModel(s, prov, id)));
     },
 
-    setFavorites: async ({ favorites, modelLabels }) => {
-      const sanitized = sanitizeStore(favorites, modelLabels ?? {});
-      const next = await writeStore((s) => {
+    toggleFavorite: async ({ providerId, modelId, label }) => {
+      const directory = await loadProviders();
+      const prov = normalizeProviderId(providerId, directory);
+      const id = normalizeModelKey(modelId);
+      if (prov === "default" || !id) {
+        return { ...await withConfig(await readStore(directory)), isFavorite: false };
+      }
+      const next = await writeStore(directory, (s) => {
+        if (s.favorites[prov]?.includes(id)) removeModel(s, prov, id);
+        else addModel(s, prov, id, label);
+      });
+      return { ...await withConfig(next), isFavorite: next.favorites[prov]?.includes(id) ?? false };
+    },
+
+    setFavorites: async ({ favorites, modelLabels, baseVersion }) => {
+      const directory = await loadProviders();
+      const sanitized = sanitizeStore(favorites, modelLabels ?? {}, directory);
+      const next = await writeStore(directory, (s) => {
+        if (s.version !== baseVersion) {
+          // BB 0.49 recognizes this refusal marker and maps conflict to HTTP 409.
+          // The installed SDK 0.4.87 does not export its constructor.
+          throw Object.assign(new Error("Favorites changed on the server"), {
+            [Symbol.for("@get-bb/plugin-sdk/rpc-refusal")]: true,
+            code: "conflict",
+          });
+        }
         s.favorites = sanitized.favorites;
         if (modelLabels !== undefined) {
           s.modelLabels = sanitized.modelLabels;
         } else {
-          // Keep only labels that still point at a favorited model.
           s.modelLabels = Object.fromEntries(
             Object.entries(s.modelLabels).filter(([key]) => {
               const idx = key.indexOf(":");
-              const list = sanitized.favorites[key.slice(0, idx)];
-              return Array.isArray(list) && list.includes(key.slice(idx + 1));
+              return sanitized.favorites[key.slice(0, idx)]?.includes(key.slice(idx + 1));
             })
           );
         }
@@ -248,8 +304,9 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     clearFavorites: async ({ providerId }) => {
-      const prov = providerId ? normalizeProviderId(providerId) : null;
-      const next = await writeStore((s) => {
+      const directory = await loadProviders();
+      const prov = providerId ? normalizeProviderId(providerId, directory) : null;
+      const next = await writeStore(directory, (s) => {
         if (prov) {
           delete s.favorites[prov];
           s.modelLabels = dropLabels(s.modelLabels, prov);
@@ -262,9 +319,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     updateConfig: async (updates) => {
-      const clean: { pinToTop?: boolean; showQuickBar?: boolean } = {};
+      const clean: { pinToTop?: boolean } = {};
       if (typeof updates.pinToTop === "boolean") clean.pinToTop = updates.pinToTop;
-      if (typeof updates.showQuickBar === "boolean") clean.showQuickBar = updates.showQuickBar;
       if (Object.keys(clean).length > 0) {
         try {
           await settings.experimental_set(clean);
@@ -280,12 +336,36 @@ export default async function plugin(bb: BbPluginApi) {
   // Register CLI Command `bb favorites`
   bb.cli.register({
     name: "favorites",
-    summary: "Manage favorite models for providers (list, add, remove, clear)",
+    summary: "Manage favorite models for providers (list, add, remove, clear, export, doctor)",
     async run(argv, _ctx) {
       const [cmd, arg1, arg2] = argv;
+      if (cmd === "doctor") {
+        if ((arg1 !== undefined && arg1 !== "--fix") || arg2 !== undefined) {
+          return { exitCode: 1, stderr: "Usage: bb favorites doctor [--fix]\n" };
+        }
+        const fix = arg1 === "--fix";
+        const directory = await fetchProviderCatalog().catch(() => []);
+        if (!directory.length) {
+          return { exitCode: 1, stderr: "Could not verify the BB provider directory.\n" };
+        }
+        return withStoreLock(async () => {
+          const before = await loadOrMigrate(directory, fix);
+          const { findings, favorites, modelLabels } = inspectFavorites(before, directory);
+          const changed = JSON.stringify(favorites) !== JSON.stringify(before.favorites) ||
+            JSON.stringify(modelLabels) !== JSON.stringify(before.modelLabels);
+          if (fix && changed) {
+            await bb.storage.kv.set(STORE_KEY, { version: before.version + 1, favorites, modelLabels });
+          }
+          const lines = findings.length ? findings : ["No favorites issues found."];
+          if (fix && changed) lines.push("Repairs applied.");
+          return { exitCode: 0, stdout: lines.join("\n") + "\n" };
+        });
+      }
+
+      const directory = await loadProviders();
 
       if (!cmd || cmd === "list" || cmd === "ls") {
-        const { favorites } = await readStore();
+        const { favorites } = await readStore(directory);
         const entries = Object.entries(favorites);
         if (entries.length === 0) {
           return {
@@ -311,15 +391,12 @@ export default async function plugin(bb: BbPluginApi) {
             stderr: "Usage: bb favorites add <provider> <model>\n",
           };
         }
-        const prov = normalizeProviderId(arg1);
-        const id = arg2.trim();
+        const prov = normalizeProviderId(arg1, directory);
+        const id = normalizeModelKey(arg2);
         if (prov === "default" || !id) {
           return { exitCode: 1, stderr: `Could not resolve provider '${arg1}'.\n` };
         }
-        await writeStore((s) => {
-          const list = s.favorites[prov] || [];
-          if (!list.includes(id)) s.favorites[prov] = [id, ...list];
-        });
+        await writeStore(directory, (s) => addModel(s, prov, id));
         return {
           exitCode: 0,
           stdout: `Added ${id} to favorites for provider '${prov}'.\n`,
@@ -336,9 +413,9 @@ export default async function plugin(bb: BbPluginApi) {
         // Same canonical key the store is written under — a raw alias like
         // "openai" must resolve to "codex" before the lookup (m1), and the
         // model id gets the same cleaning the write path applies (m3).
-        const prov = normalizeProviderId(arg1);
-        const id = cleanModelText(arg2.trim());
-        const before = await readStore();
+        const prov = normalizeProviderId(arg1, directory);
+        const id = normalizeModelKey(arg2);
+        const before = await readStore(directory);
         const list = before.favorites[prov] || [];
         if (!list.includes(id)) {
           return {
@@ -346,12 +423,7 @@ export default async function plugin(bb: BbPluginApi) {
             stderr: `Model '${id}' is not in favorites for provider '${prov}'.\n`,
           };
         }
-        await writeStore((s) => {
-          const rest = (s.favorites[prov] || []).filter((m) => m !== id);
-          if (rest.length === 0) delete s.favorites[prov];
-          else s.favorites[prov] = rest;
-          s.modelLabels = dropLabels(s.modelLabels, prov, id);
-        });
+        await writeStore(directory, (s) => removeModel(s, prov, id));
         return {
           exitCode: 0,
           stdout: `Removed ${id} from favorites for provider '${prov}'.\n`,
@@ -360,15 +432,15 @@ export default async function plugin(bb: BbPluginApi) {
 
       if (cmd === "clear") {
         if (arg1) {
-          const prov = normalizeProviderId(arg1);
-          const before = await readStore();
+          const prov = normalizeProviderId(arg1, directory);
+          const before = await readStore(directory);
           if (!before.favorites[prov]?.length) {
             return {
               exitCode: 1,
               stderr: `No favorites saved for provider '${prov}'.\n`,
             };
           }
-          await writeStore((s) => {
+          await writeStore(directory, (s) => {
             delete s.favorites[prov];
             s.modelLabels = dropLabels(s.modelLabels, prov);
           });
@@ -377,7 +449,7 @@ export default async function plugin(bb: BbPluginApi) {
             stdout: `Cleared favorites for provider '${prov}'.\n`,
           };
         }
-        await writeStore((s) => {
+        await writeStore(directory, (s) => {
           s.favorites = {};
           s.modelLabels = {};
         });
@@ -388,7 +460,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       if (cmd === "export" || cmd === "json") {
-        const snapshot = await readStore();
+        const snapshot = await readStore(directory);
         // Same wrapper shape the UI importer validates, so `bb favorites
         // export` output can be pasted straight into the settings field (m2).
         return {
@@ -409,7 +481,7 @@ export default async function plugin(bb: BbPluginApi) {
 
       return {
         exitCode: 1,
-        stderr: `Unknown subcommand '${cmd}'. Commands: list, add <prov> <model>, remove <prov> <model>, clear [prov], export\n`,
+        stderr: `Unknown subcommand '${cmd}'. Commands: list, add <prov> <model>, remove <prov> <model>, clear [prov], export, doctor [--fix]\n`,
       };
     },
   });
