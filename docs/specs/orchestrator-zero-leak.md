@@ -17,6 +17,8 @@
 - **Sandbox Preflight Probe:** обязательная проверка доступности непривилегированных пространств имён ядра хоста при инициализации оркестратора.
 - **Unmasking Oracle Attack:** класс атак, при котором злоумышленник через prompt injection или специально сформированные тесты провоцирует модель вернуть токен секрета в публичном фрагменте ответа, в результате чего наивный модуль демаскирования заменяет его на реальный секрет и запекает в коммит.
 - **Route Trust Level (`route.trust`):** уровень доверия маршрута (`trusted-local`, `trusted-cloud`, `public`), определяющий допустимость работы с конфиденциальными файлами и глубину изоляции рантайма.
+- **Build Artifact & Lock Exclude:** нормативное исключение файлов блокировок пакетных менеджеров (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `npm-shrinkwrap.json`) и карт исходников (`*.map`) из слепка для публичных маршрутов (`trust: public`), исключающее утечку URL внутренних реестров и путей хоста (§3.1).
+- **Snapshot Manifest (`.bb-snapshot-manifest.json`):** машинно-читаемый документ в корне слепка, фиксирующий состав слепка, список исключённых файлов (lock-файлы, source maps, конфиденциальные пути) и параметры изоляции рантайма (§3.1).
 
 ---
 
@@ -29,6 +31,7 @@
 | **Синтаксический слом и Unmasking Oracle (Блокер 3)** | Кириллические скобочные маркеры `[скрыто: <тип>]` ломают парсеры JSON/YAML/URL и `git apply`. Слепая подстановка запекает секреты из prompt injection в репозиторий. | **RFC ASCII-маски и One-Way Context Unmasking:** стандартизированные идентификаторы (`host-N.bb-mask.internal`, `198.51.100.N`, `__BB_REDACTED_SECRET_NNN__`). Подстановка секретов разрешена ТОЛЬКО в неизменённых строках `' '` и удалениях `'-'`. Строгий отказ сдачи при наличии токенов в `'+'` или отчёте. |
 | **Утечки окружения хоста и DoS (Блокер 4)** | bwrap без `--clearenv` передаёт переменные окружения родителя (`BB_THREAD_ID`, ключи API). Неограниченный `bash` запускает fork-бомбу. На ядрах с запретом userns запуск падает. | **Bubblewrap Sandbox, Preflight и prlimit:** обязательный `--clearenv`, полный сетевой карантин и изоляция (`--unshare-all`), боевой Sandbox Preflight Probe, исключение `/etc/resolv.conf`, лимит `prlimit --nproc=64 --as=4294967296 --cpu=1200` (4 GiB, 20 мин CPU) внутри песочницы, валидация симлинков. |
 | **Автоматический даунгрейд приватности (Блокер 5)** | При сбое доверенных провайдеров задача молча уходит на публичные бесплатные маршруты. | **Принцип Fail-Closed:** задачи с `--privacy strict` или затрагивающие `confidentialPaths` при недоступности доверенных маршрутов блокируются (`status: blocked`), фоллбэк на public запрещён. |
+| **Служебные файлы сборки и кэши (Вектор 4)** | В слепок попадают lock-файлы (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`), раскрывающие URL внутренних корпоративных registry; source maps (`*.js.map`, `*.css.map`, `*.map`), раскрывающие пути хоста и закрытые исходники; монтирование кэшей (`~/.npm`) передаёт модели полный список пакетов хоста. | **Lock & Sourcemap Exclusion, No-Cache Mounting, Snapshot Manifest:** для маршрутов `trust: public` слепок при формировании через `git archive` исключает lock-файлы (pathspec-exclude по фиксированному списку) и source maps (glob `*.map`); каталоги кэшей пакетных менеджеров (`~/.npm`, `~/.yarn`, `~/.pnpm-store`, `~/.cache`) не монтируются; перечень исключений фиксируется в манифесте слепка. |
 
 ---
 
@@ -36,12 +39,45 @@
 
 ### 3.1. Жизненный цикл одноразового слепка
 
-1. **Создание слепка:**
+1. **Создание слепка и фильтрация служебных файлов сборки (Вектор 4):**
    - Для задачи с базовым коммитом `<base-sha>` оркестратор генерирует временный каталог песочницы:
      `SANDBOX_DIR="/tmp/bb-sandbox-${taskKey}-${runId}"`
-   - Исключаются конфиденциальные пути через pathspec `:(exclude)` и tar excludes:
-     `git archive --format=tar <base-sha> -- . ':(exclude)<confidential_glob>' | tar -xf - -C "$SANDBOX_DIR"`
-   - Если путь из `confidentialPaths` всё же попал в каталог `$SANDBOX_DIR`, он физически удаляется до старта процессов: `rm -rf "$SANDBOX_DIR/<path>"`.
+   - Для маршрутов с `trust: "public"` формируется комплексный перечень pathspec-исключений `:(exclude)` и tar excludes:
+     1) **Конфиденциальные пути:** пути из `confidentialPaths` (`:(exclude)<confidential_glob>`).
+     2) **Файлы блокировок зависимостей (lock-файлы):** фиксированный список `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `npm-shrinkwrap.json` (в корне и во всех вложенных каталогах: `:(exclude)package-lock.json`, `:(exclude)*/package-lock.json`, `:(exclude)yarn.lock`, `:(exclude)*/yarn.lock`, `:(exclude)pnpm-lock.yaml`, `:(exclude)*/pnpm-lock.yaml`, `:(exclude)bun.lockb`, `:(exclude)*/bun.lockb`, `:(exclude)npm-shrinkwrap.json`, `:(exclude)*/npm-shrinkwrap.json`). Исключение предотвращает утечку URL внутренних корпоративных registry (например `https://npm.corp.internal/...`) и структуры приватных пакетов.
+     3) **Сборочные карты кода (source maps):** glob-шаблон `*.map` (`:(exclude)*.map`, `:(exclude)*/*.map`). Исключение предотвращает утечку абсолютных путей хоста сборки (`/home/.../work/...`) и оригинальных исходных текстов.
+   - Экспорт снимка в песочницу:
+     ```bash
+     LOCK_AND_MAP_EXCLUDES=(
+       ":(exclude)package-lock.json" ":(exclude)*/package-lock.json"
+       ":(exclude)yarn.lock" ":(exclude)*/yarn.lock"
+       ":(exclude)pnpm-lock.yaml" ":(exclude)*/pnpm-lock.yaml"
+       ":(exclude)bun.lockb" ":(exclude)*/bun.lockb"
+       ":(exclude)npm-shrinkwrap.json" ":(exclude)*/npm-shrinkwrap.json"
+       ":(exclude)*.map" ":(exclude)*/*.map"
+     )
+     git archive --format=tar <base-sha> -- . "${EXCLUDE_CONFIDENTIAL_ARGS[@]}" "${LOCK_AND_MAP_EXCLUDES[@]}" | tar -xf - -C "$SANDBOX_DIR"
+     ```
+   - **Физическая санитарная доочистка:** если путь из `confidentialPaths`, lock-файл или `*.map` всё же попал в каталог `$SANDBOX_DIR`, он принудительно удаляется до старта процессов:
+     `rm -rf "$SANDBOX_DIR/<path>"` и
+     `find "$SANDBOX_DIR" -type f \( -name "package-lock.json" -o -name "yarn.lock" -o -name "pnpm-lock.yaml" -o -name "bun.lockb" -o -name "npm-shrinkwrap.json" -o -name "*.map" \) -delete`
+   - **Манифест слепка (`.bb-snapshot-manifest.json`):** в корне каталога `$SANDBOX_DIR` оркестратор формирует машинно-читаемый манифест слепка, фиксирующий параметры изоляции и перечень исключённых артефактов:
+     ```json
+     {
+       "version": "1.0",
+       "taskKey": "PLUG-366",
+       "baseSha": "<base-sha>",
+       "trust": "public",
+       "createdAt": "2026-11-21T00:00:00.000Z",
+       "excludes": {
+         "confidentialPaths": ["src/auth/**", "secrets/**"],
+         "lockFiles": ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "npm-shrinkwrap.json"],
+         "sourceMaps": ["*.map"],
+         "caches": [".pytest_cache", ".mypy_cache", ".next", "node_modules/.cache"]
+       },
+       "noMountCaches": ["~/.npm", "~/.cache", "~/.yarn", "~/.pnpm-store"]
+     }
+     ```
    - Конфигурационные файлы пакетных менеджеров (`.npmrc`, `.yarnrc.yml`), содержащие токены приватных реестров, не удаляются (что вызвало бы ошибку `git apply` в соседних строках контекста), а проходят in-place замену: значения токенов заменяются масками `__BB_REDACTED_SECRET_*__` с обязательной регистрацией пар `токен -> маска` в `DLP_MAP` задачи, сохраняя структуру строк. Файлы секретов `.env`, `.env.local`, `.env.production` (за исключением шаблонов вроде `.env.example`, если они явно не включены в `confidentialPaths`), кэши `.pytest_cache`, `.mypy_cache`, `.next`, `node_modules/.cache` зачищаются.
 
 2. **Инициализация одноразового Git:**
@@ -95,6 +131,7 @@
      - если путь в репозитории — файл: `--ro-bind /dev/null /workspace/<confidentialPath>`
      - если путь в репозитории — каталог: `--tmpfs /workspace/<confidentialPath>`
    - Замечание: файл `/etc/resolv.conf` **НЕ пробрасывается**, так как сеть отключена (`--unshare-all`), а его содержимое раскрывает IP-адреса локальных DNS-серверов хоста.
+   - **Запрет монтирования кэшей пакетных менеджеров хоста:** каталоги пользовательских кэшей на хосте (`~/.npm`, `~/.cache`, `~/.yarn`, `~/.pnpm-store`, `~/.cargo/registry`, `~/.cache/pip`) **СТРОГО НЕ МОНТИРУЮТСЯ** в песочницу (никаких точек `--ro-bind` или `--bind` для каталогов кэшей пользователя). Это исключает утечку перечня всех установленных пакетов и версий в проектах хоста. В песочнице переменная `HOME` устанавливается в изолированную временную директорию `--setenv HOME /tmp`, использующую память tmpfs (`--tmpfs /tmp`).
 
 4. **Извлечение, очистка и применение результата:**
    - По завершении хода оркестратор выполняет безопасную очистку артефактов и плейсхолдеров, регистрирует новые untracked-файлы и снимает дифф:
@@ -111,7 +148,7 @@
        rm -rf "$placeholder"
      done
 
-     # 3. Инициализация и формирование массива pathspec-исключений для confidentialPaths и артефактов
+     # 3. Инициализация и формирование массива pathspec-исключений для confidentialPaths, lock-файлов, source maps и артефактов
      CONFIDENTIAL_PATHS=("${POLICY_CONFIDENTIAL_PATHS[@]}")
      EXCLUDE_CONFIDENTIAL_ARGS=()
      for p in "${CONFIDENTIAL_PATHS[@]}"; do
@@ -123,14 +160,21 @@
        ":(exclude).venv" ":(exclude)*/.venv"
        ":(exclude)__pycache__" ":(exclude)*/__pycache__"
        ":(exclude)*.pyc"
+       ":(exclude)package-lock.json" ":(exclude)*/package-lock.json"
+       ":(exclude)yarn.lock" ":(exclude)*/yarn.lock"
+       ":(exclude)pnpm-lock.yaml" ":(exclude)*/pnpm-lock.yaml"
+       ":(exclude)bun.lockb" ":(exclude)*/bun.lockb"
+       ":(exclude)npm-shrinkwrap.json" ":(exclude)*/npm-shrinkwrap.json"
+       ":(exclude)*.map" ":(exclude)*/*.map"
+       ":(exclude).bb-snapshot-manifest.json"
      )
 
      # 4. Регистрация untracked-файлов без принудительного флага -f
      # Флаг -f исключён: он втаскивал бы игнорируемые деревья и кэши в патч.
-     # Регистрация уважает .gitignore и исключает confidentialPaths.
+     # Регистрация уважает .gitignore и исключает confidentialPaths, lock-файлы и source maps.
      git -C "$SANDBOX_DIR" add -AN -- . "${EXCLUDE_CONFIDENTIAL_ARGS[@]}"
 
-     # 5. Снятие диффа с явным исключением confidentialPaths
+     # 5. Снятие диффа с явным исключением confidentialPaths, lock-файлов и source maps
      git -C "$SANDBOX_DIR" diff HEAD -- . "${EXCLUDE_CONFIDENTIAL_ARGS[@]}" > "$SANDBOX_DIR/patch.diff"
      ```
    - **Исключение флага `-f` и правило размещения артефактов:** стандартная команда `git add -AN` уважает правила `.gitignore`. Новые исходные файлы агента (например, `src/utils/new-helper.ts`) регистрируются как intent-to-add и попадают в дифф, в то время как сборочные зависимости и кэши отсекаются `git clean -fdX`, `.gitignore` и pathspec-исключениями. Исполнитель на публичном маршруте обязан сохранять целевые артефакты вне путей, включённых в `.gitignore`; если агент создаёт файл под шаблоном `.gitignore` (например `report.log` при `*.log`), такой файл трактуется как сборочный мусор и не входит в патч.
@@ -284,13 +328,14 @@ export interface PolicyRoute {
 
 ## 6. Приёмочные сценарии (Верификация 5 блокеров безопасности)
 
-1. **Тест Б1 (Snapshot Sandbox + ENV sterilization):**
-   - Запуск агента на публичном маршруте.
-   - Проверка истории: `git log --all`, `git reflog`, `git rev-list --objects` возвращают ровно один коммит `sandbox root snapshot`.
+1. **Тест Б1 (Snapshot Sandbox, ENV sterilization и изоляция Git-истории — Вектор 1):**
+   - Запуск агента на публичном маршруте (`trust: public`).
+   - Проверка истории внутри Snapshot Sandbox: команды `git log --all`, `git log -p`, `git reflog`, `git rev-list --objects`, `git log --format="%an %ae"` возвращают ровно один коммит `sandbox root snapshot`.
+   - Попытки обращения к родительской истории (`git rev-parse --git-common-dir`, чтение коммитов до `<base-sha>`) завершаются ошибкой (родительский каталог `.git` физически отсутствует в песочнице). Секреты, удалённые в истории родительского репозитория, и метаданные задач/авторов недоступны агенту.
    - Проверка ENV: вызов `env` внутри песочницы подтверждает отсутствие `BB_THREAD_ID`, `BB_SERVER_URL` и токенов провайдеров.
-2. **Тест Б2 (Физическое исключение `confidentialPaths`, сохранность отслеживаемых файлов и фильтрация .gitignore):**
+2. **Тест Б2 (Физическое исключение и транзитивное чтение `confidentialPaths` — Вектор 2):**
    - В репозитории есть `src/auth/secret.ts` (файл) и `secrets/keys/` (каталог) из `confidentialPaths`, а также закоммиченный файл сборки `dist/bundle.js`.
-   - Чтение файла возвращает пустой вывод (`/dev/null`), чтение каталога — пустую директорию `tmpfs`.
+   - Проверка невозможности транзитивного чтения: при попытке прямого или транзитивного чтения (через `read_file`, `cat`, запуск `node -e 'import("./src/auth/secret.ts")'` или чтение из bash-скрипта) чтение файла возвращает пустой вывод (`/dev/null`, 0 байт), а чтение директории — пустую директорию `tmpfs`. Попытка транзитивного импорта конфиденциального модуля падает с синтаксической ошибкой пустого файла либо отсутствия именованных экспортов, исключая транзитивную утечку данных модулей через зависимости в отчёт или контекст модели.
    - В процессе работы агент создаёт:
      - новый файл `src/utils/new-helper.ts` (untracked, не в `.gitignore`);
      - временные сборочные файлы в корне и пакетах: `node_modules/pkg/index.js`, `packages/sub/node_modules/dep/index.js` и `test.log` (подпадают под `.gitignore` либо pathspec-исключения).
@@ -311,3 +356,10 @@ export interface PolicyRoute {
    - Задача с `--privacy strict`. Провайдер `swe2` (trusted-cloud) отключен или исчерпал лимиты.
    - Попытка перехода задачи с `--privacy strict` на публичный маршрут при отключенном swe2.
    - Результат: автоматический переход в `blocked` без попытки раздачи на `argon`/`web-gemini`/`public`.
+6. **Тест Б6 (Исключение lock-файлов, source maps и кэшей пакетных менеджеров — Вектор 4):**
+   - Репозиторий на базовом коммите содержит `package-lock.json`, `packages/sub/yarn.lock`, `pnpm-lock.yaml`, сборочные карты `dist/bundle.js.map`, `src/app.ts.map`, а на хосте присутствует каталог `~/.npm`.
+   - При создании слепка для публичного маршрута (`trust: public`):
+     1) Все lock-файлы (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `npm-shrinkwrap.json`) и карты кода `*.map` отсутствуют в `$SANDBOX_DIR` (отфильтрованы pathspec-исключением `git archive` и контрольной зачисткой);
+     2) Каталоги кэшей пакетных менеджеров хоста (`~/.npm`, `~/.cache`, `~/.yarn`, `~/.pnpm-store`) не смонтированы в песочницу (внутри песочницы `ls ~/.npm` завершается `ENOENT`, домашняя директория изолирована: `HOME=/tmp`);
+     3) Манифест слепка `$SANDBOX_DIR/.bb-snapshot-manifest.json` содержит секцию `excludes` со списком исключённых lock-файлов, масок `*.map` и конфиденциальных путей с указанием причины (`build-artifact-leak-prevention`, `confidential-path`);
+     4) При снятии диффа `patch.diff` отсутствие lock-файлов и `*.map` не порождает ложных удалений (`deleted file mode`) в диффе благодаря pathspec-исключению при `git diff`.
