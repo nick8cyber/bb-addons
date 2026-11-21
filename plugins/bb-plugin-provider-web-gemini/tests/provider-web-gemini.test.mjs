@@ -5309,3 +5309,119 @@ test("31. browser-groups: kernel marker lock + unified stopChrome teardown (за
     groupPids.splice(groupPids.indexOf(pgid), 1);
   }
 });
+
+test("32. browser-groups: no flock on linux fails closed — no in-process degrade (заход 7)", async (t) => {
+  if (process.platform !== "linux") return;
+  // The fixture requires a healthy host: flock must exist HERE — the child
+  // loses it only through a stripped PATH.
+  assert.equal(
+    spawnSync("flock", ["--version"], { stdio: "ignore" }).status,
+    0,
+    "fixture requires util-linux flock on this host"
+  );
+  const groupPids = [];
+  const modulePath = path.join(PLUGIN_ROOT, "src/browser-groups.cjs");
+  const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-z7-")));
+  fs.writeFileSync(path.join(stateDir, "accounts-state.json"), JSON.stringify({ accounts: {}, leases: {} }));
+  const port = "19509";
+  const proc = spawn("bash", ["-c", `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 600`], {
+    detached: true,
+    stdio: "ignore",
+  });
+  proc.unref();
+  groupPids.push(proc.pid);
+  t.after(() => {
+    for (const pgid of groupPids) {
+      try { process.kill(-pgid, "SIGKILL"); } catch {}
+    }
+    groupPids.length = 0;
+  });
+  for (let i = 0; i < 60 && !browserGroups.cmdlineMatchesPort(proc.pid, port); i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const pgid = proc.pid;
+  browserGroups.writeMarker(stateDir, {
+    version: 1, port, pgid,
+    pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+    ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+    launchedMs: Date.now() - 10 * 60_000,
+  });
+  const before = fs.readFileSync(browserGroups.markerPath(stateDir, port), "utf8");
+
+  const noFlockPath = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-nopath-")));
+  const waitFile = async (f, what) => {
+    for (let i = 0; i < 100 && !fs.existsSync(f); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(fs.existsSync(f), `child did not signal ${what}`);
+  };
+  const readyA = path.join(stateDir, "z7-holder-ready");
+  const resB = path.join(stateDir, "z7-noflock-result.json");
+  const enteredB = path.join(stateDir, "z7-noflock-entered");
+
+  // A live holder (healthy PATH) parks inside the port's critical section.
+  const holder = spawn(process.execPath, ["-e",
+    'const bg=require(process.env.BG_MODULE);const fs=require("fs");' +
+    'bg.withMarkerLock(process.env.BG_STATE_DIR,process.env.BG_PORT,()=>{' +
+    '  fs.writeFileSync(process.env.BG_READY,"1");' +
+    '  const end=Date.now()+60000;while(Date.now()<end){}' +
+    '});'], {
+    stdio: "ignore",
+    env: { ...process.env, BG_MODULE: modulePath, BG_STATE_DIR: stateDir, BG_PORT: port, BG_READY: readyA },
+  });
+  t.after(() => { try { holder.kill("SIGKILL"); } catch {} });
+  await waitFile(readyA, "holder-ready");
+
+  // The contender runs with a PATH that has no flock. Every serialized
+  // operation — the lock itself, marker write/remove, adoption, record and
+  // the whole teardown pipeline — must refuse with BG_LOCK_UNAVAILABLE
+  // instead of degrading to the in-process map and entering concurrently
+  // with the live kernel-lock holder.
+  const m2 = JSON.stringify({
+    version: 1, port, pgid: process.pid, ownerPid: process.pid,
+    mode: "xvfb", launchedMs: Date.now(),
+  });
+  const contenderScript =
+    'const bg=require(process.env.BG_MODULE);const fs=require("fs");\n' +
+    '(async()=>{const out={};\n' +
+    'const rec=(k,fn)=>{try{const v=fn();out[k]={ok:true,value:v==null?null:String(v)};}' +
+    'catch(e){out[k]={ok:false,code:e&&e.code||null,msg:String(e&&e.message||e).slice(0,300)};}};\n' +
+    'rec("lock",()=>bg.withMarkerLock(process.env.BG_STATE_DIR,process.env.BG_PORT,()=>{' +
+    'fs.writeFileSync(process.env.BG_ENTERED,"1");return "entered";}));\n' +
+    'rec("write",()=>{bg.writeMarker(process.env.BG_STATE_DIR,JSON.parse(process.env.BG_M2));return "wrote";});\n' +
+    'rec("remove",()=>{bg.removeMarker(process.env.BG_STATE_DIR,process.env.BG_PORT);return "removed";});\n' +
+    'rec("adopt",()=>{const r=bg.adoptGroup(process.env.BG_STATE_DIR,process.env.BG_PORT);return r?"adopted":"declined";});\n' +
+    'rec("record",()=>{const r=bg.recordGroup({stateDir:process.env.BG_STATE_DIR,port:process.env.BG_PORT,pgid:process.pid});return r?"recorded":"skipped";});\n' +
+    'try{const r=await bg.teardownGroup({stateDir:process.env.BG_STATE_DIR,port:process.env.BG_PORT});' +
+    'out.teardown={ok:true,value:r.status};}catch(e){out.teardown={ok:false,code:e&&e.code||null,msg:String(e&&e.message||e).slice(0,300)};}\n' +
+    'fs.writeFileSync(process.env.BG_RES,JSON.stringify(out));\n' +
+    '})().catch((e)=>{try{fs.writeFileSync(process.env.BG_RES,"FATAL:"+String(e));}catch{}});\n';
+  const contender = spawn(process.execPath, ["-e", contenderScript], {
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      PATH: noFlockPath, // no util-linux flock on this PATH
+      BG_MODULE: modulePath, BG_STATE_DIR: stateDir, BG_PORT: port,
+      BG_M2: m2, BG_RES: resB, BG_ENTERED: enteredB,
+    },
+  });
+  t.after(() => { try { contender.kill("SIGKILL"); } catch {} });
+  await waitFile(resB, "contender result");
+
+  const out = JSON.parse(fs.readFileSync(resB, "utf8"));
+  for (const key of ["lock", "write", "remove", "adopt", "record", "teardown"]) {
+    assert.equal(out[key]?.ok, false, `${key} must refuse without flock`);
+    assert.equal(out[key]?.code, "BG_LOCK_UNAVAILABLE", `${key} refusal must carry the diagnostic code`);
+    assert.match(out[key]?.msg || "", /flock/i, `${key} refusal must name the cause`);
+  }
+  assert.equal(fs.existsSync(enteredB), false, "the contender must never enter the critical section");
+  assert.equal(
+    fs.readFileSync(browserGroups.markerPath(stateDir, port), "utf8"),
+    before,
+    "marker must be untouched by refused writes"
+  );
+  assert.equal(browserGroups.isPidAlive(pgid), true, "no signal may escape the refused teardown");
+  assert.equal(browserGroups.groupExists(pgid), true, "group alive — teardown never reached the signal path");
+  assert.equal(browserGroups.isPidAlive(holder.pid), true, "holder untouched");
+  holder.kill("SIGKILL");
+});

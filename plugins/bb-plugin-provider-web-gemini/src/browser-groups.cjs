@@ -33,7 +33,9 @@
 // (заход 5). The lock is owned by the open file description — the kernel
 // releases it when the holder's last fd closes, including on death, so no
 // stale-steal is ever needed and a paused holder's lock is never taken
-// away (заход 6).
+// away (заход 6). On Linux a missing or failing `flock` fails closed
+// (заход 7): every locked section refuses with BG_LOCK_UNAVAILABLE —
+// the in-process fallback is only ever used where boot scoping is 'off'.
 
 const fs = require('fs');
 const path = require('path');
@@ -167,10 +169,14 @@ function isPidAlive(pid) {
 
 const MARKER_LOCK_WAIT_MS = Number(process.env.BG_MARKER_LOCK_WAIT_MS) || 10_000;
 
-// Lock files this process already holds (path -> fd, or null when flock is
-// unavailable and only the in-process reentrancy guard applies — marker
-// locking is only load-bearing on Linux, where util-linux `flock` is part
-// of the base system). Same-process reentrancy: a locked writeMarker
+// Lock files this process already holds (path -> fd, or null on non-Linux
+// where flock does not exist and only the in-process reentrancy guard
+// applies — the same axis as boot scoping 'off'). On Linux the kernel lock
+// is MANDATORY: without a working flock there is no cross-process
+// serialization, so marker writes/removals and the teardown signal path
+// FAIL CLOSED (заход 7) instead of silently degrading to the Map — a
+// second process would otherwise enter the section concurrently with a
+// live kernel-lock holder. Same-process reentrancy: a locked writeMarker
 // inside a withMarkerLock section must not re-acquire.
 const heldMarkerLocks = new Map();
 
@@ -194,12 +200,25 @@ function flockBin() {
   return flockAvailable ? 'flock' : null;
 }
 
+// Fail-closed refusal on Linux (заход 7): the error carries a machine-
+// readable code and the reason so every caller — reaper, stopChrome,
+// adopt/record — propagates it into its own diagnostics (slog / thrown
+// launch error) instead of the section silently running unsynchronized.
+function markerLockUnavailable(reason) {
+  const err = new Error(`browser-group marker lock unavailable on linux: ${reason}`);
+  err.code = 'BG_LOCK_UNAVAILABLE';
+  return err;
+}
+
 function acquireMarkerLock(stateDir, port) {
   const p = markerLockPath(stateDir, port);
   if (heldMarkerLocks.has(p)) return;
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const bin = flockBin();
   if (!bin) {
+    // Non-Linux (bootState 'off' axis): no flock exists at all, degrade to
+    // the in-process guard. Linux: refuse — no serialization, no section.
+    if (process.platform === 'linux') throw markerLockUnavailable('flock not found on PATH');
     heldMarkerLocks.set(p, null);
     return;
   }
@@ -213,6 +232,11 @@ function acquireMarkerLock(stateDir, port) {
     stdio: ['ignore', 'ignore', 'ignore', fd],
     timeout: MARKER_LOCK_WAIT_MS + 10_000,
   });
+  if (res.error && process.platform === 'linux') {
+    try { fs.closeSync(fd); } catch {}
+    if (res.error.code === 'ENOENT') flockAvailable = false; // binary vanished mid-run
+    throw markerLockUnavailable(`flock spawn failed: ${res.error.code || res.error.message || res.error}`);
+  }
   if (res.error && res.error.code === 'ENOENT') {
     flockAvailable = false; // binary vanished mid-run — degrade to reentrancy
     try { fs.closeSync(fd); } catch {}
@@ -324,44 +348,39 @@ function recordGroup({ stateDir, port, pgid, mode, userDataDir, profileDir }) {
     profileDir: profileDir || null,
     launchedMs: Date.now(),
   };
-  try {
-    writeMarker(stateDir, meta);
-    return meta;
-  } catch {
-    return null;
-  }
+  // A group that cannot be marked is a group reapers will never manage —
+  // surface the failure (marker lock unavailable, fs error) instead of
+  // silently leaving an unmanaged browser running (fail-closed, заход 7).
+  writeMarker(stateDir, meta);
+  return meta;
 }
 
 // The current lease holder adopts a group launched by an earlier owner — the
 // marker then points at a live verifiable owner instead of a dead one. A
 // fresh `reaping` mark refuses adoption: the group is being torn down.
 function adoptGroup(stateDir, port, meta = null) {
-  try {
-    return withMarkerLock(stateDir, port, () => {
-      // The freshest on-disk marker wins over a caller-supplied copy.
-      meta = readMarker(stateDir, port) || meta;
-      if (!meta) return null;
-      // A stale-boot marker names a group that died with the previous boot —
-      // whatever now matches its pgid is foreign and must never be adopted.
-      // An indeterminate boot (markerMatchesBoot → null) fails closed too.
-      if (!markerMatchesBoot(meta)) return null;
-      if (isReaping(meta)) return null;
-      if (meta.ownerPid === process.pid) return meta;
-      meta.ownerPid = process.pid;
-      meta.ownerStartTime = readProcStat(process.pid)?.startTime ?? meta.ownerStartTime;
-      meta.adoptedMs = Date.now(); // covers the adopt→connect window like a launch
-      delete meta.reaping; // drop a stale mark left by a reaper that died mid-teardown
-      delete meta.doubt; // a fresh owner means the doubtful episode is over
-      try {
-        writeMarkerUnlocked(stateDir, meta);
-      } catch {}
-      return meta;
-    });
-  } catch {
-    // The lock itself is unavailable (hung holder, unwritable dir) —
-    // decline the adoption rather than claim ownership unsynchronized.
-    return null;
-  }
+  // Lock and marker-write failures propagate (заход 7): an adoption that
+  // could not run under the kernel lock or could not be persisted must not
+  // pretend to have happened — the caller sees and records the refusal.
+  // Declines inside the section still return null.
+  return withMarkerLock(stateDir, port, () => {
+    // The freshest on-disk marker wins over a caller-supplied copy.
+    meta = readMarker(stateDir, port) || meta;
+    if (!meta) return null;
+    // A stale-boot marker names a group that died with the previous boot —
+    // whatever now matches its pgid is foreign and must never be adopted.
+    // An indeterminate boot (markerMatchesBoot → null) fails closed too.
+    if (!markerMatchesBoot(meta)) return null;
+    if (isReaping(meta)) return null;
+    if (meta.ownerPid === process.pid) return meta;
+    meta.ownerPid = process.pid;
+    meta.ownerStartTime = readProcStat(process.pid)?.startTime ?? meta.ownerStartTime;
+    meta.adoptedMs = Date.now(); // covers the adopt→connect window like a launch
+    delete meta.reaping; // drop a stale mark left by a reaper that died mid-teardown
+    delete meta.doubt; // a fresh owner means the doubtful episode is over
+    writeMarkerUnlocked(stateDir, meta);
+    return meta;
+  });
 }
 
 function ownerAlive(meta) {

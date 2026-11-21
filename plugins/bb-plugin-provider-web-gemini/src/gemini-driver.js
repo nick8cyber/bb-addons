@@ -279,15 +279,25 @@ async function ensureChrome(opts = {}) {
   proc.on('error', (e) => { spawnErr = e; });
   proc.unref();
   // Mark the group before the readiness wait: a chrome that never opens CDP
-  // but stays alive (with its Xvfb) is exactly the orphan this tracks.
-  browserGroups.recordGroup({
-    stateDir,
-    port,
-    pgid: proc.pid,
-    mode: launchMode,
-    userDataDir: targetProfile.userDataDir,
-    profileDir: targetProfile.profileDir,
-  });
+  // but stays alive (with its Xvfb) is exactly the orphan this tracks. If
+  // the marker cannot be written (marker lock unavailable, заход 7) the
+  // group is invisible to every reaper forever — kill the newborn rather
+  // than leak an unmanaged browser, and let the launch fail loudly.
+  try {
+    browserGroups.recordGroup({
+      stateDir,
+      port,
+      pgid: proc.pid,
+      mode: launchMode,
+      userDataDir: targetProfile.userDataDir,
+      profileDir: targetProfile.profileDir,
+    });
+  } catch (e) {
+    try {
+      process.kill(-proc.pid, 'SIGKILL');
+    } catch {}
+    throw e;
+  }
 
   const start = Date.now();
   while (Date.now() - start < 15000) {

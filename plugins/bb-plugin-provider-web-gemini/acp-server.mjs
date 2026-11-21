@@ -484,10 +484,13 @@ function acquireInState(state, b, owner, now) {
   // lease to a browser-group port without loading the backend pool.
   state.leases[b.id] = { pid: process.pid, acquiredMs: now, cdp: b.cdp };
   // PLUG-374: the lease holder owns the browser group on this port — under
-  // the same lock, so reapers always see a live verifiable owner.
+  // the same lock, so reapers always see a live verifiable owner. A refusal
+  // (marker lock unavailable) must be recorded, not swallowed (заход 7).
   try {
     browserGroups.adoptGroup(STATE_DIR, b.cdp);
-  } catch {}
+  } catch (e) {
+    slog("lease:adopt-group-error", { cdp: b.cdp, error: String(e) });
+  }
 }
 
 /* ---------- parse reset time (§3.4) ---------- */
