@@ -37,6 +37,7 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(join(HERE, "package.json"));
+const browserGroups = require("./src/browser-groups.cjs");
 
 // Diagnostics must stay off stdout — it is the JSON-RPC channel.
 console.log = console.error;
@@ -69,6 +70,9 @@ const LEDGER_FILE = join(STATE_DIR, "accounts-state.json");
 const LOCK_FILE = join(STATE_DIR, "accounts-state.json.lock");
 const LOCK_STALE_MS = 5000;
 const LEASE_TTL_MS = 10 * 60_000;
+// A marked group younger than this with a live foreign owner is treated as
+// still launching (recordGroup precedes CDP readiness) — idle-reap skips it.
+const GROUP_STARTUP_GRACE_MS = 60_000;
 // 20 minutes (prevents timeout of long deep reviews on neon high).
 const SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000;
 
@@ -395,14 +399,22 @@ export function getAccountPriority(b, state) {
   return 10;
 }
 
-export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null, backends = BACKENDS) {
+// A port whose browser-group marker is flagged `reaping` is off-limits for
+// new leases while the mark is fresh — the teardown owner frees it shortly.
+function reapingBusyUntil(stateDir, port, now) {
+  const meta = browserGroups.readMarker(stateDir, port);
+  return browserGroups.isReaping(meta, now) ? meta.reaping.sinceMs + browserGroups.REAPING_TTL_MS : 0;
+}
+
+export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null, backends = BACKENDS, stateDir = STATE_DIR) {
   const isLeased = (b) => {
     const l = state.leases && state.leases[b.id];
     if (l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) {
       return l.acquiredMs + LEASE_TTL_MS;
     }
     const e = accEntry(state, b.id);
-    return e && (e.inUseUntilMs ?? 0) > now && e.owner !== owner ? e.inUseUntilMs : 0;
+    const accBusy = e && (e.inUseUntilMs ?? 0) > now && e.owner !== owner ? e.inUseUntilMs : 0;
+    return Math.max(accBusy, reapingBusyUntil(stateDir, b.cdp, now));
   };
 
   const req = requestedModel ? (resolveModelId(requestedModel) || requestedModel.toLowerCase()) : null;
@@ -469,6 +481,11 @@ function acquireInState(state, b, owner, now) {
   e.owner = owner;
   e.parkedReason = null;
   state.leases[b.id] = { pid: process.pid, acquiredMs: now };
+  // PLUG-374: the lease holder owns the browser group on this port — under
+  // the same lock, so reapers always see a live verifiable owner.
+  try {
+    browserGroups.adoptGroup(STATE_DIR, b.cdp);
+  } catch {}
 }
 
 /* ---------- parse reset time (§3.4) ---------- */
@@ -963,13 +980,154 @@ export function reapOrphanAcpServers() {
   return reaped;
 }
 
+// --- managed browser groups (PLUG-374) ---
+const backendsOnPort = (port, backends) =>
+  backends.filter((b) => String(b.cdp) === String(port));
+
+function hasLiveLeaseForPort(state, port, backends, now) {
+  for (const b of backendsOnPort(port, backends)) {
+    const l = state.leases && state.leases[b.id];
+    if (l && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) return true;
+  }
+  return false;
+}
+
+// Decision, `reaping` mark, AND first signal inside the ledger lock: no fresh
+// lease for the same port can be written between the checks and SIGTERM, and
+// the fresh mark keeps leases/adoptions out for the whole grace window — the
+// teardown can never race a lease someone just took (contract §3).
+function tryTeardownGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly = false, ignoreInodes = null }) {
+  return withStateLock((state) => {
+    const now = Date.now();
+    // Re-read the marker under the lock — the caller's copy predates it.
+    const cur = browserGroups.readMarker(stateDir, meta.port);
+    if (!cur || cur.pgid !== meta.pgid) return false;
+    if (ownOnly && cur.ownerPid !== process.pid) return false;
+    // A fresh reaping mark means a teardown is already in flight (marks are
+    // only ever written under this lock, so ours cannot be fresh here).
+    if (browserGroups.isReaping(cur, now)) return false;
+    const alive = browserGroups.ownerAlive(cur);
+    // A live owner may be mid-launch or mid-adoption — the marker is written
+    // before CDP readiness/client connect — so young or freshly-adopted groups
+    // get a startup grace; a dead owner or an old idle group (no lease, no
+    // clients) is fair game (contract §2). The shutdown path (ownOnly) always
+    // tears down regardless of age.
+    if (alive && !ownOnly && (groupIsYoung(cur, now) || recentlyAdopted(cur, now))) return false;
+    if (hasLiveLeaseForPort(state, cur.port, backends, now)) return false;
+    if (browserGroups.hasLiveCdpClients(cur.port, { ignoreInodes })) return false;
+    const identity = browserGroups.identifyGroup(cur);
+    if (identity !== "matched" && identity !== "leftover") return false;
+    const marked = { ...cur, reaping: { by: process.pid, sinceMs: now } };
+    browserGroups.writeMarker(stateDir, marked);
+    if (!browserGroups.signalGroup(marked, "SIGTERM")) {
+      browserGroups.writeMarker(stateDir, cur); // nothing signaled — unmark
+      return false;
+    }
+    return marked;
+  }, ledgerPath, lockPath);
+}
+
+function groupIsYoung(meta, now) {
+  return typeof meta.launchedMs === "number" && now - meta.launchedMs < GROUP_STARTUP_GRACE_MS;
+}
+
+function recentlyAdopted(meta, now) {
+  return typeof meta.adoptedMs === "number" && now - meta.adoptedMs < GROUP_STARTUP_GRACE_MS;
+}
+
+async function teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly = false, ignoreInodes = null }) {
+  const marked = tryTeardownGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly, ignoreInodes });
+  if (!marked) return false;
+  if (!(await browserGroups.waitGroupGone(marked.pgid))) {
+    // Grace expired — re-verify under the same lock before escalating: the
+    // reaping mark kept leases out, but anything that slipped through (an
+    // adopted or rewritten marker, a live lease, a connected CDP client, or
+    // a group identity that no longer matches) vetoes the SIGKILL.
+    const killed = withStateLock((state) => {
+      const now = Date.now();
+      const cur = browserGroups.readMarker(stateDir, meta.port);
+      if (!cur || cur.pgid !== marked.pgid) return false;
+      if (cur.ownerPid !== marked.ownerPid || cur.ownerStartTime !== marked.ownerStartTime) return false;
+      if (cur.reaping?.by !== process.pid || cur.reaping?.sinceMs !== marked.reaping.sinceMs) return false;
+      if (hasLiveLeaseForPort(state, cur.port, backends, now)) return false;
+      if (browserGroups.hasLiveCdpClients(cur.port, { ignoreInodes })) return false;
+      if (!browserGroups.groupAliveMatches(cur)) return false;
+      return browserGroups.signalGroup(cur, "SIGKILL");
+    }, ledgerPath, lockPath);
+    if (!killed) {
+      browserGroups.clearReaping(stateDir, meta.port, marked.reaping);
+      return false;
+    }
+  }
+  // A fresh owner may have adopted the marker while the group was dying —
+  // only remove it if it still describes what we tore down.
+  const cur = browserGroups.readMarker(stateDir, meta.port);
+  if (cur && cur.pgid === meta.pgid && cur.ownerPid === meta.ownerPid) {
+    browserGroups.removeMarker(stateDir, meta.port);
+  }
+  return true;
+}
+
+export async function reapOrphanBrowserGroups({ stateDir = STATE_DIR, ledgerPath = LEDGER_FILE, lockPath = LOCK_FILE, backends = BACKENDS } = {}) {
+  if (process.platform !== "linux") return 0;
+  let reaped = 0;
+  for (const meta of browserGroups.listMarkers(stateDir)) {
+    try {
+      const identity = browserGroups.identifyGroup(meta);
+      if (identity === "dead") {
+        browserGroups.removeMarker(stateDir, meta.port);
+        continue;
+      }
+      if (identity === "doubtful") {
+        // Members survive that cannot be attributed to our browser stack —
+        // leave the group alone and keep the marker for the next pass.
+        slog("reaper:browser-group-doubtful", { port: meta.port, pgid: meta.pgid, ownerPid: meta.ownerPid });
+        continue;
+      }
+      if (await teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends })) {
+        reaped++;
+        slog("reaper:browser-group", { port: meta.port, pgid: meta.pgid, ownerPid: meta.ownerPid });
+      }
+    } catch (e) {
+      slog("reaper:browser-group-error", { port: meta && meta.port, error: String(e) });
+    }
+  }
+  return reaped;
+}
+
+// Clean shutdown path: tear down groups this process owns — unless someone
+// else meanwhile leased the port or external CDP clients are still attached.
+// Our own CDP sockets are excluded: the playwright connection outlives the
+// last prompt and would otherwise mask the group as busy.
+export async function cleanupOwnBrowserGroups({ stateDir = STATE_DIR, ledgerPath = LEDGER_FILE, lockPath = LOCK_FILE, backends = BACKENDS } = {}) {
+  if (process.platform !== "linux") return 0;
+  const ownInodes = browserGroups.socketInodesOf(process.pid);
+  let cleaned = 0;
+  for (const meta of browserGroups.listMarkers(stateDir)) {
+    try {
+      if (meta.ownerPid !== process.pid) continue;
+      if (await teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly: true, ignoreInodes: ownInodes })) {
+        cleaned++;
+        slog("shutdown:browser-group", { port: meta.port, pgid: meta.pgid });
+      }
+    } catch (e) {
+      slog("shutdown:browser-group-error", { port: meta && meta.port, error: String(e) });
+    }
+  }
+  return cleaned;
+}
+
 // Parent-death watchdog: reparented onto init/systemd means bridge parent died
 const ownerPpid = process.ppid;
+let ppidWatchTicks = 0;
 const ppidWatch = setInterval(() => {
   if (process.ppid !== ownerPpid || process.ppid === 1) {
     slog("process:reparented-exit", { ownerPpid, currentPpid: process.ppid });
     void cleanShutdown();
     return;
+  }
+  if (++ppidWatchTicks % 12 === 0) {
+    void reapOrphanBrowserGroups().catch(() => {});
   }
   if (!activePromptSessionId) {
     checkStaleCode();
@@ -1309,6 +1467,8 @@ async function bindBackend(s, sessionId, profile = s) {
       if (activeLease && activeLease.pid !== process.pid && now - (activeLease.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(activeLease.pid)) {
         return { busyUntil: activeLease.acquiredMs + LEASE_TTL_MS, account: b.id };
       }
+      const reapUntil = reapingBusyUntil(STATE_DIR, b.cdp, now);
+      if (reapUntil > now) return { busyUntil: reapUntil, account: b.id };
       acquireInState(state, b, owner, now);
       return { ok: true };
     });
@@ -1328,14 +1488,17 @@ async function bindBackend(s, sessionId, profile = s) {
       const cool = e?.cooldownUntilMs ?? 0;
       const l = state.leases && state.leases[s.backend.id];
       const busy = l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid);
+      const reapUntil = reapingBusyUntil(STATE_DIR, s.backend.cdp, now);
+      const reaping = reapUntil > now;
 
-      if (cool <= now && !busy && !isLocked) {
+      if (cool <= now && !busy && !isLocked && !reaping) {
         acquireInState(state, s.backend, owner, now);
         return { backend: s.backend };
       }
       const prev = s.backend.id;
       if (s.convId) {
         if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
+        if (reaping) return { busyUntil: reapUntil, account: prev };
         if (isLocked) return { error: `account "${prev}" does not support model "${reqModel}" (tier: ${tier}); this conversation is pinned to it` };
         return { error: `account "${prev}" is in cooldown until ${new Date(cool).toISOString()}; this conversation is pinned to it` };
       }
@@ -1346,6 +1509,7 @@ async function bindBackend(s, sessionId, profile = s) {
       }
       if (r.busyUntil) return { busyUntil: r.busyUntil };
       if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
+      if (reaping) return { busyUntil: reapUntil, account: prev };
       if (r.none) {
         return { error: reqModel === "carbon" ? "no accounts in pool with Carbon available" : "all accounts are in cooldown or busy and no sibling is free" };
       }
@@ -2232,6 +2396,7 @@ async function cleanShutdown() {
       await releaseLease(activeBackendId);
       activeBackendId = null;
     }
+    await cleanupOwnBrowserGroups();
   } catch {}
   process.exit(0);
 }
@@ -2924,6 +3089,7 @@ function dispatchPrompt(msg, sess) {
 export function startServer({ webDriver } = {}) {
   if (webDriver) driver = webDriver;
   reapOrphanAcpServers();
+  void reapOrphanBrowserGroups().catch((e) => slog("reaper:browser-groups-error", { error: String(e) }));
   // §7.2/§9: чистка журнала (TTL/лимит записей) до чистки вложений — файлы,
   // нужные восстановлению активных ходов, защищены от pruneDir.
   try {

@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn, execSync } from "node:child_process";
+import net from "node:net";
+import { spawn, spawnSync, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { createRequire } from "node:module";
@@ -26,10 +27,13 @@ import {
   collectUploadFiles,
   pruneDir,
   settleBackend,
+  reapOrphanBrowserGroups,
+  cleanupOwnBrowserGroups,
 } from "../acp-server.mjs";
 
 const require = createRequire(import.meta.url);
 const driver = require("../src/gemini-driver.js");
+const browserGroups = require("../src/browser-groups.cjs");
 const usageLimitsModule = require("../src/usage-limits.js");
 const {
   selectModelAndThinking,
@@ -4052,5 +4056,459 @@ test("20. PLUG-304: turn completion predicate and thinking/pause guards", async 
   } finally {
     _setDriverHooks(null);
     Date.now = realDateNow;
+  }
+});
+
+/* ---------- PLUG-374: managed browser groups (chrome/xvfb lifecycle) ---------- */
+
+test("24. browser-groups: marker/adopt/identity primitives", async () => {
+  if (process.platform !== "linux") return;
+  const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-units-")));
+
+  // recordGroup captures a verifiable identity: pgid + leader starttime +
+  // owner pid + owner starttime.
+  const self = browserGroups.readProcStat(process.pid);
+  const meta = browserGroups.recordGroup({ stateDir, port: "19401", pgid: process.pid, mode: "xvfb" });
+  assert.equal(meta.ownerPid, process.pid);
+  assert.equal(meta.ownerStartTime, self.startTime);
+  assert.equal(meta.pgidStartTime, self.startTime);
+  assert.ok(fs.existsSync(browserGroups.markerPath(stateDir, "19401")));
+
+  // A dead owner pid fails ownerAlive even though a marker exists.
+  const deadPid = spawnSync("true").pid;
+  browserGroups.writeMarker(stateDir, {
+    version: 1, port: "19402", pgid: process.pid, pgidStartTime: self.startTime,
+    ownerPid: deadPid, ownerStartTime: 0, mode: "xvfb",
+  });
+  const dead = browserGroups.readMarker(stateDir, "19402");
+  assert.equal(browserGroups.ownerAlive(dead), false);
+
+  // adoptGroup re-points an orphaned marker at the current owner.
+  const adopted = browserGroups.adoptGroup(stateDir, "19402");
+  assert.equal(adopted.ownerPid, process.pid);
+  assert.equal(browserGroups.ownerAlive(browserGroups.readMarker(stateDir, "19402")), true);
+
+  // Adopting a port with no marker creates nothing (external chrome stays
+  // unmanaged — never killed by reapers).
+  assert.equal(browserGroups.adoptGroup(stateDir, "19403"), null);
+  assert.equal(browserGroups.readMarker(stateDir, "19403"), null);
+
+  // A fresh `reaping` mark refuses adoption — the group is being torn down.
+  const deadPid2 = spawnSync("true").pid;
+  browserGroups.writeMarker(stateDir, {
+    version: 1, port: "19404", pgid: process.pid, pgidStartTime: self.startTime,
+    ownerPid: deadPid2, ownerStartTime: 0, mode: "xvfb",
+    reaping: { by: 424242, sinceMs: Date.now() },
+  });
+  assert.equal(browserGroups.adoptGroup(stateDir, "19404"), null, "fresh reaping mark must refuse adoption");
+  assert.equal(browserGroups.isReaping(browserGroups.readMarker(stateDir, "19404")), true);
+
+  // A stale mark (reaper died mid-teardown) does not block adoption — and the
+  // adopting owner clears it.
+  browserGroups.writeMarker(stateDir, {
+    version: 1, port: "19404", pgid: process.pid, pgidStartTime: self.startTime,
+    ownerPid: deadPid2, ownerStartTime: 0, mode: "xvfb",
+    reaping: { by: 424242, sinceMs: Date.now() - browserGroups.REAPING_TTL_MS - 1 },
+  });
+  const adoptedStale = browserGroups.adoptGroup(stateDir, "19404");
+  assert.equal(adoptedStale.ownerPid, process.pid);
+  assert.equal(adoptedStale.reaping, undefined, "adoption clears a stale reaping mark");
+});
+
+test("25. browser-groups: orphan reap, lease/CDP preservation, reparented groups", async (t) => {
+  if (process.platform !== "linux") return;
+  const backendsFor = (port) => [{ id: "acc1", cdp: String(port) }];
+  const groupPids = [];
+
+  // Per-scenario state dir — the reaper scans every marker in the dir, so
+  // leftover groups from an earlier scenario must not leak into the next one.
+  const newState = () => {
+    const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-reap-")));
+    const ledgerPath = path.join(stateDir, "accounts-state.json");
+    fs.writeFileSync(ledgerPath, JSON.stringify({ accounts: {}, leases: {} }));
+    return { stateDir, ledgerPath, lockPath: `${ledgerPath}.lock` };
+  };
+
+  // Wait until the fixture has exec'd into its faux-chrome identity, not just
+  // until /proc/<pid>/stat is readable.
+  const waitChrome = async (pid, port) => {
+    for (let i = 0; i < 60; i++) {
+      if (browserGroups.cmdlineMatchesPort(pid, port)) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+
+  // A real detached process group whose leader cmdline carries the port flag —
+  // the same shape xvfb-run/chrome groups have.
+  const fakeChromeGroup = async (port) => {
+    const proc = spawn("bash", ["-c", `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 600`], {
+      detached: true,
+      stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    return proc.pid;
+  };
+  const markOrphan = (stateDir, port, pgid) =>
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port: String(port), pgid,
+      pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now(),
+    });
+  t.after(() => {
+    for (const pgid of groupPids) {
+      try { process.kill(-pgid, "SIGKILL"); } catch {}
+    }
+    groupPids.length = 0;
+  });
+
+  // (a) crash death: dead owner + no lease + no clients → whole group reaped.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19411";
+    const pgid = await fakeChromeGroup(port);
+    markOrphan(stateDir, port, pgid);
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    assert.equal(n, 1, "orphan group must be reaped");
+    assert.equal(browserGroups.groupMembers(pgid).length, 0, "process group must be dead");
+    assert.equal(browserGroups.readMarker(stateDir, port), null, "marker must be removed");
+    groupPids.splice(groupPids.indexOf(pgid), 1);
+  }
+
+  // (b) a live lease on the port's backend preserves the group.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19412";
+    const pgid = await fakeChromeGroup(port);
+    markOrphan(stateDir, port, pgid);
+    const holder = spawn("sleep", ["60"], { stdio: "ignore" });
+    t.after(() => { try { holder.kill("SIGKILL"); } catch {} });
+    fs.writeFileSync(ledgerPath, JSON.stringify({ accounts: {}, leases: { acc1: { pid: holder.pid, acquiredMs: Date.now() } } }));
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    assert.equal(n, 0, "group with a live lease must be preserved");
+    assert.equal(browserGroups.groupExists(pgid), true);
+  }
+
+  // (c) a live CDP client without any lease preserves the group (flow case:
+  // external tooling attached to the debugging port is not our kill decision).
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = 19413;
+    const pgid = await fakeChromeGroup(port);
+    markOrphan(stateDir, port, pgid);
+    const listener = net.createServer();
+    await new Promise((r) => listener.listen(port, "127.0.0.1", r));
+    const client = net.connect(port, "127.0.0.1");
+    await new Promise((r, j) => { client.once("connect", r); client.once("error", j); });
+    t.after(() => { client.destroy(); if (listener.listening) listener.close(); });
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    assert.equal(n, 0, "group with a live CDP client must be preserved");
+    assert.equal(browserGroups.groupExists(pgid), true);
+    client.destroy();
+    await new Promise((r) => listener.close(r));
+  }
+
+  // (d) group reparented to init/user-systemd (PPID ≠ 1 allowed) is still
+  // reaped — identity is pgid-based, not ppid-based.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19414";
+    execSync(
+      `setsid bash -c 'exec -a "faux-chrome --remote-debugging-port=${port}" sleep 600' </dev/null >/dev/null 2>&1 &`,
+      { encoding: "utf8" }
+    );
+    // $! names the setsid wrapper — the actual group leader is whichever
+    // process ends up carrying the flag with pgrp === pid (setsid may fork).
+    let pid = null;
+    for (let i = 0; i < 80 && pid == null; i++) {
+      try {
+        for (const ent of fs.readdirSync("/proc")) {
+          if (!/^\d+$/.test(ent)) continue;
+          const p = Number(ent);
+          const st = browserGroups.readProcStat(p);
+          if (st && st.pgrp === p && browserGroups.cmdlineMatchesPort(p, port)) {
+            pid = p;
+            break;
+          }
+        }
+      } catch {}
+      if (pid == null) await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.notEqual(pid, null, "flag-carrying group leader must appear");
+    groupPids.push(pid);
+    const st = browserGroups.readProcStat(pid);
+    assert.equal(st.pgrp, pid, "setsid child must be its own group leader");
+    assert.notEqual(st.ppid, process.pid, "fixture must already be reparented");
+    markOrphan(stateDir, port, pid);
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    assert.equal(n, 1, "reparented orphan group must be reaped");
+    assert.equal(browserGroups.groupMembers(pid).length, 0);
+    groupPids.splice(groupPids.indexOf(pid), 1);
+  }
+
+  // (e) marker with no matching live group → marker removed, nothing killed.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19415";
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid: 2 ** 22, pgidStartTime: 0,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0,
+    });
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    assert.equal(n, 0);
+    assert.equal(browserGroups.readMarker(stateDir, port), null, "stale marker must be dropped");
+  }
+
+  // (f) idempotent: a second pass over an empty marker dir is a clean no-op.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor("19411") });
+    assert.equal(n, 0);
+  }
+
+  // (g) TERM-grace race: while the reaping mark is fresh the backend refuses
+  //     leases, and a lease + connected CDP client slipped in during the grace
+  //     window vetoes the SIGKILL escalation — the group survives.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19416";
+    // A SIGTERM-proof member carrying the port flag forces the escalation
+    // path; the ready file proves the handler is installed before we reap.
+    const readyFile = path.join(stateDir, "term-ready");
+    const proc = spawn("bash", ["-c",
+      `exec -a "faux-chrome --remote-debugging-port=${port}" "${process.execPath}" ` +
+      `-e "process.on('SIGTERM',()=>{});require('fs').writeFileSync('${readyFile}','1');setInterval(()=>{},1e9)"`], {
+      detached: true, stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    for (let i = 0; i < 80 && !fs.existsSync(readyFile); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(fs.existsSync(readyFile), "TERM handler must be installed before teardown");
+    markOrphan(stateDir, port, proc.pid);
+
+    const reaper = reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    let marked = null;
+    for (let i = 0; i < 80; i++) {
+      marked = browserGroups.readMarker(stateDir, port);
+      if (marked?.reaping) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(marked?.reaping, "marker must be flagged reaping once SIGTERM is sent");
+
+    // Backend selection treats the reaping port as busy — no lease is written.
+    const pick = withStateLock(
+      (state) => pickBackendFromState(state, null, `${process.pid}:s`, Date.now(), null, backendsFor(port), stateDir),
+      ledgerPath, lockPath
+    );
+    assert.equal(pick.backend, undefined, "reaping backend must not be leasable");
+    assert.ok(pick.busyUntil, "reaping backend reports a busy-until");
+
+    // Even a lease that slips past selection plus a live CDP client vetoes
+    // the escalation — no SIGKILL reaches the group.
+    const listener = net.createServer();
+    await new Promise((r) => listener.listen(port, "127.0.0.1", r));
+    const client = net.connect(port, "127.0.0.1");
+    await new Promise((r, j) => { client.once("connect", r); client.once("error", j); });
+    t.after(() => { client.destroy(); if (listener.listening) listener.close(); });
+    fs.writeFileSync(ledgerPath, JSON.stringify({
+      accounts: {}, leases: { acc1: { pid: process.pid, acquiredMs: Date.now() } },
+    }));
+
+    const n = await reaper;
+    assert.equal(n, 0, "vetoed escalation must not count as reaped");
+    assert.equal(browserGroups.isPidAlive(proc.pid), true, "TERM-proof member must survive — no SIGKILL");
+    const after = browserGroups.readMarker(stateDir, port);
+    assert.ok(after, "marker is kept for the now-leased group");
+    assert.equal(after.reaping, undefined, "reaping mark cleared after the veto");
+    client.destroy();
+    await new Promise((r) => listener.close(r));
+  }
+
+  // (h) leftover identity: the flag-carrying leader is gone and only an
+  //     attributable member (Xvfb) survives — the group is still reaped
+  //     instead of leaking with a dropped marker.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19417";
+    const proc = spawn("bash", ["-c",
+      `bash -c 'exec -a "Xvfb :77 -screen 0 1280x1024x24" sleep 600' & ` +
+      `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 2`], {
+      detached: true, stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    markOrphan(stateDir, port, proc.pid);
+    for (let i = 0; i < 80; i++) {
+      const st = browserGroups.readProcStat(proc.pid);
+      if (!st || st.state === "Z") break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const leader = browserGroups.readProcStat(proc.pid);
+    assert.ok(!leader || leader.state === "Z", "flag-carrying leader must have exited");
+    assert.equal(browserGroups.groupExists(proc.pid), true, "Xvfb member outlives the leader");
+    assert.equal(
+      browserGroups.identifyGroup(browserGroups.readMarker(stateDir, port)),
+      "leftover",
+      "surviving Xvfb member must identify as ours"
+    );
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    assert.equal(n, 1, "leftover-only group must still be reaped");
+    assert.equal(browserGroups.groupMembers(proc.pid).length, 0);
+    assert.equal(browserGroups.readMarker(stateDir, port), null, "marker must be removed");
+    groupPids.splice(groupPids.indexOf(proc.pid), 1);
+  }
+
+  // (i) doubtful identity: a surviving member that cannot be attributed to
+  //     the browser stack keeps the marker and the group untouched.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19418";
+    const proc = spawn("bash", ["-c",
+      `bash -c 'exec -a "stray-tool" sleep 600' & ` +
+      `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 2`], {
+      detached: true, stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    markOrphan(stateDir, port, proc.pid);
+    for (let i = 0; i < 80; i++) {
+      const st = browserGroups.readProcStat(proc.pid);
+      if (!st || st.state === "Z") break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(browserGroups.groupExists(proc.pid), true, "stray member outlives the leader");
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    assert.equal(n, 0, "unattributable leftover must not be killed");
+    assert.equal(browserGroups.groupExists(proc.pid), true, "doubtful group is left alone");
+    assert.ok(browserGroups.readMarker(stateDir, port), "doubtful marker is kept");
+  }
+
+  // (j) idle group with a LIVE foreign owner, no lease and no clients is
+  //     reaped — a live owner alone does not preserve an idle group.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19419";
+    const holder = spawn("sleep", ["60"], { stdio: "ignore" });
+    t.after(() => { try { holder.kill("SIGKILL"); } catch {} });
+    const holderStat = browserGroups.readProcStat(holder.pid);
+    const pgid = await fakeChromeGroup(port);
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid,
+      pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+      ownerPid: holder.pid, ownerStartTime: holderStat?.startTime ?? null,
+      mode: "xvfb", launchedMs: Date.now() - 10 * 60_000,
+    });
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    assert.equal(n, 1, "idle group under a live owner must be reaped");
+    assert.equal(browserGroups.groupMembers(pgid).length, 0);
+    groupPids.splice(groupPids.indexOf(pgid), 1);
+  }
+
+  // (k) a young group under a live owner sits inside its startup grace —
+  //     markers are written before CDP readiness, so it is preserved.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19420";
+    const holder = spawn("sleep", ["60"], { stdio: "ignore" });
+    t.after(() => { try { holder.kill("SIGKILL"); } catch {} });
+    const holderStat = browserGroups.readProcStat(holder.pid);
+    const pgid = await fakeChromeGroup(port);
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid,
+      pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+      ownerPid: holder.pid, ownerStartTime: holderStat?.startTime ?? null,
+      mode: "xvfb", launchedMs: Date.now(),
+    });
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: backendsFor(port) });
+    assert.equal(n, 0, "young group under a live owner must be preserved");
+    assert.equal(browserGroups.groupExists(pgid), true);
+  }
+});
+
+test("26. browser-groups: clean-shutdown cleanup of own groups", async (t) => {
+  if (process.platform !== "linux") return;
+  const groupPids = [];
+  const newState = () => {
+    const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-shutdown-")));
+    const ledgerPath = path.join(stateDir, "accounts-state.json");
+    fs.writeFileSync(ledgerPath, JSON.stringify({ accounts: {}, leases: {} }));
+    return { stateDir, ledgerPath, lockPath: `${ledgerPath}.lock` };
+  };
+  const waitChrome = async (pid, port) => {
+    for (let i = 0; i < 60; i++) {
+      if (browserGroups.cmdlineMatchesPort(pid, port)) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  const fakeChromeGroup = async (port) => {
+    const proc = spawn("bash", ["-c", `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 600`], {
+      detached: true,
+      stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    return proc.pid;
+  };
+  const markOwned = (stateDir, port, pgid) =>
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port: String(port), pgid,
+      pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+      ownerPid: process.pid, ownerStartTime: browserGroups.readProcStat(process.pid)?.startTime ?? null,
+      mode: "xvfb", launchedMs: Date.now(),
+    });
+  t.after(() => {
+    for (const pgid of groupPids) {
+      try { process.kill(-pgid, "SIGKILL"); } catch {}
+    }
+  });
+
+  // (a) normal exit path: our own idle group is torn down and marker removed.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19421";
+    const pgid = await fakeChromeGroup(port);
+    markOwned(stateDir, port, pgid);
+    const n = await cleanupOwnBrowserGroups({
+      stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }],
+    });
+    assert.equal(n, 1, "shutdown must tear down our own idle group");
+    assert.equal(browserGroups.groupMembers(pgid).length, 0);
+    assert.equal(browserGroups.readMarker(stateDir, port), null);
+    groupPids.splice(groupPids.indexOf(pgid), 1);
+  }
+
+  // (b) an external CDP client (socket owned by ANOTHER pid — our own sockets
+  // are excluded from the check) preserves the group on shutdown too.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = 19422;
+    const pgid = await fakeChromeGroup(port);
+    markOwned(stateDir, port, pgid);
+    const listener = net.createServer();
+    await new Promise((r) => listener.listen(port, "127.0.0.1", r));
+    const clientProc = spawn(process.execPath, [
+      "-e",
+      `require("net").connect(${port},"127.0.0.1").on("connect",()=>setInterval(()=>{},1e9)).on("error",()=>process.exit(2))`,
+    ], { stdio: "ignore" });
+    t.after(() => { try { clientProc.kill("SIGKILL"); } catch {} if (listener.listening) listener.close(); });
+    for (let i = 0; i < 60 && !browserGroups.hasLiveCdpClients(port); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(browserGroups.hasLiveCdpClients(port), true, "external CDP client must be visible");
+    const n = await cleanupOwnBrowserGroups({
+      stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: String(port) }],
+    });
+    assert.equal(n, 0, "group busy with an external client must be preserved");
+    assert.equal(browserGroups.groupExists(pgid), true);
+    clientProc.kill("SIGKILL");
+    await new Promise((r) => listener.close(r));
   }
 });

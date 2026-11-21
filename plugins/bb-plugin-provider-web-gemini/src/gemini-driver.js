@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const profileManager = require('./profile-manager');
 const usageLimits = require('./usage-limits');
+const browserGroups = require('./browser-groups.cjs');
 const { isFileToolReply, verifyFileResponse } = require('./file-envelope.cjs');
 
 let driverHooks = null;
@@ -118,10 +119,21 @@ function getRunningChromeProfile(port) {
   }
 }
 
-async function stopChrome(port) {
+async function stopChrome(port, stateDir = null) {
   const { execSync } = require('child_process');
+  const p = String(port ?? CDP_PORT);
+  // Marker-based group kill first: pkill matches only processes whose cmdline
+  // carries the port flag, so the Xvfb server spawned by xvfb-run escaped it —
+  // killing the whole detached group takes it too (PLUG-374).
   try {
-    execSync(`pkill -f 'remote-debugging-port=${port ?? CDP_PORT}([[:space:]]|$)' || true`);
+    const meta = browserGroups.readMarker(stateDir, p);
+    if (meta && browserGroups.groupAliveMatches(meta)) {
+      await browserGroups.killGroup(meta);
+    }
+    browserGroups.removeMarker(stateDir, p);
+  } catch {}
+  try {
+    execSync(`pkill -f 'remote-debugging-port=${p}([[:space:]]|$)' || true`);
     await new Promise((r) => setTimeout(r, 800));
   } catch {}
 }
@@ -158,6 +170,7 @@ async function ensureChrome(opts = {}) {
   }
 
   const port = opts && typeof opts === 'object' && opts.port ? String(opts.port) : CDP_PORT;
+  const stateDir = opts && typeof opts === 'object' ? opts.stateDir : null;
   const targetProfile = profileManager.resolveProfile(requestedProfile);
   const currentProfile = getRunningChromeProfile(port);
   const currentMode = getRunningChromeMode(port);
@@ -170,7 +183,13 @@ async function ensureChrome(opts = {}) {
 
   const modeMatches = !targetMode || currentMode === targetMode;
 
-  if (cdpUp && !forceRestart && profileMatches && modeMatches) {
+  // A group mid-teardown (fresh `reaping` mark) is already doomed — never
+  // reuse it; fall through to stopChrome + respawn instead (PLUG-374).
+  const runningMeta = browserGroups.readMarker(stateDir, port);
+  if (cdpUp && !forceRestart && profileMatches && modeMatches && !browserGroups.isReaping(runningMeta)) {
+    // Reusing a group an earlier owner launched: point the marker at the
+    // current owner so reapers see a live verifiable identity (PLUG-374).
+    browserGroups.adoptGroup(stateDir, port);
     return targetProfile;
   }
 
@@ -181,7 +200,7 @@ async function ensureChrome(opts = {}) {
     );
   }
 
-  await stopChrome(port);
+  await stopChrome(port, stateDir);
 
   const { spawn } = require('child_process');
   const chromeBin = process.env.GEMINI_CHROME_BIN || process.env.CHROME_BIN || '/usr/bin/google-chrome-stable';
@@ -228,6 +247,16 @@ async function ensureChrome(opts = {}) {
   let spawnErr = null;
   proc.on('error', (e) => { spawnErr = e; });
   proc.unref();
+  // Mark the group before the readiness wait: a chrome that never opens CDP
+  // but stays alive (with its Xvfb) is exactly the orphan this tracks.
+  browserGroups.recordGroup({
+    stateDir,
+    port,
+    pgid: proc.pid,
+    mode: launchMode,
+    userDataDir: targetProfile.userDataDir,
+    profileDir: targetProfile.profileDir,
+  });
 
   const start = Date.now();
   while (Date.now() - start < 15000) {
@@ -1104,9 +1133,9 @@ async function sendPrompt({
   };
   await throwIfCancelled();
   if (driverHooks?.ensureChrome) {
-    await driverHooks.ensureChrome({ headless, profile, restart, port });
+    await driverHooks.ensureChrome({ headless, profile, restart, port, stateDir });
   } else {
-    await ensureChrome({ headless, profile, restart, port });
+    await ensureChrome({ headless, profile, restart, port, stateDir });
   }
   await throwIfCancelled();
 
