@@ -397,6 +397,21 @@ diffs-container {
   --input: #a9c1d9;
 }
 
+/* The panel body paints .bg-sidebar, but --sidebar here is light (#f4f8fc)
+ * while the global .bg-sidebar ladder is light-on-navy; restore the dark ink
+ * tiers so text inside the panel is readable on the light canvas. */
+:root:not(.dark) :is(
+  #thread-detail-secondary-panel,
+  [data-testid="secondary-panel-shelf"]
+) .bg-sidebar {
+  --foreground: #14213d;
+  --secondary-foreground: #1c3856;
+  --muted-foreground: #496784;
+  --readback-foreground: #43596f;
+  --subtle-foreground: #4c647e;
+  --sidebar-foreground: #14213d;
+}
+
 /* The usage tracker sits in the indigo rail, but its expanded card is white.
  * Keep its compact strip light-on-blue while restoring dark text inside the
  * white details surface. */
