@@ -3,6 +3,7 @@ import {
   cleanModelText,
   dropLabels,
   isValidFavoritesPayload,
+  normalizeModelKey,
   normalizeProviderId,
   sanitizeFavoritesMap,
   sanitizeStore,
@@ -16,8 +17,17 @@ describe("normalizeProviderId (M11)", () => {
     expect(normalizeProviderId("anthropic")).toBe("provider-claude-code");
     expect(normalizeProviderId("Antigravity")).toBe("agy");
     expect(normalizeProviderId("agy")).toBe("agy");
-    expect(normalizeProviderId("OpenCode")).toBe("opencode");
+    expect(normalizeProviderId("OpenCode")).toBe("acp-opencode");
     expect(normalizeProviderId("Cursor")).toBe("acp-cursor");
+    expect(normalizeProviderId("Devin")).toBe("acp-devin");
+  });
+
+  it("keeps the three antigravity/gemini providers apart (blocker 2)", () => {
+    // Only the real agy provider may collapse to the "agy" key — acp-*
+    // entries keep their own ids so a star on one tab never marks another.
+    expect(normalizeProviderId("Antigravity (agy)")).toBe("agy");
+    expect(normalizeProviderId("Google Antigravity")).toBe("acp-antigravity");
+    expect(normalizeProviderId("ACP Web Gemini")).toBe("acp-web-gemini");
   });
 
   it("does NOT pull 'openpipe' under Pi (substring bug)", () => {
@@ -108,5 +118,20 @@ describe("cleanModelText", () => {
   it("strips shortcut residue", () => {
     expect(cleanModelText("gpt-5.4 ⇧-⌘-m")).toBe("gpt-5.4");
     expect(cleanModelText("model Alt+M")).toBe("model");
+  });
+});
+
+describe("normalizeModelKey (m10)", () => {
+  it("canonicalizes a bare context-size tag to the picker's (tag) spelling", () => {
+    // Disabled rows emit "Model · 1M" while enabled rows say "Model (1M)";
+    // both must land on one canonical key.
+    expect(normalizeModelKey("Opus 5.5 · 1M")).toBe("Opus 5.5 (1M)");
+    expect(normalizeModelKey("Opus 5.5 (1M)")).toBe("Opus 5.5 (1M)");
+  });
+
+  it("keeps route qualifiers after the normalized tag", () => {
+    expect(normalizeModelKey("Opus 5.5 · 1M · Router")).toBe("Opus 5.5 (1M) · Router");
+    expect(normalizeModelKey("Model · Fast Route")).toBe("Model · Fast Route");
+    expect(normalizeModelKey("plain-model")).toBe("plain-model");
   });
 });

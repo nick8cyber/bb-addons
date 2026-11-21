@@ -1,5 +1,9 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { toast } from "sonner";
+
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 
 type Manager = typeof import("../src/favorites-manager.js");
 
@@ -21,7 +25,14 @@ async function freshManager(): Promise<Manager> {
 
 beforeEach(() => {
   window.localStorage.clear();
+  window.sessionStorage.clear();
+  vi.mocked(toast.error).mockClear();
   vi.unstubAllGlobals();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe("backend sync versioning (M8)", () => {
@@ -284,5 +295,142 @@ describe("legacy bare-modelId entries (review minor)", () => {
     expect(bodies.length).toBe(1);
     expect(bodies[0].modelId).toBe("M");
     cancel();
+  });
+});
+
+describe("live sync and the pending queue", () => {
+  it("refetches on focus, on becoming visible, and periodically, then detaches", async () => {
+    vi.useFakeTimers();
+    const mgr = await freshManager();
+    let remote = snapshot(1, { codex: ["initial"] });
+    let visibility: DocumentVisibilityState = "visible";
+    vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
+    const fetchMock = vi.fn(async () => rpcResponse(remote));
+    vi.stubGlobal("fetch", fetchMock);
+    const dispose = mgr.initBackendSync();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mgr.getState().favorites.codex).toEqual(["initial"]);
+
+    // A native settings change does not have to update favorites.version.
+    remote = snapshot(1, { codex: ["initial"] }, {}, { pinToTop: false, showQuickBar: false });
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mgr.getState()).toMatchObject({ pinToTop: false, showQuickBar: false });
+
+    visibility = "hidden";
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    visibility = "visible";
+    remote = snapshot(2, { codex: ["another tab"] });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mgr.getState().favorites.codex).toEqual(["another tab"]);
+
+    remote = snapshot(3, { codex: ["background update"] });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(mgr.getState().favorites.codex).toEqual(["background update"]);
+    dispose();
+    window.dispatchEvent(new Event("focus"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("replays pending intents over another tab's data while retrying in order", async () => {
+    vi.useFakeTimers();
+    const mgr = await freshManager();
+    let attempts = 0;
+    const writes: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      const method = url.split("/").pop();
+      if (method === "getFavorites") return rpcResponse(snapshot(3, { codex: ["remote"] }));
+      const { modelId } = JSON.parse(init.body as string);
+      writes.push(modelId);
+      if (++attempts === 1) throw new TypeError("offline");
+      if (modelId === "first") return rpcResponse(snapshot(4, { codex: ["first", "remote"] }));
+      return rpcResponse(snapshot(5, { codex: ["second", "first", "remote"] }));
+    }));
+
+    const first = mgr.addFavorite("codex", "first");
+    const second = mgr.addFavorite("codex", "second");
+    await mgr.refreshFavorites();
+    expect(writes).toEqual(["first"]);
+    expect(mgr.getState().favorites.codex).toEqual(["second", "first", "remote"]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await Promise.all([first, second])).toEqual([true, true]);
+    expect(writes).toEqual(["first", "first", "second"]);
+    expect(mgr.getState().favorites.codex).toEqual(["second", "first", "remote"]);
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("rolls back only the failed intent after exhausting retries", async () => {
+    vi.useFakeTimers();
+    const mgr = await freshManager();
+    let failures = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith("/getFavorites")) return rpcResponse(snapshot(3, { codex: ["server"] }));
+      if (JSON.parse(init.body as string).modelId === "lost") {
+        failures++;
+        return new Response("Unavailable", { status: 503 });
+      }
+      return rpcResponse(snapshot(4, { codex: ["kept", "server"] }));
+    }));
+    await mgr.refreshFavorites();
+
+    const lost = mgr.addFavorite("codex", "lost");
+    const kept = mgr.addFavorite("codex", "kept");
+    expect(mgr.getState().favorites.codex).toEqual(["kept", "lost", "server"]);
+    await vi.advanceTimersByTimeAsync(14_000);
+    expect(await Promise.all([lost, kept])).toEqual([false, true]);
+    expect(failures).toBe(4);
+    expect(mgr.getState().favorites.codex).toEqual(["kept", "server"]);
+    expect(toast.error).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores unconfirmed work from the tab's session after reload", async () => {
+    vi.useFakeTimers();
+    const first = await freshManager();
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.endsWith("/getFavorites")) return rpcResponse(snapshot(1, { codex: ["remote"] }));
+      throw new TypeError("offline");
+    }));
+    const dispose = first.initBackendSync();
+    await vi.advanceTimersByTimeAsync(0);
+    void first.addFavorite("codex", "pending");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(first.getState().favorites.codex).toEqual(["pending", "remote"]);
+    dispose();
+
+    const reloaded = await freshManager();
+    expect(reloaded.getState().favorites.codex).toEqual(["pending", "remote"]);
+    const fetchMock = vi.fn(async (url: string) => url.endsWith("/getFavorites")
+      ? rpcResponse(snapshot(1, { codex: ["remote"] }))
+      : rpcResponse(snapshot(2, { codex: ["pending", "remote"] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const close = reloaded.initBackendSync();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock.mock.calls.filter(([url]) => url.endsWith("/addFavorite"))).toHaveLength(1);
+    expect(reloaded.getState().favorites.codex).toEqual(["pending", "remote"]);
+    expect(sessionStorage.length).toBe(0);
+    close();
+  });
+
+  it("uses the confirmed version for import and pulls the winning snapshot after a 409", async () => {
+    const mgr = await freshManager();
+    let remote = snapshot(3, { codex: ["A"] });
+    const sent: unknown[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith("/getFavorites")) return rpcResponse(remote);
+      sent.push(JSON.parse(init.body as string));
+      remote = snapshot(4, { codex: ["A", "other device"] });
+      return Response.json({ ok: false, error: { code: "conflict" } }, { status: 409 });
+    }));
+    await mgr.refreshFavorites();
+    const imported = mgr.importFavoritesJson(JSON.stringify({ version: 1, favorites: { codex: ["incoming"] } }));
+    expect(mgr.getState().favorites.codex).toEqual(["incoming"]);
+    expect(await imported).toBe(false);
+    expect(sent).toEqual([{ baseVersion: 3, favorites: { codex: ["incoming"] }, modelLabels: {} }]);
+    expect(mgr.getState().favorites.codex).toEqual(["A", "other device"]);
+    expect(toast.error).toHaveBeenCalledWith(expect.stringContaining("Избранное изменилось на сервере"));
   });
 });
