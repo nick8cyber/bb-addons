@@ -29,6 +29,7 @@
      - `bb favorites remove <provider> <model>` — удалить модель из избранного.
      - `bb favorites clear [provider]` — очистить избранное.
      - `bb favorites export` — вывести JSON со всеми избранными моделями.
+     - `bb favorites doctor [--fix]` — отчёт о «сиротах» в хранилище (неизвестные провайдеры, записи без маршрута, метки `default:*`); с `--fix` — нормализует и чистит.
 
 ---
 

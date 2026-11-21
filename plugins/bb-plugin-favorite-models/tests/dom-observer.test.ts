@@ -209,6 +209,66 @@ describe("native BB 0.49.0 markup — stars (blocker 1)", () => {
     expect(bodies[0].providerId).toBe("codex");
     dispose();
   });
+
+  it("portal 'More models' submenu rows get stars and pin under the parent provider", async () => {
+    const { dom, mgr } = await freshModules();
+    const bodies: { providerId?: string; modelId?: string }[] = [];
+    stubRpc((method, body) => {
+      if (method === "addFavorite") bodies.push(body as never);
+      return method === "getFavorites"
+        ? { version: 1, favorites: { codex: ["pinned-deep"] }, modelLabels: {}, config: { pinToTop: true, showQuickBar: true } }
+        : { version: 2, favorites: { codex: ["pinned-deep"] }, modelLabels: {}, config: { pinToTop: true, showQuickBar: true } };
+    });
+    const A = composer();
+    const picker = nativePicker({ rows: [optionRow("top-model")] });
+    const more = document.createElement("button");
+    more.textContent = "More models";
+    picker.content.appendChild(more);
+
+    // Radix submenu: content portaled to body, linked via the trigger's
+    // aria-controls; submenu rows carry neither -opt- ids nor roles.
+    const sub = document.createElement("div");
+    sub.setAttribute("role", "menu");
+    sub.id = "radix-:sub-stars:";
+    sub.dataset.state = "open";
+    const portalRow = (title: string) => {
+      const row = document.createElement("button");
+      const s = document.createElement("span");
+      s.className = "truncate";
+      s.title = title;
+      s.textContent = title;
+      row.appendChild(s);
+      return row;
+    };
+    const pinned = portalRow("pinned-deep");
+    const plain = portalRow("deep-model");
+    sub.append(pinned, plain);
+    more.addEventListener("click", () => {
+      document.body.append(sub);
+      more.setAttribute("aria-controls", sub.id);
+      more.setAttribute("aria-expanded", "true");
+    });
+    openPicker(A.trigger, picker);
+    more.click();
+    await mgr.refreshFavorites();
+
+    const dispose = dom.initDomObserver();
+    await vi.advanceTimersByTimeAsync(150);
+
+    const stars = sub.querySelectorAll<HTMLButtonElement>(":scope > button > .bb-fav-star-btn");
+    expect(stars.length).toBe(2);
+    // The parent provider's favorite is starred and pinned inside the submenu.
+    expect(pinned.classList.contains("bb-fav-row-starred")).toBe(true);
+    expect(plain.classList.contains("bb-fav-row-starred")).toBe(false);
+    expect(sub.querySelector(".bb-fav-pin-section button[data-bb-fav-clone]")).toBeTruthy();
+
+    plain.querySelector<HTMLButtonElement>(".bb-fav-star-btn")!.click();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(bodies.length).toBe(1);
+    expect(bodies[0].providerId).toBe("codex");
+    expect(bodies[0].modelId).toBe("deep-model");
+    dispose();
+  });
 });
 
 describe("composer scoping (B1)", () => {
