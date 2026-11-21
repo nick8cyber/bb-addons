@@ -35,10 +35,10 @@ Coverage measurement and the procedure for extending the dictionary are in
 
 ### `favorite-models` ⭐
 
-Star any provider's model and it gets pinned to the top of the picker, with a
-quick-switch menu in the composer. Favourites are grouped per provider, and the
-store is normalised on read — provider ids are canonicalised so entries cannot
-end up filed under a provider that does not exist.
+Star any provider's model and it gets pinned to the top of the picker.
+Favourites are grouped per provider, and the store is normalised on read —
+provider ids are canonicalised so entries cannot end up filed under a provider
+that does not exist.
 
 Details in
 [plugins/bb-plugin-favorite-models/README.md](plugins/bb-plugin-favorite-models/README.md).

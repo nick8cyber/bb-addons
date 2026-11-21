@@ -22,40 +22,60 @@ export const PROVIDER_UNKNOWN = "default";
 
 const SHORTCUT_RE = /[⌘⇧⌥⌃]|\b(alt|ctrl|control|shift|cmd|meta)\b/i;
 
-/**
- * Canonical provider key for a raw name coming from DOM tab titles, SDK
- * provider ids, manual input or stored data.
- *
- * "default" means "could not name a provider" (shortcut residue, empty) —
- * callers must never store favorites under it.
- */
-export function normalizeProviderId(name: string): string {
-  let clean = (name || "").toLowerCase().trim();
-  if (!clean) return PROVIDER_UNKNOWN;
-  // Keyboard-shortcut residue that leaked into captured text ("⇧-⌘-m",
-  // "Alt+M") is not a provider name.
-  if (SHORTCUT_RE.test(clean)) return PROVIDER_UNKNOWN;
-  // Drop model qualifiers: "Provider / Model" and "Model · route" both reduce
-  // to the provider part, keeping keys consistent across contexts.
-  if (clean.includes(" · ")) clean = clean.split(" · ")[0].trim();
-  if (clean.includes("/")) clean = clean.split("/")[0].trim();
-  if (!clean) return PROVIDER_UNKNOWN;
+const PROVIDER_ALIASES = new Map([
+  ["codex", "codex"], ["openai", "codex"], ["codex (openai)", "codex"],
+  ["claude", "provider-claude-code"], ["claude code", "provider-claude-code"],
+  ["claude-code", "provider-claude-code"], ["provider-claude-code", "provider-claude-code"],
+  ["anthropic", "provider-claude-code"], ["claude code (anthropic)", "provider-claude-code"],
+  ["pi", "provider-pi"], ["provider-pi", "provider-pi"], ["inflection", "provider-pi"],
+  ["pi (inflection)", "provider-pi"],
+  ["agy", "agy"], ["provider-agy", "agy"], ["antigravity", "agy"], ["antigravity (agy)", "agy"],
+  ["devin", "acp-devin"], ["opencode", "acp-opencode"], ["cursor", "acp-cursor"],
+  ["google antigravity", "acp-antigravity"], ["google-antigravity", "acp-antigravity"],
+  ["acp web gemini", "acp-web-gemini"],
+]);
 
-  // acp-* ids are distinct providers: only the literal Cursor spellings
-  // collapse onto "acp-cursor"; everything else keeps its own key instead
-  // of being swallowed by a substring rule below (M11).
-  if (clean === "cursor" || clean === "acp-cursor") return "acp-cursor";
-  if (clean.startsWith("acp-")) return clean;
+export interface ProviderIdentity {
+  id: string;
+  displayName: string;
+}
 
-  if (clean.includes("codex") || clean === "openai") return "codex";
-  if (clean.includes("claude") || clean === "anthropic") return "provider-claude-code";
-  if (clean.includes("antigravity") || clean === "agy" || clean === "provider-agy" || clean.includes("gemini"))
-    return "agy";
-  // Exact/prefix match only: a substring test pulled "openpipe" under Pi.
-  if (clean === "pi" || clean === "provider-pi" || clean.startsWith("pi-") || clean.includes("inflection"))
-    return "provider-pi";
-  if (clean.includes("opencode")) return "opencode";
-  return clean.replace(/\s+/g, "-");
+function providerText(name: string): string {
+  return name.toLowerCase().trim();
+}
+
+/** Resolve a provider label or legacy key to an SDK ID. */
+export function normalizeProviderId(name: string, providers: readonly ProviderIdentity[] = []): string {
+  const raw = providerText(name || "");
+  if (raw === PROVIDER_UNKNOWN || Object.hasOwn(Object.prototype, raw)) return PROVIDER_UNKNOWN;
+  const exact = providers.find(({ id }) => providerText(id) === raw);
+  if (exact) return exact.id;
+  const byLabel = providers.filter(({ displayName }) => providerText(displayName) === raw);
+  if (byLabel.length === 1) return byLabel[0].id;
+  if (byLabel.length > 1 || SHORTCUT_RE.test(raw)) return PROVIDER_UNKNOWN;
+
+  const clean = raw.split(/ · |\//, 1)[0].trim();
+  if (!clean || Object.hasOwn(Object.prototype, clean)) return PROVIDER_UNKNOWN;
+  const known = PROVIDER_ALIASES.get(clean) ?? (clean.startsWith("pi-") ? "provider-pi" : undefined);
+  const matches = providers.filter(({ id, displayName }) => {
+    const label = providerText(displayName);
+    return known
+      ? providerText(id) === known || PROVIDER_ALIASES.get(providerText(id)) === known ||
+        PROVIDER_ALIASES.get(label) === known
+      : label.replace(/\s+/g, "-") === clean;
+  });
+  if (matches.length === 1) return matches[0].id;
+  return known ?? clean.replace(/\s+/g, "-");
+}
+
+/** Validate picker labels against the directory or the known label aliases. */
+export function resolvePickerProviderId(label: string, providers: readonly ProviderIdentity[]): string {
+  const text = providerText(label);
+  if (providers.some(({ id, displayName }) => providerText(id) === text || providerText(displayName) === text) ||
+      PROVIDER_ALIASES.has(text)) {
+    return normalizeProviderId(label, providers);
+  }
+  return PROVIDER_UNKNOWN;
 }
 
 /**
@@ -79,8 +99,20 @@ export function labelKey(providerId: string, modelId: string): string {
   return `${providerId}:${modelId}`;
 }
 
+export function isContextSizeTag(text: string): boolean {
+  return /^\d+(?:\.\d+)?[KM]$/i.test(text);
+}
+
+/** Canonical picker spelling for the context-size tag emitted by older stars. */
+export function normalizeModelKey(text: string): string {
+  const clean = cleanModelText(text);
+  const [model, tag, ...rest] = clean.split(" · ");
+  if (!tag || !isContextSizeTag(tag) || model.endsWith(")")) return clean;
+  return [`${model} (${tag})`, ...rest].join(" · ");
+}
+
 function inferProviderFromModels(models: string[]): string {
-  const sample = models.join(" ").toLowerCase();
+  const sample = models.filter((m) => typeof m === "string").join(" ").toLowerCase();
   if (/\b(gpt|o1|o3|o4)\b/.test(sample) || sample.includes("gpt-")) return "codex";
   if (sample.includes("gemini")) return "agy";
   if (sample.includes("claude")) return "provider-claude-code";
@@ -94,25 +126,28 @@ function inferProviderFromModels(models: string[]): string {
  */
 export function sanitizeFavoritesMap(
   raw: FavoritesMap | null | undefined,
-  keyRemap?: Map<string, string>
+  keyRemap?: Map<string, string>,
+  providers: readonly ProviderIdentity[] = []
 ): FavoritesMap {
-  const result: FavoritesMap = {};
+  const result: FavoritesMap = Object.create(null);
   if (!raw || typeof raw !== "object") return result;
   for (const [key, models] of Object.entries(raw)) {
     if (!Array.isArray(models) || models.length === 0) continue;
-    let prov = normalizeProviderId(key);
-    if (prov === PROVIDER_UNKNOWN) prov = inferProviderFromModels(models);
+    let prov = normalizeProviderId(key, providers);
+    if (prov === PROVIDER_UNKNOWN && SHORTCUT_RE.test(key)) {
+      prov = normalizeProviderId(inferProviderFromModels(models), providers);
+    }
     keyRemap?.set(key, prov);
 
     const existing = result[prov] || [];
     for (const m of models) {
       if (typeof m !== "string") continue;
-      const id = cleanModelText(m.trim());
+      const id = normalizeModelKey(m);
       if (id && !existing.includes(id)) existing.push(id);
     }
     if (existing.length > 0) result[prov] = existing;
   }
-  return result;
+  return { ...result };
 }
 
 /**
@@ -121,10 +156,11 @@ export function sanitizeFavoritesMap(
  */
 export function sanitizeStore(
   rawFavorites: FavoritesMap | null | undefined,
-  rawLabels: ModelLabels | null | undefined
+  rawLabels: ModelLabels | null | undefined,
+  providers: readonly ProviderIdentity[] = []
 ): { favorites: FavoritesMap; modelLabels: ModelLabels } {
   const remap = new Map<string, string>();
-  const favorites = sanitizeFavoritesMap(rawFavorites, remap);
+  const favorites = sanitizeFavoritesMap(rawFavorites, remap, providers);
 
   const modelLabels: ModelLabels = {};
   if (rawLabels && typeof rawLabels === "object") {
@@ -132,13 +168,46 @@ export function sanitizeStore(
       if (typeof label !== "string") continue;
       const idx = key.indexOf(":");
       if (idx < 0) continue;
-      const prov = remap.get(key.slice(0, idx)) ?? normalizeProviderId(key.slice(0, idx));
-      const model = cleanModelText(key.slice(idx + 1));
+      const prov = remap.get(key.slice(0, idx)) ?? normalizeProviderId(key.slice(0, idx), providers);
+      const model = normalizeModelKey(key.slice(idx + 1));
       const text = cleanModelText(label);
       if (!model || !text) continue;
       modelLabels[`${prov}:${model}`] = text;
     }
   }
+  return { favorites, modelLabels };
+}
+
+/** The old agy key covered three providers. Move only records with an
+ * explicit provider route or prefix because the model name can be shared. */
+export function migrateStore(
+  rawFavorites: FavoritesMap,
+  rawLabels: ModelLabels,
+  providers: readonly ProviderIdentity[] = []
+): ReturnType<typeof sanitizeStore> {
+  const { favorites, modelLabels } = sanitizeStore(rawFavorites, rawLabels, providers);
+  const agyModels = favorites.agy ?? [];
+  const remaining = agyModels.filter((model) => {
+    const oldKey = labelKey("agy", model);
+    const label = modelLabels[oldKey];
+    const sources = new Set(
+      [model, label ?? ""].flatMap((text) => {
+        const route = text.split(" · ")[1] ?? "";
+        const prefix = text.includes("/") ? text.slice(0, text.indexOf("/")) : "";
+        return [route, prefix].map((part) => normalizeProviderId(part, providers));
+      }).filter((id) => id === "agy" || id === "acp-antigravity" || id === "acp-web-gemini")
+    );
+    if (sources.size !== 1 || sources.has("agy")) return true;
+    const [provider] = sources;
+    const models = favorites[provider] ?? [];
+    if (!models.includes(model)) favorites[provider] = [...models, model];
+    const newKey = labelKey(provider, model);
+    if (label) modelLabels[newKey] ??= label;
+    delete modelLabels[oldKey];
+    return false;
+  });
+  if (remaining.length > 0) favorites.agy = remaining;
+  else delete favorites.agy;
   return { favorites, modelLabels };
 }
 

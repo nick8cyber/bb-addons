@@ -12,10 +12,9 @@ import {
   exportFavoritesJson,
   importFavoritesJson,
   getFavoritesCount,
-  isFavorite,
-  cleanModelText,
-  normalizeProviderId,
+  resolvePickerProvider,
 } from "./favorites-manager.js";
+import { normalizeModelKey } from "./store.js";
 import { StarFilledIcon, TrashIcon, PlusIcon } from "./icons.js";
 
 export function SettingsSection() {
@@ -30,61 +29,34 @@ export function SettingsSection() {
 
   const handleAddManual = (e: React.FormEvent) => {
     e.preventDefault();
-    // Same canonical key the rest of the store is written under — manual
-    // input must not mint its own provider spelling (M11).
-    const prov = normalizeProviderId(newProvider);
-    const mod = newModel.trim();
-    if (!prov || prov === "default" || !mod) {
-      toast.error("Укажите провайдера и название модели");
+    const prov = resolvePickerProvider(newProvider);
+    const mod = normalizeModelKey(newModel);
+    if (prov === "default" || !mod) {
+      toast.error("Укажите провайдера и подпись модели из списка BB");
       return;
     }
     void addFavorite(prov, mod).then((ok) => {
-      if (ok) {
-        toast.success(`Модель ${mod} добавлена в избранное для ${prov}`);
-      } else {
-        // On failure runMutation already reconciled to the server snapshot:
-        // if the model is still there the app is offline and the optimistic
-        // record stands; if it vanished, the change was rolled back.
-        toast.error(
-          isFavorite(prov, cleanModelText(mod))
-            ? "Сервер недоступен — сохранено локально, синхронизируется позже"
-            : "Сервер не подтвердил запись — изменение отменено"
-        );
-      }
+      if (ok) toast.success(`Модель ${mod} добавлена в избранное`);
     });
     setNewModel("");
   };
 
   const handleRemove = (providerId: string, modelId: string) => {
     void removeFavorite(providerId, modelId).then((ok) => {
-      if (ok) {
-        toast.success(`Модель ${modelId} удалена из избранного`);
-      } else {
-        toast.error(
-          isFavorite(providerId, modelId)
-            ? "Сервер не подтвердил удаление — модель осталась в избранном"
-            : "Сервер недоступен — удалено локально, синхронизируется позже"
-        );
-      }
+      if (ok) toast.success(`Модель ${modelId} удалена из избранного`);
     });
   };
 
   const handleClearAll = () => {
     if (confirm("Вы уверены, что хотите очистить весь список избранных моделей?")) {
       void clearFavorites().then((ok) => {
-        if (ok) {
-          toast.success("Все избранные модели очищены");
-        } else {
-          toast.error("Сервер не подтвердил очистку — проверьте список");
-        }
+        if (ok) toast.success("Все избранные модели очищены");
       });
     }
   };
 
-  const handleConfigToggle = (key: "pinToTop" | "showQuickBar") => (e: React.ChangeEvent<HTMLInputElement>) => {
-    void updateConfig({ [key]: e.target.checked }).then((ok) => {
-      if (!ok) toast.error("Не удалось сохранить настройку");
-    });
+  const handleConfigToggle = (key: "pinToTop") => (e: React.ChangeEvent<HTMLInputElement>) => {
+    void updateConfig({ [key]: e.target.checked });
   };
 
   const handleExport = async () => {
@@ -107,8 +79,6 @@ export function SettingsSection() {
         toast.success("Избранные модели успешно импортированы!");
         setShowImport(false);
         setImportJsonText("");
-      } else {
-        toast.error("Неверный формат JSON");
       }
     });
   };
@@ -136,18 +106,6 @@ export function SettingsSection() {
             />
             <span className="text-xs text-foreground font-medium">
               Закреплять избранные модели поверх общего списка в выпадающем меню
-            </span>
-          </label>
-
-          <label className="flex items-center gap-2.5 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={state.showQuickBar}
-              onChange={handleConfigToggle("showQuickBar")}
-              className="size-4 rounded border-border text-amber-500 focus:ring-amber-500"
-            />
-            <span className="text-xs text-foreground font-medium">
-              Показывать кнопку «⭐ Избранное» в панели действий поля ввода для быстрого выбора
             </span>
           </label>
         </div>
@@ -189,7 +147,7 @@ export function SettingsSection() {
             <textarea
               value={importJsonText}
               onChange={(e) => setImportJsonText(e.target.value)}
-              placeholder='Вставьте JSON в формате: {"favorites": {"codex": ["gpt-5.4"]}}'
+              placeholder='Вставьте JSON в формате: {"favorites": {"codex": ["6.2-Sol"]}}'
               className="w-full h-24 p-2 text-xs font-mono rounded border border-border bg-background"
             />
             <div className="flex justify-end gap-2">
@@ -265,7 +223,7 @@ export function SettingsSection() {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           <div>
             <label className="text-2xs text-muted-foreground block mb-1">
-              Провайдер (например: codex, claude-code, agy, pi)
+              Имя или ID провайдера из BB
             </label>
             <Input
               value={newProvider}
@@ -276,12 +234,12 @@ export function SettingsSection() {
           </div>
           <div>
             <label className="text-2xs text-muted-foreground block mb-1">
-              ID или имя модели (например: gpt-5.4, claude-3-7-sonnet)
+              Подпись модели как в списке BB, включая маршрут, если он показан
             </label>
             <Input
               value={newModel}
               onChange={(e) => setNewModel(e.target.value)}
-              placeholder="gpt-5.4"
+              placeholder="6.2-Sol или Model · route"
               className="h-8 text-xs"
             />
           </div>

@@ -1778,7 +1778,9 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
             collected = await collectTask(context, attachments.blocks, materials, packageOptions);
             packed = packTask(context, collected, packageOptions);
-            if (context.settings.innerAgent && (context.root || context.pin)) {
+            // PLUG-384: публичный research без локального инвентаря —
+            // быстрый агент по дереву не запускается.
+            if (context.settings.innerAgent && (context.root || context.pin) && !context.research) {
               const agent = await gatherAgentContext(context, collected.core, {
                 signal: task.signal,
                 maxExtraBytes: context.settings.maxTotalBytes - packed.totalBytes - packageOptions.reserveBytes,
@@ -2521,6 +2523,9 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
   const inputSha256 = sha256(JSON.stringify(normalizeInput(blocks)));
   const isContinue = blocks.every((block) => block.type === "text") && journal.isContinueText(text);
   const saved = session.journal ?? journal.findSessionRecord(STATE_DIR, sessionId);
+  // PLUG-384: флаг research живёт в записи сессии — следующий ход видит
+  // его в prepareTask и после рестарта провайдера, без маркера в тексте.
+  if (saved) session.journal = saved;
   const last = saved ? journal.listTurns(STATE_DIR, saved.key).at(-1) : null;
   if (last?.corrupt || (last && last.record.version !== journal.JOURNAL_VERSION)) {
     return { errorOutcome: "failed", reason: "recovery: saved turn journal is corrupt or has an unsupported version" };
@@ -2583,6 +2588,7 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
       model: session.model,
       thinking: session.thinking,
       account: session.account,
+      research: context.research,
     });
   }
   session.journal = entry;
