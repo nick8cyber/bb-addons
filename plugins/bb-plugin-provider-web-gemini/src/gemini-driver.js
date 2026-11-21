@@ -2187,8 +2187,9 @@ function findGeneratedFileCandidates(target, { detectOnly = false, tagAttr = 'ar
   }
   for (const b of target.querySelectorAll('button, [role="button"], a:not([href])')) {
     // Дедуп по DOM-узлу: кнопка внутри уже размеченного якоря — один файл.
+    // Префикс tagAttr — чужие разметки прошлых сканов не считаем своими.
     if (seenNodes.has(b)) continue;
-    if (b.closest && b.closest('[data-argon-dl]')) continue;
+    if (b.closest && b.closest(`[data-argon-dl^="${tagAttr}-"]`)) continue;
     const hasDl = b.hasAttribute('download');
     if (detectOnly) {
       const isFileCard = Boolean(b.closest?.('.file-card, .file-chip, [data-file-id], [data-mime-type], [data-attachment-id]'));
@@ -2359,31 +2360,124 @@ async function collectGeneratedFiles(page, opts = {}) {
     nameFromUrl(url) ||
     'file';
 
+  // Класс хоста URL скачивания: 'drive' — Google Docs/Drive (гейт, прямой
+  // файл без интеграции не стянуть), 'allowed' — белый список, 'denied' —
+  // посторонний хост, 'unknown' — хост определить не удалось.
+  const classifyDlUrl = (url) => {
+    const h = downloadUrlHost(url);
+    if (!h) return 'unknown';
+    if (DRIVE_GATE_HOST_RE.test(h)) return 'drive';
+    return isAllowedDownloadHost(h) ? 'allowed' : 'denied';
+  };
+
+  const dlHostNote = (url) => downloadUrlHost(url) || 'unknown';
+
+  // Кандидат «сетевой ответ = файл»: content-disposition=attachment или
+  // бинарный content-type, 2xx и хост белого списка. Фоновая телеметрия
+  // (batchexecute/gen_204/пиксели), иконки svg/gif и посторонние хосты до
+  // резолва победителя гасятся — не должны побеждать по клику экспорта
+  // (ревью PLUG-376). Хосты Docs/Drive возвращаем как кандидата — чтобы
+  // зафиксировать причину Drive-гейта.
+  const respFileCandidate = (resp) => {
+    try {
+      const url = (resp.url && resp.url()) || '';
+      const h = downloadUrlHost(url);
+      if (!h) return null;
+      if (DRIVE_GATE_HOST_RE.test(h)) return { resp, url };
+      if (!isAllowedDownloadHost(h)) return null;
+      const st = typeof resp.status === 'function' ? resp.status() : null;
+      if (typeof st === 'number' && (st < 200 || st >= 300)) return null;
+      const hd = (resp.headers && resp.headers()) || {};
+      const ct = String(hd['content-type'] || '').toLowerCase();
+      const cd = String(hd['content-disposition'] || '');
+      if (/attachment/i.test(cd)) return { resp, url };
+      if (/gen_204|batchexecute|\/log\b|telemetry|beacon|\/collect|playlog/i.test(url)) return null;
+      if (
+        /^(application\/(octet-stream|zip|x-zip-compressed|pdf|msword|vnd\.|x-msdownload)|video\/|audio\/)/.test(
+          ct
+        ) ||
+        /^image\/(?!svg|gif|x-icon|vnd\.microsoft\.icon)/.test(ct)
+      ) {
+        return { resp, url };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Победитель гонки каналов — первый НЕ-пустой результат; ошибка или
+  // таймаут отдельного канала не гасит остальные (ревью PLUG-376).
+  const firstNonNull = (promises) =>
+    new Promise((resolve) => {
+      if (!promises.length) return resolve(null);
+      let left = promises.length;
+      let done = false;
+      for (const pr of promises) {
+        Promise.resolve(pr).then(
+          (v) => {
+            if (done) return;
+            if (v) {
+              done = true;
+              resolve(v);
+              return;
+            }
+            if (--left === 0) resolve(null);
+          },
+          () => {
+            if (!done && --left === 0) resolve(null);
+          }
+        );
+      }
+    });
+
   // Извлечённый URL (новая вкладка / сетевой ответ) стягивается через
-  // request-контекст браузера — хост уже проверен по белому списку.
+  // request-контекст браузера. Хост проверяется и до запроса, и после —
+  // req.get идёт по редиректам, финальный URL может уйти с белого списка
+  // или на Drive-гейт (ревью PLUG-376).
   const fetchUrlToFile = async (url, fallbackName) => {
+    const name = fallbackName || nameFromUrl(url) || 'file';
+    const cls0 = classifyDlUrl(url);
+    if (cls0 === 'drive') {
+      skipNote(name, 'requires Google Drive integration');
+      return;
+    }
+    if (cls0 !== 'allowed') {
+      skipNote(name, `host not allowed (${dlHostNote(url)})`);
+      return;
+    }
     const ctx = page.context && page.context();
     const req = ctx && ctx.request;
     if (!req || typeof req.get !== 'function') {
-      skipNote(fallbackName || 'file', 'no request context');
+      skipNote(name, 'no request context');
       return;
     }
     try {
       const resp = await req.get(url, { timeout: 15000 });
       if (!resp.ok()) {
-        skipNote(fallbackName || nameFromUrl(url) || 'file', `http ${resp.status()}`);
+        skipNote(name, `http ${resp.status()}`);
+        return;
+      }
+      const finalUrl = (typeof resp.url === 'function' && resp.url()) || url;
+      const clsF = classifyDlUrl(finalUrl);
+      if (clsF === 'drive') {
+        skipNote(name, 'requires Google Drive integration');
+        return;
+      }
+      if (clsF !== 'allowed') {
+        skipNote(name, `host not allowed (${dlHostNote(finalUrl)})`);
         return;
       }
       const headers = resp.headers ? resp.headers() : {};
       const cl = Number(headers['content-length'] || 0);
       if (cl > maxBytes) {
-        skipNote(fallbackName || nameFromUrl(url) || 'file', `too large (${cl} bytes > ${maxBytes})`);
+        skipNote(name, `too large (${cl} bytes > ${maxBytes})`);
         return;
       }
       const body = await resp.body();
-      saveBufferToFile(nameForFetched(headers, url, fallbackName), headers['content-type'], body);
+      saveBufferToFile(nameForFetched(headers, finalUrl, fallbackName), headers['content-type'], body);
     } catch (e) {
-      skipNote(fallbackName || nameFromUrl(url) || 'file', String((e && e.message) || e));
+      skipNote(name, String((e && e.message) || e));
     }
   };
 
@@ -2397,10 +2491,17 @@ async function collectGeneratedFiles(page, opts = {}) {
     const ctx = (typeof page.context === 'function') ? page.context() : null;
     const clickStart = Date.now();
     let settled = false;
-    const cancels = [];
+    // Перехватчики принимают события только с начала клика — фоновая
+    // телеметрия и чужие вкладки в общем контексте не должны побеждать.
+    let accept = false;
+    const dlEvents = [];
+    const pageEvents = [];
+    const respEvents = [];
 
     // Канал fetch→blob: страница собирает blob и «кликает» по нему —
-    // download-ивента нет. Хукаем createObjectURL до клика.
+    // download-ивента нет. Хукаем createObjectURL до клика; сам Blob
+    // держим в записи — revokeObjectURL байты уже не отбирает (ревью
+    // PLUG-376: паттерн create→click→revoke обгонял опрос по URL).
     try {
       await page.evaluate(({ since }) => {
         try {
@@ -2416,6 +2517,7 @@ async function collectGeneratedFiles(page, opts = {}) {
                   url: u,
                   type: (obj && obj.type) || '',
                   ts: Date.now(),
+                  blob: obj,
                 });
               } catch {}
               return u;
@@ -2425,115 +2527,44 @@ async function collectGeneratedFiles(page, opts = {}) {
       }, { since: clickStart });
     } catch {}
 
-    const waiters = [];
-    // 1) Нативное download-событие.
-    if (typeof page.waitForEvent === 'function') {
-      waiters.push(
-        page
-          .waitForEvent('download', { timeout: CLICK_WAIT_MS })
-          .then((dl) => ({ kind: 'download', dl }))
-          .catch(() => null)
-      );
-    }
-    // 2) Новая вкладка контекста — экспорт открывает viewer/файл в новой
-    // странице; URL забираем и стягиваем через request-контекст.
-    if (ctx && typeof ctx.once === 'function') {
-      waiters.push(
-        new Promise((resolve) => {
-          const t = setTimeout(() => resolve(null), CLICK_WAIT_MS);
-          cancels.push(() => clearTimeout(t));
-          try {
-            ctx.once('page', (p) => {
-              (async () => {
-                // Вкладка может и открыть viewer с URL, и сразу отдать
-                // download-ивент — берём что придёт первым.
-                const urlP = (async () => {
-                  try {
-                    await (p.waitForLoadState && p.waitForLoadState('domcontentloaded', { timeout: 4000 }));
-                  } catch {}
-                  return 'url';
-                })();
-                const dlP =
-                  typeof p.waitForEvent === 'function'
-                    ? p.waitForEvent('download', { timeout: 4000 }).then((dl) => ({ dl })).catch(() => null)
-                    : null;
-                const first = await Promise.race(dlP ? [urlP, dlP] : [urlP]);
-                if (settled) {
-                  try {
-                    await (p.close && p.close());
-                  } catch {}
-                  resolve(null);
-                  return;
-                }
-                if (first && first.dl) {
-                  resolve({ kind: 'download', dl: first.dl, page: p });
-                  return;
-                }
-                let url = '';
-                try {
-                  url = typeof p.url === 'function' ? p.url() : '';
-                } catch {}
-                resolve({ kind: 'page', page: p, url });
-              })().catch(() => resolve(null));
-            });
-          } catch {
-            resolve(null);
-          }
-        })
-      );
-    }
-    // 3) Сетевой ответ с файлом: content-disposition или бинарный content-type.
+    // Подписки ставятся до первой попытки клика — событие, пришедшее во
+    // время клика, не теряется; снимаются в cleanupWaiters (утёкший
+    // слушатель контекста закрывал чужие вкладки — ревью PLUG-376).
+    let dlListener = null;
     let respListener = null;
+    let pageListener = null;
     if (typeof page.on === 'function') {
-      waiters.push(
-        new Promise((resolve) => {
-          const t = setTimeout(() => resolve(null), CLICK_WAIT_MS);
-          cancels.push(() => clearTimeout(t));
-          respListener = (resp) => {
-            try {
-              const h = (resp.headers && resp.headers()) || {};
-              const ct = String(h['content-type'] || '').toLowerCase();
-              const cd = String(h['content-disposition'] || '');
-              const isFile =
-                /attachment/i.test(cd) ||
-                /^(application\/(octet-stream|zip|x-zip-compressed|pdf|msword|vnd\.|x-msdownload)|image\/|video\/|audio\/)/.test(
-                  ct
-                );
-              if (!isFile || settled) return;
-              resolve({ kind: 'response', resp, url: (resp.url && resp.url()) || '' });
-            } catch {}
-          };
-          try {
-            page.on('response', respListener);
-          } catch {
-            resolve(null);
-          }
-        })
-      );
+      dlListener = (dl) => {
+        if (accept && !settled) dlEvents.push(dl);
+      };
+      respListener = (resp) => {
+        if (!accept || settled) return;
+        const cand = respFileCandidate(resp);
+        if (cand) respEvents.push(cand);
+      };
+      try {
+        page.on('download', dlListener);
+      } catch {
+        dlListener = null;
+      }
+      try {
+        page.on('response', respListener);
+      } catch {
+        respListener = null;
+      }
     }
-    // 4) fetch→blob: опрос blob-URL, записанных хуком после клика.
-    waiters.push(
-      (async () => {
-        const deadline = Date.now() + CLICK_WAIT_MS;
-        while (!settled && Date.now() < deadline) {
-          await sleep(200);
-          try {
-            const list = await page.evaluate(
-              ({ since }) =>
-                Array.isArray(window.__argonDlBlobs)
-                  ? window.__argonDlBlobs.filter((e) => e && e.url && e.ts >= since)
-                  : [],
-              { since: clickStart - 500 }
-            );
-            const hit = (list || []).find((e) => typeof e.url === 'string' && e.url.startsWith('blob:'));
-            if (hit) return { kind: 'blob', entry: hit };
-          } catch {
-            return null;
-          }
-        }
-        return null;
-      })()
-    );
+    if (ctx) {
+      pageListener = (p) => {
+        if (accept && !settled) pageEvents.push(p);
+      };
+      try {
+        if (typeof ctx.on === 'function') ctx.on('page', pageListener);
+        else if (typeof ctx.once === 'function') ctx.once('page', pageListener);
+        else pageListener = null;
+      } catch {
+        pageListener = null;
+      }
+    }
 
     // Надёжность клика: scrollIntoView → обычный → force → dispatchEvent —
     // кнопки экспорта под оверлеями/в нестабильном состоянии падают на
@@ -2543,6 +2574,7 @@ async function collectGeneratedFiles(page, opts = {}) {
     } catch {}
     let clicked = false;
     let clickErr = null;
+    accept = true;
     for (const attempt of [
       () => el.click({ timeout: 5000 }),
       () => el.click({ force: true, timeout: 3000 }),
@@ -2561,14 +2593,28 @@ async function collectGeneratedFiles(page, opts = {}) {
     }
     const cleanupWaiters = () => {
       settled = true;
-      for (const fn of cancels) {
+      if (dlListener && typeof page.off === 'function') {
         try {
-          fn();
+          page.off('download', dlListener);
         } catch {}
       }
       if (respListener && typeof page.off === 'function') {
         try {
           page.off('response', respListener);
+        } catch {}
+      }
+      if (pageListener && ctx) {
+        try {
+          if (typeof ctx.off === 'function') ctx.off('page', pageListener);
+          else if (typeof ctx.removeListener === 'function') ctx.removeListener('page', pageListener);
+        } catch {}
+      }
+      // Вкладки из буфера, не ставшие победителем, закрываем — они
+      // пойманы в окно нашего клика.
+      while (pageEvents.length) {
+        const p = pageEvents.shift();
+        try {
+          if (p && p.close) p.close();
         } catch {}
       }
     };
@@ -2578,7 +2624,152 @@ async function collectGeneratedFiles(page, opts = {}) {
       return;
     }
 
-    const winner = await Promise.race(waiters);
+    // Дедлайн гонки — после успешного клика: бюджет на скролл и ретраи
+    // клика из него не вычитается (ревью PLUG-376).
+    const deadline = Date.now() + CLICK_WAIT_MS;
+
+    // Новая вкладка: window.open стартует с about:blank, waitForLoadState
+    // резолвится до навигации — ждём реальный http(s) URL, параллельно
+    // гоним download-ивент вкладки; пустой/чужой URL — не победа.
+    const inspectNewPage = async (p) => {
+      const until = Math.min(deadline, Date.now() + 6000);
+      const urlP = (async () => {
+        while (!settled && Date.now() < until) {
+          let u = '';
+          try {
+            u = (p.url && p.url()) || '';
+          } catch {}
+          if (u && /^https?:/i.test(u)) return u;
+          try {
+            await (p.waitForLoadState &&
+              p.waitForLoadState('domcontentloaded', {
+                timeout: Math.min(1500, Math.max(1, until - Date.now())),
+              }));
+          } catch {}
+          await sleep(120);
+        }
+        return null;
+      })();
+      const dlP =
+        typeof p.waitForEvent === 'function'
+          ? p
+              .waitForEvent('download', { timeout: Math.max(1, until - Date.now()) })
+              .then((dl) => ({ dl }))
+              .catch(() => null)
+          : Promise.resolve(null);
+      // Берём первый НЕ-пустой результат — ошибка одного канала не
+      // обгоняет другой (about:blank urlP vs dlP).
+      let decided = false;
+      const first = await new Promise((resolve) => {
+        let left = 2;
+        const take = (v) => {
+          if (decided) return;
+          if (v) {
+            decided = true;
+            resolve(v);
+            return;
+          }
+          if (--left === 0) resolve(null);
+        };
+        urlP.then(take, () => take(null));
+        dlP.then(take, () => take(null));
+      });
+      if (settled || !first) {
+        try {
+          await (p.close && p.close());
+        } catch {}
+        return null;
+      }
+      if (first.dl) return { kind: 'download', dl: first.dl, page: p };
+      const cls = classifyDlUrl(first);
+      if (cls === 'allowed' || cls === 'drive') {
+        return { kind: 'page', page: p, url: first };
+      }
+      try {
+        await (p.close && p.close());
+      } catch {}
+      return null;
+    };
+
+    const waiters = [];
+    // 1) Нативное download-событие: буфер слушателя с момента клика
+    // (или прямой waitForEvent, если page.on в среде недоступен).
+    if (dlListener) {
+      waiters.push(
+        (async () => {
+          while (!settled && Date.now() < deadline) {
+            if (dlEvents.length) return { kind: 'download', dl: dlEvents[0] };
+            await sleep(60);
+          }
+          return null;
+        })()
+      );
+    } else if (typeof page.waitForEvent === 'function') {
+      waiters.push(
+        page
+          .waitForEvent('download', { timeout: Math.max(1, deadline - Date.now()) })
+          .then((dl) => ({ kind: 'download', dl }))
+          .catch(() => null)
+      );
+    }
+    // 2) Новые вкладки контекста из буфера — экспорт открывает viewer/файл
+    // в новой странице; URL забираем и стягиваем через request-контекст.
+    if (pageListener) {
+      waiters.push(
+        (async () => {
+          const seenPages = new Set();
+          while (!settled && Date.now() < deadline) {
+            while (pageEvents.length) {
+              const p = pageEvents.shift();
+              if (seenPages.has(p)) continue;
+              seenPages.add(p);
+              const r = await inspectNewPage(p);
+              if (r) return r;
+            }
+            await sleep(80);
+          }
+          return null;
+        })()
+      );
+    }
+    // 3) Сетевой ответ-файл из буфера (валидность проверена в слушателе).
+    if (respListener) {
+      waiters.push(
+        (async () => {
+          while (!settled && Date.now() < deadline) {
+            if (respEvents.length) return { kind: 'response', ...respEvents[0] };
+            await sleep(60);
+          }
+          return null;
+        })()
+      );
+    }
+    // 4) fetch→blob: опрос blob-URL, записанных хуком после клика.
+    waiters.push(
+      (async () => {
+        while (!settled && Date.now() < deadline) {
+          try {
+            const list = await page.evaluate(
+              ({ since }) =>
+                Array.isArray(window.__argonDlBlobs)
+                  ? window.__argonDlBlobs
+                      .filter((e) => e && e.url && e.ts >= since)
+                      .map((e) => ({ url: e.url, type: e.type, ts: e.ts }))
+                  : [],
+              { since: clickStart - 500 }
+            );
+            const hit = (list || []).find((e) => typeof e.url === 'string' && e.url.startsWith('blob:'));
+            if (hit) return { kind: 'blob', entry: hit };
+          } catch {
+            return null;
+          }
+          await sleep(200);
+        }
+        return null;
+      })()
+    );
+
+    const winner = await firstNonNull(waiters);
     cleanupWaiters();
 
     try {
@@ -2594,7 +2785,9 @@ async function collectGeneratedFiles(page, opts = {}) {
           const u = dl.url && dl.url();
           dlHost = u ? downloadUrlHost(u) : null;
         } catch {}
-        if (dlHost && !isAllowedDownloadHost(dlHost)) {
+        if (dlHost && DRIVE_GATE_HOST_RE.test(dlHost)) {
+          skipNote(candName, 'requires Google Drive integration');
+        } else if (dlHost && !isAllowedDownloadHost(dlHost)) {
           skipNote(candName, `host not allowed (${dlHost})`);
         } else {
           const name = sanitizeDownloadName(
@@ -2622,15 +2815,11 @@ async function collectGeneratedFiles(page, opts = {}) {
       } else if (winner.kind === 'page') {
         const p = winner.page;
         try {
-          const host = winner.url ? downloadUrlHost(winner.url) : null;
-          if (host && DRIVE_GATE_HOST_RE.test(host)) {
+          // URL и хост уже завалидированы в inspectNewPage (allowed|drive).
+          if (classifyDlUrl(winner.url) === 'drive') {
             skipNote(candName, 'requires Google Drive integration');
-          } else if (host && !isAllowedDownloadHost(host)) {
-            skipNote(candName, `host not allowed (${host})`);
-          } else if (winner.url) {
-            await fetchUrlToFile(winner.url, candName);
           } else {
-            skipNote(candName, 'download did not materialize');
+            await fetchUrlToFile(winner.url, candName);
           }
         } finally {
           try {
@@ -2639,11 +2828,9 @@ async function collectGeneratedFiles(page, opts = {}) {
         }
       } else if (winner.kind === 'response') {
         const resp = winner.resp;
-        const host = winner.url ? downloadUrlHost(winner.url) : null;
-        if (host && DRIVE_GATE_HOST_RE.test(host)) {
+        // Хост ответа уже проверен в слушателе (allowed|drive, 2xx).
+        if (classifyDlUrl(winner.url) === 'drive') {
           skipNote(candName, 'requires Google Drive integration');
-        } else if (host && !isAllowedDownloadHost(host)) {
-          skipNote(candName, `host not allowed (${host})`);
         } else {
           let body = null;
           let headers = {};
@@ -2669,23 +2856,43 @@ async function collectGeneratedFiles(page, opts = {}) {
         if (host && !isAllowedDownloadHost(host)) {
           skipNote(candName, `host not allowed (${host})`);
         } else {
+          // Байты читаем из сохранённого Blob — переживает revokeObjectURL;
+          // запасной путь — fetch(blob: URL) по старой схеме (ревью PLUG-376).
           const data = await page
-            .evaluate(async (u) => {
+            .evaluate(async ({ url, lim }) => {
               try {
-                const r = await fetch(u);
-                const buf = await r.arrayBuffer();
+                let buf = null;
+                let mime = '';
+                const rec = (window.__argonDlBlobs || []).find((e) => e && e.url === url);
+                const blob = rec && rec.blob;
+                if (blob && typeof blob.arrayBuffer === 'function') {
+                  if ((blob.size || 0) > lim) return { tooLarge: blob.size };
+                  mime = blob.type || '';
+                  buf = await blob.arrayBuffer();
+                } else {
+                  const r = await fetch(url);
+                  const cl = Number((r.headers && r.headers.get('content-length')) || 0);
+                  if (cl > lim) return { tooLarge: cl };
+                  mime = (r.headers && r.headers.get('content-type')) || '';
+                  buf = await r.arrayBuffer();
+                }
+                if (!buf || buf.byteLength > lim) {
+                  return { tooLarge: buf ? buf.byteLength : 0 };
+                }
                 const bytes = new Uint8Array(buf);
                 let s = '';
                 for (let i = 0; i < bytes.length; i += 0x8000) {
                   s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
                 }
-                return { b64: btoa(s), mime: (r.headers && r.headers.get('content-type')) || '' };
+                return { b64: btoa(s), mime };
               } catch {
                 return null;
               }
-            }, entry.url)
+            }, { url: entry.url, lim: maxBytes })
             .catch(() => null);
-          if (data && data.b64) {
+          if (data && data.tooLarge != null) {
+            skipNote(candName, `too large (${data.tooLarge} bytes > ${maxBytes})`);
+          } else if (data && data.b64) {
             const body = Buffer.from(data.b64, 'base64');
             saveBufferToFile(candName, data.mime || entry.type, body);
           } else {
@@ -2723,59 +2930,70 @@ async function collectGeneratedFiles(page, opts = {}) {
     }
     tries += 1;
     if (c.kind === 'link') {
-      let done = false;
-      try {
-        const ctx = page.context && page.context();
-        const req = ctx && ctx.request;
-        if (!req) throw new Error('no request context');
-        const resp = await req.get(c.href, { timeout: 15000 });
-        if (!resp.ok()) {
+      const linkName = c.name || nameFromUrl(c.href) || 'file';
+      const hrefCls = classifyDlUrl(c.href);
+      // Белый список DOM-скана пропускает *.google.com — ссылку на
+      // Docs/Drive viewer нельзя стягивать как файл (ревью PLUG-376).
+      if (hrefCls === 'drive') {
+        skipNote(linkName, 'requires Google Drive integration');
+      } else if (hrefCls !== 'allowed') {
+        skipNote(linkName, `host not allowed (${dlHostNote(c.href)})`);
+      } else {
+        try {
+          const ctx = page.context && page.context();
+          const req = ctx && ctx.request;
+          if (!req) throw new Error('no request context');
+          const resp = await req.get(c.href, { timeout: 15000 });
+          // req.get идёт по редиректам — финальный хост проверяем тоже.
+          const finalUrl = (typeof resp.url === 'function' && resp.url()) || c.href;
+          const fCls = classifyDlUrl(finalUrl);
+          if (fCls === 'drive') {
+            skipNote(linkName, 'requires Google Drive integration');
+          } else if (fCls !== 'allowed') {
+            skipNote(linkName, `host not allowed (${dlHostNote(finalUrl)})`);
+          } else if (!resp.ok()) {
+            if (c.canClick) {
+              await tryDownloadByClick(c);
+            } else {
+              skipNote(linkName, `http ${resp.status()}`);
+            }
+          } else {
+            const headers = resp.headers();
+            const cl = Number(headers['content-length'] || 0);
+            if (cl > maxBytes) {
+              skipNote(linkName, `too large (${cl} bytes > ${maxBytes})`);
+            } else {
+              const body = await resp.body();
+              if (body.length > maxBytes) {
+                skipNote(linkName, `too large (${body.length} bytes > ${maxBytes})`);
+              } else {
+                const name = sanitizeDownloadName(
+                  fileNameFromDisposition(headers['content-disposition']) ||
+                    c.name ||
+                    nameFromUrl(finalUrl) ||
+                    'file'
+                );
+                const dest = destFor(name);
+                const tmp = `${dest}.part`;
+                fs.writeFileSync(tmp, body);
+                fs.renameSync(tmp, dest);
+                files.push({
+                  path: dest,
+                  name,
+                  mimeType: String(headers['content-type'] || '').split(';')[0].trim() || mimeFromName(name),
+                  sizeBytes: body.length,
+                });
+              }
+            }
+          }
+        } catch (e) {
           if (c.canClick) {
             await tryDownloadByClick(c);
           } else {
-            skipNote(c.name || nameFromUrl(c.href) || 'file', `http ${resp.status()}`);
-          }
-          done = true;
-        } else {
-          const headers = resp.headers();
-          const cl = Number(headers['content-length'] || 0);
-          if (cl > maxBytes) {
-            skipNote(c.name || nameFromUrl(c.href) || 'file', `too large (${cl} bytes > ${maxBytes})`);
-            done = true;
-          } else {
-            const body = await resp.body();
-            if (body.length > maxBytes) {
-              skipNote(c.name || nameFromUrl(c.href) || 'file', `too large (${body.length} bytes > ${maxBytes})`);
-            } else {
-              const name = sanitizeDownloadName(
-                fileNameFromDisposition(headers['content-disposition']) ||
-                  c.name ||
-                  nameFromUrl(c.href) ||
-                  'file'
-              );
-              const dest = destFor(name);
-              const tmp = `${dest}.part`;
-              fs.writeFileSync(tmp, body);
-              fs.renameSync(tmp, dest);
-              files.push({
-                path: dest,
-                name,
-                mimeType: String(headers['content-type'] || '').split(';')[0].trim() || mimeFromName(name),
-                sizeBytes: body.length,
-              });
-            }
-            done = true;
+            skipNote(linkName, String((e && e.message) || e));
           }
         }
-      } catch (e) {
-        if (c.canClick) {
-          await tryDownloadByClick(c);
-        } else {
-          skipNote(c.name || nameFromUrl(c.href) || 'file', String((e && e.message) || e));
-        }
-        done = true;
       }
-      void done;
     } else {
       await tryDownloadByClick(c);
     }
