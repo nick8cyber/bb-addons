@@ -352,8 +352,11 @@ export async function collectTaskAttachments(context, blocks, options) {
       add("Embedded resource", block.resource.text, { name, at: "ACP input" });
     }
   }
-  // PLUG-384: публичный research — без локальных файлов: ни перечисленных
-  // в инструкциях путей репозитория, ни авто-подобранных file-блоков.
+  // PLUG-384: публичный research — без авто-подобранных локальных файлов
+  // (перечисленных в инструкциях путей репозитория). Явно приложенные
+  // ACP-источники (resource_link/localFile на текст) собираются через
+  // действующую ACP-валидацию, как и в репо-режиме: молчаливая потеря
+  // обязательного вложения запрещена, неприемлемое — явный отказ.
   const light = context.research && !context.write;
   if (!light) for (const file of new Set(context.repoFiles)) {
     try {
@@ -368,15 +371,14 @@ export async function collectTaskAttachments(context, blocks, options) {
   for (const block of blocks) {
     const file = blockFile(block);
     if (["image", "audio", "localImage"].includes(block.type) || /^(?:image|audio|video)\//i.test(block.mimeType ?? "")) {
-      if (light) continue;
       throw new Error("mandatory attachment is binary");
     }
-    if (!file || light) continue;
+    if (!file) continue;
     const abs = resolve(context.cwd, file);
     const repoFile = root && inside(root, abs);
     if (seenPaths.has(abs)) continue;
     seenPaths.add(abs);
-    if (pin && repoFile) {
+    if (!light && pin && repoFile) {
       add("Repository attachment", await readMaterial(root, pin, repoFile, maxUploadBytes, signal), {
         name: repoFile, at: pin.sha, upload: true,
       });
@@ -583,6 +585,11 @@ export async function taskTool(context, collected, call, limit, signal) {
   const mask = context.settings.mask;
   const bbRead = tools.bbReadCommand(call);
   if (bbRead) return readBbMaterial(bbRead, mask, limit, signal);
+  // PLUG-384: в публичном research шапка инструменты дерева не объявляет —
+  // их вызов получает явный отказ, а не чтение локальных файлов.
+  if (context.research && !context.write && ["read_file", "list_dir", "grep", "git"].includes(call.name)) {
+    return { ok: false, output: "error: repository tools are unavailable in a public research task" };
+  }
   const options = { cwd: context.root ?? context.cwd, mask, maxResultBytes: limit, rejectSensitive: true };
   if (!context.pin || !["read_file", "list_dir", "grep", "git"].includes(call.name)) {
     const result = await tools.executeTool(call, options);

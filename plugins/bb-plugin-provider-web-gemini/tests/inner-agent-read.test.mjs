@@ -1739,3 +1739,179 @@ test("research-сессия держит лёгкий пакет на повто
   assert.match(content, /=== Опись \/ Manifest ===/);
   assert.match(content, /"permissions": ?"read-only"/);
 });
+
+test("research-ход собирает явно приложенный resource_link на текст в лёгкий пакет (PLUG-384)", async (t) => {
+  const repo = setup(t);
+  repo.write("research/attached.txt", "PUBLIC-ATTACHMENT-ZQ9\n");
+  const app = fixture(t, repo, () => ({ text: "Готово." }));
+
+  const researchTask = [
+    "# RES-7 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const session = await app.newSession();
+  const link = {
+    type: "resource_link",
+    uri: pathToFileURL(join(repo.repo, "research/attached.txt")).href,
+    name: "attached",
+  };
+  const res = await app.prompt(session, researchTask, [link]);
+  assert.equal(res.result?.stopReason, "end_turn", JSON.stringify(res.error));
+
+  const [request] = app.requests();
+  const content = request.files.map((file) => file.text).join("\n") + "\n" + request.prompt;
+  // Явное вложение дошло веб-файлом — не потеряно молча.
+  assert.match(content, /PUBLIC-ATTACHMENT-ZQ9/);
+  // Пакет всё ещё лёгкий: без манифеста, git-секций и repo-инструментов;
+  // локальные файлы репозитория сами не подбираются.
+  assert.match(request.prompt.split("\n")[0], /Для поиска публичных источников используй поиск Gemini/);
+  assert.doesNotMatch(request.prompt, /<tool name="read_file"/);
+  assert.doesNotMatch(content, /Опись \/ Manifest|"permissions"|Git status|different HEAD/);
+});
+
+test("research-ход: resource_link вне корней сессии — явный отказ, а не молчаливая потеря (PLUG-384)", async (t) => {
+  const repo = setup(t);
+  const outside = join(repo.tmp, "outside.txt");
+  writeFileSync(outside, "OUTSIDE-CONTENT\n");
+  const app = fixture(t, repo, () => ({ text: "Готово." }));
+
+  const researchTask = [
+    "# RES-8 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const session = await app.newSession();
+  const link = { type: "resource_link", uri: pathToFileURL(outside).href, name: "outside" };
+  const res = await app.prompt(session, researchTask, [link]);
+  assert.ok(res.error, JSON.stringify(res.result));
+  assert.match(res.error.message, /mandatory ACP attachment/);
+  // Ход не доехал до веб-драйвера — обязательное вложение не «0 materials».
+  assert.equal(app.requests().length, 0);
+});
+
+test("research-ход: вызов repo-инструмента в цикле получает явный отказ (PLUG-384)", async (t) => {
+  const repo = setup(t);
+  const app = fixture(t, repo, (request) =>
+    request.count === 1
+      ? { text: '<tool name="read_file" path="docs/notes.txt"/>' }
+      : { text: "Готово." });
+
+  const researchTask = [
+    "# RES-9 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const session = await app.newSession();
+  const res = await app.prompt(session, researchTask);
+  assert.equal(res.result?.stopReason, "end_turn", JSON.stringify(res.error));
+
+  const [, toolRound] = app.requests();
+  assert.match(toolRound.prompt, /=== tool: read_file/);
+  assert.match(toolRound.prompt, /error: repository tools are unavailable/);
+  // Локальный файл при этом не прочитан.
+  assert.doesNotMatch(toolRound.prompt, /different HEAD/);
+});
+
+test("collectTaskAttachments и taskTool в research-режиме: явные вложения собираются, отказы диагностируемы (PLUG-384)", async (t) => {
+  const { collectTaskAttachments, prepareTask, taskTool } = await import("../src/inner-context.mjs");
+  const { tmp, repo, write } = setup(t);
+  write("research/attached.txt", "PUBLIC-ATTACHMENT-ZQ9\n");
+  const signal = new AbortController().signal;
+
+  const taskText = [
+    "# RES-10 · Публичное исследование",
+    "## Description",
+    "Исследуй публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    [RU["instr.noCode"], interpolate(RU["instr.attachList"], { list: ["docs/notes.txt"] })].join("\n"),
+  ].join("\n\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+  assert.equal(prep.research, true);
+  assert.deepEqual(prep.repoFiles, ["docs/notes.txt"]);
+
+  const options = {
+    signal,
+    maxUploadBytes: 1_000_000,
+    maxUploadCount: 5,
+    spillDir: tmp,
+    validateUploads: (blocks) => ({ files: blocks.map((block) => fileURLToPath(block.uri)) }),
+  };
+  const link = { type: "resource_link", uri: pathToFileURL(join(repo, "research/attached.txt")).href };
+
+  // Явно приложенный текст собирается через ACP-валидацию.
+  const materials = await collectTaskAttachments(prep, [link], options);
+  assert.equal(materials.length, 1);
+  assert.equal(materials[0].source, "ACP attachment");
+  assert.match(materials[0].text, /PUBLIC-ATTACHMENT-ZQ9/);
+  // repoFiles из инструкций в light по-прежнему исключены.
+  assert.ok(!materials.some((item) => /different HEAD/.test(item.text)));
+
+  // Отказ валидации — явная ошибка, не «0 materials».
+  await assert.rejects(
+    collectTaskAttachments(prep, [link], { ...options, validateUploads: () => ({ error: "denied" }) }),
+    /mandatory ACP attachment/,
+  );
+  // Бинарное вложение — тоже явный отказ, не молчаливый пропуск.
+  await assert.rejects(
+    collectTaskAttachments(prep, [{ type: "image", path: join(repo, "picture.bin") }], options),
+    /mandatory attachment is binary/,
+  );
+
+  // Инструменты дерева в light — отказ.
+  for (const [name, args] of [
+    ["read_file", { path: "docs/notes.txt" }],
+    ["list_dir", { path: "." }],
+    ["grep", { pattern: "HEAD" }],
+    ["git", { args: "status" }],
+  ]) {
+    const result = await taskTool(prep, {}, { name, args, attrs: [] }, 60_000, signal);
+    assert.equal(result.ok, false, name);
+    assert.match(result.output, /^error: .*unavailable/, name);
+  }
+
+  // Репо-режим неизменён: тот же read_file читает рабочую копию.
+  const plain = await prepareTask({
+    text: taskText.replace(RU["instr.noCode"], "Обычные инструкции без пометок."),
+    system: null,
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+  assert.equal(plain.research, false);
+  const read = await taskTool(plain, {}, { name: "read_file", args: { path: "docs/notes.txt" }, attrs: [] }, 60_000, signal);
+  assert.equal(read.ok, true);
+  assert.match(read.output, /different HEAD/);
+});
