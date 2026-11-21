@@ -584,6 +584,14 @@ function shutdown(reason) {
     spawnError: spawnErrorMessage,
     stderr: stderrTail.trim() !== "" ? stderrTail.slice(-1500) : null,
   });
+  // Orderly lifecycle exits produce hundreds of stderr files a day — delete
+  // this shim's own file. Abnormal reasons (child-close, no-real-bin, epipe,
+  // parent-death) keep theirs for postmortem; the wrapper sweeps aged files.
+  if (STDERR_FILE !== null && (reason === "stdin-eof" || reason.startsWith("sig-"))) {
+    try {
+      unlinkSync(STDERR_FILE);
+    } catch {}
+  }
   try {
     rlIn.close();
   } catch {}

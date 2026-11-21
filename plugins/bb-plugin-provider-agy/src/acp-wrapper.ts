@@ -42,6 +42,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -513,6 +514,11 @@ function drainShimEvents(): void {
       eventsFd = openSync(file, "r");
       eventsOffset = 0;
     }
+    // Cheap size probe first — the 1s timer calls this mostly to find
+    // nothing, so skip the 1 MiB alloc when the file hasn't grown.
+    if (fstatSync(eventsFd).size <= eventsOffset) {
+      return;
+    }
     const buf = Buffer.alloc(1 << 20);
     const read = readSync(eventsFd, buf, 0, buf.length, eventsOffset);
     if (read <= 0) {
@@ -601,11 +607,16 @@ function handleShimEvent(event: ShimEvent): void {
 /**
  * The shim is down. Orderly reasons (stdin-eof, signals, parent-death) are
  * the §12.1 lifecycle — journal only. A child that died on its own
- * (child-close, spawn-error, no-real-bin) before the session init resolved
- * is the PLUG-373 blind spot: the forwarded thread/start|resume could hang
- * unanswered, so the pending request gets an honest -32000 carrying the
- * exit code and the stderr tail; the bridge's own late answer for the same
- * id is swallowed via PendingDaemonSession.synthesized.
+ * (child-close, no-real-bin — a failed spawn also arrives as child-close
+ * carrying spawnError) before the session init resolved is the PLUG-373
+ * blind spot. In practice the generic bridge always answers the pending
+ * request on shim exit — its answer carries the child's stderr and drives
+ * the refusal classification (park / sibling retry). So the pending gets a
+ * grace window (EARLY_EXIT_GRACE_MS): a bridge answer inside it wins and is
+ * classified normally; only an expiry synthesizes -32000, itself run
+ * through the same classification so a refusal in the stderr tail still
+ * parks the account. A late duplicate bridge answer is swallowed via
+ * PendingDaemonSession.synthesized.
  */
 function onShimShutdown(session: WSession, event: ShimEvent): void {
   const reason = event.reason ?? "?";
@@ -624,11 +635,7 @@ function onShimShutdown(session: WSession, event: ShimEvent): void {
       `${stderrText !== "" ? ` — ${stderrText.slice(0, 300)}` : ""}` +
       `${stderrFileHint(session)}`,
   );
-  if (
-    reason !== "child-close" &&
-    reason !== "spawn-error" &&
-    reason !== "no-real-bin"
-  ) {
+  if (reason !== "child-close" && reason !== "no-real-bin") {
     return;
   }
   const detail =
@@ -637,20 +644,63 @@ function onShimShutdown(session: WSession, event: ShimEvent): void {
       : stderrText !== ""
         ? `: ${stderrText.slice(-400)}`
         : "";
+  const message = `agy exited before the session was ready${exitText !== "" ? ` (${reason}${exitText})` : ` (${reason})`}${detail}`;
   for (const [reqId, pending] of pendingDaemonSessions) {
-    if (pending.session !== session || pending.synthesized === true) {
+    if (
+      pending.session !== session ||
+      pending.synthesized === true ||
+      pending.earlyExit !== undefined
+    ) {
       continue;
     }
-    pending.synthesized = true;
+    const timer = setTimeout(() => {
+      settleEarlyExitAnswer(reqId);
+    }, EARLY_EXIT_GRACE_MS);
+    timer.unref?.();
+    pending.earlyExit = { timer, message };
     log(
-      `thread ${session.threadId}: ${pending.kind} id=${String(reqId)} answered with early-exit error (shim ${reason}${exitText})`,
-    );
-    sendError(
-      reqId,
-      -32000,
-      `agy exited before the session was ready${exitText !== "" ? ` (${reason}${exitText})` : ` (${reason})`}${detail}`,
+      `thread ${session.threadId}: ${pending.kind} id=${String(reqId)} open after shim ${reason}${exitText} — ${EARLY_EXIT_GRACE_MS}ms grace for the bridge's own answer`,
     );
   }
+}
+
+/**
+ * Grace window elapsed with no bridge answer: synthesize the -32000, but
+ * run its text through the same refusal classification as a real response
+ * — a VALIDATION_REQUIRED/ToS/eligibility/model-refusal in the captured
+ * stderr still parks or rotates the account instead of failing blind.
+ */
+function settleEarlyExitAnswer(reqId: JsonRpcId): void {
+  const pending = pendingDaemonSessions.get(reqId);
+  if (pending === undefined || pending.synthesized === true) {
+    return;
+  }
+  const message =
+    pending.earlyExit?.message ?? "agy exited before the session was ready";
+  pending.earlyExit = undefined;
+  pending.synthesized = true;
+  const { session } = pending;
+  if (
+    session.accountLabel !== null &&
+    session.model !== undefined &&
+    dataDir !== "" &&
+    isModelRefusal(message)
+  ) {
+    retryDaemonSession(reqId, pending, {});
+    return;
+  }
+  const parkedCause =
+    session.accountLabel !== null && dataDir !== ""
+      ? internalRefusalCauseOf(message)
+      : null;
+  if (parkedCause !== null) {
+    retryDaemonSessionParked(reqId, pending, parkedCause, message);
+    return;
+  }
+  log(
+    `thread ${session.threadId}: ${pending.kind} id=${String(reqId)} answered with early-exit error after grace (no bridge answer)`,
+  );
+  sendError(reqId, -32000, message);
 }
 
 /** Point the journal at the file the shim just died writing to. */
@@ -1466,6 +1516,28 @@ export function sweepStaleShimTmpDirs(): void {
       // A dir that resists any check is left for the next pass.
     }
   }
+}
+
+/** Per-spawn stderr files from abnormal deaths are postmortem material —
+ * keep them for a while (orderly shutdowns delete their own file inside
+ * the shim), then sweep so the dir can't grow unbounded (~640 spawns/day).
+ */
+const STDERR_LOG_TTL_MS = 48 * 3_600_000;
+function sweepStaleStderrLogs(): void {
+  try {
+    for (const name of readdirSync(shimDir())) {
+      if (!name.startsWith("stderr-") || !name.endsWith(".log")) {
+        continue;
+      }
+      try {
+        const file = join(shimDir(), name);
+        if (Date.now() - statSync(file).mtimeMs > STDERR_LOG_TTL_MS) {
+          unlinkSync(file);
+          log(`reaper: removed stale shim stderr log ${name}`);
+        }
+      } catch {}
+    }
+  } catch {}
 }
 
 /** Defense in depth: shims orphaned onto init/systemd are reaped here even
@@ -4717,6 +4789,12 @@ function interceptOutbound(line: string): void {
       );
       return;
     }
+    if (pending.earlyExit !== undefined) {
+      // Bridge answered inside the grace window — its real error drives
+      // the refusal classification, not our synthesized text.
+      clearTimeout(pending.earlyExit.timer);
+      pending.earlyExit = undefined;
+    }
     const errorText = "error" in msg ? errorMessageOf(msg.error) : null;
     if (
       errorText !== null &&
@@ -4877,7 +4955,13 @@ interface PendingDaemonSession {
   /** The early-shim-death path already answered this request: the bridge's
    * own response for the same id is a duplicate — swallow it. */
   synthesized?: boolean;
+  /** Shim died while the bridge's own answer is still in flight: the grace
+   * timer before synthesizing our own error, so the real response (which
+   * carries the refusal text the parking/rotation classification needs)
+   * wins when it arrives. */
+  earlyExit?: { timer: NodeJS.Timeout; message: string };
 }
+const EARLY_EXIT_GRACE_MS = 4_000;
 const pendingDaemonSessions = new Map<JsonRpcId, PendingDaemonSession>();
 
 /**
@@ -5390,6 +5474,10 @@ function discardSession(session: WSession): void {
   for (const [id, pending] of pendingDaemonSessions) {
     if (pending.session === session) {
       pendingDaemonSessions.delete(id);
+      if (pending.earlyExit !== undefined) {
+        clearTimeout(pending.earlyExit.timer);
+        pending.earlyExit = undefined;
+      }
       if (pending.synthesized === true) {
         // The bridge may still answer this id — keep swallowing it even
         // though the map entry is gone.
@@ -6182,9 +6270,11 @@ export const experimental_providerBridge = {
       } catch {}
     }, SHIM_EVENTS_DRAIN_MS);
     eventsDrainTimer.unref?.();
-    // Defense-in-depth sweep (spec §12.3): orphans of dead workers and stale
-    // harness tmp roots. Best-effort — never lets a scan failure break start.
+    // Defense-in-depth sweep (spec §12.3): orphans of dead workers, stale
+    // harness tmp roots, aged per-spawn stderr files. Best-effort — never
+    // lets a scan failure break start.
     reapOrphanShims();
+    sweepStaleStderrLogs();
   },
   handleLine,
   onClose: () => {
@@ -6201,6 +6291,7 @@ export const experimental_providerBridge = {
       }
     }
     reapOrphanShims();
+    sweepStaleStderrLogs();
     return acpBridge.onClose?.();
   },
   onSigterm: () => acpBridge.onSigterm?.(),

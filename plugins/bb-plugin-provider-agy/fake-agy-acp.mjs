@@ -148,6 +148,26 @@ if (argv.includes("models")) {
   process.exit(0);
 }
 
+// Early death before session init (PLUG-373): an account home carrying
+// `.fake-acp-early-exit` inside its .gemini dir makes `agy acp --gemini-dir`
+// print the file's content to stderr and exit 1 — the spawn-time refusal
+// shape (Verification Required / ToS / eligibility) that never reaches
+// JSON-RPC. `agy models` is unaffected (it exits above).
+const earlyExitFile =
+  geminiDir !== null ? join(geminiDir, ".fake-acp-early-exit") : null;
+if (earlyExitFile !== null && existsSync(earlyExitFile)) {
+  try {
+    process.stderr.write(readFileSync(earlyExitFile, "utf8"));
+  } catch {}
+  process.exit(1);
+}
+
+// Optional startup stderr chatter (AGY_FAKE_STDERR_BANNER): lets harnesses
+// prove the shim's per-spawn stderr file exists and its lifecycle cleanup.
+if (process.env.AGY_FAKE_STDERR_BANNER) {
+  process.stderr.write(`${process.env.AGY_FAKE_STDERR_BANNER}\n`);
+}
+
 const configOptionsFor = () => [
   { id: "model", category: "model", type: "select",
     currentValue: catalogFor(homeLabel)[0]?.id ?? "fake-model",

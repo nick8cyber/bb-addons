@@ -3,7 +3,7 @@ title: provider-agy — восстановление после сбоев и с
 status: approved
 owner: coordinator
 date: 2026-11-18
-revision: 6 (ранняя гибель agy до session init — честная `-32000` с хвостом stderr, журнал получения запроса и per-spawn stderr-файл; provider-agy-acp §12.7, PLUG-373); 5 (квота текстом ответа `⚠ Individual quota reached…` — та же строка «Квота аккаунта», provider-agy-acp §2.3 п. 13; инцидент 19.11); 4 (решение владельца 19.11, PLUG-332: отказ eligibility с просьбой/ссылкой проверки — бессрочная парковка validation-required без cooldownUntilMs; отказ без ссылки — 2 ч; суточный eligibility-кулдаун снят, 24 ч остаётся только у auth-dead; ранее 3: синхронизация со спекой ACP рев. 14, PLUG-313; 2: §2 — выбор по тирам priority, PLUG-253)
+revision: 7 (ранняя гибель agy: окно ожидания ответа моста — отказ по stderr проходит парковку/ротацию §2.3, синтез -32000 только по истечении окна; provider-agy-acp §12.7, PLUG-373); 6 (ранняя гибель agy до session init — честная `-32000` с хвостом stderr, журнал получения запроса и per-spawn stderr-файл; provider-agy-acp §12.7, PLUG-373); 5 (квота текстом ответа `⚠ Individual quota reached…` — та же строка «Квота аккаунта», provider-agy-acp §2.3 п. 13; инцидент 19.11); 4 (решение владельца 19.11, PLUG-332: отказ eligibility с просьбой/ссылкой проверки — бессрочная парковка validation-required без cooldownUntilMs; отказ без ссылки — 2 ч; суточный eligibility-кулдаун снят, 24 ч остаётся только у auth-dead; ранее 3: синхронизация со спекой ACP рев. 14, PLUG-313; 2: §2 — выбор по тирам priority, PLUG-253)
 tags: [bb, plugins, provider-agy, recovery, compaction]
 ---
 
@@ -35,7 +35,7 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 | Тишина ≥15 мин во время хода, тул не открыт | Убить agy; если в полёте один принятый ход без очереди — `errorInfo {stream-disconnected}` → bb повторяет |
 | Тишина ≥2 ч с открытым тулом | Убить agy, без автоповтора (команды не повторяются) |
 | `AGY_PATH` указан, но не исполняемый | Явная ошибка, без отката на системный agy |
-| agy умер до готовности сессии (exit/stderr без session — квота, лицензия, ранний выход) | Честная `-32000 «agy exited before the session was ready»` с кодом выхода и хвостом stderr висящему `thread/start|resume` (не молчаливый zombie); stderr ребёнка — `acp-shim/stderr-<threadId>-<nonce>.log`, шим-down — строка журнала; запрос при этом журналируется при получении ([provider-agy-acp.md](provider-agy-acp.md) §12.7, ревизия 20) |
+| agy умер до готовности сессии (exit/stderr без session — квота, лицензия, ранний выход) | Окно 4 с на ответ моста висящему `thread/start|resume`: ответ моста несёт stderr и идёт обычной классификацией отказов §2.3 (парковка/ротация); окно истекло — честная `-32000 «agy exited before the session was ready»` с кодом выхода и хвостом stderr, тоже через классификацию. stderr ребёнка — `acp-shim/stderr-<threadId>-<nonce>.log` (штатный shutdown удаляет свой, sweep старше 48 ч), шим-down — строка журнала; запрос журналируется при получении ([provider-agy-acp.md](provider-agy-acp.md) §12.7, ревизия 21) |
 
 Правила парковки по `parkedReason` действуют на ACP-транспорте; для stream-json — см. [provider-agy-acp.md](provider-agy-acp.md) §10 (аккаунт с любым `parkedReason` в stream-json не запускается).
 
