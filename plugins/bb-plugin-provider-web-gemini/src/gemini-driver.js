@@ -119,44 +119,46 @@ function getRunningChromeProfile(port) {
   }
 }
 
-async function stopChrome(port, stateDir = null) {
-  const { execSync } = require('child_process');
+// Unified safe teardown (PLUG-374 заход 6): the same pipeline the reaper
+// uses — marker-locked identify → lease/CDP gates → SIGTERM → re-verify →
+// SIGKILL. A port gated by a live foreign lease, live CDP clients, or an
+// in-flight teardown reports busy and is retried — never signaled. Groups
+// with no marker (externally launched chrome) are never touched either:
+// the old global pkill-by-port-flag is gone from the automatic path
+// (contract §4).
+async function stopChrome(port, stateDir = null, { busyWaitMs = 30_000, pollMs = 300 } = {}) {
   const p = String(port ?? CDP_PORT);
-  // Marker-based group kill first: pkill matches only processes whose cmdline
-  // carries the port flag, so the Xvfb server spawned by xvfb-run escaped it —
-  // killing the whole detached group takes it too (PLUG-374).
-  try {
-    // Claim the teardown under the per-port marker lock: the `reaping` mark
-    // (written in the same serialized section as the identity check) keeps
-    // fresh adoptions/leases out while the group dies (заход 5).
-    const marked = browserGroups.withMarkerLock(stateDir, p, () => {
-      const meta = browserGroups.readMarker(stateDir, p);
-      if (!meta || browserGroups.isReaping(meta)) return null;
-      if (!browserGroups.groupAliveMatches(meta)) return null;
-      const m = { ...meta, reaping: { by: process.pid, sinceMs: Date.now() } };
-      browserGroups.writeMarker(stateDir, m);
-      if (!browserGroups.signalGroup(m, 'SIGTERM')) {
-        browserGroups.writeMarker(stateDir, meta); // nothing signaled — unmark
-        return null;
-      }
-      return m;
-    });
-    if (marked) {
-      await browserGroups.killGroup(marked);
-      // Drop the marker only if it still describes the group we killed — a
-      // fresh owner may have recorded a new group on the port meanwhile.
-      browserGroups.withMarkerLock(stateDir, p, () => {
-        const cur = browserGroups.readMarker(stateDir, p);
-        if (cur && cur.pgid === marked.pgid && cur.ownerPid === marked.ownerPid) {
-          browserGroups.removeMarker(stateDir, p);
-        }
+  const dir = browserGroups.resolveStateDir(stateDir);
+  // Our own CDP/playwright sockets must not count as "live clients" — a
+  // lingering connection would veto our own restart forever.
+  const ownInodes = browserGroups.socketInodesOf(process.pid);
+  const deadline = Date.now() + busyWaitMs;
+  let res = { status: 'absent' };
+  for (;;) {
+    try {
+      res = await browserGroups.teardownGroup({
+        stateDir: dir,
+        port: p,
+        // Same ledger lock lease writers hold: a lease cannot slip between
+        // the check and the SIGTERM, exactly like the reaper (§3).
+        withOuterLock: (fn) => browserGroups.withLedgerLock(dir, fn),
+        // A live lease from ANOTHER process keeps the port busy; our own
+        // lease (ensureChrome under bindBackend) must not veto the restart.
+        busy: (cur, now) =>
+          browserGroups.leaseBusyOnPort(browserGroups.readLedger(dir), cur.port, now, {
+            excludePid: process.pid,
+          })
+            ? 'lease'
+            : null,
+        ignoreInodes: ownInodes,
+        ownerGraceMs: browserGroups.DEFAULT_OWNER_GRACE_MS,
       });
+    } catch (e) {
+      res = { status: 'skipped', reason: `error:${String(e && e.message ? e.message : e).slice(0, 120)}` };
     }
-  } catch {}
-  try {
-    execSync(`pkill -f 'remote-debugging-port=${p}([[:space:]]|$)' || true`);
-    await new Promise((r) => setTimeout(r, 800));
-  } catch {}
+    if (res.status !== 'busy' || Date.now() >= deadline) return res;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
 }
 
 async function ensureChrome(opts = {}) {
@@ -221,7 +223,15 @@ async function ensureChrome(opts = {}) {
     );
   }
 
-  await stopChrome(port, stateDir);
+  const stopped = await stopChrome(port, stateDir);
+  if (stopped.status !== 'torn-down' && stopped.status !== 'absent') {
+    // Busy or unverifiable: respawning would either race an in-flight
+    // teardown / a live session or collide with a group we must not kill.
+    throw new Error(
+      `chrome on :${port} cannot be restarted: ${stopped.status}` +
+        (stopped.reason ? ` (${stopped.reason})` : '')
+    );
+  }
 
   const { spawn } = require('child_process');
   const chromeBin = process.env.GEMINI_CHROME_BIN || process.env.CHROME_BIN || '/usr/bin/google-chrome-stable';

@@ -24,12 +24,16 @@
 // foreign and we cannot tell. That case fails closed (identity
 // 'boot-unknown'): no signals, no adoption, no marker deletion.
 //
-// Every marker write/delete runs under a per-port lockfile
-// (<groupsDir>/<port>.lock, O_EXCL + stale-steal): the read-verify-write
-// and read-verify-unlink sections of recordGroup/adoptGroup/reaper/
-// driver-stop are serialized across processes, so a marker written by a
-// concurrent launch or adoption cannot be clobbered by a teardown that
-// verified against an older snapshot (заход 5).
+// Every marker write/delete runs under a per-port kernel lock
+// (<groupsDir>/<port>.lock held via flock(2) on an open fd): the
+// read-verify-write and read-verify-unlink sections of
+// recordGroup/adoptGroup/reaper/driver-stop are serialized across
+// processes, so a marker written by a concurrent launch or adoption cannot
+// be clobbered by a teardown that verified against an older snapshot
+// (заход 5). The lock is owned by the open file description — the kernel
+// releases it when the holder's last fd closes, including on death, so no
+// stale-steal is ever needed and a paused holder's lock is never taken
+// away (заход 6).
 
 const fs = require('fs');
 const path = require('path');
@@ -147,22 +151,28 @@ function isPidAlive(pid) {
   }
 }
 
-// --- per-port marker lock (заход 5) ---
-// O_EXCL lockfile next to the marker. Every writer — recordGroup,
+// --- per-port marker lock (заход 5, flock — заход 6) ---
+// Kernel lock on the lockfile's open file description: `flock -x -w T <fd>`
+// applied to an fd we keep open. flock(2) locks live on the description,
+// not the calling process — the helper exits immediately and our fd keeps
+// the lock; closeSync (or our death) releases it. A paused-but-alive
+// holder simply keeps its lock — there is no steal and no
+// release-the-successor's-lock window. Every writer — recordGroup,
 // adoptGroup, clearReaping, reaper branches, driver stop — runs its
-// read-verify-write / read-verify-unlink section under it, so a marker
-// landing between a snapshot check and a write/unlink cannot be lost.
+// read-verify-write / read-verify-unlink section under it.
+// The lockfile is NEVER unlinked: deleting it would let a waiter parked on
+// the old inode and a creator of a fresh file lock different objects.
 // Readers (readMarker/listMarkers/isReaping) stay lock-free: single-file
 // rename writes are atomic.
 
-// A section only ever holds synchronous filesystem work — a few ms at
-// worst — so a lockfile older than this means its holder died or hung.
-const MARKER_LOCK_STALE_MS = 15_000;
-const MARKER_LOCK_WAIT_MS = 10_000;
+const MARKER_LOCK_WAIT_MS = Number(process.env.BG_MARKER_LOCK_WAIT_MS) || 10_000;
 
-// Lockfiles this process already holds — same-process reentrancy (a locked
-// writeMarker inside a withMarkerLock section must not re-acquire).
-const heldMarkerLocks = new Set();
+// Lock files this process already holds (path -> fd, or null when flock is
+// unavailable and only the in-process reentrancy guard applies — marker
+// locking is only load-bearing on Linux, where util-linux `flock` is part
+// of the base system). Same-process reentrancy: a locked writeMarker
+// inside a withMarkerLock section must not re-acquire.
+const heldMarkerLocks = new Map();
 
 // Sleep without burning CPU — works on the main thread in Node.
 const lockSpin = (() => {
@@ -170,49 +180,61 @@ const lockSpin = (() => {
   return (ms) => Atomics.wait(buf, 0, 0, ms);
 })();
 
+let flockAvailable;
+function flockBin() {
+  if (flockAvailable === undefined) {
+    try {
+      const { spawnSync } = require('child_process');
+      const r = spawnSync('flock', ['--version'], { stdio: 'ignore' });
+      flockAvailable = !r.error && r.status === 0;
+    } catch {
+      flockAvailable = false;
+    }
+  }
+  return flockAvailable ? 'flock' : null;
+}
+
 function acquireMarkerLock(stateDir, port) {
   const p = markerLockPath(stateDir, port);
   if (heldMarkerLocks.has(p)) return;
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  const deadline = Date.now() + MARKER_LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      const fd = fs.openSync(p, 'wx');
-      try {
-        fs.writeSync(fd, `${process.pid}\n`);
-      } finally {
-        fs.closeSync(fd);
-      }
-      heldMarkerLocks.add(p);
-      return;
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      try {
-        const st = fs.statSync(p);
-        if (Date.now() - st.mtimeMs > MARKER_LOCK_STALE_MS) {
-          // The holder died mid-section — steal, but only if the file is
-          // still the same inode we statted; a fresh holder that already
-          // replaced it keeps its lock (bounded TOCTOU, same class as the
-          // accounts-state lock in acp-server).
-          try {
-            const st2 = fs.statSync(p);
-            if (st2.ino === st.ino && st2.mtimeMs === st.mtimeMs) fs.unlinkSync(p);
-          } catch {}
-          continue;
-        }
-      } catch {}
-      if (Date.now() >= deadline) throw new Error(`browser-group marker lock held: ${p}`);
-      lockSpin(20);
-    }
+  const bin = flockBin();
+  if (!bin) {
+    heldMarkerLocks.set(p, null);
+    return;
   }
+  const { spawnSync } = require('child_process');
+  // The lock file persists forever — we only ever lock the description.
+  const fd = fs.openSync(p, 'a');
+  // stdio[3] hands the child a dup of our fd — same open file description,
+  // so the flock(2) lock the child takes stays held by OUR fd after the
+  // child exits (kernel auto-release on close/death — no stale-steal).
+  const res = spawnSync(bin, ['-x', '-w', String(Math.ceil(MARKER_LOCK_WAIT_MS / 1000)), '3'], {
+    stdio: ['ignore', 'ignore', 'ignore', fd],
+    timeout: MARKER_LOCK_WAIT_MS + 10_000,
+  });
+  if (res.error && res.error.code === 'ENOENT') {
+    flockAvailable = false; // binary vanished mid-run — degrade to reentrancy
+    try { fs.closeSync(fd); } catch {}
+    heldMarkerLocks.set(p, null);
+    return;
+  }
+  if (res.error || res.status !== 0) {
+    try { fs.closeSync(fd); } catch {}
+    throw new Error(`browser-group marker lock held: ${p}`);
+  }
+  heldMarkerLocks.set(p, fd);
 }
 
 function releaseMarkerLock(stateDir, port) {
   const p = markerLockPath(stateDir, port);
+  const fd = heldMarkerLocks.get(p);
   heldMarkerLocks.delete(p);
-  try {
-    fs.unlinkSync(p);
-  } catch {}
+  if (fd != null) {
+    try {
+      fs.closeSync(fd);
+    } catch {}
+  }
 }
 
 // Serialize a synchronous marker section per port. fn must be synchronous —
@@ -568,6 +590,201 @@ async function killGroup(meta, { graceMs = 1200, stepMs = 100 } = {}) {
   return termSent || !gone;
 }
 
+// --- shared safe teardown (заход 6) ---
+// One pipeline for both the acp-server reaper and the driver's stopChrome:
+// decision + `reaping` mark + SIGTERM run inside outerLock → markerLock;
+// the grace wait runs unlocked; SIGKILL escalation re-verifies under the
+// same locks. Lock order is always outer → marker.
+//
+//   withOuterLock(fn) — serializes the lease check against lease writers
+//     (acp-server wraps the accounts-ledger lock; the driver uses
+//     withLedgerLock). Default: no outer lock.
+//   busy(meta, now)  — caller gate inside the locked section (a live lease
+//     on the port); returns a reason string to veto, null to proceed.
+//   ownOnly          — only a marker we own may be torn down (clean
+//     shutdown); also skips the live-owner startup grace.
+//   ignoreInodes     — socket inodes excluded from the CDP-client check
+//     (the caller's own playwright connections).
+//   ownerGraceMs     — a young/recently-adopted group under a live owner is
+//     still launching: busy, never signaled.
+//
+// Returns { status, reason?, marked? }:
+//   'torn-down' — the group was verified ours, signaled, and the marker
+//                 removed; 'absent' — no (matching) marker or the group is
+//                 already gone (dead/stale-boot marker cleaned); 'busy' —
+//                 gated by reaping/owner-grace/lease/CDP — retry later;
+//   'skipped'   — refused (not ours to touch, identity unverifiable, or
+//                 nothing signalable) — the marker is left alone.
+const DEFAULT_OWNER_GRACE_MS = 60_000;
+
+async function teardownGroup({
+  stateDir,
+  port,
+  meta = null,
+  withOuterLock = null,
+  busy = null,
+  ownOnly = false,
+  ignoreInodes = null,
+  ownerGraceMs = 0,
+  graceMs = 1200,
+  stepMs = 100,
+} = {}) {
+  const outer = withOuterLock || ((fn) => fn());
+  const phase = outer(() => withMarkerLock(stateDir, port, () => {
+    const now = Date.now();
+    // Re-read under the locks — a caller-supplied snapshot predates them.
+    const cur = readMarker(stateDir, port);
+    if (!cur) return { status: 'absent' };
+    if (meta && cur.pgid !== meta.pgid) return { status: 'absent', reason: 'marker-changed' };
+    if (ownOnly && cur.ownerPid !== process.pid) return { status: 'skipped', reason: 'not-owner' };
+    // A fresh reaping mark means a teardown is already in flight (marks are
+    // only ever written under these locks, so ours cannot be fresh here).
+    if (isReaping(cur, now)) return { status: 'busy', reason: 'reaping' };
+    // A live FOREIGN owner may be mid-launch or mid-adoption — the marker
+    // is written before CDP readiness/client connect — so young or
+    // freshly-adopted groups get a startup grace; a dead owner or an old
+    // idle group (no lease, no clients) is fair game (contract §2). Our own
+    // marker needs no grace here: an own group mid-launch is already
+    // protected by the lease gate (bindBackend takes the lease before the
+    // driver spawns), and an explicit owner-driven stop must not wait it
+    // out (заход 6).
+    if (ownerAlive(cur) && !ownOnly && ownerGraceMs > 0 && cur.ownerPid !== process.pid) {
+      const young = Number.isFinite(cur.launchedMs) && now - cur.launchedMs < ownerGraceMs;
+      const adopted = Number.isFinite(cur.adoptedMs) && now - cur.adoptedMs < ownerGraceMs;
+      if (young || adopted) return { status: 'busy', reason: 'owner-starting' };
+    }
+    if (busy) {
+      const reason = busy(cur, now);
+      if (reason) return { status: 'busy', reason: String(reason) };
+    }
+    if (hasLiveCdpClients(cur.port, { ignoreInodes })) return { status: 'busy', reason: 'cdp-clients' };
+    const identity = identifyGroup(cur);
+    if (identity === 'dead' || identity === 'stale-boot') {
+      // Nothing live of ours to signal — the marker is the only residue
+      // (dead: group gone; stale-boot: it died with its boot and any group
+      // matching the recorded pgid is foreign — only the marker is ours
+      // to clean).
+      removeMarkerUnlocked(stateDir, port);
+      return { status: 'absent', reason: identity };
+    }
+    if (identity !== 'matched' && identity !== 'leftover') {
+      return { status: 'skipped', reason: identity };
+    }
+    const marked = { ...cur, reaping: { by: process.pid, sinceMs: now } };
+    writeMarkerUnlocked(stateDir, marked);
+    if (!signalGroup(marked, 'SIGTERM')) {
+      writeMarkerUnlocked(stateDir, cur); // nothing signaled — unmark
+      return { status: 'skipped', reason: 'signal-failed' };
+    }
+    return { status: 'signaled', marked };
+  }));
+  if (phase.status !== 'signaled') return phase;
+  const marked = phase.marked;
+
+  if (!(await waitGroupGone(marked.pgid, { graceMs, stepMs }))) {
+    // Grace expired — re-verify under the same locks before escalating:
+    // the reaping mark kept leases out, but anything that slipped through
+    // (a rewritten marker, a live lease, a connected CDP client, or a
+    // group identity that no longer matches) vetoes the SIGKILL.
+    const killed = outer(() => withMarkerLock(stateDir, port, () => {
+      const now = Date.now();
+      const cur = readMarker(stateDir, port);
+      if (!cur || cur.pgid !== marked.pgid) return false;
+      if (cur.ownerPid !== marked.ownerPid || cur.ownerStartTime !== marked.ownerStartTime) return false;
+      if (cur.reaping?.by !== process.pid || cur.reaping?.sinceMs !== marked.reaping.sinceMs) return false;
+      if (busy && busy(cur, now)) return false;
+      if (hasLiveCdpClients(cur.port, { ignoreInodes })) return false;
+      if (!groupAliveMatches(cur)) return false;
+      return signalGroup(cur, 'SIGKILL');
+    }));
+    if (!killed) {
+      clearReaping(stateDir, port, marked.reaping);
+      return { status: 'busy', reason: 'escalation-vetoed' };
+    }
+  }
+  // A fresh owner may have adopted the marker while the group was dying —
+  // only remove it if it still describes what we tore down; check+unlink
+  // is one serialized section.
+  withMarkerLock(stateDir, port, () => {
+    const cur = readMarker(stateDir, port);
+    if (cur && cur.pgid === marked.pgid && cur.ownerPid === marked.ownerPid) {
+      removeMarkerUnlocked(stateDir, port);
+    }
+  });
+  return { status: 'torn-down' };
+}
+
+// --- accounts-ledger lock + lease gate for non-ACP callers (заход 6) ---
+// The driver must serialize its lease check + reaping mark against lease
+// writers exactly like the reaper. acp-server's ledger lock is an O_EXCL
+// lockfile at <ledger>.lock — the same primitive and the same path are
+// used here so old and new processes still exclude each other (flock and
+// O_EXCL do not interoperate; a rolling upgrade must not mix them).
+const LEDGER_LOCK_STALE_MS = 5000; // mirrors acp-server LOCK_STALE_MS
+const LEDGER_LOCK_WAIT_MS = 10_000; // mirrors acp-server deadline
+const LEASE_TTL_MS = 10 * 60_000; // mirrors acp-server LEASE_TTL_MS
+
+const ledgerPathFor = (stateDir) => path.join(resolveStateDir(stateDir), 'accounts-state.json');
+const ledgerLockPathFor = (stateDir) => `${ledgerPathFor(stateDir)}.lock`;
+
+function withLedgerLock(stateDir, fn) {
+  const p = ledgerLockPathFor(stateDir);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const deadline = Date.now() + LEDGER_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const fd = fs.openSync(p, 'wx');
+      try {
+        fs.closeSync(fd);
+      } catch {}
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        const st = fs.statSync(p);
+        if (Date.now() - st.mtimeMs > LEDGER_LOCK_STALE_MS) {
+          try {
+            fs.unlinkSync(p);
+          } catch {}
+          continue;
+        }
+      } catch {}
+      if (Date.now() >= deadline) throw new Error(`accounts-ledger lock held: ${p}`);
+      lockSpin(40);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.unlinkSync(p);
+    } catch {}
+  }
+}
+
+function readLedger(stateDir) {
+  try {
+    return JSON.parse(fs.readFileSync(ledgerPathFor(stateDir), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// A live lease recorded against this port's CDP endpoint. Leases written
+// before the `cdp` field existed cannot be mapped — treat them as possibly
+// this port's (conservative; they expire within one TTL).
+function leaseBusyOnPort(ledger, port, now, { ttlMs = LEASE_TTL_MS, excludePid = null } = {}) {
+  for (const l of Object.values((ledger && ledger.leases) || {})) {
+    if (!l) continue;
+    if (excludePid != null && l.pid === excludePid) continue;
+    if (!Number.isFinite(l.acquiredMs) || now - l.acquiredMs >= ttlMs) continue;
+    if (!isPidAlive(l.pid)) continue;
+    if (l.cdp != null && String(l.cdp) !== String(port)) continue;
+    return true;
+  }
+  return false;
+}
+
 module.exports = {
   resolveStateDir,
   groupsDir,
@@ -599,4 +816,12 @@ module.exports = {
   signalGroup,
   waitGroupGone,
   killGroup,
+  teardownGroup,
+  DEFAULT_OWNER_GRACE_MS,
+  LEASE_TTL_MS,
+  ledgerPathFor,
+  ledgerLockPathFor,
+  withLedgerLock,
+  readLedger,
+  leaseBusyOnPort,
 };

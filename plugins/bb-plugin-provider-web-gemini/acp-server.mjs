@@ -480,7 +480,9 @@ function acquireInState(state, b, owner, now) {
   e.inUseUntilMs = now + LEASE_TTL_MS;
   e.owner = owner;
   e.parkedReason = null;
-  state.leases[b.id] = { pid: process.pid, acquiredMs: now };
+  // `cdp` lets non-ACP readers (the driver's stopChrome teardown) map the
+  // lease to a browser-group port without loading the backend pool.
+  state.leases[b.id] = { pid: process.pid, acquiredMs: now, cdp: b.cdp };
   // PLUG-374: the lease holder owns the browser group on this port — under
   // the same lock, so reapers always see a live verifiable owner.
   try {
@@ -992,87 +994,38 @@ function hasLiveLeaseForPort(state, port, backends, now) {
   return false;
 }
 
-// Decision, `reaping` mark, AND first signal inside the ledger lock AND the
+// The teardown itself is the shared browser-groups pipeline (заход 6):
+// decision, `reaping` mark, AND first signal inside the ledger lock AND the
 // per-port marker lock: no fresh lease and no concurrent marker write
 // (adoption, fresh launch, another reaper) can land between the checks and
 // SIGTERM, and the fresh mark keeps leases/adoptions out for the whole grace
 // window — the teardown can never race a lease someone just took (§3, з.5).
 // Lock order is always ledger → marker; nothing holding the marker lock ever
 // waits on the ledger.
-function tryTeardownGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly = false, ignoreInodes = null }) {
-  return withStateLock((state) => browserGroups.withMarkerLock(stateDir, meta.port, () => {
-    const now = Date.now();
-    // Re-read the marker under the locks — the caller's copy predates them.
-    const cur = browserGroups.readMarker(stateDir, meta.port);
-    if (!cur || cur.pgid !== meta.pgid) return false;
-    if (ownOnly && cur.ownerPid !== process.pid) return false;
-    // A fresh reaping mark means a teardown is already in flight (marks are
-    // only ever written under these locks, so ours cannot be fresh here).
-    if (browserGroups.isReaping(cur, now)) return false;
-    const alive = browserGroups.ownerAlive(cur);
-    // A live owner may be mid-launch or mid-adoption — the marker is written
-    // before CDP readiness/client connect — so young or freshly-adopted groups
-    // get a startup grace; a dead owner or an old idle group (no lease, no
-    // clients) is fair game (contract §2). The shutdown path (ownOnly) always
-    // tears down regardless of age.
-    if (alive && !ownOnly && (groupIsYoung(cur, now) || recentlyAdopted(cur, now))) return false;
-    if (hasLiveLeaseForPort(state, cur.port, backends, now)) return false;
-    if (browserGroups.hasLiveCdpClients(cur.port, { ignoreInodes })) return false;
-    const identity = browserGroups.identifyGroup(cur);
-    if (identity !== "matched" && identity !== "leftover") return false;
-    const marked = { ...cur, reaping: { by: process.pid, sinceMs: now } };
-    browserGroups.writeMarker(stateDir, marked);
-    if (!browserGroups.signalGroup(marked, "SIGTERM")) {
-      browserGroups.writeMarker(stateDir, cur); // nothing signaled — unmark
-      return false;
-    }
-    return marked;
-  }), ledgerPath, lockPath);
-}
-
-function groupIsYoung(meta, now) {
-  return typeof meta.launchedMs === "number" && now - meta.launchedMs < GROUP_STARTUP_GRACE_MS;
-}
-
-function recentlyAdopted(meta, now) {
-  return typeof meta.adoptedMs === "number" && now - meta.adoptedMs < GROUP_STARTUP_GRACE_MS;
-}
-
 async function teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly = false, ignoreInodes = null }) {
-  const marked = tryTeardownGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly, ignoreInodes });
-  if (!marked) return false;
-  if (!(await browserGroups.waitGroupGone(marked.pgid))) {
-    // Grace expired — re-verify under the same lock before escalating: the
-    // reaping mark kept leases out, but anything that slipped through (an
-    // adopted or rewritten marker, a live lease, a connected CDP client, or
-    // a group identity that no longer matches) vetoes the SIGKILL.
-    const killed = withStateLock((state) => browserGroups.withMarkerLock(stateDir, meta.port, () => {
-      const now = Date.now();
-      const cur = browserGroups.readMarker(stateDir, meta.port);
-      if (!cur || cur.pgid !== marked.pgid) return false;
-      if (cur.ownerPid !== marked.ownerPid || cur.ownerStartTime !== marked.ownerStartTime) return false;
-      if (cur.reaping?.by !== process.pid || cur.reaping?.sinceMs !== marked.reaping.sinceMs) return false;
-      if (hasLiveLeaseForPort(state, cur.port, backends, now)) return false;
-      if (browserGroups.hasLiveCdpClients(cur.port, { ignoreInodes })) return false;
-      if (!browserGroups.groupAliveMatches(cur)) return false;
-      return browserGroups.signalGroup(cur, "SIGKILL");
-    }), ledgerPath, lockPath);
-    if (!killed) {
-      browserGroups.clearReaping(stateDir, meta.port, marked.reaping);
-      return false;
+  const withOuterLock = (fn) => {
+    acquireLock(lockPath);
+    try {
+      return fn();
+    } finally {
+      releaseLock(lockPath);
     }
-  }
-  // A fresh owner may have adopted the marker while the group was dying —
-  // only remove it if it still describes what we tore down. Check and
-  // unlink are one serialized section: a marker a concurrent writer lands
-  // between them is never lost (заход 5).
-  browserGroups.withMarkerLock(stateDir, meta.port, () => {
-    const cur = browserGroups.readMarker(stateDir, meta.port);
-    if (cur && cur.pgid === meta.pgid && cur.ownerPid === meta.ownerPid) {
-      browserGroups.removeMarker(stateDir, meta.port);
-    }
+  };
+  const busy = (cur, now) => {
+    const state = loadState(ledgerPath);
+    return hasLiveLeaseForPort(state, cur.port, backends, now) ? "lease" : null;
+  };
+  const res = await browserGroups.teardownGroup({
+    stateDir,
+    port: meta.port,
+    meta,
+    withOuterLock,
+    busy,
+    ownOnly,
+    ignoreInodes,
+    ownerGraceMs: GROUP_STARTUP_GRACE_MS,
   });
-  return true;
+  return res.status === "torn-down";
 }
 
 export async function reapOrphanBrowserGroups({ stateDir = STATE_DIR, ledgerPath = LEDGER_FILE, lockPath = LOCK_FILE, backends = BACKENDS } = {}) {
