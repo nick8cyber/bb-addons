@@ -1606,7 +1606,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
             collected = await collectTask(context, attachments.blocks, materials, packageOptions);
             packed = packTask(context, collected, packageOptions);
-            if (context.settings.innerAgent) {
+            if (context.settings.innerAgent && (context.root || context.pin)) {
               const agent = await gatherAgentContext(context, collected.core, {
                 signal: task.signal,
                 maxExtraBytes: context.settings.maxTotalBytes - packed.totalBytes - packageOptions.reserveBytes,
@@ -1660,6 +1660,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             // .md-файлом в uploads/ и прикладываются как веб-вложение.
             spillDir: UPLOADS_DIR,
             spillId: sessionId,
+            repo: Boolean(s.cwd),
           });
       }
       // Spill-пакет идёт сверх WEB_GEMINI_MAX_UPLOAD_COUNT и без проверки

@@ -1197,20 +1197,32 @@ export function executeTool(call, ctx = {}) {
 }
 
 /* ---------- §2/§3: системная шапка и цикл раундов ---------- */
-export function toolSystemHeader(maxRounds = MAX_TOOL_ROUNDS, { pinned = false } = {}) {
-  return [
-    "[provider tools] В этой сессии доступны инструменты только чтения (рабочая копия сессии, пути относительные).",
+export function toolSystemHeader(maxRounds = MAX_TOOL_ROUNDS, { pinned = false, repo = true } = {}) {
+  const lines = [
+    repo
+      ? "[provider tools] В этой сессии доступны инструменты только чтения (рабочая копия сессии, пути относительные)."
+      : "[provider tools] В этой сессии доступны инструменты только чтения.",
     "Вызов — строго одна строка XML на инструмент:",
-    '<tool name="read_file" path="src/index.js" from="1" to="80"/>',
-    '<tool name="list_dir" path="plugins"/>',
-    '<tool name="grep" pattern="pickBackend" path="plugins"/>',
-    pinned ? '<tool name="git" args="diff --stat"/>' : '<tool name="git" args="diff --stat HEAD~1..HEAD"/>',
+  ];
+  if (repo) {
+    lines.push(
+      '<tool name="read_file" path="src/index.js" from="1" to="80"/>',
+      '<tool name="list_dir" path="plugins"/>',
+      '<tool name="grep" pattern="pickBackend" path="plugins"/>',
+      pinned ? '<tool name="git" args="diff --stat"/>' : '<tool name="git" args="diff --stat HEAD~1..HEAD"/>',
+    );
+  }
+  lines.push(
     `<tool name="bb_thread_output" threadId="${THR}xxxxxxxxxx"/>`,
     `<tool name="bb_thread_message" threadId="${THR}xxxxxxxxxx" msg="2"/>`,
     '<tool name="bb_task_show" key="PLUG-129"/>',
-    "git — только show|diff|log|blame|ls-files|status; bb_* — по указанным аргументам.",
+    repo
+      ? "git — только show|diff|log|blame|ls-files|status; bb_* — по указанным аргументам."
+      : "bb_* — по указанным аргументам.",
     `Ответ без тегов <tool .../> считается финальным. Лимит раундов инструментов: ${maxRounds}.`,
-  ].join("\n");
+    "Помимо них доступны собственные возможности веб-интерфейса (поиск в интернете, чтение страниц): для актуальных данных из интернета используйте их как обычно.",
+  );
+  return lines.join("\n");
 }
 
 export function forceFinalMessage(maxRounds = MAX_TOOL_ROUNDS) {
@@ -1394,6 +1406,7 @@ export function packFirstMessage({
   spillDir = null,
   spillId = null,
   completePackage = null,
+  repo = undefined,
 }) {
   maxBytes = effectiveMessageBytes(maxBytes);
   if (completePackage) {
@@ -1408,9 +1421,10 @@ export function packFirstMessage({
   }
   const seen = new Set();
   const candidates = [];
+  const hasRepo = repo !== undefined ? Boolean(repo) : Boolean(cwd);
 
   // Дифф репозитория — только внутри git-дерева (§5.2).
-  if (cwd) {
+  if (cwd && hasRepo) {
     const baseR = resolveInCwd(cwd, ".");
     if (!baseR.error) {
       const probe = runCmd("git", ["rev-parse", "--is-inside-work-tree"], { cwd: baseR.abs });
@@ -1466,7 +1480,7 @@ export function packFirstMessage({
     });
   }
 
-  if (cwd) fileCandidates(text, cwd, seen, candidates);
+  if (cwd && hasRepo) fileCandidates(text, cwd, seen, candidates);
 
   // Треды: <t>hr_…, @thread:<t>hr_…, …/threads/<t>hr_…[#msg=N].
   for (const m of String(text).matchAll(THREAD_ID_IN_TEXT_RE)) {
@@ -1510,7 +1524,7 @@ export function packFirstMessage({
     });
   }
 
-  const header = toolSystemHeader(maxRounds);
+  const header = toolSystemHeader(maxRounds, { repo: hasRepo });
   let body = String(text ?? "");
   const len = (s) => Buffer.byteLength(s, "utf8");
   // Резерв на строку «Можно запросить инструментом:».

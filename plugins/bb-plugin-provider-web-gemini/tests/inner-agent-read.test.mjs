@@ -1515,3 +1515,51 @@ test("agentSettings parsing: chain assembly, deduplication, and single gateway o
   // 6. Invalid entry in gateways -> throws
   assert.throws(() => agentSettings({ enabled: true, gateways: [null] }, setting), /gateways/);
 });
+
+test("research-подобный ход без дерева собирает шапку без repo-строк (PLUG-370)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-research-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const nonRepoDir = join(tmp, "research");
+  mkdirSync(nonRepoDir);
+
+  const taskText = [
+    "# RES-1 · Исследование интернет-источников",
+    "## Description",
+    "Исследуй документацию в сети.",
+    "## Attachments",
+    "None",
+    "## Recent comments",
+    "None",
+    "## Report-back contract",
+    "Report",
+  ].join("\n\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: nonRepoDir },
+    thread: { thread: { id: threadId, projectId }, environment: { path: nonRepoDir } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.root, null);
+  assert.equal(prep.pin, null);
+
+  const packageOptions = { limit: 120_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  const [header] = packed.message.split("\n\n=== ");
+  assert.doesNotMatch(header, /<tool name="read_file"/);
+  assert.doesNotMatch(header, /<tool name="list_dir"/);
+  assert.doesNotMatch(header, /<tool name="grep"/);
+  assert.doesNotMatch(header, /<tool name="git"/);
+  assert.doesNotMatch(header, /\bgit\b/i);
+  assert.doesNotMatch(header, /read_file/);
+  assert.match(header, /<tool name="bb_thread_output"/);
+  assert.match(header, /<tool name="bb_thread_message"/);
+  assert.match(header, /<tool name="bb_task_show"/);
+  assert.match(header, /bb_\* — по указанным аргументам\./);
+  assert.match(header, /Помимо них доступны собственные возможности веб-интерфейса \(поиск в интернете, чтение страниц\): для актуальных данных из интернета используйте их как обычно\./);
+});
