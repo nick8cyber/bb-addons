@@ -749,6 +749,108 @@ function OwnerGateCard(props: PluginPendingInteractionProps) {
   );
 }
 
+/**
+ * §32.3 (PLUG-360): Critical settings alert card for outside_menu changes.
+ */
+function CriticalSettingsAlertCard(props: PluginPendingInteractionProps) {
+  const { interaction, submit } = props;
+  const rpc = useRpc<Contract>();
+  const payload = (interaction.payload || {}) as Record<string, unknown>;
+  const setting = String(payload.setting || "");
+  const oldValue = String(payload.oldValue ?? "");
+  const newValue = String(payload.newValue ?? "");
+
+  const [actionInProgress, setActionInProgress] = useState<string | null>(null);
+
+  const onKeep = async () => {
+    setActionInProgress("keep");
+    try {
+      await submit({ action: "keep" });
+    } catch {
+      setActionInProgress(null);
+    }
+  };
+
+  const onRevert = async () => {
+    setActionInProgress("revert");
+    try {
+      if (
+        setting === "workGraph" ||
+        setting === "workGraphProjects" ||
+        setting === "approvalMode"
+      ) {
+        await rpc.call("revertCriticalSetting", {
+          setting: setting as "workGraph" | "workGraphProjects" | "approvalMode",
+          oldValue,
+        });
+      }
+      await submit({ action: "revert" });
+    } catch {
+      setActionInProgress(null);
+    }
+  };
+
+  const titleText =
+    interaction.title ||
+    `⚠️ Настройка ${setting} оркестратора изменена вне меню плагина (было: ${oldValue}, стало: ${newValue})`;
+
+  return (
+    <div
+      style={{
+        border: "1px solid rgba(239, 68, 68, 0.4)",
+        borderRadius: 8,
+        padding: 12,
+        margin: "8px 0",
+        background: "rgba(239, 68, 68, 0.05)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          marginBottom: 8,
+          fontWeight: 600,
+        }}
+      >
+        <span>{titleText}</span>
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <button
+          type="button"
+          disabled={actionInProgress !== null}
+          onClick={onKeep}
+          style={{
+            background: "rgba(128,128,128,.2)",
+            color: "inherit",
+            border: "1px solid rgba(128,128,128,.4)",
+            borderRadius: 4,
+            padding: "4px 10px",
+            cursor: "pointer",
+          }}
+        >
+          {actionInProgress === "keep" ? "..." : "Оставить"}
+        </button>
+        <button
+          type="button"
+          disabled={actionInProgress !== null}
+          onClick={onRevert}
+          style={{
+            background: "rgba(239, 68, 68, 0.2)",
+            color: "inherit",
+            border: "1px solid rgba(239, 68, 68, 0.5)",
+            borderRadius: 4,
+            padding: "4px 10px",
+            cursor: "pointer",
+          }}
+        >
+          {actionInProgress === "revert" ? "..." : "Вернуть прежнее значение"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.composer.customize({
     id: "orchestrator-role",
@@ -761,5 +863,10 @@ export default definePluginApp((app) => {
   app.slots.pendingInteraction({
     id: "orchestrator-owner-gate",
     component: OwnerGateCard,
+  });
+
+  app.slots.pendingInteraction({
+    id: "orchestrator-settings-alert",
+    component: CriticalSettingsAlertCard,
   });
 });

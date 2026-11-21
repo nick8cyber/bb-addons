@@ -44,6 +44,23 @@ const { cleanupTrackedTempDirs, cleanStaleTempDirs } = await import(
 // new ones.
 cleanStaleTempDirs();
 
+const origSetTimeout = globalThis.setTimeout;
+(globalThis as any).setTimeout = function (
+  callback: (...args: any[]) => void,
+  ms?: number,
+  ...args: any[]
+) {
+  const timer = origSetTimeout(callback, ms, ...args);
+  if (
+    typeof ms === "number" &&
+    ms >= 60_000 &&
+    typeof timer?.unref === "function"
+  ) {
+    timer.unref();
+  }
+  return timer;
+};
+
 afterEach(cleanupTrackedTempDirs);
 process.on("exit", cleanupTrackedTempDirs);
 process.on("SIGINT", () => {

@@ -1958,6 +1958,25 @@ export class DelegationStore {
     return rows.map((r) => r.t);
   }
 
+  /** §32.3 (PLUG-360): Latest active coordinator thread id for alert routing. */
+  latestCoordinatorThreadId(): string | undefined {
+    try {
+      const task = this.db
+        .prepare(
+          "SELECT coordinator_thread_id FROM task_queue WHERE coordinator_thread_id IS NOT NULL AND coordinator_thread_id != '' ORDER BY id DESC LIMIT 1",
+        )
+        .get() as { coordinator_thread_id: string } | undefined;
+      if (task?.coordinator_thread_id) return task.coordinator_thread_id;
+      const del = this.db
+        .prepare(
+          "SELECT coordinator_thread_id FROM delegations WHERE coordinator_thread_id IS NOT NULL AND coordinator_thread_id != '' ORDER BY id DESC LIMIT 1",
+        )
+        .get() as { coordinator_thread_id: string } | undefined;
+      if (del?.coordinator_thread_id) return del.coordinator_thread_id;
+    } catch {}
+    return undefined;
+  }
+
   coordinatorWatchdogGet(
     coordinatorThreadId: string,
   ): CoordinatorWatchdogRow | undefined {
@@ -3366,6 +3385,50 @@ export class DelegationStore {
     at: number = Date.now(),
   ): number {
     return this.emitEvent(kind, fields, at);
+  }
+
+  /**
+   * §32.3 (PLUG-360): Запись изменения критических настроек в events и command_runs.
+   */
+  recordSettingChangeEvent(
+    setting: string,
+    oldValue: unknown,
+    newValue: unknown,
+    source: "menu" | "outside_menu",
+    at: number = Date.now(),
+  ): number {
+    const fields = {
+      setting,
+      oldValue,
+      newValue,
+      timestamp: at,
+      source,
+    };
+    const eventId = this.emitEvent("setting.changed", fields, at);
+    try {
+      this.enqueueCommandRun(
+        {
+          source: "setting.change",
+          runKey: `setting:${setting}:${at}:${Math.random().toString(36).slice(2, 6)}`,
+          name: `setting:${setting}`,
+          argv: [],
+          cwd: "/",
+          stdin: JSON.stringify({
+            event: "setting.changed",
+            setting,
+            oldValue,
+            newValue,
+            timestamp: at,
+            source,
+          }),
+          timeoutSec: 0,
+        },
+        at,
+      );
+    } catch {
+      // command_runs enqueue failure should not break settings event recording
+    }
+    return eventId;
   }
 
   private emitEvent(
