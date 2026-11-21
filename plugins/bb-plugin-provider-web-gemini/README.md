@@ -12,7 +12,8 @@ ACP-провайдер «Gemini Web» (`acp-web-gemini`, обратная сов
 
 - Google Chrome (системный `google-chrome-stable` или путь через `GEMINI_CHROME_BIN`);
 - `playwright` или `playwright-core` (драйвер пробует сначала `playwright`, затем `playwright-core`);
-- Пул аккаунтов (`pool.json`) с авторизованными профилями.
+- Пул аккаунтов (`pool.json`) с авторизованными профилями;
+- `flock` (пакет `util-linux`) — обязателен на Linux для сериализации операций над маркерами групп браузера через `flock(2)` (PLUG-374); без него на Linux операции завершаются fail-closed ошибкой `BG_LOCK_UNAVAILABLE`.
 
 ## Модели и возможности
 
@@ -82,6 +83,7 @@ ACP-провайдер «Gemini Web» (`acp-web-gemini`, обратная сов
 - `GEMINI_CDP_PORT`: порт CDP для одиночного профиля по умолчанию (по умолчанию `9222`).
 - `WEB_GEMINI_USE_BUNDLED=1` / `ARGON_USE_BUNDLED=1`: принудительное использование встроенного `acp-server.mjs`.
 - `GEMINI_NO_AUTOSPAWN=1`: запрет авто-перезапуска Chrome.
+- `BG_MARKER_LOCK_WAIT_MS`: таймаут ожидания блокировки маркера группы браузера в миллисекундах (по умолчанию `10000` мс / 10 с, PLUG-374).
 
 **Разделение пула между OS-пользователями:** `profileDir` в `pool.json` должен быть абсолютным (`~` резолвится в HOME читающего процесса — `pool-add.mjs` пишет абсолютным); `STATE_DIR` общий с default-ACL `rwx` на каталог и `accounts/`; у второго юзера ставить `GEMINI_NO_AUTOSPAWN=1`.
 
