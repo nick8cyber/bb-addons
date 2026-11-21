@@ -37,6 +37,7 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(join(HERE, "package.json"));
+const browserGroups = require("./src/browser-groups.cjs");
 
 // Diagnostics must stay off stdout — it is the JSON-RPC channel.
 console.log = console.error;
@@ -469,6 +470,11 @@ function acquireInState(state, b, owner, now) {
   e.owner = owner;
   e.parkedReason = null;
   state.leases[b.id] = { pid: process.pid, acquiredMs: now };
+  // PLUG-374: the lease holder owns the browser group on this port — under
+  // the same lock, so reapers always see a live verifiable owner.
+  try {
+    browserGroups.adoptGroup(STATE_DIR, b.cdp);
+  } catch {}
 }
 
 /* ---------- parse reset time (§3.4) ---------- */
@@ -963,13 +969,99 @@ export function reapOrphanAcpServers() {
   return reaped;
 }
 
+// --- managed browser groups (PLUG-374) ---
+const backendsOnPort = (port, backends) =>
+  backends.filter((b) => String(b.cdp) === String(port));
+
+function hasLiveLeaseForPort(state, port, backends, now) {
+  for (const b of backendsOnPort(port, backends)) {
+    const l = state.leases && state.leases[b.id];
+    if (l && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) return true;
+  }
+  return false;
+}
+
+// Decision AND first signal inside the ledger lock: no fresh lease for the
+// same port can be written between the checks and SIGTERM, so teardown can
+// never race a lease someone just took (contract §3).
+function tryTeardownGroup(meta, { stateDir, ledgerPath, lockPath, backends, ignoreOwnerDeath = false, ignoreInodes = null }) {
+  return withStateLock((state) => {
+    const now = Date.now();
+    if (!ignoreOwnerDeath && browserGroups.ownerAlive(meta)) return false;
+    if (hasLiveLeaseForPort(state, meta.port, backends, now)) return false;
+    if (browserGroups.hasLiveCdpClients(meta.port, { ignoreInodes })) return false;
+    if (!browserGroups.groupAliveMatches(meta)) return false;
+    return browserGroups.signalGroup(meta, "SIGTERM");
+  }, ledgerPath, lockPath);
+}
+
+async function teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends, ignoreOwnerDeath = false, ignoreInodes = null }) {
+  const torn = tryTeardownGroup(meta, { stateDir, ledgerPath, lockPath, backends, ignoreOwnerDeath, ignoreInodes });
+  if (!torn) return false;
+  await browserGroups.killGroup(meta);
+  // A fresh owner may have adopted the marker while the group was dying —
+  // only remove it if it still describes what we tore down.
+  const cur = browserGroups.readMarker(stateDir, meta.port);
+  if (cur && cur.pgid === meta.pgid && cur.ownerPid === meta.ownerPid) {
+    browserGroups.removeMarker(stateDir, meta.port);
+  }
+  return true;
+}
+
+export async function reapOrphanBrowserGroups({ stateDir = STATE_DIR, ledgerPath = LEDGER_FILE, lockPath = LOCK_FILE, backends = BACKENDS } = {}) {
+  if (process.platform !== "linux") return 0;
+  let reaped = 0;
+  for (const meta of browserGroups.listMarkers(stateDir)) {
+    try {
+      if (browserGroups.ownerAlive(meta)) continue;
+      if (!browserGroups.groupAliveMatches(meta)) {
+        browserGroups.removeMarker(stateDir, meta.port);
+        continue;
+      }
+      if (await teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends })) {
+        reaped++;
+        slog("reaper:browser-group", { port: meta.port, pgid: meta.pgid, ownerPid: meta.ownerPid });
+      }
+    } catch (e) {
+      slog("reaper:browser-group-error", { port: meta && meta.port, error: String(e) });
+    }
+  }
+  return reaped;
+}
+
+// Clean shutdown path: tear down groups this process owns — unless someone
+// else meanwhile leased the port or external CDP clients are still attached.
+// Our own CDP sockets are excluded: the playwright connection outlives the
+// last prompt and would otherwise mask the group as busy.
+export async function cleanupOwnBrowserGroups({ stateDir = STATE_DIR, ledgerPath = LEDGER_FILE, lockPath = LOCK_FILE, backends = BACKENDS } = {}) {
+  if (process.platform !== "linux") return 0;
+  const ownInodes = browserGroups.socketInodesOf(process.pid);
+  let cleaned = 0;
+  for (const meta of browserGroups.listMarkers(stateDir)) {
+    try {
+      if (meta.ownerPid !== process.pid) continue;
+      if (await teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends, ignoreOwnerDeath: true, ignoreInodes: ownInodes })) {
+        cleaned++;
+        slog("shutdown:browser-group", { port: meta.port, pgid: meta.pgid });
+      }
+    } catch (e) {
+      slog("shutdown:browser-group-error", { port: meta && meta.port, error: String(e) });
+    }
+  }
+  return cleaned;
+}
+
 // Parent-death watchdog: reparented onto init/systemd means bridge parent died
 const ownerPpid = process.ppid;
+let ppidWatchTicks = 0;
 const ppidWatch = setInterval(() => {
   if (process.ppid !== ownerPpid || process.ppid === 1) {
     slog("process:reparented-exit", { ownerPpid, currentPpid: process.ppid });
     void cleanShutdown();
     return;
+  }
+  if (++ppidWatchTicks % 12 === 0) {
+    void reapOrphanBrowserGroups().catch(() => {});
   }
   if (!activePromptSessionId) {
     checkStaleCode();
@@ -2232,6 +2324,7 @@ async function cleanShutdown() {
       await releaseLease(activeBackendId);
       activeBackendId = null;
     }
+    await cleanupOwnBrowserGroups();
   } catch {}
   process.exit(0);
 }
@@ -2924,6 +3017,7 @@ function dispatchPrompt(msg, sess) {
 export function startServer({ webDriver } = {}) {
   if (webDriver) driver = webDriver;
   reapOrphanAcpServers();
+  void reapOrphanBrowserGroups().catch((e) => slog("reaper:browser-groups-error", { error: String(e) }));
   // §7.2/§9: чистка журнала (TTL/лимит записей) до чистки вложений — файлы,
   // нужные восстановлению активных ходов, защищены от pruneDir.
   try {
