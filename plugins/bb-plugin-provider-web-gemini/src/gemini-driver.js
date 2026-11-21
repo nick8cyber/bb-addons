@@ -2211,6 +2211,137 @@ function findGeneratedFileCandidates(target, { detectOnly = false, tagAttr = 'ar
 // оттуда без интеграции с Drive не стянуть, фиксируем причину в skipped.
 const DRIVE_GATE_HOST_RE = /^(docs|drive|sheets|slides)\.google\.com$/i;
 
+// URL-шаблоны телеметрии и RPC эндпоинтов Google (batchexecute, gen_204, /log,
+// telemetry, beacon, /collect, playlog, RPC-эндпоинты google с /_/ или rpcids=,
+// а также служебные имена файлов вроде response.bin).
+// Ответы таких URL не должны приниматься как файлы даже при заголовке attachment (PLUG-376).
+const TELEMETRY_OR_RPC_URL_RE =
+  /gen_204|batchexecute|\/log\b|telemetry|beacon|\/collect|playlog|\/_\/|\/rpc\b|rpcids=|response\.bin/i;
+
+const isTelemetryOrRpcName = (name) => /(^|\b|[-_])response\.bin$/i.test(String(name || '').trim());
+
+// Проверка JSON-конверта: Google RPC / batchexecute возвращает тело, начинающееся
+// с )]}' (wrb.fr фреймы) либо JSON-объекта { / массива [ (PLUG-376).
+function isJsonEnvelope(buf) {
+  if (!buf || !buf.length) return false;
+  let offset = 0;
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    offset = 3;
+  }
+  while (
+    offset < buf.length &&
+    (buf[offset] === 0x20 || buf[offset] === 0x09 || buf[offset] === 0x0a || buf[offset] === 0x0d)
+  ) {
+    offset++;
+  }
+  if (offset >= buf.length) return false;
+  if (buf[offset] === 0x7b /* '{' */ || buf[offset] === 0x5b /* '[' */) return true;
+  if (
+    offset + 4 <= buf.length &&
+    buf.slice(offset, offset + 4).toString('ascii') === ")]}'"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// Признак бинарного типа (image/*, video/*, audio/*, zip/doc/pdf или бинарное расширение).
+function isBinaryMimeOrExt(mime, name) {
+  const m = String(mime || '').toLowerCase().split(';')[0].trim();
+  if (
+    /^(image\/|video\/|audio\/|application\/(octet-stream|zip|x-zip-compressed|pdf|msword|vnd\.|x-msdownload))/.test(
+      m
+    )
+  ) {
+    return true;
+  }
+  const ext = String(name || '').split('.').pop().toLowerCase();
+  return /^(png|jpe?g|webp|gif|zip|docx|xlsx|pptx|pdf|bin|tar|gz|mp4|webm|mp3)$/.test(ext);
+}
+
+// Валидация контента для сетевого ответа (PLUG-376 заход 3):
+// 1) JSON-конверт ()]}' или {) при заявленном бинарном типе — отказ (RPC-ответ).
+// 2) Для image/* и zip-семейства (docx/xlsx/pptx) — проверка magic bytes первых байт тела.
+function isValidResponseContent(body, mime, name) {
+  if (!body || !body.length) return false;
+  const m = String(mime || '').toLowerCase().split(';')[0].trim();
+  const n = String(name || '').toLowerCase();
+  const isBin = isBinaryMimeOrExt(m, n);
+
+  // Служебный файл response.bin — признак RPC-ответа
+  if (isTelemetryOrRpcName(n)) {
+    return false;
+  }
+
+  // JSON-конверт при бинарном типе — отклонять как RPC
+  if (isBin && isJsonEnvelope(body)) {
+    return false;
+  }
+
+  // PNG: \x89PNG
+  if (m === 'image/png' || n.endsWith('.png')) {
+    return (
+      body.length >= 4 &&
+      body[0] === 0x89 &&
+      body[1] === 0x50 &&
+      body[2] === 0x4e &&
+      body[3] === 0x47
+    );
+  }
+
+  // JPEG: \xFF\xD8
+  if (m === 'image/jpeg' || m === 'image/jpg' || n.endsWith('.jpg') || n.endsWith('.jpeg')) {
+    return body.length >= 2 && body[0] === 0xff && body[1] === 0xd8;
+  }
+
+  // WebP: RIFF....WEBP
+  if (m === 'image/webp' || n.endsWith('.webp')) {
+    return (
+      body.length >= 12 &&
+      body.slice(0, 4).toString('ascii') === 'RIFF' &&
+      body.slice(8, 12).toString('ascii') === 'WEBP'
+    );
+  }
+
+  // GIF: GIF8
+  if (m === 'image/gif' || n.endsWith('.gif')) {
+    return body.length >= 4 && body.slice(0, 4).toString('ascii') === 'GIF8';
+  }
+
+  // docx / xlsx / pptx / zip: PK\x03\x04
+  if (
+    /\.(docx|xlsx|pptx|zip)$/i.test(n) ||
+    /application\/(vnd\.openxmlformats|zip|x-zip-compressed)/i.test(m)
+  ) {
+    return (
+      body.length >= 4 &&
+      body[0] === 0x50 &&
+      body[1] === 0x4b &&
+      body[2] === 0x03 &&
+      body[3] === 0x04
+    );
+  }
+
+  // Общий случай image/* без конкретного подтипа
+  if (/^image\//i.test(m)) {
+    const isPng =
+      body.length >= 4 &&
+      body[0] === 0x89 &&
+      body[1] === 0x50 &&
+      body[2] === 0x4e &&
+      body[3] === 0x47;
+    const isJpg = body.length >= 2 && body[0] === 0xff && body[1] === 0xd8;
+    const isWebp =
+      body.length >= 12 &&
+      body.slice(0, 4).toString('ascii') === 'RIFF' &&
+      body.slice(8, 12).toString('ascii') === 'WEBP';
+    const isGif = body.length >= 4 && body.slice(0, 4).toString('ascii') === 'GIF8';
+    return isPng || isJpg || isWebp || isGif;
+  }
+
+  return true;
+}
+
 const EXT_BY_MIME = (() => {
   const m = {};
   for (const [ext, mime] of Object.entries(MIME_BY_EXT)) {
@@ -2333,7 +2464,7 @@ async function collectGeneratedFiles(page, opts = {}) {
   const attemptBudget = Math.max(8, maxCount * 2);
   let tries = 0;
 
-  const CLICK_WAIT_MS = 10000;
+  const CLICK_WAIT_MS = typeof opts.clickWaitMs === 'number' ? opts.clickWaitMs : 10000;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const saveBufferToFile = (nameHint, mime, body) => {
@@ -2374,24 +2505,34 @@ async function collectGeneratedFiles(page, opts = {}) {
 
   // Кандидат «сетевой ответ = файл»: content-disposition=attachment или
   // бинарный content-type, 2xx и хост белого списка. Фоновая телеметрия
-  // (batchexecute/gen_204/пиксели), иконки svg/gif и посторонние хосты до
-  // резолва победителя гасятся — не должны побеждать по клику экспорта
-  // (ревью PLUG-376). Хосты Docs/Drive возвращаем как кандидата — чтобы
-  // зафиксировать причину Drive-гейта.
+  // (batchexecute/gen_204/пиксели/RPC), служебные response.bin, иконки svg/gif
+  // и посторонние хосты до резолва победителя гасятся — не должны побеждать
+  // по клику экспорта (PLUG-376 заход 3). Порядок строгий: сначала отсев
+  // телеметрии/RPC по URL и имени, потом статус/whitelist, потом disposition/тип.
   const respFileCandidate = (resp) => {
     try {
       const url = (resp.url && resp.url()) || '';
+      if (!url) return null;
+      // 1. Сначала отсев по URL/пути (batchexecute, gen_204, /log, telemetry, beacon,
+      // /collect, playlog, RPC-эндпоинты google, response.bin)
+      if (TELEMETRY_OR_RPC_URL_RE.test(url)) return null;
+
+      const hd = (resp.headers && resp.headers()) || {};
+      const cd = String(hd['content-disposition'] || '');
+      const dispName = fileNameFromDisposition(cd) || '';
+      if (isTelemetryOrRpcName(dispName) || isTelemetryOrRpcName(nameFromUrl(url))) return null;
+
+      // 2. Статус и хост белого списка / Drive-гейт
       const h = downloadUrlHost(url);
       if (!h) return null;
       if (DRIVE_GATE_HOST_RE.test(h)) return { resp, url };
       if (!isAllowedDownloadHost(h)) return null;
       const st = typeof resp.status === 'function' ? resp.status() : null;
       if (typeof st === 'number' && (st < 200 || st >= 300)) return null;
-      const hd = (resp.headers && resp.headers()) || {};
+
+      // 3. Заголовки: disposition=attachment или бинарный content-type
       const ct = String(hd['content-type'] || '').toLowerCase();
-      const cd = String(hd['content-disposition'] || '');
       if (/attachment/i.test(cd)) return { resp, url };
-      if (/gen_204|batchexecute|\/log\b|telemetry|beacon|\/collect|playlog/i.test(url)) return null;
       if (
         /^(application\/(octet-stream|zip|x-zip-compressed|pdf|msword|vnd\.|x-msdownload)|video\/|audio\/)/.test(
           ct
@@ -2475,7 +2616,13 @@ async function collectGeneratedFiles(page, opts = {}) {
         return;
       }
       const body = await resp.body();
-      saveBufferToFile(nameForFetched(headers, finalUrl, fallbackName), headers['content-type'], body);
+      const ct = String(headers['content-type'] || '').toLowerCase();
+      const fetchedName = nameForFetched(headers, finalUrl, fallbackName);
+      if (isBinaryMimeOrExt(ct, fetchedName) && (isJsonEnvelope(body) || isTelemetryOrRpcName(fetchedName))) {
+        skipNote(fallbackName || fetchedName, 'telemetry/rpc');
+        return;
+      }
+      saveBufferToFile(fetchedName, headers['content-type'], body);
     } catch (e) {
       skipNote(name, String((e && e.message) || e));
     }
@@ -2491,6 +2638,7 @@ async function collectGeneratedFiles(page, opts = {}) {
     const ctx = (typeof page.context === 'function') ? page.context() : null;
     const clickStart = Date.now();
     let settled = false;
+    let telemetryReject = false;
     // Перехватчики принимают события только с начала клика — фоновая
     // телеметрия и чужие вкладки в общем контексте не должны побеждать.
     let accept = false;
@@ -2540,7 +2688,25 @@ async function collectGeneratedFiles(page, opts = {}) {
       respListener = (resp) => {
         if (!accept || settled) return;
         const cand = respFileCandidate(resp);
-        if (cand) respEvents.push(cand);
+        if (cand) {
+          respEvents.push(cand);
+        } else {
+          try {
+            const u = (resp.url && resp.url()) || '';
+            const hd = (resp.headers && resp.headers()) || {};
+            const cd = String(hd['content-disposition'] || '');
+            const ct = String(hd['content-type'] || '').toLowerCase();
+            const dispName = fileNameFromDisposition(cd) || '';
+            if (
+              (TELEMETRY_OR_RPC_URL_RE.test(u) ||
+                isTelemetryOrRpcName(dispName) ||
+                isTelemetryOrRpcName(nameFromUrl(u))) &&
+              (/attachment/i.test(cd) || isBinaryMimeOrExt(ct, u))
+            ) {
+              telemetryReject = true;
+            }
+          } catch {}
+        }
       };
       try {
         page.on('download', dlListener);
@@ -2774,7 +2940,83 @@ async function collectGeneratedFiles(page, opts = {}) {
 
     try {
       if (!winner) {
-        skipNote(candName, 'download did not materialize');
+        // Fallback для изображений (PLUG-376 заход 3, расширение PLUG-380):
+        // клик по «Скачать в полном размере» в Imagen не порождает событий сети
+        // или новой вкладки — пробуем canvas-экстракцию / data: URI изображения
+        // из контейнера сообщения (механизм downloadGeneratedMedia).
+        let canvasSaved = false;
+        try {
+          const imgMedia = await safeEval(
+            page,
+            ({ tag, idx, promptPrefix }) => {
+              const btn = document.querySelector(`[data-argon-dl="${tag}"]`);
+              let root = btn ? btn.closest('generated-image, .image-container, message-content, model-response') : null;
+              if (!root && window.__argonFindTurnTarget) {
+                root = window.__argonFindTurnTarget(document, idx, promptPrefix);
+              }
+              if (!root) {
+                root = document.querySelector('model-response:last-of-type');
+              }
+              if (!root) return null;
+              const img = root.querySelector(
+                'generated-image img, img.image, .image-container img, img[src*="blob:"], img[src*="googleusercontent"], img'
+              );
+              if (!img) return null;
+              try {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth || img.width || 1024;
+                canvas.height = img.naturalHeight || img.height || 1024;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                const dataUrl = canvas.toDataURL('image/png');
+                if (dataUrl && dataUrl.startsWith('data:image/')) {
+                  return { dataUrl, alt: img.alt || '' };
+                }
+              } catch {}
+              if (img.src && typeof img.src === 'string') {
+                return { src: img.src, alt: img.alt || '' };
+              }
+              return null;
+            },
+            { tag: c.tag, idx: opts.turnIndex ?? 0, promptPrefix: opts.promptPrefix || '' }
+          );
+
+          if (imgMedia && imgMedia.dataUrl && imgMedia.dataUrl.startsWith('data:image/')) {
+            const base64 = imgMedia.dataUrl.split(',')[1];
+            if (base64) {
+              const body = Buffer.from(base64, 'base64');
+              if (isValidResponseContent(body, 'image/png', candName)) {
+                saveBufferToFile(candName, 'image/png', body);
+                canvasSaved = true;
+              }
+            }
+          } else if (imgMedia && imgMedia.src) {
+            if (imgMedia.src.startsWith('data:image/')) {
+              const base64 = imgMedia.src.split(',')[1];
+              if (base64) {
+                const body = Buffer.from(base64, 'base64');
+                if (isValidResponseContent(body, 'image/png', candName)) {
+                  saveBufferToFile(candName, 'image/png', body);
+                  canvasSaved = true;
+                }
+              }
+            } else if (/^https?:/i.test(imgMedia.src)) {
+              const host = downloadUrlHost(imgMedia.src);
+              if (host && isAllowedDownloadHost(host)) {
+                await fetchUrlToFile(imgMedia.src, candName);
+                canvasSaved = true;
+              }
+            }
+          }
+        } catch {}
+
+        if (!canvasSaved) {
+          if (telemetryReject) {
+            skipNote(candName, 'telemetry/rpc');
+          } else {
+            skipNote(candName, 'download did not materialize');
+          }
+        }
       } else if (winner.kind === 'download') {
         const dl = winner.dl;
         // У click-кандидатов href в DOM не было — хост download-события
@@ -2839,11 +3081,17 @@ async function collectGeneratedFiles(page, opts = {}) {
             body = await resp.body();
           } catch {}
           if (body && body.length) {
-            saveBufferToFile(
-              nameForFetched(headers, winner.url, candName),
-              headers['content-type'],
-              body
-            );
+            const ct = String(headers['content-type'] || '').toLowerCase();
+            const candNameOrFetched = nameForFetched(headers, winner.url, candName);
+            if (!isValidResponseContent(body, ct, candNameOrFetched)) {
+              skipNote(candName, 'telemetry/rpc');
+            } else {
+              saveBufferToFile(
+                candNameOrFetched,
+                headers['content-type'],
+                body
+              );
+            }
           } else if (winner.url) {
             await fetchUrlToFile(winner.url, candName);
           } else {
@@ -3167,6 +3415,11 @@ module.exports = {
   isAllowedDownloadHost,
   downloadUrlHost,
   downloadGeneratedMedia,
+  TELEMETRY_OR_RPC_URL_RE,
+  isTelemetryOrRpcName,
+  isJsonEnvelope,
+  isBinaryMimeOrExt,
+  isValidResponseContent,
   listConversations,
   listConversationsInternal,
   getConversationTranscript,

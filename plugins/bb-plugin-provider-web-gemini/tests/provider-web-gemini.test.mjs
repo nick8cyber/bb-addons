@@ -4433,3 +4433,173 @@ test("22. PLUG-376 review fixes: response channel, host/redirect re-checks, abou
     `page listeners must be removed per candidate, got ${JSON.stringify(pageOffCalls)}`
   );
 });
+
+test("23. PLUG-376 round 3: batchexecute/RPC & response.bin filtering, magic-bytes validation, and canvas fallback for images", async () => {
+  const dlDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "plug376c-dl-")));
+  const scanOf = (candidates, meta = {}) => ({ candidates, meta });
+  const timeoutEvent = (ev, opts) =>
+    new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), (opts && opts.timeout) || 50));
+
+  /* --- A. Контракт 1 & 3: Content-Disposition attachment + image/png на batchexecute-URL с JSON-конвертом --- */
+  let respFireA = null;
+  const rpcPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-rpc", name: "Скачать" }]) : null,
+    $: async () => ({
+      click: async () => {
+        if (respFireA) {
+          respFireA({
+            url: () => "https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=hNvQHb",
+            status: () => 200,
+            headers: () => ({
+              "content-disposition": 'attachment; filename="image.png"',
+              "content-type": "image/png",
+            }),
+            body: async () => Buffer.from(")]}'\n1001\n[[\"wrb.fr\",null,null]]"),
+          });
+        }
+      },
+    }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    on: (ev, fn) => {
+      if (ev === "response") respFireA = fn;
+    },
+    off: () => {},
+    waitForEvent: timeoutEvent,
+  };
+  const collRpc = await collectGeneratedFiles(rpcPage, { dir: dlDir, sessionId: "s-rpc", clickWaitMs: 150 });
+  assert.equal(collRpc.files.length, 0, `RPC response must not resolve as file: ${JSON.stringify(collRpc)}`);
+  assert.equal(collRpc.skipped.length, 1);
+  assert.match(collRpc.skipped[0].reason, /telemetry\/rpc/);
+
+  /* --- B. response.bin как имя файла: служебный ответ отсекается наравне с batchexecute --- */
+  let respFireB = null;
+  const respBinPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-rbin", name: "Экспорт" }]) : null,
+    $: async () => ({
+      click: async () => {
+        if (respFireB) {
+          respFireB({
+            url: () => "https://gemini.google.com/dl/file",
+            status: () => 200,
+            headers: () => ({
+              "content-disposition": 'attachment; filename="response.bin"',
+              "content-type": "application/octet-stream",
+            }),
+            body: async () => Buffer.from(")]}'\n1001\n[[\"wrb.fr\"]]"),
+          });
+        }
+      },
+    }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    on: (ev, fn) => {
+      if (ev === "response") respFireB = fn;
+    },
+    off: () => {},
+    waitForEvent: timeoutEvent,
+  };
+  const collRespBin = await collectGeneratedFiles(respBinPage, { dir: dlDir, sessionId: "s-rbin", clickWaitMs: 150 });
+  assert.equal(collRespBin.files.length, 0);
+  assert.equal(collRespBin.skipped.length, 1);
+  assert.match(collRespBin.skipped[0].reason, /telemetry\/rpc/);
+
+  /* --- C. Magic bytes & JSON-конверт: отказ при бинарном типе и JSON-конверте или битых байтах --- */
+  let respFireC = null;
+  const badMagicPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-magic", name: "Скачать изображение" }]) : null,
+    $: async () => ({
+      click: async () => {
+        if (respFireC) {
+          respFireC({
+            url: () => "https://gemini.google.com/dl/photo.png",
+            status: () => 200,
+            headers: () => ({
+              "content-type": "image/png",
+            }),
+            body: async () => Buffer.from("{\"error\": \"not an image\"}"),
+          });
+        }
+      },
+    }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    on: (ev, fn) => {
+      if (ev === "response") respFireC = fn;
+    },
+    off: () => {},
+    waitForEvent: timeoutEvent,
+  };
+  const collBadMagic = await collectGeneratedFiles(badMagicPage, { dir: dlDir, sessionId: "s-badmagic", clickWaitMs: 150 });
+  assert.equal(collBadMagic.files.length, 0);
+  assert.equal(collBadMagic.skipped.length, 1);
+  assert.match(collBadMagic.skipped[0].reason, /telemetry\/rpc/);
+
+  /* --- D. Валидный бинарный ответ: корректные magic bytes PNG принимаются --- */
+  let respFireD = null;
+  const validPngPayload = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from("VALID_PNG_BODY"),
+  ]);
+  const validPngPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-vpng", name: "Скачать PNG" }]) : null,
+    $: async () => ({
+      click: async () => {
+        if (respFireD) {
+          respFireD({
+            url: () => "https://gemini.google.com/dl/real.png",
+            status: () => 200,
+            headers: () => ({
+              "content-disposition": 'attachment; filename="real.png"',
+              "content-type": "image/png",
+            }),
+            body: async () => validPngPayload,
+          });
+        }
+      },
+    }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    on: (ev, fn) => {
+      if (ev === "response") respFireD = fn;
+    },
+    off: () => {},
+    waitForEvent: timeoutEvent,
+  };
+  const collValidPng = await collectGeneratedFiles(validPngPage, { dir: dlDir, sessionId: "s-vpng", clickWaitMs: 150 });
+  assert.equal(collValidPng.files.length, 1);
+  assert.equal(collValidPng.skipped.length, 0);
+  assert.equal(collValidPng.files[0].name, "real.png");
+  assert.deepEqual(fs.readFileSync(collValidPng.files[0].path), validPngPayload);
+
+  /* --- E. Расширение захода 3: кандидат-картинка без событий → файл собран canvas-путём --- */
+  const canvas1x1PngB64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const canvasImgPayload = Buffer.from(canvas1x1PngB64, "base64");
+  const canvasPage = {
+    evaluate: async (fn, arg) => {
+      if (arg && arg.candSrc) {
+        return scanOf([{ kind: "click", tag: "n0-canvas", name: "Скачать в полном размере" }]);
+      }
+      if (arg && arg.tag === "n0-canvas") {
+        return {
+          dataUrl: `data:image/png;base64,${canvas1x1PngB64}`,
+          alt: "generated preview",
+        };
+      }
+      return null;
+    },
+    $: async () => ({
+      click: async () => {
+        // Клик по «Скачать в полном размере» в Imagen не порождает событий сети
+      },
+    }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    waitForEvent: timeoutEvent,
+  };
+  const collCanvas = await collectGeneratedFiles(canvasPage, { dir: dlDir, sessionId: "s-canvas", clickWaitMs: 150 });
+  assert.equal(collCanvas.files.length, 1, `canvas fallback must collect image: ${JSON.stringify(collCanvas)}`);
+  assert.equal(collCanvas.skipped.length, 0);
+  assert.equal(collCanvas.files[0].mimeType, "image/png");
+  assert.deepEqual(fs.readFileSync(collCanvas.files[0].path), canvasImgPayload);
+});
