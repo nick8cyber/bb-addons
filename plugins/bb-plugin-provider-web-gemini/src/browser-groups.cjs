@@ -3,9 +3,13 @@
 // driver launches gets a marker file under <stateDir>/browser-groups/<port>.json
 // recording the group identity (pgid + leader starttime) and a verifiable
 // owner (pid + owner starttime). Reapers in acp-server.mjs use these markers to
-// tear down groups whose owner died while holding no lease and no live CDP
-// clients. Groups without a marker (externally launched chrome) are never
-// touched.
+// tear down groups that hold no lease and no live CDP clients — whether the
+// owner died or the group simply went idle. Groups without a marker
+// (externally launched chrome) are never touched.
+//
+// A marker flagged `reaping` is mid-teardown: backend selection refuses new
+// leases/adoptions for its port while the flag is fresh, so the SIGTERM→grace→
+// SIGKILL sequence cannot race a brand-new lease (contract §3).
 
 const fs = require('fs');
 const path = require('path');
@@ -24,6 +28,28 @@ function resolveStateDir(explicit) {
 
 const groupsDir = (stateDir) => path.join(resolveStateDir(stateDir), 'browser-groups');
 const markerPath = (stateDir, port) => path.join(groupsDir(stateDir), `${port}.json`);
+
+// A `reaping` mark stays authoritative only briefly — long enough to cover a
+// SIGTERM grace + escalation check, short enough that a reaper dying
+// mid-teardown releases the port quickly.
+const REAPING_TTL_MS = 30_000;
+
+function isReaping(meta, now = Date.now()) {
+  const r = meta && meta.reaping;
+  return Boolean(r && Number.isFinite(r.sinceMs) && now - r.sinceMs < REAPING_TTL_MS);
+}
+
+// Drop our own reaping flag after a vetoed escalation — only when the marker
+// still carries the exact mark this teardown wrote (by + sinceMs identity).
+function clearReaping(stateDir, port, expected) {
+  const cur = readMarker(stateDir, port);
+  if (!cur || !cur.reaping) return;
+  if (expected && (cur.reaping.by !== expected.by || cur.reaping.sinceMs !== expected.sinceMs)) return;
+  delete cur.reaping;
+  try {
+    writeMarker(stateDir, cur);
+  } catch {}
+}
 
 function readProcStat(pid) {
   if (process.platform !== 'linux') return null;
@@ -118,13 +144,17 @@ function recordGroup({ stateDir, port, pgid, mode, userDataDir, profileDir }) {
 }
 
 // The current lease holder adopts a group launched by an earlier owner — the
-// marker then points at a live verifiable owner instead of a dead one.
+// marker then points at a live verifiable owner instead of a dead one. A
+// fresh `reaping` mark refuses adoption: the group is being torn down.
 function adoptGroup(stateDir, port, meta = null) {
   meta = meta || readMarker(stateDir, port);
   if (!meta) return null;
+  if (isReaping(meta)) return null;
   if (meta.ownerPid === process.pid) return meta;
   meta.ownerPid = process.pid;
   meta.ownerStartTime = readProcStat(process.pid)?.startTime ?? meta.ownerStartTime;
+  meta.adoptedMs = Date.now(); // covers the adopt→connect window like a launch
+  delete meta.reaping; // drop a stale mark left by a reaper that died mid-teardown
   try {
     writeMarker(stateDir, meta);
   } catch {}
@@ -138,38 +168,83 @@ function ownerAlive(meta) {
   return isPidAlive(meta.ownerPid);
 }
 
+function portFlagInCmdline(cmdline, port) {
+  return new RegExp(`--remote-debugging-port=${port}(?![0-9])`).test(cmdline);
+}
+
 function cmdlineMatchesPort(pid, port) {
   try {
     const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
-    return new RegExp(`--remote-debugging-port=${port}(?![0-9])`).test(cmd);
+    return portFlagInCmdline(cmd, port);
   } catch {
     return false;
   }
 }
 
-// The pgid may outlive the group leader (e.g. xvfb-run exits while Xvfb and
-// chrome stay). Check the leader first, then scan /proc for any member of the
-// group still carrying our port flag — reparented members (ppid 1 or
-// user-systemd) are found the same way.
-function groupAliveMatches(meta) {
-  if (!meta || !meta.pgid) return false;
-  const leader = readProcStat(meta.pgid);
-  if (leader && leader.pgrp === meta.pgid) {
-    if (meta.pgidStartTime == null || leader.startTime === meta.pgidStartTime) {
-      if (cmdlineMatchesPort(meta.pgid, meta.port)) return true;
-    }
-  }
-  if (process.platform !== 'linux') return false;
+// Live non-zombie members of a process group — reparented members (ppid 1 or
+// user-systemd) are found the same way since only pgrp matters.
+function groupMembers(pgid) {
+  const out = [];
+  if (process.platform !== 'linux') return out;
   try {
     for (const ent of fs.readdirSync('/proc')) {
       if (!/^\d+$/.test(ent)) continue;
-      const pid = Number(ent);
-      if (pid === meta.pgid) continue;
-      const st = readProcStat(pid);
-      if (st && st.pgrp === meta.pgid && cmdlineMatchesPort(pid, meta.port)) return true;
+      const st = readProcStat(Number(ent));
+      if (!st || st.pgrp !== pgid || st.state === 'Z') continue;
+      let cmdline = '';
+      try {
+        cmdline = fs.readFileSync(`/proc/${ent}/cmdline`, 'utf8').replace(/\0/g, ' ');
+      } catch {}
+      out.push({ pid: Number(ent), startTime: st.startTime, cmdline });
     }
   } catch {}
-  return false;
+  return out;
+}
+
+// Our groups only ever contain the xvfb-run/chrome/Xvfb family. A leftover
+// member is attributed to us when its cmdline matches that family and it did
+// not start before the recorded group leader — the combination a foreign
+// process group reusing our pgid cannot realistically satisfy.
+const GROUP_MEMBER_CMDLINE = /xvfb|chrome|chromium|crashpad/i;
+
+function memberLooksOurs(m, meta) {
+  if (!GROUP_MEMBER_CMDLINE.test(m.cmdline)) return false;
+  if (meta.pgidStartTime != null && m.startTime != null && m.startTime < meta.pgidStartTime) {
+    return false;
+  }
+  return true;
+}
+
+// Verifiable identity of the group behind a marker:
+//   'dead'     — no members left; ours is gone
+//   'matched'  — a member still carries our remote-debugging-port flag
+//   'leftover' — no flag carrier remains (chrome and the leader exited, e.g.
+//                only Xvfb survives) but every remaining member is
+//                attributable to our browser stack
+//   'doubtful' — members exist that cannot be attributed to us, or a live
+//                leader pid carries a different starttime (the pgid may have
+//                been reused by a foreign group); the caller must keep the
+//                marker and leave the group alone
+function identifyGroup(meta) {
+  if (!meta || !meta.pgid) return 'dead';
+  if (process.platform !== 'linux') return groupExists(meta.pgid) ? 'doubtful' : 'dead';
+  const members = groupMembers(meta.pgid);
+  if (members.length === 0) return 'dead';
+  for (const m of members) {
+    if (portFlagInCmdline(m.cmdline, meta.port)) return 'matched';
+  }
+  const leader = members.find((m) => m.pid === meta.pgid);
+  if (leader && meta.pgidStartTime != null && leader.startTime !== meta.pgidStartTime) {
+    return 'doubtful';
+  }
+  return members.every((m) => memberLooksOurs(m, meta)) ? 'leftover' : 'doubtful';
+}
+
+// The group is verified as ours: either a member still carries the port flag,
+// or only attributable leftovers (e.g. a lone Xvfb) survive the leader.
+function groupAliveMatches(meta) {
+  const identity = identifyGroup(meta);
+  return identity === 'matched' || identity === 'leftover';
 }
 
 function groupExists(pgid) {
@@ -224,7 +299,7 @@ function hasLiveCdpClients(port, { ignoreInodes = null } = {}) {
 }
 
 // Send a signal to the whole group only after re-verifying the marker still
-// points at a chrome group with our port — protects against pgid reuse.
+// points at an identifiable group of ours — protects against pgid reuse.
 function signalGroup(meta, sig) {
   if (!groupAliveMatches(meta)) return false;
   try {
@@ -235,24 +310,38 @@ function signalGroup(meta, sig) {
   }
 }
 
+// Live (non-zombie) membership — a group reduced to zombies is done for all
+// signaling purposes even while kill(-pgid, 0) still answers.
+function groupHasMembers(pgid) {
+  if (process.platform !== 'linux') return groupExists(pgid);
+  return groupMembers(pgid).length > 0;
+}
+
+// Poll until no member of the group remains (grace window for SIGTERM).
+async function waitGroupGone(pgid, { graceMs = 1200, stepMs = 100 } = {}) {
+  const deadline = Date.now() + graceMs;
+  while (groupHasMembers(pgid) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+  return !groupHasMembers(pgid);
+}
+
 // SIGTERM, short grace, SIGKILL — kills the whole detached group including
 // Xvfb (children keep the leader's pgid). Async: callers hold no locks here.
 async function killGroup(meta, { graceMs = 1200, stepMs = 100 } = {}) {
   const termSent = signalGroup(meta, 'SIGTERM');
-  const deadline = Date.now() + graceMs;
-  while (groupExists(meta.pgid) && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, stepMs));
-  }
-  if (groupExists(meta.pgid)) signalGroup(meta, 'SIGKILL');
+  const gone = await waitGroupGone(meta.pgid, { graceMs, stepMs });
+  if (!gone) signalGroup(meta, 'SIGKILL');
   // A second may pass before the group fully disappears; the caller decides
   // whether to drop the marker — the group is already doomed either way.
-  return termSent || groupExists(meta.pgid);
+  return termSent || !gone;
 }
 
 module.exports = {
   resolveStateDir,
   groupsDir,
   markerPath,
+  REAPING_TTL_MS,
   readProcStat,
   isPidAlive,
   writeMarker,
@@ -261,12 +350,18 @@ module.exports = {
   listMarkers,
   recordGroup,
   adoptGroup,
+  isReaping,
+  clearReaping,
   ownerAlive,
+  portFlagInCmdline,
   cmdlineMatchesPort,
+  groupMembers,
+  identifyGroup,
   groupAliveMatches,
   groupExists,
   socketInodesOf,
   hasLiveCdpClients,
   signalGroup,
+  waitGroupGone,
   killGroup,
 };

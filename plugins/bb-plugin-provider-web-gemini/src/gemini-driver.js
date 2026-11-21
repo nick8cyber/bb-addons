@@ -183,7 +183,10 @@ async function ensureChrome(opts = {}) {
 
   const modeMatches = !targetMode || currentMode === targetMode;
 
-  if (cdpUp && !forceRestart && profileMatches && modeMatches) {
+  // A group mid-teardown (fresh `reaping` mark) is already doomed — never
+  // reuse it; fall through to stopChrome + respawn instead (PLUG-374).
+  const runningMeta = browserGroups.readMarker(stateDir, port);
+  if (cdpUp && !forceRestart && profileMatches && modeMatches && !browserGroups.isReaping(runningMeta)) {
     // Reusing a group an earlier owner launched: point the marker at the
     // current owner so reapers see a live verifiable identity (PLUG-374).
     browserGroups.adoptGroup(stateDir, port);
