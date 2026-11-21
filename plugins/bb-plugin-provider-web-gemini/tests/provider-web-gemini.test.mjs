@@ -4638,3 +4638,153 @@ test("27. browser-groups: identity mismatch stays doubtful — no signal, marker
     assert.ok(browserGroups.readMarker(stateDir, port));
   }
 });
+
+test("28. browser-groups: stale-boot marker authorizes nothing — no signal, port free", async (t) => {
+  if (process.platform !== "linux") return;
+  const groupPids = [];
+  const newState = () => {
+    const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-boot-")));
+    const ledgerPath = path.join(stateDir, "accounts-state.json");
+    fs.writeFileSync(ledgerPath, JSON.stringify({ accounts: {}, leases: {} }));
+    return { stateDir, ledgerPath, lockPath: `${ledgerPath}.lock` };
+  };
+  const waitChrome = async (pid, port) => {
+    for (let i = 0; i < 60; i++) {
+      if (browserGroups.cmdlineMatchesPort(pid, port)) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  const fakeChromeGroup = async (port) => {
+    const proc = spawn("bash", ["-c", `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 600`], {
+      detached: true,
+      stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    return proc.pid;
+  };
+  t.after(() => {
+    for (const pgid of groupPids) {
+      try { process.kill(-pgid, "SIGKILL"); } catch {}
+    }
+    groupPids.length = 0;
+  });
+
+  const staleBoot = "00000000-0000-0000-0000-000000000000";
+  assert.ok(browserGroups.currentBootId(), "boot_id must be readable on linux");
+  assert.notEqual(staleBoot, browserGroups.currentBootId(), "fixture boot id must differ from the real one");
+
+  // recordGroup stamps the marker with the current boot.
+  {
+    const { stateDir } = newState();
+    const meta = browserGroups.recordGroup({ stateDir, port: "19426", pgid: process.pid });
+    assert.equal(meta.bootId, browserGroups.currentBootId());
+    assert.equal(browserGroups.markerMatchesBoot(browserGroups.readMarker(stateDir, "19426")), true);
+  }
+
+  // (a) reboot collision shape: stale-boot marker + a live foreign group
+  //     whose pgid/starttime/port flag all match the recorded values →
+  //     classified stale-boot, no signal, marker cleaned, group untouched.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19427";
+    const pgid = await fakeChromeGroup(port);
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid,
+      pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+      bootId: staleBoot,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now() - 10 * 60_000,
+    });
+    const diag = {};
+    assert.equal(
+      browserGroups.identifyGroup(browserGroups.readMarker(stateDir, port), diag),
+      "stale-boot",
+      "boot mismatch must precede PID/PGID/port interpretation"
+    );
+    assert.equal(diag.reason, "boot-mismatch");
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+    assert.equal(n, 0, "foreign group must not be reaped");
+    assert.equal(browserGroups.isPidAlive(pgid), true, "no SIGTERM may reach the foreign group");
+    assert.equal(browserGroups.readMarker(stateDir, port), null, "stale-boot marker is cleaned");
+    // The port is free for a fresh lease.
+    const pick = withStateLock(
+      (state) => pickBackendFromState(state, null, `${process.pid}:s`, Date.now(), null, [{ id: "acc1", cdp: port }], stateDir),
+      ledgerPath, lockPath
+    );
+    assert.equal(pick.backend?.id, "acc1", "port must be leasable once the stale marker is gone");
+  }
+
+  // (b) a stale-boot reaping mark holds nothing busy — backend selection
+  //     leases the port even while the flag is fresh.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19428";
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid: 2 ** 22, pgidStartTime: 0,
+      bootId: staleBoot,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      reaping: { by: 424242, sinceMs: Date.now() },
+    });
+    assert.equal(
+      browserGroups.isReaping(browserGroups.readMarker(stateDir, port)),
+      false,
+      "stale-boot reaping mark must be inert"
+    );
+    const pick = withStateLock(
+      (state) => pickBackendFromState(state, null, `${process.pid}:s`, Date.now(), null, [{ id: "acc1", cdp: port }], stateDir),
+      ledgerPath, lockPath
+    );
+    assert.equal(pick.backend?.id, "acc1", "stale-boot mark must not hold the port busy");
+  }
+
+  // (c) a marker with no bootId at all authorizes nothing — same stale-boot
+  //     classification, no signal, marker cleaned. The raw file is written
+  //     directly: writeMarker auto-stamps a missing bootId.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19429";
+    const pgid = await fakeChromeGroup(port);
+    fs.mkdirSync(browserGroups.groupsDir(stateDir), { recursive: true });
+    fs.writeFileSync(browserGroups.markerPath(stateDir, port), JSON.stringify({
+      version: 1, port, pgid,
+      pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now() - 10 * 60_000,
+    }));
+    const diag = {};
+    assert.equal(
+      browserGroups.identifyGroup(browserGroups.readMarker(stateDir, port), diag),
+      "stale-boot"
+    );
+    assert.equal(diag.reason, "boot-unrecorded");
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+    assert.equal(n, 0);
+    assert.equal(browserGroups.isPidAlive(pgid), true, "no SIGTERM may reach the foreign group");
+    assert.equal(browserGroups.readMarker(stateDir, port), null);
+  }
+
+  // (d) adoption refuses a stale-boot marker — reusing the port never claims
+  //     the foreign group.
+  {
+    const { stateDir } = newState();
+    const port = "19430";
+    const pgid = await fakeChromeGroup(port);
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid,
+      pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+      bootId: staleBoot,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now() - 10 * 60_000,
+    });
+    assert.equal(
+      browserGroups.adoptGroup(stateDir, port),
+      null,
+      "stale-boot marker must refuse adoption"
+    );
+    const kept = browserGroups.readMarker(stateDir, port);
+    assert.notEqual(kept.ownerPid, process.pid, "foreign marker is not re-owned");
+    assert.equal(kept.bootId, staleBoot, "foreign bootId is preserved for the reaper's cleanup");
+  }
+});

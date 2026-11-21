@@ -10,6 +10,13 @@
 // A marker flagged `reaping` is mid-teardown: backend selection refuses new
 // leases/adoptions for its port while the flag is fresh, so the SIGTERM→grace→
 // SIGKILL sequence cannot race a brand-new lease (contract §3).
+//
+// Boot scoping: pgid and starttime are per-boot values that repeat after a
+// reboot, while markers on disk survive one. Every marker records the boot
+// it was written in (boot_id); a marker with an absent or foreign bootId can
+// never authorize signals and must not hold its port busy — the pgid it
+// names may now belong to a foreign group. Reapers may clean such stale
+// markers; the processes under them are never ours to touch (заход 4).
 
 const fs = require('fs');
 const path = require('path');
@@ -34,7 +41,30 @@ const markerPath = (stateDir, port) => path.join(groupsDir(stateDir), `${port}.j
 // mid-teardown releases the port quickly.
 const REAPING_TTL_MS = 30_000;
 
+// The boot this process runs under — /proc/sys/kernel/random/boot_id is a
+// fresh random UUID per boot, so it separates markers across reboots with no
+// reliance on clock state.
+function currentBootId() {
+  if (process.platform !== 'linux') return null;
+  try {
+    return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+// True only when the marker was written in this boot. Off Linux (or when
+// boot_id is unreadable) there is nothing to compare — no scoping.
+function markerMatchesBoot(meta) {
+  const boot = currentBootId();
+  if (!boot) return true;
+  return Boolean(meta && meta.bootId && meta.bootId === boot);
+}
+
 function isReaping(meta, now = Date.now()) {
+  // A reaping mark from a previous boot describes a teardown that can no
+  // longer be in flight — it authorizes nothing and holds nothing busy.
+  if (!markerMatchesBoot(meta)) return false;
   const r = meta && meta.reaping;
   return Boolean(r && Number.isFinite(r.sinceMs) && now - r.sinceMs < REAPING_TTL_MS);
 }
@@ -78,6 +108,10 @@ function isPidAlive(pid) {
 function writeMarker(stateDir, meta) {
   const dir = groupsDir(stateDir);
   fs.mkdirSync(dir, { recursive: true });
+  // Every marker is boot-scoped: an explicit bootId (replay of an older meta,
+  // or a deliberately foreign one) is preserved; a missing one is stamped
+  // with the boot this write happens under.
+  if (meta.bootId == null) meta.bootId = currentBootId();
   const target = markerPath(stateDir, meta.port);
   const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(meta, null, 2) + '\n');
@@ -128,6 +162,7 @@ function recordGroup({ stateDir, port, pgid, mode, userDataDir, profileDir }) {
     port: String(port),
     pgid: Number(pgid),
     pgidStartTime: readProcStat(pgid)?.startTime ?? null,
+    bootId: currentBootId(),
     ownerPid: process.pid,
     ownerStartTime: readProcStat(process.pid)?.startTime ?? null,
     mode: mode || null,
@@ -149,6 +184,9 @@ function recordGroup({ stateDir, port, pgid, mode, userDataDir, profileDir }) {
 function adoptGroup(stateDir, port, meta = null) {
   meta = meta || readMarker(stateDir, port);
   if (!meta) return null;
+  // A stale-boot marker names a group that died with the previous boot —
+  // whatever now matches its pgid is foreign and must never be adopted.
+  if (!markerMatchesBoot(meta)) return null;
   if (isReaping(meta)) return null;
   if (meta.ownerPid === process.pid) return meta;
   meta.ownerPid = process.pid;
@@ -233,7 +271,14 @@ const MEMBER_LAUNCH_WINDOW_JIFFIES = 3000;
 //                or leaderless survivors postdate the recorded launch (the
 //                pgid may have been reused by a foreign group); the caller
 //                must keep the marker and leave the group alone
+//   'stale-boot' — the marker predates the current boot (or carries no
+//                bootId): the pgid/starttime it records belong to processes
+//                that died with that boot, so any live group matching them
+//                is foreign; the caller must never signal it and may drop
+//                the stale marker
 //
+// Boot scope is checked BEFORE any PID/PGID/port interpretation: those
+// fields are per-boot values and a stale marker must not even reach them.
 // Identity is checked BEFORE the port flag: --remote-debugging-port in a
 // cmdline is only an attribute of an already-confirmed group — a foreign
 // group that reused our pgid may carry the very same flag. When `diag` is
@@ -244,6 +289,9 @@ function identifyGroup(meta, diag = null) {
     return identity;
   };
   if (!meta || !meta.pgid) return why('dead', 'no-pgid');
+  if (!markerMatchesBoot(meta)) {
+    return why('stale-boot', meta.bootId ? 'boot-mismatch' : 'boot-unrecorded');
+  }
   if (process.platform !== 'linux') {
     return groupExists(meta.pgid) ? why('doubtful', 'non-linux') : why('dead', 'no-members');
   }
@@ -378,6 +426,8 @@ module.exports = {
   groupsDir,
   markerPath,
   REAPING_TTL_MS,
+  currentBootId,
+  markerMatchesBoot,
   readProcStat,
   isPidAlive,
   writeMarker,

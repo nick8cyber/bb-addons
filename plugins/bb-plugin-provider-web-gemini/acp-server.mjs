@@ -1079,6 +1079,18 @@ export async function reapOrphanBrowserGroups({ stateDir = STATE_DIR, ledgerPath
         browserGroups.removeMarker(stateDir, meta.port);
         continue;
       }
+      if (identity === "stale-boot") {
+        // The marker describes a group that died with a previous boot — its
+        // pgid may now name a foreign group, so only the stale marker is
+        // cleaned; processes are never touched (заход 4). Re-read first so a
+        // marker rewritten meanwhile (fresh launch on the port) is not lost.
+        const cur = browserGroups.readMarker(stateDir, meta.port);
+        if (cur && cur.pgid === meta.pgid && !browserGroups.markerMatchesBoot(cur)) {
+          browserGroups.removeMarker(stateDir, meta.port);
+        }
+        slog("reaper:browser-group-stale", { port: meta.port, pgid: meta.pgid, reason: diag.reason });
+        continue;
+      }
       if (identity === "doubtful") {
         // Members survive that cannot be attributed to our browser stack —
         // leave the group alone and keep the marker (annotated with the
