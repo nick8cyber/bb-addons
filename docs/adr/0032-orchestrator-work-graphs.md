@@ -85,3 +85,12 @@ updated: 2026-11-19
 - [docs/specs/orchestrator.md](../specs/orchestrator.md) — §27–§32 (ревизия 34.1)
 - [docs/specs/orchestrator-release.md](../specs/orchestrator-release.md) — шаг 1 (вызов release от run-queue)
 - База знаний: `projects/bb-orchestrator-graph-architecture.md`, `projects/bb-orchestrator-work-graphs-plan.md`
+
+## Решения от 20.11 (PLUG-359, PLUG-360, PLUG-361)
+
+1. **Компактное меню роли и режима одобрения в композере (PLUG-359):**
+   Вместо отдельного тумблера и переключателя ролей реализован компактный объединённый селектор `RoleApprovalMenu` в строке действий композера. Единая кнопка-меню отображает текущую роль и статус одобрения (`✅` авто / `👤` сам). Меню содержит две секции: выбор роли треда и выбор режима одобрения (отображается при активном графе для orchestrator и executor).
+2. **Проектный режим графа задач (PLUG-361, ADR-0039):**
+   Введена настройка `workGraphProjects: { [projectId: string]: "off" | "shadow" | "strict" }`. Проекты вне графа (`off`) полностью изолированы: наблюдатель абсолютно молчит (0 записей в `task_transitions`), прямые действия не блокируются. Режим `strict` в одном проекте не затрагивает другие проекты стенда.
+3. **Защита критических настроек от агентов (PLUG-360, ADR-0039):**
+   Любое изменение `workGraph`, `workGraphProjects`, `approvalMode` фиксируется в `events` и `command_runs`. Изменения вне меню (`source: 'outside_menu'`) создают карточку владельцу `PluginInteractionRequest` с кнопками `[ Оставить ]` и `[ Вернуть прежнее значение ]`. Прямой вызов из тредов агента (`BB_THREAD_ID`) отклоняется с `permission-denied: owner-only`.

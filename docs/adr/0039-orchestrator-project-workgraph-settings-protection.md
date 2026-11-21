@@ -1,6 +1,6 @@
 ---
 title: ADR-0039 — Режим графа задач на уровне проекта (PLUG-361) и защита настроек от агентов (PLUG-360)
-status: proposed
+status: accepted
 date: 2026-11-20
 ---
 

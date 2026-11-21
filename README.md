@@ -300,9 +300,14 @@ no kanban drag. Details in
 Policy-driven delegation of `bb tasks` to executor threads: one `delegate`
 call dispatches the task under a routing policy, wires the executor as a
 hidden child with parent notifications, and a watchdog tracks the first
-response, quota holds and auto-reissue down the level's route chain. Thread
-roles (`orchestrator`, `executor`, `auditor`) decide which instructions and
-plugin tools each thread gets.
+response, quota holds and auto-reissue down the level's route chain.
+
+Key capabilities:
+- **Work Graphs & Task Queue (§27–§34):** Deterministic execution state machine (`task_queue`, `task_transitions`) with background `run-queue` pipeline, TDD acceptance contracts before code, machine verification nodes (`checks`), and automated branch lifecycle.
+- **Hierarchical Project Modes (`workGraphProjects`, PLUG-361):** Per-project mode overrides (`off` / `shadow` / `strict`). Strict isolation ensures projects in `strict` never block operations in other projects, while `off` projects enjoy absolute observer silence.
+- **Unified Role & Approval Menu (PLUG-359):** Single compact composer action menu combining role selection (`orchestrator`, `executor`, `auditor`, `researcher`, `architect`) and interactive approval mode (`✅` Auto / `👤` Manual).
+- **Settings Protection (PLUG-360, §32.3):** Audits all changes to critical settings (`workGraph`, `workGraphProjects`, `approvalMode`) in `events` and `command_runs`, raises owner interaction cards (`PluginInteractionRequest`) with `[ Keep ]` and `[ Revert ]` buttons for outside-menu changes, and rejects direct modification attempts from agent threads (`permission-denied: owner-only`).
+- **Zero-Leak Sandbox (§33, ADR-0035):** Disposable Snapshot Sandbox using bubblewrap and RFC ASCII DLP masking for safe execution with public/free models.
 
 Details in
 [plugins/bb-plugin-orchestrator/README.md](plugins/bb-plugin-orchestrator/README.md).

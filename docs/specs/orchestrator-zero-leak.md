@@ -1,3 +1,10 @@
+---
+title: Изоляция данных и исполнение в песочнице (Zero-Leak Sandbox)
+status: approved
+updated: 2026-11-20
+revision: 34.6
+---
+
 # Изоляция данных и исполнение в песочнице (Zero-Leak Sandbox)
 
 > [!IMPORTANT] Нормативный статус
