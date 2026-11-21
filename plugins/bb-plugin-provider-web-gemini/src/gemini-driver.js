@@ -126,11 +126,32 @@ async function stopChrome(port, stateDir = null) {
   // carries the port flag, so the Xvfb server spawned by xvfb-run escaped it —
   // killing the whole detached group takes it too (PLUG-374).
   try {
-    const meta = browserGroups.readMarker(stateDir, p);
-    if (meta && browserGroups.groupAliveMatches(meta)) {
-      await browserGroups.killGroup(meta);
+    // Claim the teardown under the per-port marker lock: the `reaping` mark
+    // (written in the same serialized section as the identity check) keeps
+    // fresh adoptions/leases out while the group dies (заход 5).
+    const marked = browserGroups.withMarkerLock(stateDir, p, () => {
+      const meta = browserGroups.readMarker(stateDir, p);
+      if (!meta || browserGroups.isReaping(meta)) return null;
+      if (!browserGroups.groupAliveMatches(meta)) return null;
+      const m = { ...meta, reaping: { by: process.pid, sinceMs: Date.now() } };
+      browserGroups.writeMarker(stateDir, m);
+      if (!browserGroups.signalGroup(m, 'SIGTERM')) {
+        browserGroups.writeMarker(stateDir, meta); // nothing signaled — unmark
+        return null;
+      }
+      return m;
+    });
+    if (marked) {
+      await browserGroups.killGroup(marked);
+      // Drop the marker only if it still describes the group we killed — a
+      // fresh owner may have recorded a new group on the port meanwhile.
+      browserGroups.withMarkerLock(stateDir, p, () => {
+        const cur = browserGroups.readMarker(stateDir, p);
+        if (cur && cur.pgid === marked.pgid && cur.ownerPid === marked.ownerPid) {
+          browserGroups.removeMarker(stateDir, p);
+        }
+      });
     }
-    browserGroups.removeMarker(stateDir, p);
   } catch {}
   try {
     execSync(`pkill -f 'remote-debugging-port=${p}([[:space:]]|$)' || true`);

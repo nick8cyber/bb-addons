@@ -992,19 +992,22 @@ function hasLiveLeaseForPort(state, port, backends, now) {
   return false;
 }
 
-// Decision, `reaping` mark, AND first signal inside the ledger lock: no fresh
-// lease for the same port can be written between the checks and SIGTERM, and
-// the fresh mark keeps leases/adoptions out for the whole grace window — the
-// teardown can never race a lease someone just took (contract §3).
+// Decision, `reaping` mark, AND first signal inside the ledger lock AND the
+// per-port marker lock: no fresh lease and no concurrent marker write
+// (adoption, fresh launch, another reaper) can land between the checks and
+// SIGTERM, and the fresh mark keeps leases/adoptions out for the whole grace
+// window — the teardown can never race a lease someone just took (§3, з.5).
+// Lock order is always ledger → marker; nothing holding the marker lock ever
+// waits on the ledger.
 function tryTeardownGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly = false, ignoreInodes = null }) {
-  return withStateLock((state) => {
+  return withStateLock((state) => browserGroups.withMarkerLock(stateDir, meta.port, () => {
     const now = Date.now();
-    // Re-read the marker under the lock — the caller's copy predates it.
+    // Re-read the marker under the locks — the caller's copy predates them.
     const cur = browserGroups.readMarker(stateDir, meta.port);
     if (!cur || cur.pgid !== meta.pgid) return false;
     if (ownOnly && cur.ownerPid !== process.pid) return false;
     // A fresh reaping mark means a teardown is already in flight (marks are
-    // only ever written under this lock, so ours cannot be fresh here).
+    // only ever written under these locks, so ours cannot be fresh here).
     if (browserGroups.isReaping(cur, now)) return false;
     const alive = browserGroups.ownerAlive(cur);
     // A live owner may be mid-launch or mid-adoption — the marker is written
@@ -1024,7 +1027,7 @@ function tryTeardownGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownO
       return false;
     }
     return marked;
-  }, ledgerPath, lockPath);
+  }), ledgerPath, lockPath);
 }
 
 function groupIsYoung(meta, now) {
@@ -1043,7 +1046,7 @@ async function teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backe
     // reaping mark kept leases out, but anything that slipped through (an
     // adopted or rewritten marker, a live lease, a connected CDP client, or
     // a group identity that no longer matches) vetoes the SIGKILL.
-    const killed = withStateLock((state) => {
+    const killed = withStateLock((state) => browserGroups.withMarkerLock(stateDir, meta.port, () => {
       const now = Date.now();
       const cur = browserGroups.readMarker(stateDir, meta.port);
       if (!cur || cur.pgid !== marked.pgid) return false;
@@ -1053,18 +1056,22 @@ async function teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backe
       if (browserGroups.hasLiveCdpClients(cur.port, { ignoreInodes })) return false;
       if (!browserGroups.groupAliveMatches(cur)) return false;
       return browserGroups.signalGroup(cur, "SIGKILL");
-    }, ledgerPath, lockPath);
+    }), ledgerPath, lockPath);
     if (!killed) {
       browserGroups.clearReaping(stateDir, meta.port, marked.reaping);
       return false;
     }
   }
   // A fresh owner may have adopted the marker while the group was dying —
-  // only remove it if it still describes what we tore down.
-  const cur = browserGroups.readMarker(stateDir, meta.port);
-  if (cur && cur.pgid === meta.pgid && cur.ownerPid === meta.ownerPid) {
-    browserGroups.removeMarker(stateDir, meta.port);
-  }
+  // only remove it if it still describes what we tore down. Check and
+  // unlink are one serialized section: a marker a concurrent writer lands
+  // between them is never lost (заход 5).
+  browserGroups.withMarkerLock(stateDir, meta.port, () => {
+    const cur = browserGroups.readMarker(stateDir, meta.port);
+    if (cur && cur.pgid === meta.pgid && cur.ownerPid === meta.ownerPid) {
+      browserGroups.removeMarker(stateDir, meta.port);
+    }
+  });
   return true;
 }
 
@@ -1075,34 +1082,57 @@ export async function reapOrphanBrowserGroups({ stateDir = STATE_DIR, ledgerPath
     try {
       const diag = {};
       const identity = browserGroups.identifyGroup(meta, diag);
+      if (identity === "boot-unknown") {
+        // The marker's boot cannot be verified — it may be ours. Fail
+        // closed: no signals, no adoption, no marker deletion (заход 5).
+        slog("reaper:browser-group-boot-unknown", { port: meta.port, pgid: meta.pgid, reason: diag.reason });
+        continue;
+      }
       if (identity === "dead") {
-        browserGroups.removeMarker(stateDir, meta.port);
+        // Verify-and-unlink under the per-port lock: a marker rewritten
+        // meanwhile (fresh launch or adoption on the port) survives.
+        browserGroups.withMarkerLock(stateDir, meta.port, () => {
+          const cur = browserGroups.readMarker(stateDir, meta.port);
+          if (!cur || cur.pgid !== meta.pgid) return;
+          if (browserGroups.isReaping(cur)) return; // in-flight teardown owns it
+          if (browserGroups.identifyGroup(cur) !== "dead") return;
+          browserGroups.removeMarker(stateDir, meta.port);
+        });
         continue;
       }
       if (identity === "stale-boot") {
         // The marker describes a group that died with a previous boot — its
         // pgid may now name a foreign group, so only the stale marker is
-        // cleaned; processes are never touched (заход 4). Re-read first so a
-        // marker rewritten meanwhile (fresh launch on the port) is not lost.
-        const cur = browserGroups.readMarker(stateDir, meta.port);
-        if (cur && cur.pgid === meta.pgid && !browserGroups.markerMatchesBoot(cur)) {
+        // cleaned; processes are never touched (заход 4). Re-verify under
+        // the marker lock so a marker rewritten meanwhile (fresh launch on
+        // the port) is never lost; 'null' (boot turned indeterminate) and
+        // 'true' (rewritten for this boot) both keep the marker (заход 5).
+        browserGroups.withMarkerLock(stateDir, meta.port, () => {
+          const cur = browserGroups.readMarker(stateDir, meta.port);
+          if (!cur || cur.pgid !== meta.pgid) return;
+          if (browserGroups.markerMatchesBoot(cur) !== false) return;
           browserGroups.removeMarker(stateDir, meta.port);
-        }
+        });
         slog("reaper:browser-group-stale", { port: meta.port, pgid: meta.pgid, reason: diag.reason });
         continue;
       }
       if (identity === "doubtful") {
         // Members survive that cannot be attributed to our browser stack —
         // leave the group alone and keep the marker (annotated with the
-        // reason) for the next pass.
-        const cur = browserGroups.readMarker(stateDir, meta.port);
-        if (cur && cur.pgid === meta.pgid) {
-          const reason = diag.reason || "unidentified";
+        // reason) for the next pass. The annotate is serialized: a rewrite
+        // since the snapshot is re-verified, not clobbered.
+        browserGroups.withMarkerLock(stateDir, meta.port, () => {
+          const cur = browserGroups.readMarker(stateDir, meta.port);
+          if (!cur || cur.pgid !== meta.pgid) return;
+          if (browserGroups.isReaping(cur)) return; // a teardown is in flight
+          const reDiag = {};
+          if (browserGroups.identifyGroup(cur, reDiag) !== "doubtful") return;
+          const reason = reDiag.reason || diag.reason || "unidentified";
           cur.doubt = { reason, sinceMs: cur.doubt?.reason === reason ? cur.doubt.sinceMs : Date.now() };
           try {
             browserGroups.writeMarker(stateDir, cur);
           } catch {}
-        }
+        });
         slog("reaper:browser-group-doubtful", { port: meta.port, pgid: meta.pgid, ownerPid: meta.ownerPid, reason: diag.reason });
         continue;
       }

@@ -17,6 +17,19 @@
 // never authorize signals and must not hold its port busy — the pgid it
 // names may now belong to a foreign group. Reapers may clean such stale
 // markers; the processes under them are never ours to touch (заход 4).
+//
+// Boot knowledge itself is tri-state (заход 5): on non-Linux platforms
+// /proc does not exist and scoping simply does not apply, but on Linux an
+// UNREADABLE boot_id is a broken-proc state — the marker may be ours or
+// foreign and we cannot tell. That case fails closed (identity
+// 'boot-unknown'): no signals, no adoption, no marker deletion.
+//
+// Every marker write/delete runs under a per-port lockfile
+// (<groupsDir>/<port>.lock, O_EXCL + stale-steal): the read-verify-write
+// and read-verify-unlink sections of recordGroup/adoptGroup/reaper/
+// driver-stop are serialized across processes, so a marker written by a
+// concurrent launch or adoption cannot be clobbered by a teardown that
+// verified against an older snapshot (заход 5).
 
 const fs = require('fs');
 const path = require('path');
@@ -35,36 +48,63 @@ function resolveStateDir(explicit) {
 
 const groupsDir = (stateDir) => path.join(resolveStateDir(stateDir), 'browser-groups');
 const markerPath = (stateDir, port) => path.join(groupsDir(stateDir), `${port}.json`);
+const markerLockPath = (stateDir, port) => path.join(groupsDir(stateDir), `${port}.lock`);
 
 // A `reaping` mark stays authoritative only briefly — long enough to cover a
 // SIGTERM grace + escalation check, short enough that a reaper dying
 // mid-teardown releases the port quickly.
 const REAPING_TTL_MS = 30_000;
 
-// The boot this process runs under — /proc/sys/kernel/random/boot_id is a
-// fresh random UUID per boot, so it separates markers across reboots with no
-// reliance on clock state.
-function currentBootId() {
-  if (process.platform !== 'linux') return null;
+const BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id';
+
+// Boot knowledge is tri-state:
+//   'off'      — non-Linux: /proc (and boot_id) does not exist, so boot
+//                scoping does not apply at all;
+//   'unknown'  — Linux but boot_id unreadable (EACCES, broken /proc in a
+//                sandbox): FAIL CLOSED. A marker may be ours or foreign;
+//                nothing may be signaled, adopted, or deleted on it;
+//   <uuid>     — the id of the boot this process runs under
+//                (/proc/sys/kernel/random/boot_id is a fresh random UUID
+//                per boot, separating markers across reboots with no
+//                reliance on clock state).
+function bootState() {
+  if (process.platform !== 'linux') return 'off';
   try {
-    return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null;
+    return fs.readFileSync(BOOT_ID_PATH, 'utf8').trim() || 'unknown';
   } catch {
-    return null;
+    return 'unknown';
   }
 }
 
-// True only when the marker was written in this boot. Off Linux (or when
-// boot_id is unreadable) there is nothing to compare — no scoping.
+// The boot id string, or null when scoping does not apply / cannot be
+// determined. Markers stamped while boot is 'unknown' carry bootId:null —
+// once boot_id is readable again they classify as boot-unrecorded stale.
+function currentBootId() {
+  const s = bootState();
+  return s === 'off' || s === 'unknown' ? null : s;
+}
+
+// Tri-state boot check:
+//   true  — the marker verifiably belongs to this boot (or the platform
+//           has no boot scoping at all);
+//   false — the marker is verifiably foreign (other boot or no bootId);
+//   null  — indeterminate: Linux, but boot_id unreadable. Callers must
+//           treat this as fail-closed, exactly like false for signaling
+//           and adoption, and must NOT remove the marker either.
 function markerMatchesBoot(meta) {
-  const boot = currentBootId();
-  if (!boot) return true;
-  return Boolean(meta && meta.bootId && meta.bootId === boot);
+  const s = bootState();
+  if (s === 'off') return true;
+  if (s === 'unknown') return null;
+  return Boolean(meta && meta.bootId && meta.bootId === s);
 }
 
 function isReaping(meta, now = Date.now()) {
-  // A reaping mark from a previous boot describes a teardown that can no
-  // longer be in flight — it authorizes nothing and holds nothing busy.
-  if (!markerMatchesBoot(meta)) return false;
+  // A reaping mark from a verifiably foreign boot describes a teardown that
+  // can no longer be in flight — it authorizes nothing and holds nothing
+  // busy. An indeterminate boot keeps the mark: a teardown that may still
+  // be running is allowed to hold its port briefly (TTL-bounded), though
+  // it can never authorize a signal — groupAliveMatches gates that first.
+  if (markerMatchesBoot(meta) === false) return false;
   const r = meta && meta.reaping;
   return Boolean(r && Number.isFinite(r.sinceMs) && now - r.sinceMs < REAPING_TTL_MS);
 }
@@ -72,13 +112,15 @@ function isReaping(meta, now = Date.now()) {
 // Drop our own reaping flag after a vetoed escalation — only when the marker
 // still carries the exact mark this teardown wrote (by + sinceMs identity).
 function clearReaping(stateDir, port, expected) {
-  const cur = readMarker(stateDir, port);
-  if (!cur || !cur.reaping) return;
-  if (expected && (cur.reaping.by !== expected.by || cur.reaping.sinceMs !== expected.sinceMs)) return;
-  delete cur.reaping;
-  try {
-    writeMarker(stateDir, cur);
-  } catch {}
+  withMarkerLock(stateDir, port, () => {
+    const cur = readMarker(stateDir, port);
+    if (!cur || !cur.reaping) return;
+    if (expected && (cur.reaping.by !== expected.by || cur.reaping.sinceMs !== expected.sinceMs)) return;
+    delete cur.reaping;
+    try {
+      writeMarkerUnlocked(stateDir, cur);
+    } catch {}
+  });
 }
 
 function readProcStat(pid) {
@@ -105,7 +147,89 @@ function isPidAlive(pid) {
   }
 }
 
-function writeMarker(stateDir, meta) {
+// --- per-port marker lock (заход 5) ---
+// O_EXCL lockfile next to the marker. Every writer — recordGroup,
+// adoptGroup, clearReaping, reaper branches, driver stop — runs its
+// read-verify-write / read-verify-unlink section under it, so a marker
+// landing between a snapshot check and a write/unlink cannot be lost.
+// Readers (readMarker/listMarkers/isReaping) stay lock-free: single-file
+// rename writes are atomic.
+
+// A section only ever holds synchronous filesystem work — a few ms at
+// worst — so a lockfile older than this means its holder died or hung.
+const MARKER_LOCK_STALE_MS = 15_000;
+const MARKER_LOCK_WAIT_MS = 10_000;
+
+// Lockfiles this process already holds — same-process reentrancy (a locked
+// writeMarker inside a withMarkerLock section must not re-acquire).
+const heldMarkerLocks = new Set();
+
+// Sleep without burning CPU — works on the main thread in Node.
+const lockSpin = (() => {
+  const buf = new Int32Array(new SharedArrayBuffer(4));
+  return (ms) => Atomics.wait(buf, 0, 0, ms);
+})();
+
+function acquireMarkerLock(stateDir, port) {
+  const p = markerLockPath(stateDir, port);
+  if (heldMarkerLocks.has(p)) return;
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const deadline = Date.now() + MARKER_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const fd = fs.openSync(p, 'wx');
+      try {
+        fs.writeSync(fd, `${process.pid}\n`);
+      } finally {
+        fs.closeSync(fd);
+      }
+      heldMarkerLocks.add(p);
+      return;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        const st = fs.statSync(p);
+        if (Date.now() - st.mtimeMs > MARKER_LOCK_STALE_MS) {
+          // The holder died mid-section — steal, but only if the file is
+          // still the same inode we statted; a fresh holder that already
+          // replaced it keeps its lock (bounded TOCTOU, same class as the
+          // accounts-state lock in acp-server).
+          try {
+            const st2 = fs.statSync(p);
+            if (st2.ino === st.ino && st2.mtimeMs === st.mtimeMs) fs.unlinkSync(p);
+          } catch {}
+          continue;
+        }
+      } catch {}
+      if (Date.now() >= deadline) throw new Error(`browser-group marker lock held: ${p}`);
+      lockSpin(20);
+    }
+  }
+}
+
+function releaseMarkerLock(stateDir, port) {
+  const p = markerLockPath(stateDir, port);
+  heldMarkerLocks.delete(p);
+  try {
+    fs.unlinkSync(p);
+  } catch {}
+}
+
+// Serialize a synchronous marker section per port. fn must be synchronous —
+// the lock is never held across an await (async phases like the SIGTERM
+// grace happen outside it).
+function withMarkerLock(stateDir, port, fn) {
+  const p = markerLockPath(stateDir, port);
+  if (heldMarkerLocks.has(p)) return fn(); // already inside our own section
+  acquireMarkerLock(stateDir, port);
+  try {
+    return fn();
+  } finally {
+    releaseMarkerLock(stateDir, port);
+  }
+}
+
+function writeMarkerUnlocked(stateDir, meta) {
   const dir = groupsDir(stateDir);
   fs.mkdirSync(dir, { recursive: true });
   // Every marker is boot-scoped: an explicit bootId (replay of an older meta,
@@ -118,6 +242,10 @@ function writeMarker(stateDir, meta) {
   fs.renameSync(tmp, target);
 }
 
+function writeMarker(stateDir, meta) {
+  withMarkerLock(stateDir, meta.port, () => writeMarkerUnlocked(stateDir, meta));
+}
+
 function readMarker(stateDir, port) {
   try {
     const meta = JSON.parse(fs.readFileSync(markerPath(stateDir, port), 'utf8'));
@@ -127,10 +255,14 @@ function readMarker(stateDir, port) {
   }
 }
 
-function removeMarker(stateDir, port) {
+function removeMarkerUnlocked(stateDir, port) {
   try {
     fs.unlinkSync(markerPath(stateDir, port));
   } catch {}
+}
+
+function removeMarker(stateDir, port) {
+  withMarkerLock(stateDir, port, () => removeMarkerUnlocked(stateDir, port));
 }
 
 function listMarkers(stateDir) {
@@ -182,22 +314,32 @@ function recordGroup({ stateDir, port, pgid, mode, userDataDir, profileDir }) {
 // marker then points at a live verifiable owner instead of a dead one. A
 // fresh `reaping` mark refuses adoption: the group is being torn down.
 function adoptGroup(stateDir, port, meta = null) {
-  meta = meta || readMarker(stateDir, port);
-  if (!meta) return null;
-  // A stale-boot marker names a group that died with the previous boot —
-  // whatever now matches its pgid is foreign and must never be adopted.
-  if (!markerMatchesBoot(meta)) return null;
-  if (isReaping(meta)) return null;
-  if (meta.ownerPid === process.pid) return meta;
-  meta.ownerPid = process.pid;
-  meta.ownerStartTime = readProcStat(process.pid)?.startTime ?? meta.ownerStartTime;
-  meta.adoptedMs = Date.now(); // covers the adopt→connect window like a launch
-  delete meta.reaping; // drop a stale mark left by a reaper that died mid-teardown
-  delete meta.doubt; // a fresh owner means the doubtful episode is over
   try {
-    writeMarker(stateDir, meta);
-  } catch {}
-  return meta;
+    return withMarkerLock(stateDir, port, () => {
+      // The freshest on-disk marker wins over a caller-supplied copy.
+      meta = readMarker(stateDir, port) || meta;
+      if (!meta) return null;
+      // A stale-boot marker names a group that died with the previous boot —
+      // whatever now matches its pgid is foreign and must never be adopted.
+      // An indeterminate boot (markerMatchesBoot → null) fails closed too.
+      if (!markerMatchesBoot(meta)) return null;
+      if (isReaping(meta)) return null;
+      if (meta.ownerPid === process.pid) return meta;
+      meta.ownerPid = process.pid;
+      meta.ownerStartTime = readProcStat(process.pid)?.startTime ?? meta.ownerStartTime;
+      meta.adoptedMs = Date.now(); // covers the adopt→connect window like a launch
+      delete meta.reaping; // drop a stale mark left by a reaper that died mid-teardown
+      delete meta.doubt; // a fresh owner means the doubtful episode is over
+      try {
+        writeMarkerUnlocked(stateDir, meta);
+      } catch {}
+      return meta;
+    });
+  } catch {
+    // The lock itself is unavailable (hung holder, unwritable dir) —
+    // decline the adoption rather than claim ownership unsynchronized.
+    return null;
+  }
 }
 
 function ownerAlive(meta) {
@@ -276,6 +418,9 @@ const MEMBER_LAUNCH_WINDOW_JIFFIES = 3000;
 //                that died with that boot, so any live group matching them
 //                is foreign; the caller must never signal it and may drop
 //                the stale marker
+//   'boot-unknown' — Linux, but boot_id is unreadable: the marker's boot
+//                cannot be verified at all — it may be ours. Fail closed:
+//                no signals, no adoption, no marker deletion (заход 5).
 //
 // Boot scope is checked BEFORE any PID/PGID/port interpretation: those
 // fields are per-boot values and a stale marker must not even reach them.
@@ -289,9 +434,11 @@ function identifyGroup(meta, diag = null) {
     return identity;
   };
   if (!meta || !meta.pgid) return why('dead', 'no-pgid');
-  if (!markerMatchesBoot(meta)) {
+  const boot = markerMatchesBoot(meta);
+  if (boot === false) {
     return why('stale-boot', meta.bootId ? 'boot-mismatch' : 'boot-unrecorded');
   }
+  if (boot === null) return why('boot-unknown', 'boot-unreadable');
   if (process.platform !== 'linux') {
     return groupExists(meta.pgid) ? why('doubtful', 'non-linux') : why('dead', 'no-members');
   }
@@ -425,6 +572,8 @@ module.exports = {
   resolveStateDir,
   groupsDir,
   markerPath,
+  markerLockPath,
+  withMarkerLock,
   REAPING_TTL_MS,
   currentBootId,
   markerMatchesBoot,

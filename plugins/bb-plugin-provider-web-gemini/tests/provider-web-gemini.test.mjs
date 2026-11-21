@@ -4788,3 +4788,267 @@ test("28. browser-groups: stale-boot marker authorizes nothing — no signal, po
     assert.equal(kept.bootId, staleBoot, "foreign bootId is preserved for the reaper's cleanup");
   }
 });
+
+test("29. browser-groups: unreadable boot_id fails closed — no signal, no adopt, marker kept", async (t) => {
+  if (process.platform !== "linux") return;
+  const groupPids = [];
+  const newState = () => {
+    const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-bootunk-")));
+    const ledgerPath = path.join(stateDir, "accounts-state.json");
+    fs.writeFileSync(ledgerPath, JSON.stringify({ accounts: {}, leases: {} }));
+    return { stateDir, ledgerPath, lockPath: `${ledgerPath}.lock` };
+  };
+  const waitChrome = async (pid, port) => {
+    for (let i = 0; i < 60; i++) {
+      if (browserGroups.cmdlineMatchesPort(pid, port)) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  const fakeChromeGroup = async (port) => {
+    const proc = spawn("bash", ["-c", `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 600`], {
+      detached: true,
+      stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    return proc.pid;
+  };
+  t.after(() => {
+    for (const pgid of groupPids) {
+      try { process.kill(-pgid, "SIGKILL"); } catch {}
+    }
+    groupPids.length = 0;
+  });
+
+  const staleBoot = "00000000-0000-0000-0000-000000000000";
+  const realBoot = browserGroups.currentBootId();
+  assert.ok(realBoot, "boot_id must be readable on linux");
+
+  // Simulate EACCES on /proc/sys/kernel/random/boot_id — the shared fs
+  // module is patched, so browser-groups sees the failure while every other
+  // path is delegated untouched.
+  const realReadFileSync = fs.readFileSync;
+  fs.readFileSync = function (p, opts) {
+    if (String(p) === "/proc/sys/kernel/random/boot_id") {
+      const e = new Error("EACCES: permission denied, open '/proc/sys/kernel/random/boot_id'");
+      e.code = "EACCES";
+      throw e;
+    }
+    return realReadFileSync.call(this, p, opts);
+  };
+  try {
+    // (a) a FOREIGN-boot marker under unreadable boot: without the
+    //     fail-closed check this classified 'matched' and earned a SIGTERM.
+    {
+      const { stateDir, ledgerPath, lockPath } = newState();
+      const port = "19431";
+      const pgid = await fakeChromeGroup(port);
+      browserGroups.writeMarker(stateDir, {
+        version: 1, port, pgid,
+        pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+        bootId: staleBoot,
+        ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+        launchedMs: Date.now() - 10 * 60_000,
+      });
+      const meta = browserGroups.readMarker(stateDir, port);
+      assert.equal(browserGroups.markerMatchesBoot(meta), null, "unreadable boot must be indeterminate");
+      const diag = {};
+      assert.equal(browserGroups.identifyGroup(meta, diag), "boot-unknown");
+      assert.equal(diag.reason, "boot-unreadable");
+      assert.equal(browserGroups.signalGroup(meta, "SIGTERM"), false, "no signal while boot is indeterminate");
+      assert.equal(browserGroups.adoptGroup(stateDir, port), null, "no adoption while boot is indeterminate");
+      const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+      assert.equal(n, 0);
+      assert.equal(browserGroups.isPidAlive(pgid), true, "group untouched");
+      assert.ok(browserGroups.readMarker(stateDir, port), "marker preserved — it may be ours");
+    }
+
+    // (b) an OUR-boot marker under unreadable boot: still boot-unknown —
+    //     kept and unsignaled. This is the failure the blocker reported:
+    //     EACCES degraded to 'matched' and the reaper killed our own group.
+    {
+      const { stateDir, ledgerPath, lockPath } = newState();
+      const port = "19432";
+      const pgid = await fakeChromeGroup(port);
+      browserGroups.writeMarker(stateDir, {
+        version: 1, port, pgid,
+        pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+        bootId: realBoot,
+        ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+        launchedMs: Date.now() - 10 * 60_000,
+      });
+      const meta = browserGroups.readMarker(stateDir, port);
+      assert.equal(browserGroups.identifyGroup(meta), "boot-unknown", "our-boot marker is indeterminate too");
+      // A fresh reaping mark stays busy — a maybe-running teardown keeps
+      // its port for the TTL (fail closed), though it can never signal.
+      assert.equal(
+        browserGroups.isReaping({ ...meta, reaping: { by: 424242, sinceMs: Date.now() } }),
+        true,
+        "indeterminate boot must not release a fresh reaping mark"
+      );
+      const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+      assert.equal(n, 0, "maybe-ours group must survive while boot is unreadable");
+      assert.equal(browserGroups.isPidAlive(pgid), true);
+      assert.ok(browserGroups.readMarker(stateDir, port), "marker must not be deleted");
+    }
+  } finally {
+    fs.readFileSync = realReadFileSync;
+  }
+});
+
+test("30. browser-groups: marker lock serializes writers — a concurrent fresh marker survives", async (t) => {
+  if (process.platform !== "linux") return;
+  const groupPids = [];
+  const modulePath = path.join(PLUGIN_ROOT, "src/browser-groups.cjs");
+  const newState = () => {
+    const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-lock-")));
+    const ledgerPath = path.join(stateDir, "accounts-state.json");
+    fs.writeFileSync(ledgerPath, JSON.stringify({ accounts: {}, leases: {} }));
+    return { stateDir, ledgerPath, lockPath: `${ledgerPath}.lock` };
+  };
+  const waitChrome = async (pid, port) => {
+    for (let i = 0; i < 60; i++) {
+      if (browserGroups.cmdlineMatchesPort(pid, port)) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  const fakeChromeGroup = async (port) => {
+    const proc = spawn("bash", ["-c", `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 600`], {
+      detached: true,
+      stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    return proc.pid;
+  };
+  t.after(() => {
+    for (const pgid of groupPids) {
+      try { process.kill(-pgid, "SIGKILL"); } catch {}
+    }
+    groupPids.length = 0;
+  });
+
+  const staleBoot = "00000000-0000-0000-0000-000000000000";
+  const realBoot = browserGroups.currentBootId();
+  assert.ok(realBoot, "boot_id must be readable on linux");
+
+  // A child process playing a concurrent writer: it acquires the port's
+  // marker lock, signals readiness, holds ~400 ms, then writes a FRESH
+  // marker for a newly launched group — the exact interleave that used to
+  // clobber markers between a reaper's re-read and unlink. The reaper's
+  // verify+unlink must now be serialized behind the writer's section.
+  const contendingWriter = ({ stateDir, port, m2 }) => {
+    const readyFile = path.join(stateDir, `writer-ready-${port}`);
+    const child = spawn(process.execPath, ["-e",
+      'const bg = require(process.env.BG_MODULE);\n' +
+      'const fs = require("fs");\n' +
+      'bg.withMarkerLock(process.env.BG_STATE_DIR, process.env.BG_PORT, () => {\n' +
+      '  fs.writeFileSync(process.env.BG_READY, "1");\n' +
+      '  const end = Date.now() + 400; while (Date.now() < end) {}\n' +
+      '  bg.writeMarker(process.env.BG_STATE_DIR, JSON.parse(process.env.BG_M2));\n' +
+      '});',
+    ], {
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        BG_MODULE: modulePath,
+        BG_STATE_DIR: stateDir,
+        BG_PORT: String(port),
+        BG_M2: JSON.stringify(m2),
+        BG_READY: readyFile,
+      },
+    });
+    t.after(() => { try { child.kill("SIGKILL"); } catch {} });
+    return readyFile;
+  };
+  const waitFile = async (f) => {
+    for (let i = 0; i < 100 && !fs.existsSync(f); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(fs.existsSync(f), `contending writer did not signal ${f}`);
+  };
+  const freshMarkerFor = (port, pgid) => ({
+    version: 1, port: String(port), pgid,
+    pgidStartTime: browserGroups.readProcStat(pgid)?.startTime ?? null,
+    bootId: realBoot,
+    ownerPid: process.pid,
+    ownerStartTime: browserGroups.readProcStat(process.pid)?.startTime ?? null,
+    mode: "xvfb", launchedMs: Date.now(),
+  });
+
+  // (a) stale-boot branch: the snapshot names a foreign-boot group; a fresh
+  //     marker lands while the reaper waits on the lock — it must survive.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19433";
+    const pgid2 = await fakeChromeGroup(port);
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid: 2 ** 22, pgidStartTime: 0,
+      bootId: staleBoot,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now() - 10 * 60_000,
+    });
+    const readyFile = contendingWriter({ stateDir, port, m2: freshMarkerFor(port, pgid2) });
+    await waitFile(readyFile);
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+    assert.equal(n, 0);
+    const kept = browserGroups.readMarker(stateDir, port);
+    assert.equal(kept?.pgid, pgid2, "fresh marker must survive the reaper's stale-boot cleanup");
+    assert.equal(kept?.bootId, realBoot);
+    assert.equal(browserGroups.isPidAlive(pgid2), true, "the new group is never touched");
+  }
+
+  // (b) dead branch: the old code unlinked the marker on the snapshot with
+  //     no re-read at all — a fresh launch on the same port was deleted.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19434";
+    const pgid2 = await fakeChromeGroup(port);
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid: 2 ** 22, pgidStartTime: 0,
+      bootId: realBoot,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now() - 10 * 60_000,
+    });
+    const readyFile = contendingWriter({ stateDir, port, m2: freshMarkerFor(port, pgid2) });
+    await waitFile(readyFile);
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+    assert.equal(n, 0);
+    const kept = browserGroups.readMarker(stateDir, port);
+    assert.equal(kept?.pgid, pgid2, "fresh marker must survive the reaper's dead-marker cleanup");
+    assert.equal(browserGroups.isPidAlive(pgid2), true);
+  }
+
+  // (c) doubtful branch: the annotate write must not clobber a fresh marker
+  //     either — verify identity again inside the locked section.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19435";
+    const pgid1 = await fakeChromeGroup(port);
+    const pgid2 = await fakeChromeGroup(port);
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid: pgid1,
+      // starttime mismatch → the snapshot classifies 'doubtful'.
+      pgidStartTime: (browserGroups.readProcStat(pgid1)?.startTime ?? 0) + 7,
+      bootId: realBoot,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now() - 10 * 60_000,
+    });
+    const diag = {};
+    assert.equal(
+      browserGroups.identifyGroup(browserGroups.readMarker(stateDir, port), diag),
+      "doubtful",
+      "fixture must classify doubtful before the race"
+    );
+    const readyFile = contendingWriter({ stateDir, port, m2: freshMarkerFor(port, pgid2) });
+    await waitFile(readyFile);
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+    assert.equal(n, 0);
+    const kept = browserGroups.readMarker(stateDir, port);
+    assert.equal(kept?.pgid, pgid2, "fresh marker must survive the doubtful annotate");
+    assert.equal(kept?.doubt, undefined, "fresh marker must not carry a doubt annotation");
+    assert.equal(browserGroups.isPidAlive(pgid2), true);
+  }
+});
