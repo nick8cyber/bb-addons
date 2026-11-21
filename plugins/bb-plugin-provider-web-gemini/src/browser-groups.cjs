@@ -155,6 +155,7 @@ function adoptGroup(stateDir, port, meta = null) {
   meta.ownerStartTime = readProcStat(process.pid)?.startTime ?? meta.ownerStartTime;
   meta.adoptedMs = Date.now(); // covers the adopt→connect window like a launch
   delete meta.reaping; // drop a stale mark left by a reaper that died mid-teardown
+  delete meta.doubt; // a fresh owner means the doubtful episode is over
   try {
     writeMarker(stateDir, meta);
   } catch {}
@@ -215,29 +216,64 @@ function memberLooksOurs(m, meta) {
   return true;
 }
 
+// Surviving members of a leaderless group must sit inside the recorded
+// launch burst — startTime is in USER_HZ jiffies (~100/s), so ~30 s covers
+// even a slow xvfb-run→Xvfb→chrome spawn while exposing a foreign group
+// that reused our pgid long after the recorded start.
+const MEMBER_LAUNCH_WINDOW_JIFFIES = 3000;
+
 // Verifiable identity of the group behind a marker:
 //   'dead'     — no members left; ours is gone
 //   'matched'  — a member still carries our remote-debugging-port flag
 //   'leftover' — no flag carrier remains (chrome and the leader exited, e.g.
 //                only Xvfb survives) but every remaining member is
 //                attributable to our browser stack
-//   'doubtful' — members exist that cannot be attributed to us, or a live
-//                leader pid carries a different starttime (the pgid may have
-//                been reused by a foreign group); the caller must keep the
-//                marker and leave the group alone
-function identifyGroup(meta) {
-  if (!meta || !meta.pgid) return 'dead';
-  if (process.platform !== 'linux') return groupExists(meta.pgid) ? 'doubtful' : 'dead';
+//   'doubtful' — members exist that cannot be attributed to us, a live
+//                leader carries a starttime different from the recorded one,
+//                or leaderless survivors postdate the recorded launch (the
+//                pgid may have been reused by a foreign group); the caller
+//                must keep the marker and leave the group alone
+//
+// Identity is checked BEFORE the port flag: --remote-debugging-port in a
+// cmdline is only an attribute of an already-confirmed group — a foreign
+// group that reused our pgid may carry the very same flag. When `diag` is
+// given, diag.reason receives a short machine-readable cause.
+function identifyGroup(meta, diag = null) {
+  const why = (identity, reason) => {
+    if (diag) diag.reason = reason;
+    return identity;
+  };
+  if (!meta || !meta.pgid) return why('dead', 'no-pgid');
+  if (process.platform !== 'linux') {
+    return groupExists(meta.pgid) ? why('doubtful', 'non-linux') : why('dead', 'no-members');
+  }
   const members = groupMembers(meta.pgid);
-  if (members.length === 0) return 'dead';
-  for (const m of members) {
-    if (portFlagInCmdline(m.cmdline, meta.port)) return 'matched';
-  }
+  if (members.length === 0) return why('dead', 'no-members');
   const leader = members.find((m) => m.pid === meta.pgid);
-  if (leader && meta.pgidStartTime != null && leader.startTime !== meta.pgidStartTime) {
-    return 'doubtful';
+  if (leader) {
+    // A live leader must carry the recorded starttime — pgid reuse leaves a
+    // mismatch here regardless of any port flag its members may carry.
+    if (meta.pgidStartTime == null) return why('doubtful', 'leader-starttime-unrecorded');
+    if (leader.startTime !== meta.pgidStartTime) return why('doubtful', 'leader-starttime-mismatch');
+    if (members.some((m) => portFlagInCmdline(m.cmdline, meta.port))) return why('matched', 'port-flag');
+    return members.every((m) => memberLooksOurs(m, meta))
+      ? why('leftover', 'attributable-members')
+      : why('doubtful', 'unattributed-members');
   }
-  return members.every((m) => memberLooksOurs(m, meta)) ? 'leftover' : 'doubtful';
+  // Leader gone: survivors must prove they still belong to the recorded
+  // launch — every member attributable to the browser stack AND the earliest
+  // survivor inside the launch burst. A foreign group that reused the pgid
+  // after our recorded start fails the window even when every member wears
+  // a chrome-family cmdline.
+  if (meta.pgidStartTime == null) return why('doubtful', 'starttime-unrecorded');
+  if (!members.every((m) => memberLooksOurs(m, meta))) return why('doubtful', 'unattributed-members');
+  const earliest = Math.min(...members.map((m) => m.startTime ?? Infinity));
+  if (earliest - meta.pgidStartTime > MEMBER_LAUNCH_WINDOW_JIFFIES) {
+    return why('doubtful', 'members-postdate-launch');
+  }
+  return members.some((m) => portFlagInCmdline(m.cmdline, meta.port))
+    ? why('matched', 'port-flag')
+    : why('leftover', 'attributable-members');
 }
 
 // The group is verified as ours: either a member still carries the port flag,

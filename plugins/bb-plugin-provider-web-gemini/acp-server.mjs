@@ -1073,15 +1073,25 @@ export async function reapOrphanBrowserGroups({ stateDir = STATE_DIR, ledgerPath
   let reaped = 0;
   for (const meta of browserGroups.listMarkers(stateDir)) {
     try {
-      const identity = browserGroups.identifyGroup(meta);
+      const diag = {};
+      const identity = browserGroups.identifyGroup(meta, diag);
       if (identity === "dead") {
         browserGroups.removeMarker(stateDir, meta.port);
         continue;
       }
       if (identity === "doubtful") {
         // Members survive that cannot be attributed to our browser stack —
-        // leave the group alone and keep the marker for the next pass.
-        slog("reaper:browser-group-doubtful", { port: meta.port, pgid: meta.pgid, ownerPid: meta.ownerPid });
+        // leave the group alone and keep the marker (annotated with the
+        // reason) for the next pass.
+        const cur = browserGroups.readMarker(stateDir, meta.port);
+        if (cur && cur.pgid === meta.pgid) {
+          const reason = diag.reason || "unidentified";
+          cur.doubt = { reason, sinceMs: cur.doubt?.reason === reason ? cur.doubt.sinceMs : Date.now() };
+          try {
+            browserGroups.writeMarker(stateDir, cur);
+          } catch {}
+        }
+        slog("reaper:browser-group-doubtful", { port: meta.port, pgid: meta.pgid, ownerPid: meta.ownerPid, reason: diag.reason });
         continue;
       }
       if (await teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends })) {

@@ -4512,3 +4512,129 @@ test("26. browser-groups: clean-shutdown cleanup of own groups", async (t) => {
     await new Promise((r) => listener.close(r));
   }
 });
+
+test("27. browser-groups: identity mismatch stays doubtful — no signal, marker kept", async (t) => {
+  if (process.platform !== "linux") return;
+  const groupPids = [];
+  const newState = () => {
+    const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-ident-")));
+    const ledgerPath = path.join(stateDir, "accounts-state.json");
+    fs.writeFileSync(ledgerPath, JSON.stringify({ accounts: {}, leases: {} }));
+    return { stateDir, ledgerPath, lockPath: `${ledgerPath}.lock` };
+  };
+  const waitChrome = async (pid, port) => {
+    for (let i = 0; i < 60; i++) {
+      if (browserGroups.cmdlineMatchesPort(pid, port)) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  const fakeChromeGroup = async (port) => {
+    const proc = spawn("bash", ["-c", `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 600`], {
+      detached: true,
+      stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    return proc.pid;
+  };
+  t.after(() => {
+    for (const pgid of groupPids) {
+      try { process.kill(-pgid, "SIGKILL"); } catch {}
+    }
+    groupPids.length = 0;
+  });
+
+  // (a) pgid reuse shape: same port flag and same pgid as the marker, but the
+  //     live leader's starttime differs from the recorded one → the group is
+  //     foreign, classified doubtful, and NOT signaled (PLUG-374 заход 3).
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19423";
+    const pgid = await fakeChromeGroup(port);
+    const recorded = browserGroups.readProcStat(pgid).startTime;
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid,
+      pgidStartTime: recorded + 7,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now() - 10 * 60_000,
+    });
+    const diag = {};
+    assert.equal(
+      browserGroups.identifyGroup(browserGroups.readMarker(stateDir, port), diag),
+      "doubtful",
+      "starttime mismatch must win over the port flag"
+    );
+    assert.equal(diag.reason, "leader-starttime-mismatch");
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+    assert.equal(n, 0, "foreign group must not be reaped");
+    assert.equal(browserGroups.isPidAlive(pgid), true, "no SIGTERM may reach the foreign leader");
+    const kept = browserGroups.readMarker(stateDir, port);
+    assert.ok(kept, "doubtful marker is preserved");
+    assert.equal(kept.doubt?.reason, "leader-starttime-mismatch", "marker carries the diagnosis");
+  }
+
+  // (b) leader missing and the survivors postdate the recorded launch: a
+  //     foreign group reused the pgid after our marker was written — family
+  //     cmdline alone must not confirm it.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19424";
+    const proc = spawn("bash", ["-c",
+      `bash -c 'exec -a "Xvfb :79 -screen 0 1280x1024x24" sleep 600' & ` +
+      `exec -a "faux-chrome --remote-debugging-port=${port}" sleep 2`], {
+      detached: true, stdio: "ignore",
+    });
+    proc.unref();
+    groupPids.push(proc.pid);
+    await waitChrome(proc.pid, port);
+    for (let i = 0; i < 80; i++) {
+      const st = browserGroups.readProcStat(proc.pid);
+      if (!st || st.state === "Z") break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const members = browserGroups.groupMembers(proc.pid);
+    assert.equal(members.length, 1, "only the Xvfb member outlives the leader");
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid: proc.pid,
+      // Recorded launch sits ~1000 s before the surviving member — the shape
+      // of a pgid reused by a later, foreign group.
+      pgidStartTime: members[0].startTime - 100_000,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now() - 10 * 60_000,
+    });
+    const diag = {};
+    assert.equal(
+      browserGroups.identifyGroup(browserGroups.readMarker(stateDir, port), diag),
+      "doubtful",
+      "members postdating the recorded launch must not confirm the group"
+    );
+    assert.equal(diag.reason, "members-postdate-launch");
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+    assert.equal(n, 0);
+    assert.equal(browserGroups.groupExists(proc.pid), true, "doubtful group is left alone");
+    assert.equal(browserGroups.readMarker(stateDir, port)?.doubt?.reason, "members-postdate-launch");
+  }
+
+  // (c) a live leader with no recorded starttime is unverifiable → doubtful.
+  {
+    const { stateDir, ledgerPath, lockPath } = newState();
+    const port = "19425";
+    const pgid = await fakeChromeGroup(port);
+    browserGroups.writeMarker(stateDir, {
+      version: 1, port, pgid, pgidStartTime: null,
+      ownerPid: spawnSync("true").pid, ownerStartTime: 0, mode: "xvfb",
+      launchedMs: Date.now() - 10 * 60_000,
+    });
+    const diag = {};
+    assert.equal(
+      browserGroups.identifyGroup(browserGroups.readMarker(stateDir, port), diag),
+      "doubtful"
+    );
+    assert.equal(diag.reason, "leader-starttime-unrecorded");
+    const n = await reapOrphanBrowserGroups({ stateDir, ledgerPath, lockPath, backends: [{ id: "acc1", cdp: port }] });
+    assert.equal(n, 0);
+    assert.equal(browserGroups.isPidAlive(pgid), true);
+    assert.ok(browserGroups.readMarker(stateDir, port));
+  }
+});
