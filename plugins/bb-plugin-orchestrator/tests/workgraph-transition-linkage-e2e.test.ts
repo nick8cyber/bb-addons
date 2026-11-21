@@ -207,7 +207,7 @@ test("§31.6 E2E: spec task with fabricated symbol fails, [new] passes, notRun d
 
     insertDelegation(db, {
       task_key: taskKey2,
-      threadId: "thr_spec_02",
+      thread_id: "thr_spec_02",
       route: "feature",
       status: "done",
       result_sha: "spec_sha_2",
@@ -456,18 +456,23 @@ test("research_question_or_no_report E2E: nudges then stalls upon exhaustion", a
 });
 
 test("owner_gate_timeout E2E: resolveTransition keeps task in waiting_approval", () => {
-  const t: TaskQueueRow = {
-    id: 1,
+  const t = {
     task_key: "GATE-001",
-    route: "feature",
-    node: "owner_gate",
-    status: "waiting_approval",
+    project_id: "default",
+    level: "medium",
+    route: "feature" as const,
+    node: "owner_gate" as const,
+    status: "waiting_approval" as const,
     priority: 0,
     spec_sha: null,
     result_sha: null,
     acceptance_sha: null,
     branch: null,
-    confirmation_mode: "manual",
+    confirmation_mode: "manual" as const,
+    release_note: null,
+    deadline_at: null,
+    dispatch_at: null,
+    attempts: 0,
     spec_attempts: 0,
     code_attempts: 0,
     check_attempts: 0,
@@ -475,16 +480,15 @@ test("owner_gate_timeout E2E: resolveTransition keeps task in waiting_approval",
     code_review_rounds: 0,
     design_check_rounds: 0,
     release_attempts: 0,
-    nudge_count: 0,
     node_alarm_at: null,
     interaction_id: "int_123",
     depends_on: null,
-    coordinator_thread_id: null,
+    coordinator_thread_id: "",
     payload: null,
     entered_at: 1000,
     updated_at: 1000,
     created_at: 1000,
-  };
+  } as unknown as TaskQueueRow;
 
   const res = resolveTransition({
     route: t.route,

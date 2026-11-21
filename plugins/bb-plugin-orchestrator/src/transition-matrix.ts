@@ -55,6 +55,7 @@ export type TransitionEvent =
   | {
       type: "git_failure";
       reason?: string;
+      gitError?: string;
     }
   | {
       type: "design_delivered";
@@ -81,6 +82,8 @@ export type TransitionEvent =
   | {
       type: "spec_invalid_reference";
       reason?: string;
+      invalidCodebaseReference?: boolean;
+      specSha?: string;
     }
   | {
       type: "spec_failed";
@@ -132,6 +135,7 @@ export type TransitionEvent =
     }
   | {
       type: "owner_gate_timeout";
+      reason?: string;
     }
   | {
       type: "code_delivered";
@@ -144,6 +148,8 @@ export type TransitionEvent =
   | {
       type: "code_route_violation";
       reason?: string;
+      routeViolation?: boolean;
+      resultSha?: string;
     }
   | {
       type: "code_failed";

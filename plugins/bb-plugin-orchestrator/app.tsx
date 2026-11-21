@@ -15,9 +15,24 @@ import {
   type PluginPendingInteractionProps,
 } from "@get-bb/plugin-sdk/app";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { rpcContract } from "./server";
 import { createT, resolveLang } from "./src/i18n/index.js";
+import {
+  type WorkGraphMode,
+  normalizeWorkGraphMode,
+  parseWorkGraphProjects,
+  computeEffectiveWorkGraphMode,
+  shouldShowApprovalMenu,
+} from "./src/workgraph-mode.js";
+
+export {
+  type WorkGraphMode,
+  normalizeWorkGraphMode,
+  parseWorkGraphProjects,
+  computeEffectiveWorkGraphMode,
+  shouldShowApprovalMenu,
+};
 
 type Contract = typeof rpcContract;
 
@@ -59,7 +74,34 @@ function RoleApprovalMenu() {
   const [lockedLabel, setLockedLabel] = useState<string | null>(null);
   const [taskKey, setTaskKey] = useState<string | null>(null);
   const [mode, setMode] = useState<"auto" | "manual" | null>(null);
-  const [serverWorkGraph, setServerWorkGraph] = useState<string | null>(null);
+  const [serverWorkGraph, setServerWorkGraph] = useState<"off" | "shadow" | "strict" | null>(null);
+  const [resolvedProjectId, setResolvedProjectId] = useState<string | null>(null);
+
+  // Reset per-thread/scope state when threadId or projectId changes (§32.2)
+  useEffect(() => {
+    setRole(DEFAULT_ROLE);
+    setLockedLabel(null);
+    setTaskKey(null);
+    setMode(null);
+    setServerWorkGraph(null);
+    setResolvedProjectId(null);
+  }, [threadId, projectId]);
+
+  const effectivePid = projectId || resolvedProjectId;
+  const rawWorkGraph = values?.workGraph;
+  const rawWorkGraphProjects = values?.workGraphProjects;
+
+  // Client project override directly derived from settings
+  const projectOverride = useMemo(() => {
+    if (!effectivePid || !rawWorkGraphProjects) return null;
+    const map = parseWorkGraphProjects(rawWorkGraphProjects);
+    return map[effectivePid] ?? null;
+  }, [effectivePid, rawWorkGraphProjects]);
+
+  // Reset serverWorkGraph when settings change so stale cache doesn't stick
+  useEffect(() => {
+    setServerWorkGraph(null);
+  }, [rawWorkGraph, rawWorkGraphProjects]);
 
   const report = (next: RoleId) => {
     setRole(next);
@@ -78,7 +120,7 @@ function RoleApprovalMenu() {
     setMode(nextMode);
     if (role === "orchestrator") {
       void rpc
-        .call("setProjectApprovalMode", { projectId, mode: nextMode })
+        .call("setProjectApprovalMode", { projectId: effectivePid, mode: nextMode })
         .catch(() => {});
     } else if (role === "executor" && taskKey) {
       void rpc
@@ -130,39 +172,59 @@ function RoleApprovalMenu() {
 
     void loadRole();
 
-    // Mode loading
+    // Mode loading for current thread/project
+    const targetPid = effectivePid ?? undefined;
     if (role === "orchestrator") {
       void rpc
-        .call("projectApprovalMode", { projectId })
+        .call("projectApprovalMode", { projectId: targetPid, threadId: threadId ?? undefined })
         .then((res) => {
           if (!alive) return;
           if (res?.mode) setMode(res.mode);
-          if (res?.workGraph) setServerWorkGraph(res.workGraph);
+          if (res?.workGraph) setServerWorkGraph(normalizeWorkGraphMode(res.workGraph));
+          if (res?.projectId) setResolvedProjectId(res.projectId);
         })
         .catch(() => {});
-    } else if (role === "executor" && threadId) {
+    } else if (role === "executor") {
       void rpc
-        .call("taskConfirmationMode", { threadId })
+        .call("taskConfirmationMode", {
+          threadId: threadId ?? undefined,
+          projectId: targetPid,
+        })
         .then((res) => {
           if (!alive) return;
-          if (res?.taskKey) setTaskKey(res.taskKey);
+          setTaskKey(res?.taskKey ?? null);
           if (res?.mode) setMode(res.mode);
-          if (res?.workGraph) setServerWorkGraph(res.workGraph);
+          if (res?.workGraph) setServerWorkGraph(normalizeWorkGraphMode(res.workGraph));
+          if (res?.projectId) setResolvedProjectId(res.projectId);
         })
         .catch(() => {});
+    } else {
+      // In composer with role="none": still query projectApprovalMode to prime workGraph mode
+      if (threadId || targetPid) {
+        void rpc
+          .call("projectApprovalMode", { projectId: targetPid, threadId: threadId ?? undefined })
+          .then((res) => {
+            if (!alive) return;
+            if (res?.workGraph) setServerWorkGraph(normalizeWorkGraphMode(res.workGraph));
+            if (res?.projectId) setResolvedProjectId(res.projectId);
+          })
+          .catch(() => {});
+      }
     }
 
     return () => {
       alive = false;
       if (retryTimer !== undefined) clearTimeout(retryTimer);
     };
-  }, [projectId, threadId, isThread, role]);
+  }, [projectId, threadId, isThread, role, rawWorkGraph, rawWorkGraphProjects, effectivePid]);
 
-  // Determine if workGraph is active
-  const workGraphVal = (values?.workGraph as string) ?? serverWorkGraph ?? "off";
-  const workGraphOn = workGraphVal === "strict" || workGraphVal === "shadow";
-  const hasApproval =
-    workGraphOn && (role === "orchestrator" || role === "executor");
+  // Determine if workGraph is active: effective project mode (server is canonical source of truth; falls back to client project override and normalized global) (§29.2, §32.2)
+  const workGraphVal = computeEffectiveWorkGraphMode(
+    serverWorkGraph,
+    projectOverride,
+    rawWorkGraph,
+  );
+  const hasApproval = shouldShowApprovalMenu(workGraphVal, role);
 
   const currentMode =
     role === "orchestrator" ? mode : (mode ?? "auto");
