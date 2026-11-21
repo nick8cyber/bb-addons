@@ -67,7 +67,7 @@ bb plugin reload favorite-models
 | `src/dom-observer.ts` | MutationObserver: поиск меню выбора моделей, внедрение звёздочек, подъём избранного наверх |
 | `src/favorites-manager.ts` | Управление состоянием избранного (localStorage + backend RPC sync + event bus) |
 | `src/SettingsSection.tsx` | Интерфейс настроек: список избранного, ручное добавление, экспорт/импорт JSON |
-| `src/icons.tsx` | SVG-иконки звёздочек (Filled / Outline) и вспомогательных элементов |
+| `src/icons.tsx` | SVG-иконки звёздочек (Filled) и вспомогательных элементов |
 | `src/store.ts` | Единый модуль нормализации провайдеров и санации стора для клиента и сервера |
 | `src/doctor.ts` | Диагностика и ремонт хранилища избранного для `bb favorites doctor` |
 | `tests/` | Юнит-тесты vitest: DOM-фикстуры разметки BB, гонки стора, нормализация провайдеров |
