@@ -177,8 +177,11 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
     attachments.push({ name: match[1], id: match[2] });
   }
   const key = /^# ([A-Z][A-Z0-9]{1,9}-\d+) · /m.exec(text)?.[1];
+  // PLUG-384: признак на первом ходу или сохранённый в записи сессии —
+  // повторные ходы исследовательской сессии остаются лёгкими без маркера.
   const research = !pin && !verdict &&
-    (additional.some((line) => NO_CODE.test(line)) || RESEARCHER.test(system ?? ""));
+    (session?.journal?.record?.research === true ||
+      additional.some((line) => NO_CODE.test(line)) || RESEARCHER.test(system ?? ""));
   return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions, key, thread: thread.thread, research };
 }
 
@@ -349,7 +352,10 @@ export async function collectTaskAttachments(context, blocks, options) {
       add("Embedded resource", block.resource.text, { name, at: "ACP input" });
     }
   }
-  for (const file of new Set(context.repoFiles)) {
+  // PLUG-384: публичный research — без локальных файлов: ни перечисленных
+  // в инструкциях путей репозитория, ни авто-подобранных file-блоков.
+  const light = context.research && !context.write;
+  if (!light) for (const file of new Set(context.repoFiles)) {
     try {
       add("Repository attachment", await readMaterial(root ?? context.cwd, pin, file, maxBytes, signal), { name: file });
     } catch {
@@ -362,9 +368,10 @@ export async function collectTaskAttachments(context, blocks, options) {
   for (const block of blocks) {
     const file = blockFile(block);
     if (["image", "audio", "localImage"].includes(block.type) || /^(?:image|audio|video)\//i.test(block.mimeType ?? "")) {
+      if (light) continue;
       throw new Error("mandatory attachment is binary");
     }
-    if (!file) continue;
+    if (!file || light) continue;
     const abs = resolve(context.cwd, file);
     const repoFile = root && inside(root, abs);
     if (seenPaths.has(abs)) continue;
@@ -482,7 +489,8 @@ function renderTaskPackage(context, collected, options, supplements, agentOmissi
   // агента, ни манифеста разрешений. Write-режим манифест сохраняет.
   const light = context.research && !context.write;
   const header = [
-    tools.toolSystemHeader(undefined, { pinned: Boolean(pin), repo }),
+    // В лёгком research-режиме шапка без repo-инструментов — только bb_*.
+    tools.toolSystemHeader(undefined, { pinned: Boolean(pin), repo: repo && !light }),
     pin ? "All repository tools use the pinned review tree: " + pin.sha : "",
     taskInstruction(context),
   ].filter(Boolean).join("\n\n");

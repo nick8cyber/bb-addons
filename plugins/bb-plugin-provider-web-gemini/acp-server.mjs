@@ -2350,6 +2350,9 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
   const inputSha256 = sha256(JSON.stringify(normalizeInput(blocks)));
   const isContinue = blocks.every((block) => block.type === "text") && journal.isContinueText(text);
   const saved = session.journal ?? journal.findSessionRecord(STATE_DIR, sessionId);
+  // PLUG-384: флаг research живёт в записи сессии — следующий ход видит
+  // его в prepareTask и после рестарта провайдера, без маркера в тексте.
+  if (saved) session.journal = saved;
   const last = saved ? journal.listTurns(STATE_DIR, saved.key).at(-1) : null;
   if (last?.corrupt || (last && last.record.version !== journal.JOURNAL_VERSION)) {
     return { errorOutcome: "failed", reason: "recovery: saved turn journal is corrupt or has an unsupported version" };
@@ -2412,6 +2415,7 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
       model: session.model,
       thinking: session.thinking,
       account: session.account,
+      research: context.research,
     });
   }
   session.journal = entry;

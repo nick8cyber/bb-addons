@@ -1600,6 +1600,14 @@ test("research по явному признаку «задача без кода
   assert.match(packed.message.split("\n")[0], /Для поиска публичных источников используй поиск Gemini/);
   assert.doesNotMatch(packed.message, /доступны только/);
   assert.match(packed.message, /=== Task text ===/);
+  // Без repo-инструментов в шапке — только bb_* команды.
+  const header = packed.message.split("\n\n===")[0];
+  assert.doesNotMatch(header, /<tool name="read_file"/);
+  assert.doesNotMatch(header, /<tool name="list_dir"/);
+  assert.doesNotMatch(header, /<tool name="grep"/);
+  assert.doesNotMatch(header, /<tool name="git"/);
+  assert.doesNotMatch(header, /рабочая копия/);
+  assert.match(header, /<tool name="bb_task_show"/);
   // Без git-секций, инвентаря быстрого агента и манифеста разрешений.
   assert.doesNotMatch(packed.message, /Git status/);
   assert.doesNotMatch(packed.message, /Git \S+ diff/);
@@ -1668,4 +1676,66 @@ test("роль ресерчера в системных инструкциях �
   });
 
   assert.equal(prep.research, true);
+});
+
+test("research-сессия держит лёгкий пакет на повторных ходах; обычная сессия — полный (PLUG-384)", async (t) => {
+  const repo = setup(t);
+  const app = fixture(t, repo, () => ({ text: "Готово." }));
+  const contentOf = (request) =>
+    (request.files ?? []).map((file) => file.text).join("\n") + "\n" + request.prompt;
+  const assertLight = (request) => {
+    const content = contentOf(request);
+    assert.match(request.prompt.split("\n")[0], /Для поиска публичных источников используй поиск Gemini/);
+    assert.doesNotMatch(content, /<tool name="read_file"/);
+    assert.doesNotMatch(content, /<tool name="git"/);
+    assert.doesNotMatch(content, /Git status/);
+    assert.doesNotMatch(content, /Git \S+ diff/);
+    assert.doesNotMatch(content, /Дополнения быстрого агента/);
+    assert.doesNotMatch(content, /Опись \/ Manifest/);
+    assert.doesNotMatch(content, /"permissions"/);
+  };
+
+  const researchTask = [
+    "# RES-5 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const session = await app.newSession();
+  const first = await app.prompt(session, researchTask);
+  assert.equal(first.result?.stopReason, "end_turn", JSON.stringify(first.error));
+  // Повторный ход той же сессии без маркера в тексте — всё равно лёгкий.
+  const second = await app.prompt(session, "А теперь сравни ещё два варианта.");
+  assert.equal(second.result?.stopReason, "end_turn", JSON.stringify(second.error));
+  const [req1, req2] = app.requests();
+  assertLight(req1);
+  assertLight(req2);
+
+  // Отрицательный контроль: обычная задача того же дерева без маркера
+  // (отдельный экземпляр провайдера — session/new на том же worktree иначе
+  // подхватывает запись research-сессии как алиас) — полный репо-пакет.
+  const app2 = fixture(t, repo, () => ({ text: "Готово." }));
+  const plain = await app2.newSession();
+  const repoTask = [
+    "# RES-6 · Задача по репозиторию",
+    "## Description",
+    "Разберись с состоянием дерева.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+  ].join("\n\n");
+  const third = await app2.prompt(plain, repoTask);
+  assert.equal(third.result?.stopReason, "end_turn", JSON.stringify(third.error));
+  const content = contentOf(app2.requests().at(-1));
+  assert.match(content, /<tool name="read_file"/);
+  assert.match(content, /=== Git status \(index and worktree\) ===/);
+  assert.match(content, /=== Опись \/ Manifest ===/);
+  assert.match(content, /"permissions": ?"read-only"/);
 });
