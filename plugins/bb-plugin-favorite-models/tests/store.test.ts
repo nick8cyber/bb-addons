@@ -16,7 +16,7 @@ describe("normalizeProviderId (M11)", () => {
     expect(normalizeProviderId("anthropic")).toBe("provider-claude-code");
     expect(normalizeProviderId("Antigravity")).toBe("agy");
     expect(normalizeProviderId("agy")).toBe("agy");
-    expect(normalizeProviderId("OpenCode")).toBe("opencode");
+    expect(normalizeProviderId("OpenCode")).toBe("acp-opencode");
     expect(normalizeProviderId("Cursor")).toBe("acp-cursor");
   });
 

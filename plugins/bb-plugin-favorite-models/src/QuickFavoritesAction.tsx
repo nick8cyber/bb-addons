@@ -13,13 +13,13 @@ import {
   getFavoritesForProvider,
   getModelLabel,
   getProviderDisplayName,
+  resolveProviderKey,
 } from "./favorites-manager.js";
 import {
   switchComposerModel,
   openNativeModelPicker,
   detectActiveProvider,
   cancelPendingSwitch,
-  normalizeProviderId,
   type SwitchFailure,
 } from "./dom-observer.js";
 import { StarFilledIcon, StarOutlineIcon } from "./icons.js";
@@ -84,7 +84,7 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
   const sdkProvider = (() => {
     if (!threadId) return null;
     const thread = sidebar.threads.find((t) => t.id === threadId);
-    return thread ? normalizeProviderId(thread.providerId) : null;
+    return thread ? resolveProviderKey(thread.providerId) : null;
   })();
   const [coords, setCoords] = useState<{
     top?: number;
@@ -97,6 +97,12 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
   const menuRef = useRef<HTMLDivElement>(null);
   const measuredHRef = useRef(0);
   const placeRetryRef = useRef(0);
+
+  useLayoutEffect(() => {
+    setIsOpen(false);
+    setMenuProvider(null);
+    setDomProvider("default");
+  }, [threadId, state.showQuickBar]);
 
   // A pending programmatic switch must not survive a context change or this
   // composer's unmount — its polls would then click into a menu that no
