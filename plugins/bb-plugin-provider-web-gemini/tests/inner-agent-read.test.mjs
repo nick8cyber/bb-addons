@@ -1561,5 +1561,111 @@ test("research-подобный ход без дерева собирает ша
   assert.match(header, /<tool name="bb_thread_message"/);
   assert.match(header, /<tool name="bb_task_show"/);
   assert.match(header, /bb_\* — по указанным аргументам\./);
-  assert.match(header, /Помимо них доступны собственные возможности веб-интерфейса \(поиск в интернете, чтение страниц\): для актуальных данных из интернета используйте их как обычно\./);
+  assert.match(header.split("\n")[0], /Для поиска публичных источников используй поиск Gemini и открывай найденные страницы\./);
+  assert.doesNotMatch(header, /доступны только/);
+});
+
+test("research по явному признаку «задача без кода» в git-дереве собирает короткий пакет (PLUG-384)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const { tmp, repo } = setup(t);
+
+  const taskText = [
+    "# RES-2 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+  assert.ok(prep.root);
+
+  const packageOptions = { limit: 120_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  // Шапка ставит веб-поиск первым, без общесессионного «доступны только».
+  assert.match(packed.message.split("\n")[0], /Для поиска публичных источников используй поиск Gemini/);
+  assert.doesNotMatch(packed.message, /доступны только/);
+  assert.match(packed.message, /=== Task text ===/);
+  // Без git-секций, инвентаря быстрого агента и манифеста разрешений.
+  assert.doesNotMatch(packed.message, /Git status/);
+  assert.doesNotMatch(packed.message, /Git \S+ diff/);
+  assert.doesNotMatch(packed.message, /Дополнения быстрого агента/);
+  assert.doesNotMatch(packed.message, /Опись \/ Manifest/);
+  assert.doesNotMatch(packed.message, /"permissions"/);
+  // Короткий пакет: шапка + задача, а не десятки КБ инвентаря.
+  assert.ok(Buffer.byteLength(packed.message) < 8_000, "research package should be short");
+});
+
+test("та же git-копия без признака research сохраняет полный репо-пакет (PLUG-384)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const { tmp, repo } = setup(t);
+
+  const taskText = [
+    "# RES-3 · Задача по репозиторию",
+    "## Description",
+    "Разберись с состоянием дерева.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    "Обычные инструкции без пометок.",
+  ].join("\n\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, false);
+
+  const packageOptions = { limit: 120_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  assert.match(packed.message, /=== Git status \(index and worktree\) ===/);
+  assert.match(packed.message, /=== Опись \/ Manifest ===/);
+  assert.match(packed.message, /"permissions": ?"read-only"/);
+});
+
+test("роль ресерчера в системных инструкциях включает research-пакет (PLUG-384)", async (t) => {
+  const { prepareTask } = await import("../src/inner-context.mjs");
+  const { tmp, repo } = setup(t);
+
+  const taskText = [
+    "# RES-4 · Исследование",
+    "## Description",
+    "Собери сведения по вопросу.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+  ].join("\n\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: RU["role.body.researcher"],
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
 });

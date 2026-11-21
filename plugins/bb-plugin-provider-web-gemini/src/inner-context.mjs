@@ -15,6 +15,12 @@ const REVIEW_LINE = /^(?:Проверяемый итог: коммит|Result un
 const REVIEW_PREFIX = /^(?:Проверяемый итог: коммит|Result under review: commit)(?:\s|$)/;
 const ATTACHED_PATHS = /^(?:Приложенные файлы \(прочитай в репозитории\)|Attached files \(read them in the repo\)):[ \t]*(.+)$/;
 const AUDITOR = /(?:^|\n)[ \t]*(?:[-*][ \t]+)?(?:Заканчивай отчёт строкой JSON|End the report with the JSON line)[ \t]+\{"verdict":"OK"\|"CHANGES","blockers":<[^>\n]+>\}/;
+// PLUG-384: явные признаки публичного research — строка оркестратора
+// «задача без кода» / "no-code task" в Additional instructions либо роль
+// ресерчера в системных инструкциях. Для такого хода пакет лёгкий: без
+// git-секций, инвентаря быстрого агента и манифеста разрешений.
+const NO_CODE = /^(?:задача без кода|no-code task)[\s:—-]/i;
+const RESEARCHER = /Ты — ресерчер|You are the researcher\b/;
 const FILE_ATTACHMENT_ID = "[0-9A-HJKMNP-TV-Z]{26}";
 const TRACKER_ATTACHMENT = new RegExp("^- (.+) · (" + FILE_ATTACHMENT_ID + ")$");
 const THREAD_TOKEN = new RegExp("\\b" + tools.THREAD_ID_RE.source.slice(1, -1) + "\\b", "gi");
@@ -171,7 +177,9 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
     attachments.push({ name: match[1], id: match[2] });
   }
   const key = /^# ([A-Z][A-Z0-9]{1,9}-\d+) · /m.exec(text)?.[1];
-  return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions, key, thread: thread.thread };
+  const research = !pin && !verdict &&
+    (additional.some((line) => NO_CODE.test(line)) || RESEARCHER.test(system ?? ""));
+  return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions, key, thread: thread.thread, research };
 }
 
 export function verdictInstruction(context) {
@@ -447,7 +455,7 @@ export async function collectTask(context, blocks, materials, options) {
     }
   }
   let reviewDiff = null;
-  if (root) {
+  if (root && !context.research) {
     if (!pin) {
       const status = await worktreeStatus(root, maxBytes, signal);
       add("Git status (index and worktree)", status.text);
@@ -459,7 +467,7 @@ export async function collectTask(context, blocks, materials, options) {
       for (const entry of diff.excluded) omit(entry.source, entry.reason);
       if (pin) reviewDiff = Object.freeze({ stat: diff.stat, patch: diff.patch, excluded: diff.excluded });
     }
-  } else {
+  } else if (!root) {
     omit("Git status and diff", "working directory is not a Git worktree");
   }
   return Object.freeze({ core: Object.freeze(core), omitted: Object.freeze(omitted.map(Object.freeze)),
@@ -470,6 +478,9 @@ function renderTaskPackage(context, collected, options, supplements, agentOmissi
   const { limit, spillDir } = options;
   const pin = context.pin;
   const repo = Boolean(pin || context.root);
+  // PLUG-384: публичный research — короткий пакет: ни добавок быстрого
+  // агента, ни манифеста разрешений. Write-режим манифест сохраняет.
+  const light = context.research && !context.write;
   const header = [
     tools.toolSystemHeader(undefined, { pinned: Boolean(pin), repo }),
     pin ? "All repository tools use the pinned review tree: " + pin.sha : "",
@@ -487,15 +498,16 @@ function renderTaskPackage(context, collected, options, supplements, agentOmissi
       return { ...entry, delivery, range: [start, start + entry.bytes] };
     };
     const included = collected.core.map(({ entry, text }) => append(entry, text));
-    if (supplements.length) {
+    if (!light && supplements.length) {
       const heading = "=== Дополнения быстрого агента / Fast agent additions ===\n";
       body += heading;
       offset += bytes(heading);
     }
-    const added = supplements.map(({ text, partial, ...item }) => append({
+    const added = light ? [] : supplements.map(({ text, partial, ...item }) => append({
       ...item, delivery: "package", required: false, included: partial ? "partial" : "full",
       bytes: bytes(text), sha256: digest(text),
     }, text));
+    if (light) return body;
     const manifest = {
       version: 1,
       revision: pin?.sha ?? "working copy",

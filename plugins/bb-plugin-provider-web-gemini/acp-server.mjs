@@ -1606,7 +1606,9 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
             collected = await collectTask(context, attachments.blocks, materials, packageOptions);
             packed = packTask(context, collected, packageOptions);
-            if (context.settings.innerAgent && (context.root || context.pin)) {
+            // PLUG-384: публичный research без локального инвентаря —
+            // быстрый агент по дереву не запускается.
+            if (context.settings.innerAgent && (context.root || context.pin) && !context.research) {
               const agent = await gatherAgentContext(context, collected.core, {
                 signal: task.signal,
                 maxExtraBytes: context.settings.maxTotalBytes - packed.totalBytes - packageOptions.reserveBytes,
