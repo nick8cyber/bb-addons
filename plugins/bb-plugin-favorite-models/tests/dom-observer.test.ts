@@ -721,3 +721,233 @@ describe("legacy favorites stored as bare modelId", () => {
     cleanup();
   });
 });
+
+/** Real BB ToggleGroup ("Speed" / agent-option sections): a role=radiogroup
+ * (or toolbar) flex strip whose items carry title=item.description. */
+function titledToggleGroup(role: "radiogroup" | "toolbar" = "radiogroup"): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "flex items-center justify-center gap-1";
+  group.setAttribute("role", role);
+  for (const [label, desc, on] of [
+    ["Default", "Default speed", false],
+    ["Fast", "Priority processing for this model", true],
+  ] as const) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.title = desc;
+    item.textContent = label;
+    item.className =
+      "inline-flex items-center justify-center gap-2 h-6 min-w-0 flex-auto shrink-0 " +
+      "whitespace-nowrap rounded-sm px-1 text-xs font-normal shadow-none hover:bg-state-hover " +
+      "hover:text-foreground data-[state=on]:bg-state-active data-[state=on]:text-foreground";
+    item.setAttribute("data-state", on ? "on" : "off");
+    group.append(item);
+  }
+  return group;
+}
+
+/** Real BB disabled row: title = disabledReason, the label lives in the
+ * row's own text (base node + "(tag)"/route subtitle spans). */
+function disabledOptionRow(
+  label: string,
+  reason: string | null,
+  opts: { tag?: string; route?: string; withRole?: boolean } = {}
+): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.id = `:r5:-opt-${rowSeq++}`;
+  b.disabled = true;
+  if (opts.withRole) b.setAttribute("role", "option");
+  const s = document.createElement("span");
+  s.className = "truncate";
+  s.title = reason ?? (opts.route ? `${label} · ${opts.route}` : label);
+  s.appendChild(document.createTextNode(label));
+  for (const sub of [opts.tag, opts.route]) {
+    if (!sub) continue;
+    const sp = document.createElement("span");
+    sp.className = "ml-1.5 text-subtle-foreground";
+    sp.textContent = sub;
+    s.append(sp);
+  }
+  const chk = document.createElement("span");
+  chk.className = "flex shrink-0 items-center gap-1.5";
+  b.append(s, chk);
+  return b;
+}
+
+describe("native ToggleGroup sections (review r3 blocker)", () => {
+  it("titled ToggleGroup items are NOT provider tabs — star writes under the trigger's provider", async () => {
+    const { dom } = await freshModules();
+    const bodies: { providerId?: string; modelId?: string }[] = [];
+    stubRpc((method, body) => {
+      if (method === "addFavorite") bodies.push(body as never);
+      return { version: 1, favorites: {}, modelLabels: {}, config: {} };
+    });
+
+    const A = composer();
+    const picker = nativePicker({
+      search: true,
+      rows: Array.from({ length: 7 }, (_, i) => optionRow(`m${i}`, { withRole: true })),
+    });
+    const section = document.createElement("div");
+    section.className = "shrink-0 px-2 py-2.5";
+    section.append(titledToggleGroup("radiogroup"), titledToggleGroup("toolbar"));
+    picker.content.append(section);
+    openPicker(A.trigger, picker);
+
+    const cleanup = dom.initDomObserver();
+    expect(dom.detectActiveProvider(picker.content)).toBe("codex");
+    document.querySelector<HTMLButtonElement>(".bb-fav-star-btn")!.click();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(bodies.length).toBe(1);
+    expect(bodies[0].providerId).toBe("codex");
+    expect(bodies[0].modelId).toBe("m0");
+    cleanup();
+  });
+
+  it("single-provider picker + ToggleGroup: quick switch reaches the row (no provider-tab-missing)", async () => {
+    const { dom } = await freshModules();
+    const A = composer();
+    const row = optionRow("target", { withRole: true });
+    const picker = nativePicker({ search: true, rows: [row] });
+    const section = document.createElement("div");
+    section.append(titledToggleGroup());
+    picker.content.append(section);
+    row.addEventListener("click", () => picker.wrapper.remove());
+    openOnClick(A.trigger, picker);
+
+    const p = dom.switchComposerModel("target", "codex", A.anchor);
+    await vi.advanceTimersByTimeAsync(3000);
+    await expect(p).resolves.toEqual({ ok: true });
+  });
+
+  it("' (current thread)' marker on a tab title does not poison the provider key", async () => {
+    const { dom } = await freshModules();
+    const bodies: { providerId?: string }[] = [];
+    stubRpc((method, body) => {
+      if (method === "addFavorite") bodies.push(body as never);
+      return { version: 1, favorites: {}, modelLabels: {}, config: {} };
+    });
+
+    const A = composer();
+    const picker = nativePicker({
+      search: true,
+      tabs: [{ title: "Pi (current thread)", active: true }],
+      rows: Array.from({ length: 7 }, (_, i) => optionRow(`m${i}`, { withRole: true })),
+    });
+    openPicker(A.trigger, picker);
+
+    const cleanup = dom.initDomObserver();
+    expect(dom.detectActiveProvider(picker.content)).toBe("provider-pi");
+    document.querySelector<HTMLButtonElement>(".bb-fav-star-btn")!.click();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(bodies[0]?.providerId).toBe("provider-pi");
+    cleanup();
+  });
+});
+
+describe("disabled rows (review r3)", () => {
+  it("title holds the disable reason → the star stores the row label, not the reason", async () => {
+    const { dom } = await freshModules();
+    const bodies: { providerId?: string; modelId?: string }[] = [];
+    stubRpc((method, body) => {
+      if (method === "addFavorite") bodies.push(body as never);
+      return { version: 1, favorites: {}, modelLabels: {}, config: {} };
+    });
+
+    const A = composer();
+    const picker = nativePicker({
+      search: true,
+      rows: [
+        optionRow("gpt-5 · codex", { withRole: true }),
+        disabledOptionRow("gpt-5-mini", "Cannot switch while the agent is running", {
+          route: "codex",
+          withRole: true,
+        }),
+      ],
+    });
+    openPicker(A.trigger, picker);
+
+    const cleanup = dom.initDomObserver();
+    const stars = document.querySelectorAll<HTMLButtonElement>(".bb-fav-star-btn");
+    expect(stars.length).toBe(2);
+    stars[1].click();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(bodies.length).toBe(1);
+    expect(bodies[0].modelId).toBe("gpt-5-mini · codex");
+    cleanup();
+  });
+
+  it("disabled row WITHOUT a reason keeps its real 'label · route' key", async () => {
+    const { dom } = await freshModules();
+    const bodies: { modelId?: string }[] = [];
+    stubRpc((method, body) => {
+      if (method === "addFavorite") bodies.push(body as never);
+      return { version: 1, favorites: {}, modelLabels: {}, config: {} };
+    });
+
+    const A = composer();
+    const picker = nativePicker({
+      search: true,
+      rows: [disabledOptionRow("gpt-5-mini", null, { route: "codex", withRole: true })],
+    });
+    openPicker(A.trigger, picker);
+
+    const cleanup = dom.initDomObserver();
+    document.querySelector<HTMLButtonElement>(".bb-fav-star-btn")!.click();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(bodies[0]?.modelId).toBe("gpt-5-mini · codex");
+    cleanup();
+  });
+});
+
+describe("switch hygiene (review r3 minor)", () => {
+  it("provider-tab-missing closes the popover we opened", async () => {
+    const { dom } = await freshModules();
+    const A = composer();
+    const picker = nativePicker({
+      search: true,
+      tabs: [{ title: "Claude Code", active: true }],
+      rows: [optionRow("m0", { withRole: true })],
+    });
+    const escapes: string[] = [];
+    picker.content.addEventListener("keydown", (e) => escapes.push((e as KeyboardEvent).key));
+    openOnClick(A.trigger, picker);
+
+    const p = dom.switchComposerModel("m0", "codex", A.anchor);
+    await vi.advanceTimersByTimeAsync(3000);
+    await expect(p).resolves.toEqual({ ok: false, reason: "provider-tab-missing" });
+    expect(escapes).toContain("Escape");
+  });
+
+  it("trigger showing 'M2' does NOT confirm a click on 'M' (exact match only)", async () => {
+    const { dom } = await freshModules();
+    const A = composer("primary", "Codex: M2");
+    const picker = nativePicker({
+      search: true,
+      rows: [optionRow("M", { withRole: true })],
+    });
+    openOnClick(A.trigger, picker);
+
+    const p = dom.switchComposerModel("M", "codex", A.anchor);
+    await vi.advanceTimersByTimeAsync(3000);
+    await expect(p).resolves.toEqual({ ok: false, reason: "unconfirmed" });
+  });
+
+  it("trigger's own '· reasoning' qualifier still confirms the right model", async () => {
+    const { dom } = await freshModules();
+    const A = composer("primary", "Codex: target · high reasoning");
+    // The row stays open after our click: only triggerShowsModel can confirm.
+    const picker = nativePicker({
+      search: true,
+      rows: [optionRow("target", { withRole: true })],
+    });
+    openOnClick(A.trigger, picker);
+
+    const p = dom.switchComposerModel("target", "codex", A.anchor);
+    await vi.advanceTimersByTimeAsync(3000);
+    await expect(p).resolves.toEqual({ ok: true });
+  });
+});

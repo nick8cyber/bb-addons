@@ -104,7 +104,12 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
   // trigger: another composer unmounting cancels nothing of ours.
   useEffect(() => {
     const btn = buttonRef.current;
-    return () => cancelPendingSwitch(btn);
+    // With showQuickBar off the button never renders (btn === null): a bare
+    // cancelPendingSwitch(null) would cancel EVERY composer's pending
+    // switch, so guard it.
+    return () => {
+      if (btn) cancelPendingSwitch(btn);
+    };
   }, [threadId]);
 
   // Pin the menu to the button edge: upward opens get their BOTTOM edge fixed

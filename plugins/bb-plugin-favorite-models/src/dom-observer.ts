@@ -253,7 +253,12 @@ function refreshAllOpenPickers(): void {
 }
 
 function providerTabs(popover: HTMLElement): HTMLButtonElement[] {
-  const strips = popover.querySelectorAll("div.border-b, div.flex.items-center");
+  // Only the bordered strip is the provider tab bar: BB renders it as
+  // `div.border-b` of `border-b-2` buttons. Option-section ToggleGroups
+  // (Speed/agent options) are flex containers WITHOUT border-b and live
+  // under role="radiogroup"/"toolbar" — both excluded so their
+  // description-titled items are never mistaken for provider tabs.
+  const strips = popover.querySelectorAll("div.border-b");
   const tabs: HTMLButtonElement[] = [];
   for (const strip of strips) {
     for (const b of strip.querySelectorAll<HTMLButtonElement>("button[title]")) {
@@ -265,17 +270,27 @@ function providerTabs(popover: HTMLElement): HTMLButtonElement[] {
         b.hasAttribute("data-bb-fav-star") ||
         b.hasAttribute("data-bb-fav-clone") ||
         b.closest(".bb-fav-pin-section") ||
-        b.closest('button[role="option"]')
+        b.closest('button[role="option"]') ||
+        b.closest('[role="radiogroup"], [role="toolbar"]') ||
+        !b.className.includes("border-b-2")
       ) {
         continue;
       }
-      const t = (b.getAttribute("title") || b.textContent || "").trim();
+      const t = providerTabLabel(b);
       if (t !== "" && !t.includes("/") && !t.includes("·") && !tabs.includes(b)) {
         tabs.push(b);
       }
     }
   }
   return tabs;
+}
+
+/** Provider name on a tab, without BB's " (current thread)" marker. */
+function providerTabLabel(tab: HTMLButtonElement): string {
+  return (tab.getAttribute("title") || tab.textContent || "")
+    .trim()
+    .replace(/\s*\(current thread\)\s*$/i, "")
+    .trim();
 }
 
 function tabIsActive(tab: HTMLButtonElement): boolean {
@@ -329,9 +344,12 @@ export function detectActiveProvider(container?: HTMLElement, anchor?: HTMLEleme
   // 1. Active provider tab inside THIS popover (scoped — never global).
   if (container) {
     const tabs = providerTabs(container);
-    const activeTab = tabs.find(tabIsActive) || tabs.find((b) => b.className.includes("text-foreground"));
+    // Only the explicit active marker counts: "text-foreground" also matches
+    // INACTIVE tabs ("hover:text-foreground") and junk items, which made a
+    // ToggleGroup description look like the provider name.
+    const activeTab = tabs.find(tabIsActive);
     if (activeTab) {
-      const title = activeTab.getAttribute("title") || activeTab.textContent?.trim();
+      const title = providerTabLabel(activeTab);
       if (title) {
         const norm = normalizeProviderId(title);
         if (norm !== "default") return norm;
@@ -382,12 +400,21 @@ export interface ModelOption {
 
 export function extractModelOption(btn: HTMLButtonElement): ModelOption {
   const truncateSpan = btn.querySelector<HTMLElement>("span.truncate, span[title]");
-  let fullTitle =
-    truncateSpan?.getAttribute("title") ||
-    (truncateSpan ? firstTextNodeText(truncateSpan) : "") ||
-    btn.getAttribute("aria-label") ||
-    btn.textContent ||
-    "";
+  const disabled = btn.disabled || btn.getAttribute("aria-disabled") === "true";
+  let fullTitle: string;
+  if (disabled && truncateSpan) {
+    // A disabled row's title carries the disable REASON (native BB:
+    // title = disabledReason ?? "label · route") — the key must come from
+    // the row's own text instead.
+    fullTitle = disabledRowKey(truncateSpan) || btn.textContent || "";
+  } else {
+    fullTitle =
+      truncateSpan?.getAttribute("title") ||
+      (truncateSpan ? firstTextNodeText(truncateSpan) : "") ||
+      btn.getAttribute("aria-label") ||
+      btn.textContent ||
+      "";
+  }
   fullTitle = cleanModelText(fullTitle.trim());
 
   let modelId = fullTitle;
@@ -406,6 +433,27 @@ export function extractModelOption(btn: HTMLButtonElement): ModelOption {
   }
 
   return { key, modelId, route, label: key };
+}
+
+/**
+ * Rebuild the "label · route" key for a disabled row from its rendered
+ * text: the leading text node is the label base, trailing subtitle spans
+ * are the "(tag)" and then the route qualifier (title already holds the
+ * reason, so it is only trusted when it echoes the label itself).
+ */
+function disabledRowKey(truncateSpan: HTMLElement): string {
+  const base = firstTextNodeText(truncateSpan);
+  const title = (truncateSpan.getAttribute("title") || "").trim();
+  if (base && title.toLowerCase().startsWith(base.toLowerCase())) {
+    return title;
+  }
+  const subs = Array.from(truncateSpan.children)
+    .map((el) => (el.textContent || "").trim())
+    .filter(Boolean);
+  if (!base) return subs.join(" ");
+  if (subs.length >= 2) return `${base} (${subs[0]}) · ${subs[subs.length - 1]}`;
+  if (subs.length === 1) return `${base} · ${subs[0]}`;
+  return base;
 }
 
 function isToggleRow(btn: HTMLButtonElement): boolean {
@@ -775,10 +823,16 @@ async function runSwitch(
   if (!popover) return { ok: false, reason: "no-popover" };
 
   // Provider tabs render only when the composer offers more than one provider.
+  const closeOurPopover = () => {
+    const live = findOwnedPopover(triggerBtn) || popover;
+    if (live?.isConnected) {
+      live.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    }
+  };
   const wantProvider = providerId ? normalizeProviderId(providerId) : null;
   if (wantProvider) {
     let tabs = providerTabs(popover);
-    let target = tabs.find((tab) => normalizeProviderId(tab.getAttribute("title") || "") === wantProvider);
+    let target = tabs.find((tab) => normalizeProviderId(providerTabLabel(tab)) === wantProvider);
     if (target) {
       if (!tabIsActive(target)) {
         target.click();
@@ -789,22 +843,28 @@ async function runSwitch(
           const live = findOwnedPopover(triggerBtn) || popover;
           tabs = providerTabs(live);
           const fresh = tabs.find(
-            (tab) => normalizeProviderId(tab.getAttribute("title") || "") === wantProvider
+            (tab) => normalizeProviderId(providerTabLabel(tab)) === wantProvider
           );
           if (fresh) target = fresh;
           if (tabIsActive(target)) break;
           await sleep(25);
         }
         if (!alive()) return { ok: false, reason: "cancelled" };
-        if (!tabIsActive(target)) return { ok: false, reason: "provider-tab-missing" };
+        if (!tabIsActive(target)) {
+          // Leave no menu WE opened hanging behind a reported failure.
+          closeOurPopover();
+          return { ok: false, reason: "provider-tab-missing" };
+        }
       }
     } else if (tabs.length > 0) {
+      closeOurPopover();
       return { ok: false, reason: "provider-tab-missing" };
     } else {
       // Single-provider picker: nothing to click, but still verify the
       // composer's actual provider against the requested one (M2).
       const actual = providerFromTrigger(triggerBtn);
       if (actual !== "default" && actual !== wantProvider) {
+        closeOurPopover();
         return { ok: false, reason: "provider-tab-missing" };
       }
     }
@@ -945,7 +1005,11 @@ function triggerShowsModel(triggerBtn: HTMLButtonElement, ex: ModelOption): bool
   const fullTitle = titleElem?.getAttribute("title") || "";
   if (!fullTitle.includes(":")) return false;
   const modelPart = cleanModelText(fullTitle.split(":").slice(1).join(":").trim());
-  return modelPart === ex.modelId || modelPart === ex.key || modelPart.includes(ex.modelId);
+  // The trigger appends its own qualifier ("· high reasoning"), so the bare
+  // label head counts too — but never a substring ("M2" must not confirm a
+  // click on "M").
+  const head = modelPart.split(" · ")[0].trim();
+  return modelPart === ex.modelId || modelPart === ex.key || head === ex.modelId;
 }
 
 function setNativeInputValue(input: HTMLInputElement, value: string): void {
