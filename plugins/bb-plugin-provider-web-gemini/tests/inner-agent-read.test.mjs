@@ -1561,7 +1561,7 @@ test("research-подобный ход без дерева собирает ша
   assert.match(header, /<tool name="bb_thread_message"/);
   assert.match(header, /<tool name="bb_task_show"/);
   assert.match(header, /bb_\* — по указанным аргументам\./);
-  assert.match(header.split("\n")[0], /Для поиска публичных источников используй поиск Gemini и открывай найденные страницы\./);
+  assert.match(header.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini\./);
   assert.doesNotMatch(header, /доступны только/);
 });
 
@@ -1597,7 +1597,7 @@ test("research по явному признаку «задача без кода
   const packed = packTask(prep, collected, packageOptions);
 
   // Шапка ставит веб-поиск первым, без общесессионного «доступны только».
-  assert.match(packed.message.split("\n")[0], /Для поиска публичных источников используй поиск Gemini/);
+  assert.match(packed.message.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini/);
   assert.doesNotMatch(packed.message, /доступны только/);
   assert.match(packed.message, /=== Task text ===/);
   // Без repo-инструментов в шапке — только bb_* команды.
@@ -1685,7 +1685,7 @@ test("research-сессия держит лёгкий пакет на повто
     (request.files ?? []).map((file) => file.text).join("\n") + "\n" + request.prompt;
   const assertLight = (request) => {
     const content = contentOf(request);
-    assert.match(request.prompt.split("\n")[0], /Для поиска публичных источников используй поиск Gemini/);
+    assert.match(request.prompt.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini/);
     assert.doesNotMatch(content, /<tool name="read_file"/);
     assert.doesNotMatch(content, /<tool name="git"/);
     assert.doesNotMatch(content, /Git status/);
@@ -1772,7 +1772,7 @@ test("research-ход собирает явно приложенный resource_
   assert.match(content, /PUBLIC-ATTACHMENT-ZQ9/);
   // Пакет всё ещё лёгкий: без манифеста, git-секций и repo-инструментов;
   // локальные файлы репозитория сами не подбираются.
-  assert.match(request.prompt.split("\n")[0], /Для поиска публичных источников используй поиск Gemini/);
+  assert.match(request.prompt.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini/);
   assert.doesNotMatch(request.prompt, /<tool name="read_file"/);
   assert.doesNotMatch(content, /Опись \/ Manifest|"permissions"|Git status|different HEAD/);
 });
