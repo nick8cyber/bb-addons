@@ -55,7 +55,7 @@ export function SettingsSection() {
     }
   };
 
-  const handleConfigToggle = (key: "pinToTop" | "showQuickBar") => (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleConfigToggle = (key: "pinToTop") => (e: React.ChangeEvent<HTMLInputElement>) => {
     void updateConfig({ [key]: e.target.checked });
   };
 
@@ -106,18 +106,6 @@ export function SettingsSection() {
             />
             <span className="text-xs text-foreground font-medium">
               Закреплять избранные модели поверх общего списка в выпадающем меню
-            </span>
-          </label>
-
-          <label className="flex items-center gap-2.5 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={state.showQuickBar}
-              onChange={handleConfigToggle("showQuickBar")}
-              className="size-4 rounded border-border text-amber-500 focus:ring-amber-500"
-            />
-            <span className="text-xs text-foreground font-medium">
-              Показывать кнопку «⭐ Избранное» в панели действий поля ввода для быстрого выбора
             </span>
           </label>
         </div>

@@ -33,7 +33,6 @@ const snapshotOutput = z.object({
   modelLabels: z.record(z.string(), z.string()),
   config: z.object({
     pinToTop: z.boolean(),
-    showQuickBar: z.boolean(),
   }),
 });
 
@@ -83,13 +82,11 @@ export const rpcContract = defineRpcContract({
   updateConfig: {
     input: z.object({
       pinToTop: z.boolean().optional(),
-      showQuickBar: z.boolean().optional(),
     }),
     output: z.object({
       success: z.boolean(),
       config: z.object({
         pinToTop: z.boolean(),
-        showQuickBar: z.boolean(),
       }),
     }),
   },
@@ -102,11 +99,6 @@ export default async function plugin(bb: BbPluginApi) {
     pinToTop: {
       type: "boolean",
       label: "Pin favorites to top of model dropdown",
-      default: true,
-    },
-    showQuickBar: {
-      type: "boolean",
-      label: "Show quick favorites in composer",
       default: true,
     },
   });
@@ -223,7 +215,6 @@ export default async function plugin(bb: BbPluginApi) {
     const s = await settings.get();
     return {
       pinToTop: s.pinToTop ?? true,
-      showQuickBar: s.showQuickBar ?? true,
     };
   };
 
@@ -235,14 +226,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   // One-off migration of the pre-refactor KV config override into real BB
   // settings: after it ran once, `favorites:config` is gone and bb.settings
-  // alone governs pinToTop/showQuickBar (M13).
-  const legacyConfig = await bb.storage.kv.get<{ pinToTop?: boolean; showQuickBar?: boolean }>(
+  // alone governs pinToTop (M13).
+  const legacyConfig = await bb.storage.kv.get<{ pinToTop?: boolean }>(
     LEGACY_CONFIG_KEY
   );
   if (legacyConfig && typeof legacyConfig === "object") {
-    const updates: { pinToTop?: boolean; showQuickBar?: boolean } = {};
+    const updates: { pinToTop?: boolean } = {};
     if (typeof legacyConfig.pinToTop === "boolean") updates.pinToTop = legacyConfig.pinToTop;
-    if (typeof legacyConfig.showQuickBar === "boolean") updates.showQuickBar = legacyConfig.showQuickBar;
     if (Object.keys(updates).length > 0) {
       try {
         await settings.experimental_set(updates);
@@ -329,9 +319,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     updateConfig: async (updates) => {
-      const clean: { pinToTop?: boolean; showQuickBar?: boolean } = {};
+      const clean: { pinToTop?: boolean } = {};
       if (typeof updates.pinToTop === "boolean") clean.pinToTop = updates.pinToTop;
-      if (typeof updates.showQuickBar === "boolean") clean.showQuickBar = updates.showQuickBar;
       if (Object.keys(clean).length > 0) {
         try {
           await settings.experimental_set(clean);

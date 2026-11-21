@@ -1,14 +1,13 @@
 /**
  * bb-plugin-favorite-models — Frontend entry.
  *
- * Registers content script for DOM star injection & reordering in the model picker,
- * settings section for managing favorites, and composer action for quick switching.
+ * Registers content script for DOM star injection & reordering in the model picker
+ * and a settings section for managing favorites.
  */
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 import { initDomObserver } from "./src/dom-observer.js";
 import { initBackendSync } from "./src/favorites-manager.js";
 import { SettingsSection } from "./src/SettingsSection.js";
-import { QuickFavoritesAction } from "./src/QuickFavoritesAction.js";
 
 export default definePluginApp((app) => {
   // 1. Content Script: Injects star buttons and reorders models in model picker popovers
@@ -30,16 +29,5 @@ export default definePluginApp((app) => {
     title: "Избранные модели",
     description: "Звёздочки у моделей провайдеров и закрепление избранного вверху списка.",
     component: SettingsSection,
-  });
-
-  // 3. Composer Customization: Quick favorite switcher action in composer
-  app.composer.customize({
-    id: "favorite-models-composer",
-    actions: [
-      {
-        id: "quick-favorites-btn",
-        component: QuickFavoritesAction,
-      },
-    ],
   });
 });

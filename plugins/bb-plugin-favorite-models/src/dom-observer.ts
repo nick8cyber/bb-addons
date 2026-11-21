@@ -11,12 +11,10 @@
 
 import { toast } from "sonner";
 import {
-  cleanModelText,
   getState,
   isFavorite,
   refreshFavorites,
   resolvePickerProvider,
-  resolveProviderKey,
   toggleFavorite,
   subscribe,
 } from "./favorites-manager.js";
@@ -34,8 +32,6 @@ const STAR_OUTLINE_SVG = `
 </svg>
 `;
 
-/** BB marks each composer root with this attribute (primary vs secondary). */
-const COMPOSER_ROOT_SELECTOR = "[data-app-composer-role]";
 /** BB's trigger carries aria-label "Provider, model and reasoning (<shortcut>)". */
 const MODEL_TRIGGER_SELECTOR = 'button[aria-label*="Provider, model" i]';
 const POPOVER_SELECTOR =
@@ -152,7 +148,6 @@ export function initDomObserver(): () => void {
 
   return () => {
     unsubscribeState();
-    cancelPendingSwitch();
     if (refreshTimer) {
       clearTimeout(refreshTimer);
       refreshTimer = null;
@@ -342,18 +337,17 @@ function findOwnerTrigger(container: HTMLElement): HTMLButtonElement | null {
   return null;
 }
 
-function activeProviderLabel(container?: HTMLElement, anchor?: HTMLElement | null): string {
+function activeProviderLabel(container?: HTMLElement): string {
   if (container) {
     const active = providerTabs(container).find(tabIsActive);
     if (active) return providerTabLabel(active);
   }
   const owner = container ? findOwnerTrigger(container) : null;
-  const trigger = owner ?? findModelTrigger(anchor);
-  return trigger ? providerLabelFromTrigger(trigger) : "";
+  return owner ? providerLabelFromTrigger(owner) : "";
 }
 
-export function detectActiveProvider(container?: HTMLElement, anchor?: HTMLElement | null): string {
-  return resolvePickerProvider(activeProviderLabel(container, anchor));
+export function detectActiveProvider(container?: HTMLElement): string {
+  return resolvePickerProvider(activeProviderLabel(container));
 }
 
 function firstTextNodeText(el: HTMLElement): string {
@@ -698,224 +692,6 @@ function findOwnedPopover(trigger: HTMLButtonElement): HTMLElement | null {
   return el instanceof HTMLElement && el.isConnected ? el : null;
 }
 
-function findModelTrigger(anchor?: HTMLElement | null): HTMLButtonElement | null {
-  // Scope strictly to the composer the caller lives in: several composers
-  // (thread, side chat, queued message) can be mounted at once and a bare
-  // document.querySelector would drive whichever comes first (B1). No
-  // document fallback — if this composer has no trigger, we say so.
-  const root = anchor?.closest<HTMLElement>(COMPOSER_ROOT_SELECTOR) ?? null;
-  return root?.querySelector<HTMLButtonElement>(MODEL_TRIGGER_SELECTOR) ?? null;
-}
-
-/**
- * Open the native BB composer model picker popover.
- */
-export function openNativeModelPicker(anchor?: HTMLElement | null): void {
-  const triggerBtn = findModelTrigger(anchor);
-  if (!triggerBtn || triggerBtn.disabled || triggerBtn.getAttribute("aria-disabled") === "true") {
-    return;
-  }
-  // Only click when OUR popover is not already open — a foreign composer's
-  // open listbox must not suppress (or be hijacked for) this one.
-  if (!findOwnedPopover(triggerBtn)) {
-    triggerBtn.click();
-  }
-}
-
-/**
- * Fast programmatic model switcher:
- * Opens the composer's model picker, clicks the matching model option, and closes it.
- */
-export type SwitchFailure =
-  | "no-trigger"
-  | "trigger-disabled"
-  | "no-popover"
-  | "provider-tab-missing"
-  | "model-not-found"
-  | "unconfirmed"
-  | "cancelled";
-
-export interface SwitchResult {
-  ok: boolean;
-  reason?: SwitchFailure;
-}
-
-/**
- * Cancellation (B3): tokens are PER TRIGGER. A new switch on the same
- * composer cancels the previous one, and `cancelPendingSwitch(anchor)`
- * cancels only that composer's loop — another composer unmounting must not
- * abort a switch the user started elsewhere. Tokens also die with their
- * trigger (`isConnected`), so a removed composer frees itself.
- */
-const pendingSwitches = new Map<HTMLElement, { cancelled: boolean }>();
-
-export function cancelPendingSwitch(anchor?: HTMLElement | null): void {
-  if (anchor === undefined || anchor === null) {
-    for (const token of pendingSwitches.values()) token.cancelled = true;
-    return;
-  }
-  const trigger = findModelTrigger(anchor);
-  const token = trigger ? pendingSwitches.get(trigger) : undefined;
-  if (token) token.cancelled = true;
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-export async function switchComposerModel(
-  modelId: string,
-  providerId?: string,
-  anchor?: HTMLElement | null
-): Promise<SwitchResult> {
-  const triggerBtn = findModelTrigger(anchor);
-  if (!triggerBtn) return { ok: false, reason: "no-trigger" };
-  // BB disables the trigger while the model is locked (e.g. mid-run); a click
-  // on a disabled button is silently swallowed, so report it instead.
-  if (triggerBtn.disabled || triggerBtn.getAttribute("aria-disabled") === "true") {
-    return { ok: false, reason: "trigger-disabled" };
-  }
-
-  const token = { cancelled: false };
-  const prev = pendingSwitches.get(triggerBtn);
-  if (prev) prev.cancelled = true;
-  pendingSwitches.set(triggerBtn, token);
-  const alive = () => !token.cancelled && triggerBtn.isConnected;
-
-  try {
-    return await runSwitch(modelId, providerId, triggerBtn, alive);
-  } finally {
-    if (pendingSwitches.get(triggerBtn) === token) pendingSwitches.delete(triggerBtn);
-  }
-}
-
-async function runSwitch(
-  modelId: string,
-  providerId: string | undefined,
-  triggerBtn: HTMLButtonElement,
-  alive: () => boolean
-): Promise<SwitchResult> {
-  if (!findOwnedPopover(triggerBtn)) {
-    triggerBtn.click();
-  }
-
-  // Wait for THIS trigger's popover — a listbox already open for another
-  // composer is ignored, not adopted (B1).
-  let popover: HTMLElement | null = null;
-  for (let i = 0; i < 40 && alive(); i++) {
-    popover = findOwnedPopover(triggerBtn);
-    if (popover) break;
-    await sleep(25);
-  }
-  if (!alive()) return { ok: false, reason: "cancelled" };
-  if (!popover) return { ok: false, reason: "no-popover" };
-
-  // Provider tabs render only when the composer offers more than one provider.
-  const closeOurPopover = () => {
-    const live = findOwnedPopover(triggerBtn) || popover;
-    if (live?.isConnected) {
-      live.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    }
-  };
-  const wantProvider = providerId ? resolveProviderKey(providerId) : null;
-  if (wantProvider) {
-    let tabs = providerTabs(popover);
-    let target = tabs.find((tab) => resolvePickerProvider(providerTabLabel(tab)) === wantProvider);
-    if (target) {
-      if (!tabIsActive(target)) {
-        target.click();
-        // The tab's list re-renders asynchronously: rows from the PREVIOUS
-        // provider are still clickable until the new tab shows active, so we
-        // must wait for that signal before matching anything (B3).
-        for (let i = 0; i < 40 && alive(); i++) {
-          const live = findOwnedPopover(triggerBtn) || popover;
-          tabs = providerTabs(live);
-          const fresh = tabs.find(
-            (tab) => resolvePickerProvider(providerTabLabel(tab)) === wantProvider
-          );
-          if (fresh) target = fresh;
-          if (tabIsActive(target)) break;
-          await sleep(25);
-        }
-        if (!alive()) return { ok: false, reason: "cancelled" };
-        if (!tabIsActive(target)) {
-          // Leave no menu WE opened hanging behind a reported failure.
-          closeOurPopover();
-          return { ok: false, reason: "provider-tab-missing" };
-        }
-      }
-    } else if (tabs.length > 0) {
-      closeOurPopover();
-      return { ok: false, reason: "provider-tab-missing" };
-    } else {
-      // Single-provider picker: nothing to click, but still verify the
-      // composer's actual provider against the requested one (M2).
-      const actual = resolvePickerProvider(providerLabelFromTrigger(triggerBtn));
-      if (actual !== "default" && actual !== wantProvider) {
-        closeOurPopover();
-        return { ok: false, reason: "provider-tab-missing" };
-      }
-    }
-  }
-
-  // Find the option. Poll: the list itself may still be loading, the tab
-  // switch re-renders it, and "More models"/search may have to reveal it (M3).
-  let expandedMore = false;
-  let searchedInput: HTMLInputElement | null = null;
-  const fail = (reason: SwitchFailure): SwitchResult => {
-    cleanupSwitchRemnants(popover, searchedInput);
-    return { ok: false, reason };
-  };
-  for (let i = 0; i < 40 && alive(); i++) {
-    const live = findOwnedPopover(triggerBtn);
-    if (!live) {
-      // The popover was open and is gone (Escape, outside click): abort —
-      // a menu the USER reopens later must not receive our click.
-      return fail("cancelled");
-    }
-    popover = live;
-
-    for (const opt of [...scanOptions(popover), ...scanSubmenuOptions(popover)]) {
-      const ex = extractModelOption(opt);
-      if (ex.key !== modelId && ex.modelId !== modelId) continue;
-      if (opt.disabled || opt.getAttribute("aria-disabled") === "true") {
-        // A disabled row cannot apply anything — keep scanning instead of
-        // reporting a click that did nothing (M1).
-        continue;
-      }
-      opt.click();
-      return await confirmSwitch(alive, triggerBtn, live, ex);
-    }
-
-    if (!expandedMore) {
-      const more = Array.from(popover.querySelectorAll<HTMLButtonElement>("button")).find(
-        (b) =>
-          !b.hasAttribute("data-bb-fav-clone") &&
-          !b.closest(".bb-fav-pin-section") &&
-          ((b.getAttribute("id") || "").includes("more-toggle") ||
-            (b.textContent || "").trim().startsWith("More models"))
-      );
-      if (more) {
-        expandedMore = true;
-        more.click();
-        continue;
-      }
-    }
-
-    if (!searchedInput) {
-      const input = popover.querySelector<HTMLInputElement>(MODEL_SEARCH_SELECTOR);
-      if (input) {
-        searchedInput = input;
-        setNativeInputValue(input, modelId.split(" · ")[0]);
-        continue;
-      }
-    }
-
-    await sleep(25);
-  }
-
-  if (!alive()) return fail("cancelled");
-  return fail("model-not-found");
-}
-
 /** More models uses a separate Radix Popover on desktop (BB ve/ye).
  * Follow only the owner's More button. Its portal rows have title spans
  * even though they have neither option ids nor option roles. */
@@ -936,73 +712,4 @@ function scanPortalOptions(submenu: HTMLElement): HTMLButtonElement[] {
   return Array.from(submenu.querySelectorAll<HTMLButtonElement>("button")).filter(
     (button) => !button.closest(".bb-fav-pin-section") && !!button.querySelector(":scope > span.truncate[title]")
   );
-}
-
-function scanSubmenuOptions(popover: HTMLElement): HTMLButtonElement[] {
-  return findMoreSubmenus(popover).flatMap(scanPortalOptions);
-}
-
-/**
- * Undo whatever the failed scan left behind: the search text WE typed and
- * any menu surface we opened (the popover plus portal submenus it spawned).
- */
-function cleanupSwitchRemnants(
-  popover: HTMLElement | null,
-  searchedInput: HTMLInputElement | null
-): void {
-  if (searchedInput?.isConnected && searchedInput.value) {
-    setNativeInputValue(searchedInput, "");
-  }
-  if (!popover?.isConnected) return;
-  for (const submenu of findMoreSubmenus(popover)) {
-    submenu.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-  }
-  popover.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-}
-
-/**
- * After the option click, prove the switch actually happened before claiming
- * success (M1): the owned popover closing, or the trigger reporting the new
- * model, counts. An unconfirmed attempt closes our own popover and reports
- * failure instead of a false "ok".
- */
-async function confirmSwitch(
-  alive: () => boolean,
-  triggerBtn: HTMLButtonElement,
-  popover: HTMLElement,
-  ex: ModelOption
-): Promise<SwitchResult> {
-  for (let i = 0; i < 24 && alive(); i++) {
-    await sleep(25);
-    if (!popover.isConnected) return { ok: true };
-    const owned = findOwnedPopover(triggerBtn);
-    if (!owned) return { ok: true };
-    if (triggerShowsModel(triggerBtn, ex)) return { ok: true };
-  }
-  if (!alive()) return { ok: false, reason: "cancelled" };
-  // Leave no orphan menu we opened behind.
-  popover.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-  return { ok: false, reason: "unconfirmed" };
-}
-
-function triggerShowsModel(triggerBtn: HTMLButtonElement, ex: ModelOption): boolean {
-  const titleElem = triggerBtn.hasAttribute("title") ? triggerBtn : triggerBtn.querySelector("[title]");
-  const fullTitle = titleElem?.getAttribute("title") || "";
-  if (!fullTitle.includes(":")) return false;
-  const modelPart = cleanModelText(fullTitle.split(":").slice(1).join(":").trim());
-  // The trigger appends its own qualifier ("· high reasoning"), so the bare
-  // label head counts too — but never a substring ("M2" must not confirm a
-  // click on "M").
-  const head = modelPart.split(" · ")[0].trim();
-  return modelPart === ex.modelId || modelPart === ex.key || head === ex.modelId;
-}
-
-function setNativeInputValue(input: HTMLInputElement, value: string): void {
-  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-  if (setter) {
-    setter.call(input, value);
-  } else {
-    input.value = value;
-  }
-  input.dispatchEvent(new Event("input", { bubbles: true }));
 }

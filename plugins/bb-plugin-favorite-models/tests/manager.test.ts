@@ -15,7 +15,7 @@ const snapshot = (
   version: number,
   favorites: Record<string, string[]> = {},
   modelLabels: Record<string, string> = {},
-  config = { pinToTop: true, showQuickBar: true }
+  config = { pinToTop: true }
 ) => ({ version, favorites, modelLabels, config });
 
 async function freshManager(): Promise<Manager> {
@@ -248,7 +248,7 @@ describe("updateConfig honest result (review minor)", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
-        rpcResponse({ success: false, config: { pinToTop: true, showQuickBar: true } })
+        rpcResponse({ success: false, config: { pinToTop: true } })
       )
     );
     const ok = await mgr.updateConfig({ pinToTop: false });
@@ -261,7 +261,7 @@ describe("updateConfig honest result (review minor)", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
-        rpcResponse({ success: true, config: { pinToTop: false, showQuickBar: true } })
+        rpcResponse({ success: true, config: { pinToTop: false } })
       )
     );
     const ok = await mgr.updateConfig({ pinToTop: false });
@@ -312,10 +312,10 @@ describe("live sync and the pending queue", () => {
     expect(mgr.getState().favorites.codex).toEqual(["initial"]);
 
     // A native settings change does not have to update favorites.version.
-    remote = snapshot(1, { codex: ["initial"] }, {}, { pinToTop: false, showQuickBar: false });
+    remote = snapshot(1, { codex: ["initial"] }, {}, { pinToTop: false });
     window.dispatchEvent(new Event("focus"));
     await vi.advanceTimersByTimeAsync(0);
-    expect(mgr.getState()).toMatchObject({ pinToTop: false, showQuickBar: false });
+    expect(mgr.getState()).toMatchObject({ pinToTop: false });
 
     visibility = "hidden";
     document.dispatchEvent(new Event("visibilitychange"));

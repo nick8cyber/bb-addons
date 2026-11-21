@@ -18,7 +18,7 @@ import {
 
 export { cleanModelText };
 
-type Config = { pinToTop: boolean; showQuickBar: boolean };
+type Config = { pinToTop: boolean };
 export interface FavoritesState extends Config {
   favorites: FavoritesMap;
   modelLabels: ModelLabels;
@@ -39,7 +39,6 @@ const DEFAULT_STATE: FavoritesState = {
   favorites: {},
   modelLabels: {},
   pinToTop: true,
-  showQuickBar: true,
 };
 
 type ModelInput = { providerId: string; modelId: string };
@@ -72,7 +71,6 @@ function loadInitialState(): FavoritesState {
     return {
       ...migrateStore(parsed.favorites ?? {}, parsed.modelLabels ?? {}),
       pinToTop: typeof parsed.pinToTop === "boolean" ? parsed.pinToTop : true,
-      showQuickBar: typeof parsed.showQuickBar === "boolean" ? parsed.showQuickBar : true,
     };
   } catch {
     return { ...DEFAULT_STATE };
@@ -118,25 +116,6 @@ export function resolveProviderKey(provider: string): string {
 
 export function resolvePickerProvider(label: string): string {
   return resolvePickerProviderId(label, directory);
-}
-
-export function getProviderDisplayName(providerId: string): string {
-  const name = directory.find(({ id }) => id === providerId)?.displayName;
-  if (name) return name;
-  switch (providerId) {
-    case "codex": return "Codex (OpenAI)";
-    case "provider-claude-code":
-    case "claude-code": return "Claude Code";
-    case "agy": return "Antigravity (agy)";
-    case "provider-pi": return "Pi";
-    case "acp-opencode": return "OpenCode";
-    case "acp-devin": return "Devin";
-    case "acp-cursor": return "Cursor";
-    case "acp-antigravity": return "Google Antigravity";
-    case "acp-web-gemini": return "ACP Web Gemini";
-    case "default": return "Текущий провайдер";
-    default: return providerId.charAt(0).toUpperCase() + providerId.slice(1);
-  }
 }
 
 export function subscribe(listener: (state: FavoritesState) => void): () => void {
@@ -330,20 +309,12 @@ export function isFavorite(providerId: string, modelId: string): boolean {
   return currentState.favorites[resolveProviderKey(providerId)]?.includes(modelId) ?? false;
 }
 
-export function getFavoritesForProvider(providerId: string): string[] {
-  return [...(currentState.favorites[resolveProviderKey(providerId)] ?? [])];
-}
-
 export function getAllFavorites(): FavoritesMap {
   return { ...currentState.favorites };
 }
 
 export function getFavoritesCount(): number {
   return Object.values(currentState.favorites).reduce((count, list) => count + list.length, 0);
-}
-
-export function getModelLabel(providerId: string, modelId: string): string {
-  return cleanModelText(currentState.modelLabels[labelKey(resolveProviderKey(providerId), modelId)] || modelId);
 }
 
 export function addFavorite(providerId: string, modelId: string, label?: string): Promise<boolean> {

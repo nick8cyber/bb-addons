@@ -97,7 +97,7 @@ const call = (ctx: Awaited<ReturnType<typeof loadPlugin>>, method: string, input
     version: number;
     favorites: Record<string, string[]>;
     modelLabels: Record<string, string>;
-    config: { pinToTop: boolean; showQuickBar: boolean };
+    config: { pinToTop: boolean };
   }>;
 
 describe("server store (M10)", () => {
@@ -175,14 +175,14 @@ describe("server RPC add/remove (M9, m3)", () => {
 describe("updateConfig (M13)", () => {
   it("writes through to bb.settings, not a KV override", async () => {
     const ctx = await loadPlugin();
-    const res = (await call(ctx, "updateConfig", { showQuickBar: false })) as unknown as {
+    const res = (await call(ctx, "updateConfig", { pinToTop: false })) as unknown as {
       success: boolean;
-      config: { pinToTop: boolean; showQuickBar: boolean };
+      config: { pinToTop: boolean };
     };
     expect(res.success).toBe(true);
-    expect(res.config.showQuickBar).toBe(false);
-    expect(ctx.settings.showQuickBar).toBe(false);
-    expect(ctx.setCalls).toEqual([{ showQuickBar: false }]);
+    expect(res.config.pinToTop).toBe(false);
+    expect(ctx.settings.pinToTop).toBe(false);
+    expect(ctx.setCalls).toEqual([{ pinToTop: false }]);
     // No KV config key is created — settings stay the single source.
     expect([...ctx.kv.keys()].filter((k) => k.includes("config"))).toEqual([]);
   });
