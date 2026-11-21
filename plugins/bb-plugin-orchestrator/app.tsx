@@ -172,8 +172,8 @@ function RoleApprovalMenu() {
 
     void loadRole();
 
-    // Mode loading for current thread/project
-    const targetPid = effectivePid ?? undefined;
+    // Mode loading for current thread/project: inside thread, omit targetPid so thread's project resolves cleanly without stale state from previous thread
+    const targetPid = isThread ? undefined : (projectId ?? undefined);
     if (role === "orchestrator") {
       void rpc
         .call("projectApprovalMode", { projectId: targetPid, threadId: threadId ?? undefined })

@@ -24,6 +24,7 @@
   ],
   "scripts": {
     "build": "bb plugin build",
+    "postbuild": "node --experimental-strip-types -e 'import(\"./src/build-check.ts\").then(m => m.writeBuildInfo())'",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --import ./tests/register-hooks.ts --test tests/*.test.ts"
   },
