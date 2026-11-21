@@ -4054,3 +4054,157 @@ test("20. PLUG-304: turn completion predicate and thinking/pause guards", async 
     Date.now = realDateNow;
   }
 });
+
+test("21. PLUG-376: collectGeneratedFiles channels — fetch->blob, new tab, force-click, Drive gate", async () => {
+  const dlDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "plug376-dl-")));
+  const scanOf = (candidates, meta = {}) => ({ candidates, meta });
+  const neverEvent = () => new Promise(() => {});
+
+  /* --- A. fetch->blob: download-ивента нет, файл собран через blob-хук --- */
+  const blobPayload = Buffer.from("PNG-BLOB-DATA");
+  let blobReady = false;
+  const blobPage = {
+    evaluate: async (fn, arg) => {
+      if (arg && arg.candSrc) {
+        return scanOf([{ kind: "click", tag: "n0-0", name: "Скачать изображение" }]);
+      }
+      if (typeof arg === "string" && arg.startsWith("blob:")) {
+        return { b64: blobPayload.toString("base64"), mime: "image/png" };
+      }
+      if (arg && typeof arg.since === "number") {
+        return blobReady ? [{ url: "blob:https://gemini.google.com/uuid-9", type: "image/png", ts: Date.now() }] : [];
+      }
+      return null;
+    },
+    $: async () => ({ click: async () => { blobReady = true; } }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    waitForEvent: neverEvent,
+  };
+  const collBlob = await collectGeneratedFiles(blobPage, { dir: dlDir, sessionId: "s-a" });
+  assert.equal(collBlob.files.length, 1, `blob file expected, got ${JSON.stringify(collBlob)}`);
+  assert.equal(collBlob.skipped.length, 0);
+  assert.equal(fs.readFileSync(collBlob.files[0].path, "utf8"), "PNG-BLOB-DATA");
+  assert.equal(collBlob.files[0].mimeType, "image/png");
+
+  /* --- B. Новая вкладка: URL страницы стянут через request-контекст --- */
+  let emitNewPage = null;
+  let newPageClosed = false;
+  const imgPayload = Buffer.from("FULL-SIZE-IMG");
+  const newTabPage = {
+    evaluate: async (fn, arg) => {
+      if (arg && arg.candSrc) {
+        return scanOf([{ kind: "click", tag: "n0-1", name: "Скачать изображение в полном размере" }]);
+      }
+      return null;
+    },
+    $: async () => ({ click: async () => { if (emitNewPage) await emitNewPage(); } }),
+    context: () => ({
+      once: (ev, fn) => {
+        if (ev === "page") {
+          emitNewPage = async () =>
+            fn({
+              url: () => "https://lh3.googleusercontent.com/full/img.png",
+              waitForLoadState: async () => {},
+              close: async () => { newPageClosed = true; },
+            });
+        }
+      },
+      request: {
+        get: async (url) => {
+          assert.equal(url, "https://lh3.googleusercontent.com/full/img.png");
+          return {
+            ok: () => true,
+            headers: () => ({
+              "content-disposition": 'attachment; filename="full.png"',
+              "content-type": "image/png",
+            }),
+            body: async () => imgPayload,
+          };
+        },
+      },
+    }),
+    waitForEvent: neverEvent,
+  };
+  const collTab = await collectGeneratedFiles(newTabPage, { dir: dlDir, sessionId: "s-b" });
+  assert.equal(collTab.files.length, 1, `new-tab file expected, got ${JSON.stringify(collTab)}`);
+  assert.equal(collTab.skipped.length, 0);
+  assert.equal(collTab.files[0].name, "full.png");
+  assert.equal(fs.readFileSync(collTab.files[0].path, "utf8"), "FULL-SIZE-IMG");
+  assert.ok(newPageClosed, "opened tab must be closed");
+
+  /* --- C. Нестабильный элемент: обычный click падает, force-путь срабатывает --- */
+  let clickCalls = [];
+  const forcePage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-2", name: "Скачать код" }]) : null,
+    $: async () => ({
+      scrollIntoViewIfNeeded: async () => {},
+      click: async (opts) => {
+        clickCalls.push(opts);
+        if (!opts || opts.force !== true) throw new Error("element is not stable");
+      },
+      dispatchEvent: async () => {},
+    }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    waitForEvent: async (ev) => {
+      assert.equal(ev, "download");
+      return {
+        suggestedFilename: () => "code.html",
+        url: () => "https://gemini.google.com/dl/code",
+        saveAs: async (p) => fs.writeFileSync(p, "CODE-BODY"),
+      };
+    },
+  };
+  const collForce = await collectGeneratedFiles(forcePage, { dir: dlDir, sessionId: "s-c" });
+  assert.equal(collForce.files.length, 1, `force-click file expected, got ${JSON.stringify(collForce)}`);
+  assert.equal(collForce.skipped.length, 0);
+  assert.equal(collForce.files[0].name, "code.html");
+  assert.equal(fs.readFileSync(collForce.files[0].path, "utf8"), "CODE-BODY");
+  assert.equal(clickCalls.length, 2, "plain click must fail, then force retry");
+  assert.equal(clickCalls[1].force, true);
+
+  /* --- D. Drive-гейт: новая вкладка на docs.google.com --- */
+  let emitDocsPage = null;
+  const docsTabPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-3", name: "Экспортировать" }]) : null,
+    $: async () => ({ click: async () => { if (emitDocsPage) await emitDocsPage(); } }),
+    context: () => ({
+      once: (ev, fn) => {
+        if (ev === "page") {
+          emitDocsPage = async () =>
+            fn({
+              url: () => "https://docs.google.com/presentation/d/abc/edit",
+              waitForLoadState: async () => {},
+              close: async () => {},
+            });
+        }
+      },
+      request: { get: async () => { throw new Error("drive viewer must not be fetched"); } },
+    }),
+    waitForEvent: neverEvent,
+  };
+  const collDocs = await collectGeneratedFiles(docsTabPage, { dir: dlDir, sessionId: "s-d" });
+  assert.equal(collDocs.files.length, 0);
+  assert.equal(collDocs.skipped.length, 1);
+  assert.match(collDocs.skipped[0].reason, /requires Google Drive integration/);
+
+  /* --- E. Drive-гейт и неэкспортируемый контент из скана DOM --- */
+  const gatePage = {
+    evaluate: async () => scanOf([], { driveGate: true }),
+    context: () => ({ request: { get: async () => ({}) } }),
+  };
+  const collGate = await collectGeneratedFiles(gatePage, { dir: dlDir, sessionId: "s-e" });
+  assert.equal(collGate.files.length, 0);
+  assert.deepEqual(collGate.skipped, [{ name: "generated file", reason: "requires Google Drive integration" }]);
+
+  const asyncPage = {
+    evaluate: async () => scanOf([], { nonExportable: true, mediaKind: "async media" }),
+    context: () => ({ request: { get: async () => ({}) } }),
+  };
+  const collAsync = await collectGeneratedFiles(asyncPage, { dir: dlDir, sessionId: "s-e2" });
+  assert.equal(collAsync.files.length, 0);
+  assert.deepEqual(collAsync.skipped, [
+    { name: "generated async media", reason: "файл не экспортируем в этом ходе" },
+  ]);
+});
