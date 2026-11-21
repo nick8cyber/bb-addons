@@ -4054,3 +4054,382 @@ test("20. PLUG-304: turn completion predicate and thinking/pause guards", async 
     Date.now = realDateNow;
   }
 });
+
+test("21. PLUG-376: collectGeneratedFiles channels — fetch->blob, new tab, force-click, Drive gate", async () => {
+  const dlDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "plug376-dl-")));
+  const scanOf = (candidates, meta = {}) => ({ candidates, meta });
+  const neverEvent = () => new Promise(() => {});
+
+  /* --- A. fetch->blob: download-ивента нет, файл собран через blob-хук --- */
+  const blobPayload = Buffer.from("PNG-BLOB-DATA");
+  let blobReady = false;
+  const blobPage = {
+    evaluate: async (fn, arg) => {
+      if (arg && arg.candSrc) {
+        return scanOf([{ kind: "click", tag: "n0-0", name: "Скачать изображение" }]);
+      }
+      if (arg && typeof arg.url === "string" && arg.url.startsWith("blob:")) {
+        return { b64: blobPayload.toString("base64"), mime: "image/png" };
+      }
+      if (arg && typeof arg.since === "number") {
+        return blobReady ? [{ url: "blob:https://gemini.google.com/uuid-9", type: "image/png", ts: Date.now() }] : [];
+      }
+      return null;
+    },
+    $: async () => ({ click: async () => { blobReady = true; } }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    waitForEvent: neverEvent,
+  };
+  const collBlob = await collectGeneratedFiles(blobPage, { dir: dlDir, sessionId: "s-a" });
+  assert.equal(collBlob.files.length, 1, `blob file expected, got ${JSON.stringify(collBlob)}`);
+  assert.equal(collBlob.skipped.length, 0);
+  assert.equal(fs.readFileSync(collBlob.files[0].path, "utf8"), "PNG-BLOB-DATA");
+  assert.equal(collBlob.files[0].mimeType, "image/png");
+
+  /* --- B. Новая вкладка: URL страницы стянут через request-контекст --- */
+  let emitNewPage = null;
+  let newPageClosed = false;
+  const imgPayload = Buffer.from("FULL-SIZE-IMG");
+  const newTabPage = {
+    evaluate: async (fn, arg) => {
+      if (arg && arg.candSrc) {
+        return scanOf([{ kind: "click", tag: "n0-1", name: "Скачать изображение в полном размере" }]);
+      }
+      return null;
+    },
+    $: async () => ({ click: async () => { if (emitNewPage) await emitNewPage(); } }),
+    context: () => ({
+      once: (ev, fn) => {
+        if (ev === "page") {
+          emitNewPage = async () =>
+            fn({
+              url: () => "https://lh3.googleusercontent.com/full/img.png",
+              waitForLoadState: async () => {},
+              close: async () => { newPageClosed = true; },
+            });
+        }
+      },
+      request: {
+        get: async (url) => {
+          assert.equal(url, "https://lh3.googleusercontent.com/full/img.png");
+          return {
+            ok: () => true,
+            headers: () => ({
+              "content-disposition": 'attachment; filename="full.png"',
+              "content-type": "image/png",
+            }),
+            body: async () => imgPayload,
+          };
+        },
+      },
+    }),
+    waitForEvent: neverEvent,
+  };
+  const collTab = await collectGeneratedFiles(newTabPage, { dir: dlDir, sessionId: "s-b" });
+  assert.equal(collTab.files.length, 1, `new-tab file expected, got ${JSON.stringify(collTab)}`);
+  assert.equal(collTab.skipped.length, 0);
+  assert.equal(collTab.files[0].name, "full.png");
+  assert.equal(fs.readFileSync(collTab.files[0].path, "utf8"), "FULL-SIZE-IMG");
+  assert.ok(newPageClosed, "opened tab must be closed");
+
+  /* --- C. Нестабильный элемент: обычный click падает, force-путь срабатывает --- */
+  let clickCalls = [];
+  const forcePage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-2", name: "Скачать код" }]) : null,
+    $: async () => ({
+      scrollIntoViewIfNeeded: async () => {},
+      click: async (opts) => {
+        clickCalls.push(opts);
+        if (!opts || opts.force !== true) throw new Error("element is not stable");
+      },
+      dispatchEvent: async () => {},
+    }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    waitForEvent: async (ev) => {
+      assert.equal(ev, "download");
+      return {
+        suggestedFilename: () => "code.html",
+        url: () => "https://gemini.google.com/dl/code",
+        saveAs: async (p) => fs.writeFileSync(p, "CODE-BODY"),
+      };
+    },
+  };
+  const collForce = await collectGeneratedFiles(forcePage, { dir: dlDir, sessionId: "s-c" });
+  assert.equal(collForce.files.length, 1, `force-click file expected, got ${JSON.stringify(collForce)}`);
+  assert.equal(collForce.skipped.length, 0);
+  assert.equal(collForce.files[0].name, "code.html");
+  assert.equal(fs.readFileSync(collForce.files[0].path, "utf8"), "CODE-BODY");
+  assert.equal(clickCalls.length, 2, "plain click must fail, then force retry");
+  assert.equal(clickCalls[1].force, true);
+
+  /* --- D. Drive-гейт: новая вкладка на docs.google.com --- */
+  let emitDocsPage = null;
+  const docsTabPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-3", name: "Экспортировать" }]) : null,
+    $: async () => ({ click: async () => { if (emitDocsPage) await emitDocsPage(); } }),
+    context: () => ({
+      once: (ev, fn) => {
+        if (ev === "page") {
+          emitDocsPage = async () =>
+            fn({
+              url: () => "https://docs.google.com/presentation/d/abc/edit",
+              waitForLoadState: async () => {},
+              close: async () => {},
+            });
+        }
+      },
+      request: { get: async () => { throw new Error("drive viewer must not be fetched"); } },
+    }),
+    waitForEvent: neverEvent,
+  };
+  const collDocs = await collectGeneratedFiles(docsTabPage, { dir: dlDir, sessionId: "s-d" });
+  assert.equal(collDocs.files.length, 0);
+  assert.equal(collDocs.skipped.length, 1);
+  assert.match(collDocs.skipped[0].reason, /requires Google Drive integration/);
+
+  /* --- E. Drive-гейт и неэкспортируемый контент из скана DOM --- */
+  const gatePage = {
+    evaluate: async () => scanOf([], { driveGate: true }),
+    context: () => ({ request: { get: async () => ({}) } }),
+  };
+  const collGate = await collectGeneratedFiles(gatePage, { dir: dlDir, sessionId: "s-e" });
+  assert.equal(collGate.files.length, 0);
+  assert.deepEqual(collGate.skipped, [{ name: "generated file", reason: "requires Google Drive integration" }]);
+
+  const asyncPage = {
+    evaluate: async () => scanOf([], { nonExportable: true, mediaKind: "async media" }),
+    context: () => ({ request: { get: async () => ({}) } }),
+  };
+  const collAsync = await collectGeneratedFiles(asyncPage, { dir: dlDir, sessionId: "s-e2" });
+  assert.equal(collAsync.files.length, 0);
+  assert.deepEqual(collAsync.skipped, [
+    { name: "generated async media", reason: "файл не экспортируем в этом ходе" },
+  ]);
+});
+
+test("22. PLUG-376 review fixes: response channel, host/redirect re-checks, about:blank tab, listener cleanup", async () => {
+  const dlDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "plug376b-dl-")));
+  const scanOf = (candidates, meta = {}) => ({ candidates, meta });
+  const neverEvent = () => new Promise(() => {});
+
+  /* --- F. Сетевой ответ-файл: body сохранён; чужой хост и телеметрия не побеждают --- */
+  const respPayload = Buffer.from("RESP-FILE-BODY");
+  let respFire = null;
+  const respPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-4", name: "Экспортировать" }]) : null,
+    $: async () => ({
+      click: async () => {
+        respFire({
+          url: () => "https://evil.example.com/track.bin",
+          status: () => 200,
+          headers: () => ({ "content-type": "application/octet-stream" }),
+          body: async () => Buffer.from("EVIL"),
+        });
+        respFire({
+          url: () => "https://gemini.google.com/_/data/batchexecute",
+          status: () => 200,
+          headers: () => ({ "content-type": "application/octet-stream" }),
+          body: async () => Buffer.from("RPC"),
+        });
+        respFire({
+          url: () => "https://gemini.google.com/dl/report",
+          status: () => 200,
+          headers: () => ({
+            "content-disposition": 'attachment; filename="report.csv"',
+            "content-type": "text/csv",
+          }),
+          body: async () => respPayload,
+        });
+      },
+    }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    on: (ev, fn) => {
+      if (ev === "response") respFire = fn;
+    },
+    off: () => {},
+    waitForEvent: neverEvent,
+  };
+  const collResp = await collectGeneratedFiles(respPage, { dir: dlDir, sessionId: "s-f" });
+  assert.equal(collResp.files.length, 1, `response file expected, got ${JSON.stringify(collResp)}`);
+  assert.equal(collResp.skipped.length, 0);
+  assert.equal(collResp.files[0].name, "report.csv");
+  assert.equal(fs.readFileSync(collResp.files[0].path, "utf8"), "RESP-FILE-BODY");
+
+  /* --- G. Link на docs.google.com — Drive-гейт без запроса --- */
+  const getCalls = [];
+  const gateLinkPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc
+        ? scanOf([
+            { kind: "link", tag: "n0-5", href: "https://docs.google.com/document/d/x", name: "doc", canClick: false },
+          ])
+        : null,
+    context: () => ({
+      request: {
+        get: async (u) => {
+          getCalls.push(u);
+          throw new Error("must not fetch drive viewer");
+        },
+      },
+    }),
+  };
+  const collGateLink = await collectGeneratedFiles(gateLinkPage, { dir: dlDir, sessionId: "s-g" });
+  assert.equal(collGateLink.files.length, 0);
+  assert.deepEqual(collGateLink.skipped, [{ name: "doc", reason: "requires Google Drive integration" }]);
+  assert.equal(getCalls.length, 0, "drive link must not be fetched");
+
+  /* --- H. Link с редиректом на чужой хост — финальный URL проверяется --- */
+  const redirPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc
+        ? scanOf([
+            { kind: "link", tag: "n0-6", href: "https://gemini.google.com/dl/x", name: "file.bin", canClick: false },
+          ])
+        : null,
+    context: () => ({
+      request: {
+        get: async () => ({
+          ok: () => true,
+          url: () => "https://cdn.evil.example.com/f.bin",
+          headers: () => ({ "content-type": "application/octet-stream" }),
+          body: async () => Buffer.from("EVIL-REDIR"),
+        }),
+      },
+    }),
+  };
+  const collRedir = await collectGeneratedFiles(redirPage, { dir: dlDir, sessionId: "s-h" });
+  assert.equal(collRedir.files.length, 0);
+  assert.equal(collRedir.skipped.length, 1);
+  assert.match(collRedir.skipped[0].reason, /host not allowed \(cdn\.evil\.example\.com\)/);
+
+  /* --- I. Новая вкладка about:blank → позже реальный URL: собираем --- */
+  let emitTab = null;
+  let tabClosed = false;
+  const tabState = { url: "about:blank" };
+  const blankTabPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-7", name: "Открыть файл" }]) : null,
+    $: async () => ({
+      click: async () => {
+        if (emitTab) await emitTab();
+        setTimeout(() => {
+          tabState.url = "https://lh3.googleusercontent.com/doc.pdf";
+        }, 150);
+      },
+    }),
+    context: () => ({
+      on: (ev, fn) => {
+        if (ev === "page") {
+          emitTab = async () =>
+            fn({
+              url: () => tabState.url,
+              waitForLoadState: async () => {},
+              close: async () => {
+                tabClosed = true;
+              },
+            });
+        }
+      },
+      off: () => {},
+      request: {
+        get: async (url) => ({
+          ok: () => true,
+          url: () => url,
+          headers: () => ({ "content-type": "application/pdf" }),
+          body: async () => Buffer.from("PDF-DATA"),
+        }),
+      },
+    }),
+    waitForEvent: neverEvent,
+  };
+  const collBlank = await collectGeneratedFiles(blankTabPage, { dir: dlDir, sessionId: "s-i" });
+  assert.equal(collBlank.files.length, 1, `about:blank tab file expected, got ${JSON.stringify(collBlank)}`);
+  assert.equal(collBlank.skipped.length, 0);
+  assert.equal(fs.readFileSync(collBlank.files[0].path, "utf8"), "PDF-DATA");
+  assert.ok(tabClosed, "opened tab must be closed");
+
+  /* --- J. dispatchEvent-fallback: оба click падают, dispatch срабатывает --- */
+  let dispatchUsed = false;
+  let dlFireJ = null;
+  const dlObjJ = {
+    url: () => "https://gemini.google.com/dl/y",
+    suggestedFilename: () => "disp.txt",
+    saveAs: async (p) => fs.writeFileSync(p, "DISP-BODY"),
+  };
+  const dispPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc ? scanOf([{ kind: "click", tag: "n0-8", name: "Скачать" }]) : null,
+    $: async () => ({
+      scrollIntoViewIfNeeded: async () => {},
+      click: async () => {
+        throw new Error("element is not stable");
+      },
+      dispatchEvent: async () => {
+        dispatchUsed = true;
+        if (dlFireJ) dlFireJ(dlObjJ);
+      },
+    }),
+    context: () => ({ request: { get: async () => { throw new Error("must not fetch"); } } }),
+    on: (ev, fn) => {
+      if (ev === "download") dlFireJ = fn;
+    },
+    off: () => {},
+    waitForEvent: neverEvent,
+  };
+  const collDisp = await collectGeneratedFiles(dispPage, { dir: dlDir, sessionId: "s-j" });
+  assert.equal(collDisp.files.length, 1, `dispatch file expected, got ${JSON.stringify(collDisp)}`);
+  assert.equal(collDisp.files[0].name, "disp.txt");
+  assert.ok(dispatchUsed, "dispatchEvent fallback must be used");
+
+  /* --- K. Утечки нет: каждый кандидат снимает ctx 'page' и page-слушатели --- */
+  const ctxOffCalls = [];
+  const pageOffCalls = [];
+  let dlFireK = null;
+  const mkDl = (n) => ({
+    url: () => "https://gemini.google.com/dl/z",
+    suggestedFilename: () => n,
+    saveAs: async (p) => fs.writeFileSync(p, `BODY-${n}`),
+  });
+  const leakPage = {
+    evaluate: async (fn, arg) =>
+      arg && arg.candSrc
+        ? scanOf([
+            { kind: "click", tag: "n0-9", name: "Скачать раз" },
+            { kind: "click", tag: "n0-10", name: "Скачать два" },
+          ])
+        : null,
+    $: async () => ({ click: async () => {} }),
+    context: () => ({
+      on: () => {},
+      off: (ev) => {
+        ctxOffCalls.push(ev);
+      },
+      request: { get: async () => { throw new Error("must not fetch"); } },
+    }),
+    on: (ev, fn) => {
+      if (ev === "download") dlFireK = fn;
+    },
+    off: (ev) => {
+      pageOffCalls.push(ev);
+    },
+    waitForEvent: neverEvent,
+  };
+  let kClicks = 0;
+  leakPage.$ = async () => ({
+    click: async () => {
+      kClicks += 1;
+      if (dlFireK) dlFireK(mkDl(`k${kClicks}.bin`));
+    },
+  });
+  const collLeak = await collectGeneratedFiles(leakPage, { dir: dlDir, sessionId: "s-k" });
+  assert.equal(collLeak.files.length, 2, `two files expected, got ${JSON.stringify(collLeak)}`);
+  assert.deepEqual(ctxOffCalls, ["page", "page"], "ctx page listener must be removed per candidate");
+  assert.ok(
+    pageOffCalls.filter((e) => e === "download").length === 2 &&
+      pageOffCalls.filter((e) => e === "response").length === 2,
+    `page listeners must be removed per candidate, got ${JSON.stringify(pageOffCalls)}`
+  );
+});
