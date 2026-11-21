@@ -720,10 +720,18 @@ async function createTestHost(
     },
   });
   testHosts.push(host);
+
   const instance = await createPlugin(host.bb, {
     bbCli: fakeCli(),
     cmd: fakeCmd(),
   });
+
+  // Register a test orchestrator thread so alert cards have a valid target (after migrations create thread_roles)
+  const db = host.bb.storage.database();
+  db.prepare(
+    "INSERT OR REPLACE INTO thread_roles (thread_id, role, decided_at, source) VALUES (?, ?, ?, ?)",
+  ).run("thr_test_coordinator", "orchestrator", Date.now(), "owner");
+
   return {
     ...host,
     getSettings: async () => instance.settings.get(),
@@ -822,13 +830,23 @@ test("§32.3 п.5 (3): Тест записи в журнал с source в обо
   assert.equal(outsideEvent.newValue, "shadow");
   assert.equal(outsideEvent.source, "outside_menu");
 
-  // Verify command_runs entries logged for both
+  // Verify command_runs entries logged for both with terminal status 'ok' (not queued)
   const commandRuns = db
     .prepare("SELECT * FROM command_runs WHERE source = 'setting.change' ORDER BY id ASC")
-    .all() as { id: number; name: string; stdin: string }[];
+    .all() as { id: number; name: string; stdin: string; status: string; exit_code: number }[];
   assert.equal(commandRuns.length, 2);
   assert.match(commandRuns[0]!.name, /setting:approvalMode/);
   assert.match(commandRuns[1]!.name, /setting:workGraph/);
+  assert.equal(commandRuns[0]!.status, "ok");
+  assert.equal(commandRuns[0]!.exit_code, 0);
+  assert.equal(commandRuns[1]!.status, "ok");
+  assert.equal(commandRuns[1]!.exit_code, 0);
+
+  // Ensure commandRunner queue has 0 queued items from settings changes
+  const queued = db
+    .prepare("SELECT * FROM command_runs WHERE status = 'queued'")
+    .all();
+  assert.equal(queued.length, 0);
 });
 
 test("§32.3 п.5 (4): Тест кнопки возврата - [ Вернуть прежнее значение ] восстанавливает oldValue", async () => {
@@ -938,4 +956,63 @@ test("§32.3 п.5 (6): Тест CLI-защиты - вызов с BB_THREAD_ID о
   const current = await host.getSettings();
   assert.equal(current.workGraph, "shadow");
 });
+
+test("§32.3: latestCoordinatorThreadId & orchestratorThreadIds ordering and safety", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // 1. Initially empty: returns undefined / empty array
+  assert.equal(store.latestCoordinatorThreadId(), undefined);
+  assert.deepEqual(store.orchestratorThreadIds(), []);
+
+  // 2. Insert into delegations
+  store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord_old",
+    level: "simple",
+    route: "fix",
+    preset: "gemini-38-wt",
+    provider: "agy",
+  });
+  assert.equal(store.latestCoordinatorThreadId(), "thr_coord_old");
+
+  // 3. Insert newer task into task_queue with updated_at
+  store.insertTask({
+    taskKey: "PLUG-2",
+    coordinatorThreadId: "thr_coord_new",
+    projectId: "proj_1",
+    route: "fix",
+    level: "simple",
+  });
+  // Update task's updated_at in database to simulate newer update
+  db.prepare("UPDATE task_queue SET updated_at = 2000 WHERE task_key = 'PLUG-2'").run();
+
+  // Should pick thr_coord_new from task_queue without crashing on missing id column
+  assert.equal(store.latestCoordinatorThreadId(), "thr_coord_new");
+
+  // 4. Test orchestratorThreadIds ordered by decided_at DESC
+  db.prepare("INSERT INTO thread_roles (thread_id, role, decided_at, source) VALUES (?, ?, ?, ?)").run(
+    "thr_orch_1",
+    "orchestrator",
+    100,
+    "owner",
+  );
+  db.prepare("INSERT INTO thread_roles (thread_id, role, decided_at, source) VALUES (?, ?, ?, ?)").run(
+    "thr_orch_2",
+    "orchestrator",
+    500,
+    "owner",
+  );
+  db.prepare("INSERT INTO thread_roles (thread_id, role, decided_at, source) VALUES (?, ?, ?, ?)").run(
+    "thr_exec",
+    "executor",
+    300,
+    "delegate",
+  );
+
+  const orchs = store.orchestratorThreadIds();
+  assert.deepEqual(orchs, ["thr_orch_2", "thr_orch_1"]);
+});
+
 

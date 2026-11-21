@@ -727,12 +727,12 @@ export async function createPlugin(
     return "outside_menu";
   }
 
-  async function resolveAlertThreadId(): Promise<string> {
+  async function resolveAlertThreadId(): Promise<string | undefined> {
     const orchIds = store.orchestratorThreadIds();
     if (orchIds.length > 0) return orchIds[0]!;
     const latest = store.latestCoordinatorThreadId();
     if (latest) return latest;
-    return "thr_orchestrator";
+    return undefined;
   }
 
   async function createCriticalSettingAlertCard(
@@ -741,6 +741,12 @@ export async function createPlugin(
     newValue: unknown,
   ): Promise<void> {
     const threadId = await resolveAlertThreadId();
+    if (!threadId) {
+      bb.log.warn(
+        `orchestrator: cannot deliver critical setting alert card for ${setting}: no active orchestrator or coordinator thread found`,
+      );
+      return;
+    }
     const oldValStr = String(oldValue ?? "");
     const newValStr = String(newValue ?? "");
     const title = `⚠️ Настройка ${setting} оркестратора изменена вне меню плагина (было: ${oldValStr}, стало: ${newValStr})`;

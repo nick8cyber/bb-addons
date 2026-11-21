@@ -1952,7 +1952,7 @@ export class DelegationStore {
   orchestratorThreadIds(): string[] {
     const rows = this.db
       .prepare(
-        `SELECT thread_id AS t FROM thread_roles WHERE role = 'orchestrator'`,
+        `SELECT thread_id AS t FROM thread_roles WHERE role = 'orchestrator' ORDER BY decided_at DESC`,
       )
       .all() as { t: string }[];
     return rows.map((r) => r.t);
@@ -1963,10 +1963,13 @@ export class DelegationStore {
     try {
       const task = this.db
         .prepare(
-          "SELECT coordinator_thread_id FROM task_queue WHERE coordinator_thread_id IS NOT NULL AND coordinator_thread_id != '' ORDER BY id DESC LIMIT 1",
+          "SELECT coordinator_thread_id FROM task_queue WHERE coordinator_thread_id IS NOT NULL AND coordinator_thread_id != '' ORDER BY updated_at DESC LIMIT 1",
         )
         .get() as { coordinator_thread_id: string } | undefined;
       if (task?.coordinator_thread_id) return task.coordinator_thread_id;
+    } catch {}
+
+    try {
       const del = this.db
         .prepare(
           "SELECT coordinator_thread_id FROM delegations WHERE coordinator_thread_id IS NOT NULL AND coordinator_thread_id != '' ORDER BY id DESC LIMIT 1",
@@ -1974,6 +1977,7 @@ export class DelegationStore {
         .get() as { coordinator_thread_id: string } | undefined;
       if (del?.coordinator_thread_id) return del.coordinator_thread_id;
     } catch {}
+
     return undefined;
   }
 
@@ -3389,6 +3393,8 @@ export class DelegationStore {
 
   /**
    * §32.3 (PLUG-360): Запись изменения критических настроек в events и command_runs.
+   * В command_runs запись сохраняется сразу в терминальном статусе 'ok',
+   * чтобы commandRunner не пытался исполнять её как фоновый процесс.
    */
   recordSettingChangeEvent(
     setting: string,
@@ -3406,27 +3412,38 @@ export class DelegationStore {
     };
     const eventId = this.emitEvent("setting.changed", fields, at);
     try {
-      this.enqueueCommandRun(
-        {
-          source: "setting.change",
-          runKey: `setting:${setting}:${at}:${Math.random().toString(36).slice(2, 6)}`,
-          name: `setting:${setting}`,
-          argv: [],
-          cwd: "/",
-          stdin: JSON.stringify({
-            event: "setting.changed",
-            setting,
-            oldValue,
-            newValue,
-            timestamp: at,
-            source,
-          }),
-          timeoutSec: 0,
-        },
-        at,
-      );
+      const runKey = `setting:${setting}:${at}:${Math.random().toString(36).slice(2, 6)}`;
+      const stdin = JSON.stringify({
+        event: "setting.changed",
+        setting,
+        oldValue,
+        newValue,
+        timestamp: at,
+        source,
+      });
+      this.db
+        .prepare(
+          `INSERT INTO command_runs (
+            source, run_key, group_key, name, status, argv, cwd, env,
+            stdin, timeout_sec, notify_on_fail, queued_at, started_at, finished_at,
+            exit_code, output_tail
+          ) VALUES (?, ?, ?, ?, 'ok', ?, ?, ?, ?, 0, 0, ?, ?, ?, 0, '')`,
+        )
+        .run(
+          "setting.change",
+          runKey,
+          null,
+          `setting:${setting}`,
+          "[]",
+          "/",
+          null,
+          stdin,
+          at,
+          at,
+          at,
+        );
     } catch {
-      // command_runs enqueue failure should not break settings event recording
+      // command_runs audit insert failure should not break settings event recording
     }
     return eventId;
   }

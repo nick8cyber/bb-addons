@@ -754,7 +754,6 @@ function OwnerGateCard(props: PluginPendingInteractionProps) {
  */
 function CriticalSettingsAlertCard(props: PluginPendingInteractionProps) {
   const { interaction, submit } = props;
-  const rpc = useRpc<Contract>();
   const payload = (interaction.payload || {}) as Record<string, unknown>;
   const setting = String(payload.setting || "");
   const oldValue = String(payload.oldValue ?? "");
@@ -774,16 +773,6 @@ function CriticalSettingsAlertCard(props: PluginPendingInteractionProps) {
   const onRevert = async () => {
     setActionInProgress("revert");
     try {
-      if (
-        setting === "workGraph" ||
-        setting === "workGraphProjects" ||
-        setting === "approvalMode"
-      ) {
-        await rpc.call("revertCriticalSetting", {
-          setting: setting as "workGraph" | "workGraphProjects" | "approvalMode",
-          oldValue,
-        });
-      }
       await submit({ action: "revert" });
     } catch {
       setActionInProgress(null);
