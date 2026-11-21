@@ -214,6 +214,20 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ ok: z.literal(true) }),
   },
+  // §32.3 (PLUG-360): Намерение изменения настроек из меню и возврат значения
+  setSettingIntent: {
+    input: z.object({
+      setting: z.enum(["workGraph", "workGraphProjects", "approvalMode"]),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  revertCriticalSetting: {
+    input: z.object({
+      setting: z.enum(["workGraph", "workGraphProjects", "approvalMode"]),
+      oldValue: z.string(),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
   // §29.2 (Б2, r34.2): подтверждение задачи confirmation_mode (тумблер исполнителя)
   taskConfirmationMode: {
     input: z.object({
@@ -688,6 +702,91 @@ export async function createPlugin(
     if (raw === "auto" || raw === "manual") return raw;
     return null;
   };
+
+  // §32.3 (PLUG-360): Отслеживание критических настроек и защита шлюзов
+  const CRITICAL_SETTINGS = [
+    "workGraph",
+    "workGraphProjects",
+    "approvalMode",
+  ] as const;
+  type CriticalSetting = (typeof CRITICAL_SETTINGS)[number];
+
+  const menuIntents = new Map<CriticalSetting, number>();
+
+  function recordMenuIntent(setting: CriticalSetting, ttlMs: number = 10_000): void {
+    menuIntents.set(setting, now() + ttlMs);
+  }
+
+  function checkAndConsumeMenuIntent(setting: CriticalSetting): "menu" | "outside_menu" {
+    const expiresAt = menuIntents.get(setting);
+    if (expiresAt !== undefined && expiresAt >= now()) {
+      menuIntents.delete(setting);
+      return "menu";
+    }
+    menuIntents.delete(setting);
+    return "outside_menu";
+  }
+
+  async function resolveAlertThreadId(): Promise<string> {
+    const orchIds = store.orchestratorThreadIds();
+    if (orchIds.length > 0) return orchIds[0]!;
+    const latest = store.latestCoordinatorThreadId();
+    if (latest) return latest;
+    return "thr_orchestrator";
+  }
+
+  async function createCriticalSettingAlertCard(
+    setting: CriticalSetting,
+    oldValue: unknown,
+    newValue: unknown,
+  ): Promise<void> {
+    const threadId = await resolveAlertThreadId();
+    const oldValStr = String(oldValue ?? "");
+    const newValStr = String(newValue ?? "");
+    const title = `⚠️ Настройка ${setting} оркестратора изменена вне меню плагина (было: ${oldValStr}, стало: ${newValStr})`;
+
+    const payload = {
+      setting,
+      oldValue: oldValStr,
+      newValue: newValStr,
+      source: "outside_menu",
+    };
+
+    try {
+      const reqPromise = bb.ui.requestInput({
+        threadId,
+        rendererId: "orchestrator-settings-alert",
+        title,
+        payload,
+        timeoutMs: 3_600_000,
+      });
+
+      reqPromise
+        .then(async (result) => {
+          if (result.outcome === "submitted") {
+            const resVal =
+              result.value && typeof result.value === "object" && !Array.isArray(result.value)
+                ? (result.value as Record<string, unknown>)
+                : null;
+            if (resVal?.action === "revert" || resVal?.action === "reverted") {
+              recordMenuIntent(setting);
+              await settings.experimental_set({
+                [setting]: oldValStr || (setting === "workGraph" ? "off" : null),
+              });
+            }
+          }
+        })
+        .catch((err) => {
+          bb.log.warn(
+            `orchestrator: settings alert interaction failed: ${describeError(err)}`,
+          );
+        });
+    } catch (err) {
+      bb.log.warn(
+        `orchestrator: createCriticalSettingAlertCard failed: ${describeError(err)}`,
+      );
+    }
+  }
   /** §18.1 (PLUG-247a): the selected language and its translator.
    * `t` is a STABLE forwarding wrapper — deps objects capture it once,
    * a `language` change only rebinds `currentT`, and every later call
@@ -1136,7 +1235,35 @@ export async function createPlugin(
   maybeCheckPresets();
   void execSettingsCheck();
 
-  settings.onChange((next) => {
+  let lastKnownSettings: Record<string, unknown> = {
+    workGraph: currentSettings.workGraph ?? "off",
+    workGraphProjects: currentSettings.workGraphProjects ?? "",
+    approvalMode: currentSettings.approvalMode ?? "",
+  };
+
+  settings.onChange((next: any, prev?: any) => {
+    // §32.3 (PLUG-360): Отслеживание критических настроек
+    for (const key of CRITICAL_SETTINGS) {
+      const prevVal =
+        prev && prev[key] !== undefined
+          ? prev[key]
+          : (lastKnownSettings[key] ?? (key === "workGraph" ? "off" : ""));
+      const nextVal = next[key] ?? (key === "workGraph" ? "off" : "");
+      if (String(prevVal ?? "") !== String(nextVal ?? "")) {
+        const source = checkAndConsumeMenuIntent(key);
+        const at = now();
+        store.recordSettingChangeEvent(key, prevVal, nextVal, source, at);
+        if (source === "outside_menu") {
+          void createCriticalSettingAlertCard(key, prevVal, nextVal);
+        }
+      }
+    }
+    lastKnownSettings = {
+      workGraph: next.workGraph ?? "off",
+      workGraphProjects: next.workGraphProjects ?? "",
+      approvalMode: next.approvalMode ?? "",
+    };
+
     currentSettings = next;
     // §18.1 (PLUG-247a): a language change rebuilds the translator and
     // rewrites the installed pre-push (its texts are versioned with the
@@ -2396,9 +2523,21 @@ export async function createPlugin(
       };
     },
     async setProjectApprovalMode(input) {
+      recordMenuIntent("approvalMode");
       const modeVal = input.mode ?? "";
       await settings.experimental_set({ approvalMode: modeVal || null });
       currentSettings.approvalMode = modeVal;
+      return { ok: true as const };
+    },
+    async setSettingIntent(input) {
+      recordMenuIntent(input.setting);
+      return { ok: true as const };
+    },
+    async revertCriticalSetting(input) {
+      recordMenuIntent(input.setting);
+      const val = input.oldValue || (input.setting === "workGraph" ? "off" : null);
+      await settings.experimental_set({ [input.setting]: val });
+      currentSettings[input.setting] = input.oldValue;
       return { ok: true as const };
     },
     async taskConfirmationMode(input) {
@@ -3237,6 +3376,16 @@ export async function createPlugin(
         summary: t("cli.helpRunQueueS"),
         usage: "bb orchestrator run-queue [--once] [--json]",
       },
+      {
+        name: "config",
+        summary: "Inspect or change orchestrator settings (owner-only)",
+        usage: "bb orchestrator config set <key> <value> [--json]",
+      },
+      {
+        name: "mode",
+        summary: "Set orchestrator approval mode (owner-only)",
+        usage: "bb orchestrator mode <auto|manual> [--json]",
+      },
     ],
     async run(argv, ctx: PluginCliContext) {
       const json = argv.includes("--json");
@@ -3295,6 +3444,82 @@ export async function createPlugin(
         ) {
           watchdog.markCoordinatorAction(ctx.threadId);
         }
+        // §32.3 (PLUG-360): Защита CLI — изменение настроек только владельцем
+        if (cmd === "config") {
+          const isOwner = !ctx.threadId && !process.env.BB_THREAD_ID;
+          if (!isOwner) {
+            throw new OrchestratorError("permission-denied", "owner-only");
+          }
+          const action = positional[1];
+          const key = positional[2];
+          const val = positional[3];
+          if (action === "set" && key) {
+            await settings.experimental_set({ [key]: val ?? null });
+            return json
+              ? jsonOk({ ok: true, key, value: val })
+              : { exitCode: 0, stdout: `Set ${key} = ${val}\n` };
+          }
+          throw new OrchestratorError(
+            "invalid-arguments",
+            "usage: bb orchestrator config set <key> <value>",
+          );
+        }
+
+        if (cmd === "mode") {
+          const isOwner = !ctx.threadId && !process.env.BB_THREAD_ID;
+          if (!isOwner) {
+            throw new OrchestratorError("permission-denied", "owner-only");
+          }
+          const modeVal = positional[1];
+          if (modeVal !== "auto" && modeVal !== "manual") {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "флаг mode принимает только auto или manual",
+            );
+          }
+          await settings.experimental_set({ approvalMode: modeVal });
+          return json
+            ? jsonOk({ ok: true, approvalMode: modeVal })
+            : { exitCode: 0, stdout: `approvalMode set to ${modeVal}\n` };
+        }
+
+        if (cmd === "set") {
+          const isOwner = !ctx.threadId && !process.env.BB_THREAD_ID;
+          if (!isOwner) {
+            throw new OrchestratorError("permission-denied", "owner-only");
+          }
+          const key = positional[1];
+          const val = positional[2];
+          if (key) {
+            await settings.experimental_set({ [key]: val ?? null });
+            return json
+              ? jsonOk({ ok: true, key, value: val })
+              : { exitCode: 0, stdout: `Set ${key} = ${val}\n` };
+          }
+          throw new OrchestratorError(
+            "invalid-arguments",
+            "usage: bb orchestrator set <key> <value>",
+          );
+        }
+
+        if (cmd === "workgraph") {
+          const isOwner = !ctx.threadId && !process.env.BB_THREAD_ID;
+          if (!isOwner) {
+            throw new OrchestratorError("permission-denied", "owner-only");
+          }
+          const modeVal = positional[1];
+          if (modeVal !== "off" && modeVal !== "shadow" && modeVal !== "strict") {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "workgraph принимает off, shadow или strict",
+            );
+          }
+          await settings.experimental_set({ workGraph: modeVal });
+          return json
+            ? jsonOk({ ok: true, workGraph: modeVal })
+            : { exitCode: 0, stdout: `workGraph set to ${modeVal}\n` };
+        }
+
         if (cmd === "kb") {
           const sub = positional[1];
           if (!sub) {
@@ -4510,6 +4735,8 @@ abandoned: ${res.reported
       }
     } catch {}
   });
+
+  return { settings, store };
 }
 
 export default async function plugin(bb: BbPluginApi) {

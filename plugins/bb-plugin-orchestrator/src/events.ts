@@ -48,6 +48,7 @@ export const EVENT_KINDS = [
   "task.checks_run",
   "task.alarm_triggered",
   "task.blocked",
+  "setting.changed",
 ] as const;
 
 export type EventKind = (typeof EVENT_KINDS)[number];

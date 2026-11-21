@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test, { beforeEach, after } from "node:test";
+import test, { beforeEach, afterEach, after } from "node:test";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
@@ -13,6 +13,9 @@ import {
   runReject,
   runResume,
 } from "../src/workgraph.js";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { createPlugin } from "../server.js";
+import { makeTempDir } from "./helpers/temp.js";
 
 function createStore(): DelegationStore {
   const db = new Database(":memory:");
@@ -693,5 +696,246 @@ test("§29.2: owner defer moves task to deferred and resume restores status with
   assert.equal(requested, true);
   assert.equal(resQueue.advancedCount, 0); // Not counted as task advance!
   assert.equal(store.getTask("PLUG-160")?.interaction_id, "interact_fresh_456");
+});
+
+const testHosts: Array<{ harness: { dispose: () => Promise<void> } }> = [];
+afterEach(async () => {
+  while (testHosts.length > 0) {
+    const h = testHosts.pop();
+    if (h) await h.harness.dispose();
+  }
+});
+
+async function createTestHost(
+  settings: Record<string, string | boolean> = {},
+) {
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    dataDir: makeTempDir("orch-test-plug360-"),
+    settings: {
+      workGraph: "off",
+      approvalMode: "",
+      language: "ru",
+      ...settings,
+    },
+  });
+  testHosts.push(host);
+  const instance = await createPlugin(host.bb, {
+    bbCli: fakeCli(),
+    cmd: fakeCmd(),
+  });
+  return {
+    ...host,
+    getSettings: async () => instance.settings.get(),
+  };
+}
+
+test("§32.3 п.5 (1): Тест меню владельца - интерфейсный вызов изменяет настройку с source: 'menu'", async () => {
+  const host = await createTestHost({ approvalMode: "" });
+
+  // Interface call from owner menu (setProjectApprovalMode)
+  const rpcRes = (await host.harness.callRpc("setProjectApprovalMode", {
+    mode: "auto",
+  })) as { ok: true };
+  assert.equal(rpcRes.ok, true);
+
+  // Setting is updated
+  const current = await host.getSettings();
+  assert.equal(current.approvalMode, "auto");
+
+  // Interaction card is NOT created for menu changes
+  assert.equal(host.harness.pendingInteractions.length, 0);
+
+  // Machine event recorded in events table with source: 'menu'
+  const db = host.bb.storage.database();
+  const events = db
+    .prepare("SELECT * FROM events WHERE kind = 'setting.changed' ORDER BY id DESC")
+    .all() as { id: number; kind: string; payload: string }[];
+  assert.ok(events.length >= 1);
+  const payload = JSON.parse(events[0]!.payload);
+  assert.equal(payload.setting, "approvalMode");
+  assert.equal(payload.oldValue, "");
+  assert.equal(payload.newValue, "auto");
+  assert.equal(payload.source, "menu");
+  assert.ok(typeof payload.timestamp === "number");
+});
+
+test("§32.3 п.5 (2): Тест смены вне меню - изменение настройки без метки фиксирует source: 'outside_menu' и создаёт карточку", async () => {
+  const host = await createTestHost({ workGraph: "off" });
+
+  // Outside menu change (e.g. platform/CLI settings write without menu intent)
+  await host.harness.setSettings({ workGraph: "strict" });
+
+  // Event recorded with source: 'outside_menu'
+  const db = host.bb.storage.database();
+  const events = db
+    .prepare("SELECT * FROM events WHERE kind = 'setting.changed' ORDER BY id DESC")
+    .all() as { id: number; kind: string; payload: string }[];
+  assert.ok(events.length >= 1);
+  const payload = JSON.parse(events[0]!.payload);
+  assert.equal(payload.setting, "workGraph");
+  assert.equal(payload.oldValue, "off");
+  assert.equal(payload.newValue, "strict");
+  assert.equal(payload.source, "outside_menu");
+  assert.ok(typeof payload.timestamp === "number");
+
+  // Card created for owner
+  assert.equal(host.harness.pendingInteractions.length, 1);
+  const interaction = host.harness.pendingInteractions[0]!;
+  assert.equal(interaction.rendererId, "orchestrator-settings-alert");
+  assert.equal(
+    interaction.title,
+    "⚠️ Настройка workGraph оркестратора изменена вне меню плагина (было: off, стало: strict)",
+  );
+  assert.deepEqual(interaction.payload, {
+    setting: "workGraph",
+    oldValue: "off",
+    newValue: "strict",
+    source: "outside_menu",
+  });
+});
+
+test("§32.3 п.5 (3): Тест записи в журнал с source в обоих случаях (menu и outside_menu)", async () => {
+  const host = await createTestHost({ approvalMode: "", workGraph: "off" });
+
+  // 1) Menu change
+  await host.harness.callRpc("setProjectApprovalMode", { mode: "manual" });
+
+  // 2) Outside menu change
+  await host.harness.setSettings({ workGraph: "shadow" });
+
+  const db = host.bb.storage.database();
+  const events = db
+    .prepare("SELECT * FROM events WHERE kind = 'setting.changed' ORDER BY id ASC")
+    .all() as { id: number; kind: string; payload: string }[];
+  assert.equal(events.length, 2);
+
+  const menuEvent = JSON.parse(events[0]!.payload);
+  assert.equal(menuEvent.setting, "approvalMode");
+  assert.equal(menuEvent.oldValue, "");
+  assert.equal(menuEvent.newValue, "manual");
+  assert.equal(menuEvent.source, "menu");
+
+  const outsideEvent = JSON.parse(events[1]!.payload);
+  assert.equal(outsideEvent.setting, "workGraph");
+  assert.equal(outsideEvent.oldValue, "off");
+  assert.equal(outsideEvent.newValue, "shadow");
+  assert.equal(outsideEvent.source, "outside_menu");
+
+  // Verify command_runs entries logged for both
+  const commandRuns = db
+    .prepare("SELECT * FROM command_runs WHERE source = 'setting.change' ORDER BY id ASC")
+    .all() as { id: number; name: string; stdin: string }[];
+  assert.equal(commandRuns.length, 2);
+  assert.match(commandRuns[0]!.name, /setting:approvalMode/);
+  assert.match(commandRuns[1]!.name, /setting:workGraph/);
+});
+
+test("§32.3 п.5 (4): Тест кнопки возврата - [ Вернуть прежнее значение ] восстанавливает oldValue", async () => {
+  const host = await createTestHost({ approvalMode: "manual" });
+
+  // Outside menu change
+  await host.harness.setSettings({ approvalMode: "auto" });
+  assert.equal(host.harness.pendingInteractions.length, 1);
+  const card = host.harness.pendingInteractions[0]!;
+
+  // Owner clicks [ Вернуть прежнее значение ] (submits interaction with { action: "revert" })
+  host.harness.submitInteraction(card.id, { action: "revert" });
+  await new Promise((r) => setTimeout(r, 50));
+
+  // Setting is restored to oldValue ("manual")
+  const restored = await host.getSettings();
+  assert.equal(restored.approvalMode, "manual");
+
+  // Interaction card closed
+  assert.equal(host.harness.pendingInteractions.length, 0);
+
+  // The revert itself was performed with menu intent, so events record source: 'menu'
+  const db = host.bb.storage.database();
+  const events = db
+    .prepare("SELECT * FROM events WHERE kind = 'setting.changed' ORDER BY id DESC")
+    .all() as { id: number; kind: string; payload: string }[];
+  const revertEvent = JSON.parse(events[0]!.payload);
+  assert.equal(revertEvent.setting, "approvalMode");
+  assert.equal(revertEvent.oldValue, "auto");
+  assert.equal(revertEvent.newValue, "manual");
+  assert.equal(revertEvent.source, "menu");
+});
+
+test("§32.3 п.5 (5): Тест кнопки подтверждения - [ Оставить ] сохраняет newValue", async () => {
+  const host = await createTestHost({ workGraph: "off" });
+
+  // Outside menu change
+  await host.harness.setSettings({ workGraph: "strict" });
+  assert.equal(host.harness.pendingInteractions.length, 1);
+  const card = host.harness.pendingInteractions[0]!;
+
+  // Owner clicks [ Оставить ] (submits interaction with { action: "keep" })
+  host.harness.submitInteraction(card.id, { action: "keep" });
+  await new Promise((r) => setTimeout(r, 50));
+
+  // Setting is kept at newValue ("strict")
+  const current = await host.getSettings();
+  assert.equal(current.workGraph, "strict");
+
+  // Interaction card closed
+  assert.equal(host.harness.pendingInteractions.length, 0);
+});
+
+test("§32.3 п.5 (6): Тест CLI-защиты - вызов с BB_THREAD_ID отклоняется с permission-denied: owner-only", async () => {
+  const host = await createTestHost({ workGraph: "off" });
+
+  // 1) Agent call with ctx.threadId
+  const resAgentCtx = await host.harness.runCli(
+    ["config", "set", "workGraph", "strict", "--json"],
+    { threadId: "thr_agent_42" },
+  );
+  assert.equal(resAgentCtx.exitCode, 1);
+  const errAgentCtx = JSON.parse(resAgentCtx.stdout);
+  assert.equal(errAgentCtx.error.code, "permission-denied");
+  assert.equal(errAgentCtx.error.message, "owner-only");
+
+  // 2) Agent call with process.env.BB_THREAD_ID
+  process.env.BB_THREAD_ID = "thr_agent_env_99";
+  try {
+    const resEnv = await host.harness.runCli([
+      "config",
+      "set",
+      "workGraph",
+      "strict",
+      "--json",
+    ]);
+    assert.equal(resEnv.exitCode, 1);
+    const errEnv = JSON.parse(resEnv.stdout);
+    assert.equal(errEnv.error.code, "permission-denied");
+    assert.equal(errEnv.error.message, "owner-only");
+
+    // Also test mode command
+    const resModeEnv = await host.harness.runCli([
+      "mode",
+      "auto",
+      "--json",
+    ]);
+    assert.equal(resModeEnv.exitCode, 1);
+    const errModeEnv = JSON.parse(resModeEnv.stdout);
+    assert.equal(errModeEnv.error.code, "permission-denied");
+    assert.equal(errModeEnv.error.message, "owner-only");
+  } finally {
+    delete process.env.BB_THREAD_ID;
+  }
+
+  // 3) Owner call (no threadId, no BB_THREAD_ID) succeeds
+  const resOwner = await host.harness.runCli([
+    "config",
+    "set",
+    "workGraph",
+    "shadow",
+    "--json",
+  ]);
+  assert.equal(resOwner.exitCode, 0);
+  const okOwner = JSON.parse(resOwner.stdout);
+  assert.equal(okOwner.ok, true);
+  const current = await host.getSettings();
+  assert.equal(current.workGraph, "shadow");
 });
 
