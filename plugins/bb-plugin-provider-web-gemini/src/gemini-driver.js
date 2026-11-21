@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const profileManager = require('./profile-manager');
 const usageLimits = require('./usage-limits');
+const browserGroups = require('./browser-groups.cjs');
 const { isFileToolReply, verifyFileResponse } = require('./file-envelope.cjs');
 
 let driverHooks = null;
@@ -118,12 +119,46 @@ function getRunningChromeProfile(port) {
   }
 }
 
-async function stopChrome(port) {
-  const { execSync } = require('child_process');
-  try {
-    execSync(`pkill -f 'remote-debugging-port=${port ?? CDP_PORT}([[:space:]]|$)' || true`);
-    await new Promise((r) => setTimeout(r, 800));
-  } catch {}
+// Unified safe teardown (PLUG-374 заход 6): the same pipeline the reaper
+// uses — marker-locked identify → lease/CDP gates → SIGTERM → re-verify →
+// SIGKILL. A port gated by a live foreign lease, live CDP clients, or an
+// in-flight teardown reports busy and is retried — never signaled. Groups
+// with no marker (externally launched chrome) are never touched either:
+// the old global pkill-by-port-flag is gone from the automatic path
+// (contract §4).
+async function stopChrome(port, stateDir = null, { busyWaitMs = 30_000, pollMs = 300 } = {}) {
+  const p = String(port ?? CDP_PORT);
+  const dir = browserGroups.resolveStateDir(stateDir);
+  // Our own CDP/playwright sockets must not count as "live clients" — a
+  // lingering connection would veto our own restart forever.
+  const ownInodes = browserGroups.socketInodesOf(process.pid);
+  const deadline = Date.now() + busyWaitMs;
+  let res = { status: 'absent' };
+  for (;;) {
+    try {
+      res = await browserGroups.teardownGroup({
+        stateDir: dir,
+        port: p,
+        // Same ledger lock lease writers hold: a lease cannot slip between
+        // the check and the SIGTERM, exactly like the reaper (§3).
+        withOuterLock: (fn) => browserGroups.withLedgerLock(dir, fn),
+        // A live lease from ANOTHER process keeps the port busy; our own
+        // lease (ensureChrome under bindBackend) must not veto the restart.
+        busy: (cur, now) =>
+          browserGroups.leaseBusyOnPort(browserGroups.readLedger(dir), cur.port, now, {
+            excludePid: process.pid,
+          })
+            ? 'lease'
+            : null,
+        ignoreInodes: ownInodes,
+        ownerGraceMs: browserGroups.DEFAULT_OWNER_GRACE_MS,
+      });
+    } catch (e) {
+      res = { status: 'skipped', reason: `error:${String(e && e.message ? e.message : e).slice(0, 120)}` };
+    }
+    if (res.status !== 'busy' || Date.now() >= deadline) return res;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
 }
 
 async function ensureChrome(opts = {}) {
@@ -158,6 +193,7 @@ async function ensureChrome(opts = {}) {
   }
 
   const port = opts && typeof opts === 'object' && opts.port ? String(opts.port) : CDP_PORT;
+  const stateDir = opts && typeof opts === 'object' ? opts.stateDir : null;
   const targetProfile = profileManager.resolveProfile(requestedProfile);
   const currentProfile = getRunningChromeProfile(port);
   const currentMode = getRunningChromeMode(port);
@@ -170,7 +206,13 @@ async function ensureChrome(opts = {}) {
 
   const modeMatches = !targetMode || currentMode === targetMode;
 
-  if (cdpUp && !forceRestart && profileMatches && modeMatches) {
+  // A group mid-teardown (fresh `reaping` mark) is already doomed — never
+  // reuse it; fall through to stopChrome + respawn instead (PLUG-374).
+  const runningMeta = browserGroups.readMarker(stateDir, port);
+  if (cdpUp && !forceRestart && profileMatches && modeMatches && !browserGroups.isReaping(runningMeta)) {
+    // Reusing a group an earlier owner launched: point the marker at the
+    // current owner so reapers see a live verifiable identity (PLUG-374).
+    browserGroups.adoptGroup(stateDir, port);
     return targetProfile;
   }
 
@@ -181,7 +223,15 @@ async function ensureChrome(opts = {}) {
     );
   }
 
-  await stopChrome(port);
+  const stopped = await stopChrome(port, stateDir);
+  if (stopped.status !== 'torn-down' && stopped.status !== 'absent') {
+    // Busy or unverifiable: respawning would either race an in-flight
+    // teardown / a live session or collide with a group we must not kill.
+    throw new Error(
+      `chrome on :${port} cannot be restarted: ${stopped.status}` +
+        (stopped.reason ? ` (${stopped.reason})` : '')
+    );
+  }
 
   const { spawn } = require('child_process');
   const chromeBin = process.env.GEMINI_CHROME_BIN || process.env.CHROME_BIN || '/usr/bin/google-chrome-stable';
@@ -228,6 +278,26 @@ async function ensureChrome(opts = {}) {
   let spawnErr = null;
   proc.on('error', (e) => { spawnErr = e; });
   proc.unref();
+  // Mark the group before the readiness wait: a chrome that never opens CDP
+  // but stays alive (with its Xvfb) is exactly the orphan this tracks. If
+  // the marker cannot be written (marker lock unavailable, заход 7) the
+  // group is invisible to every reaper forever — kill the newborn rather
+  // than leak an unmanaged browser, and let the launch fail loudly.
+  try {
+    browserGroups.recordGroup({
+      stateDir,
+      port,
+      pgid: proc.pid,
+      mode: launchMode,
+      userDataDir: targetProfile.userDataDir,
+      profileDir: targetProfile.profileDir,
+    });
+  } catch (e) {
+    try {
+      process.kill(-proc.pid, 'SIGKILL');
+    } catch {}
+    throw e;
+  }
 
   const start = Date.now();
   while (Date.now() - start < 15000) {
@@ -1104,9 +1174,9 @@ async function sendPrompt({
   };
   await throwIfCancelled();
   if (driverHooks?.ensureChrome) {
-    await driverHooks.ensureChrome({ headless, profile, restart, port });
+    await driverHooks.ensureChrome({ headless, profile, restart, port, stateDir });
   } else {
-    await ensureChrome({ headless, profile, restart, port });
+    await ensureChrome({ headless, profile, restart, port, stateDir });
   }
   await throwIfCancelled();
 
