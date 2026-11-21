@@ -20,6 +20,10 @@
  *   E)  stderr-file lifecycle: a stale stderr-*.log is swept at bridge
  *       start; a live shim's own file is deleted on orderly shutdown
  *       (stdin-eof) but kept on child-close (direct shim spawn, no bridge).
+ *   F)  macOS stderr race (pool): the bridge's in-window answer carries a
+ *       bare exit error — the refusal text survives only in the shutdown
+ *       event's tail. The glued classification must still park q1
+ *       (validation-required) and land the thread on q2.
  *
  * Usage: node harness-plug373.mjs
  */
@@ -82,8 +86,8 @@ const logText = () =>
   existsSync(join(root, "acp-wrapper.log")) ? readFileSync(join(root, "acp-wrapper.log"), "utf8") : "";
 const shimDirFiles = (dir = root) =>
   existsSync(join(dir, "acp-shim")) ? readdirSync(join(dir, "acp-shim")) : [];
-const nonceOf = (threadId) => {
-  const ctl = shimDirFiles().find((f) => f.startsWith(`ctl-${threadId}-`) && f.endsWith(".ndjson"));
+const nonceOf = (threadId, dir = root) => {
+  const ctl = shimDirFiles(dir).find((f) => f.startsWith(`ctl-${threadId}-`) && f.endsWith(".ndjson"));
   return ctl ? ctl.slice(`ctl-${threadId}-`.length, -".ndjson".length) : null;
 };
 
@@ -267,9 +271,8 @@ check(
 );
 check(
   "early-exit/late-answer-swallowed",
-  /swallowed (duplicate resume answer|late bridge answer)/.test(logText()) ||
-    replies("r1").length === 1,
-  "",
+  /swallowed (duplicate resume answer|late bridge answer)/.test(logText()),
+  logText().match(/swallowed[^\n]*/)?.[0] ?? "no swallowed journal line",
 );
 // NOTE: never call bridge.onClose() — the embedded generic bridge's onClose
 // ends with process.exit(0) and would eat the report.
@@ -396,17 +399,114 @@ check(
   poolStderr ?? "no stderr file",
 );
 
+// --- F: macOS stderr race — bridge answer sans refusal + event tail -----
+// The shim's last stderr write can lose the process.exit race, so the
+// bridge's in-window answer carries a bare exit error while the refusal
+// text survives only in the shim-shutdown event's tail (earlyExit.message).
+// The classification must run on the glue of both. Fake: q1 dies SILENTLY
+// after 2 s (no stderr at all); a forged shutdown event with the refusal
+// tail arms the window first.
+const acpData2 = join(root, "pool373b");
+for (const label of ["q1", "q2"]) {
+  const cli = join(acpData2, "accounts", label, ".gemini", "antigravity-cli");
+  mkdirSync(cli, { recursive: true });
+  writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
+}
+writeFileSync(
+  join(acpData2, "accounts", "q1", ".gemini", ".fake-acp-silent-exit"),
+  "2000",
+);
+writeFileSync(
+  join(acpData2, "accounts-state.json"),
+  JSON.stringify({ accounts: {
+    q1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    q2: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 5 },
+  } }, null, 1),
+);
+writeFileSync(
+  join(acpData2, "accounts-models.json"),
+  JSON.stringify({ accounts: {
+    q1: { raw: [{ id: "fake-model", displayName: "Fake Model" }], families: ["fake-model"], unsupported: {}, atMs: Date.now() },
+    q2: { raw: [{ id: "fake-model", displayName: "Fake Model" }], families: ["fake-model"], unsupported: {}, atMs: Date.now() },
+  } }, null, 1),
+);
+mkdirSync(join(acpData2, "acp-shim"), { recursive: true });
+const poolBridge2 = (await import(
+  new URL("./dist/host.js?pool373b", import.meta.url).href
+)).experimental_providerBridge;
+poolBridge2.start?.({ pluginId: "provider-agy", dataDir: acpData2, tempDir: acpData2 });
+const sendPool2 = (m) => poolBridge2.handleLine(JSON.stringify(m));
+const pool2LogText = () =>
+  existsSync(join(acpData2, "acp-wrapper.log")) ? readFileSync(join(acpData2, "acp-wrapper.log"), "utf8") : "";
+const ledger2 = () => {
+  try {
+    return JSON.parse(readFileSync(join(acpData2, "accounts-state.json"), "utf8")).accounts ?? {};
+  } catch { return {}; }
+};
+
+sendPool2({
+  jsonrpc: "2.0",
+  id: "poolB",
+  method: "thread/start",
+  params: { threadId: "t_pool373b", cwd: workspace, options: { model: "fake-model", ...pol }, instructionMode: "append" },
+});
+// The forged event must precede the real silent death (~2 s): its stderr
+// tail is what the armed earlyExit.message will carry.
+await waitFor(() => nonceOf("t_pool373b", acpData2) !== null, 15_000, "pool373b shim launch");
+appendFileSync(
+  join(acpData2, "acp-shim", "events.ndjson"),
+  `${JSON.stringify({
+    nonce: nonceOf("t_pool373b", acpData2),
+    threadId: "t_pool373b",
+    t: "shim-shutdown",
+    reason: "child-close",
+    exit: 1,
+    sessionId: null,
+    spawnError: null,
+    stderr: "error: Eligibility check failed: Your current account is not eligible for Antigravity. Verify your account to continue.",
+  })}\n`,
+);
+// The real child then dies silently: the bridge answers inside the window
+// with a refusal-less exit error — parking must still happen via the glue.
+await waitFor(() => replies("poolB").length === 1, 30_000, "pool373b thread/start answered");
+check(
+  "pool-grace/lands-on-sibling",
+  replies("poolB")[0]?.result !== undefined,
+  JSON.stringify(replies("poolB")[0]).slice(0, 300),
+);
+await waitFor(
+  () => ledger2().q1?.parkedReason !== undefined || replies("poolB").length === 1,
+  10_000,
+  "q1 parked via glued classification",
+);
+check(
+  "pool-grace/q1-parked-validation",
+  ledger2().q1?.parkedReason === "validation-required",
+  JSON.stringify(ledger2().q1).slice(0, 200),
+);
+check(
+  "pool-grace/bridge-answer-won-window",
+  !/answered with early-exit error after grace/.test(pool2LogText()),
+  "synthesis would mean the bridge answer lost the window — the glue path was not exercised",
+);
+check(
+  "pool-grace/grace-armed",
+  /open after shim child-close/.test(pool2LogText()),
+  "",
+);
+
 // --- E: shim-level stderr lifecycle (direct spawn, no bridge) ------------
 const shimBin = join(root, "acp-shim.mjs");
 const eDir = join(root, "shimtest");
 mkdirSync(eDir, { recursive: true });
 const eventsFile = join(eDir, "events.ndjson");
 writeFileSync(eventsFile, "");
-// Orderly: child writes a banner, we close stdin → stdin-eof → file removed.
+// Orderly: child writes a banner and keeps ticking to stderr — a write in
+// the ~6 s shutdown grace must NOT recreate the file the shim just removed.
 const bannerFake = join(root, "agy-banner");
 writeFileSync(
   bannerFake,
-  `#!/bin/sh\nexec /usr/bin/node -e "process.stderr.write('banner-alive\\n');process.stdin.on('data',()=>{});setInterval(()=>{},1e5)"\n`,
+  `#!/bin/sh\nexec /usr/bin/node -e "process.stderr.write('banner-alive\\n');setInterval(()=>{try{process.stderr.write('tick\\n')}catch{}},150);process.stdin.on('data',()=>{})"\n`,
 );
 chmodSync(bannerFake, 0o755);
 const orderly = spawn(process.execPath, [shimBin, "acp"], {

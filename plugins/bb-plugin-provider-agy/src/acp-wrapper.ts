@@ -633,7 +633,7 @@ function onShimShutdown(session: WSession, event: ShimEvent): void {
   log(
     `shim down on thread ${session.threadId}: ${reason}${exitText}${spawnErrorText}` +
       `${stderrText !== "" ? ` — ${stderrText.slice(0, 300)}` : ""}` +
-      `${stderrFileHint(session)}`,
+      `${stderrFileHint(session, reason)}`,
   );
   if (reason !== "child-close" && reason !== "no-real-bin") {
     return;
@@ -704,7 +704,11 @@ function settleEarlyExitAnswer(reqId: JsonRpcId): void {
 }
 
 /** Point the journal at the file the shim just died writing to. */
-function stderrFileHint(session: WSession): string {
+function stderrFileHint(session: WSession, reason: string): string {
+  // Orderly exits deleted their own file — the hint would point at nothing.
+  if (reason === "stdin-eof" || reason.startsWith("sig-")) {
+    return "";
+  }
   return session.nonce !== ""
     ? ` [stderr: acp-shim/stderr-${session.threadId}-${session.nonce}.log]`
     : "";
@@ -2377,6 +2381,9 @@ function queryAgyModels(): Promise<{ id: string; displayName: string }[]> {
   });
 }
 
+/** Serial for the models-probe shim nonce (per-spawn stderr file name). */
+let modelsProbeSeq = 0;
+
 /**
  * Cold-path discovery against a live `agy acp`: session/new's configOptions
  * name the selectable model values when `agy models` cannot answer.
@@ -2400,7 +2407,10 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
           AGY_SHIM_EVENTS: eventsFilePath(),
           AGY_SHIM_CONTROL: join(shimDir(), "ctl-models.ndjson"),
           AGY_SHIM_THREAD_ID: "__models__",
-          AGY_SHIM_NONCE: "models",
+          // Unique per probe: concurrent probes sharing one name would
+          // write the same stderr-<id>-<nonce>.log and an orderly probe
+          // would delete a sibling's file mid-write.
+          AGY_SHIM_NONCE: `models-${process.pid}-${++modelsProbeSeq}`,
           AGY_SHIM_SET_MODE: "",
         },
         stdio: ["pipe", "pipe", "ignore"],
@@ -4789,6 +4799,7 @@ function interceptOutbound(line: string): void {
       );
       return;
     }
+    const earlyExitMessage = pending.earlyExit?.message ?? null;
     if (pending.earlyExit !== undefined) {
       // Bridge answered inside the grace window — its real error drives
       // the refusal classification, not our synthesized text.
@@ -4796,9 +4807,17 @@ function interceptOutbound(line: string): void {
       pending.earlyExit = undefined;
     }
     const errorText = "error" in msg ? errorMessageOf(msg.error) : null;
+    // On macOS the shim's last stderr write can lose the race to
+    // process.exit, so the bridge's exit error carries no refusal text.
+    // The shim-shutdown event already captured the tail — classify the
+    // answer glued with it, or the account slips past parking.
+    const classifyText =
+      errorText !== null && earlyExitMessage !== null
+        ? `${errorText}\n${earlyExitMessage}`
+        : errorText;
     if (
-      errorText !== null &&
-      isModelRefusal(errorText) &&
+      classifyText !== null &&
+      isModelRefusal(classifyText) &&
       pending.session.accountLabel !== null &&
       pending.session.model !== undefined &&
       dataDir !== ""
@@ -4810,10 +4829,10 @@ function interceptOutbound(line: string): void {
       return;
     }
     const parkedCause =
-      errorText !== null &&
+      classifyText !== null &&
       pending.session.accountLabel !== null &&
       dataDir !== ""
-        ? internalRefusalCauseOf(errorText)
+        ? internalRefusalCauseOf(classifyText)
         : null;
     if (parkedCause !== null) {
       // §2.3 п.11 (ревизия 15): a parking refusal (VALIDATION_REQUIRED/ToS
@@ -4823,7 +4842,7 @@ function interceptOutbound(line: string): void {
         msg.id as JsonRpcId,
         pending,
         parkedCause,
-        errorText ?? undefined,
+        classifyText ?? undefined,
       );
       return;
     }

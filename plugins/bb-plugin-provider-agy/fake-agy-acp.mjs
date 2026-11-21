@@ -162,6 +162,17 @@ if (earlyExitFile !== null && existsSync(earlyExitFile)) {
   process.exit(1);
 }
 
+// `.fake-acp-silent-exit` (content: delay ms) — hold, then die writing
+// NOTHING: the macOS-race shape where the bridge's exit error carries no
+// stderr text and only the shim's own captured tail keeps the refusal.
+const silentExitFile =
+  geminiDir !== null ? join(geminiDir, ".fake-acp-silent-exit") : null;
+if (silentExitFile !== null && existsSync(silentExitFile)) {
+  const delayMs = Number(readFileSync(silentExitFile, "utf8").trim()) || 1500;
+  await sleep(delayMs);
+  process.exit(1);
+}
+
 // Optional startup stderr chatter (AGY_FAKE_STDERR_BANNER): lets harnesses
 // prove the shim's per-spawn stderr file exists and its lifecycle cleanup.
 if (process.env.AGY_FAKE_STDERR_BANNER) {
