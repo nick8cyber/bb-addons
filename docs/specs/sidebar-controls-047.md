@@ -11,6 +11,9 @@ tags: [bb, sidebar, controls]
 
 ## Действия строки
 
+> [!NOTE]
+> **Расхождение со спецификацией в фактической реализации**: согласно контракту ниже изначально формулировалось требование о трёх кнопках в строке («Скопировать ссылку», «Архивировать», «⋯»). В фактической реализации `compact-ui` (`app.tsx:443-469`) в строку вынесены **две** кнопки (`data-bb-sidebar-row-action="copy"` и `="menu"`), а действие «Архивировать» (Archive) реализовано как пункт выпадающего меню `⋯` (`ThreadMenuItems`, `key: "archive"`, `app.tsx:244-250`) для экономии горизонтального пространства строки.
+
 В обычной строке всегда видны три кнопки, слева направо: «Скопировать ссылку», «Архивировать», «⋯». Не ждать hover; это одинаково для desktop, широкого touch и compact/PWA. Минимальные размеры: 24px desktop, 28px touch/compact. Текст треда обрезается многоточием, кнопки не сжимаются и не перекрываются.
 
 Копирование использует существующий canonical URL: origin текущего клиента + project/personal thread path. Один helper используется кнопкой и существующим меню. Ошибка/отсутствие clipboard API показывается как ошибка, не успех и не необработанное исключение. Действия не открывают тред и не закрывают drawer; клавиатура, фокус и menu pointer handling сохраняются. При inline rename кнопки по-прежнему скрыты. Архивирование идёт через прежний host action/подтверждение; production-треды ради проверки не архивировать.
@@ -27,9 +30,9 @@ tags: [bb, sidebar, controls]
 
 Один cleanup-safe content script держит статический собственный style; lifecycle abort/dispose удаляет только его. CSS :has реагирует на наличие родного Settings без observer/polling. Неизвестные маркеры — fail-open. Сохранить rail controller и пагинацию 3→10→20→30→37 и обратно, текущие настройки и native fallback.
 
-- Unit: порядок трёх действий, canonical clipboard URL для project/personal, reject/missing clipboard, отсутствие навигации, archive host call, menu opening, rename; CSS и cleanup script.
+- Unit: порядок трёх действий (в реализации: 2 кнопки строки + Archive в меню), canonical clipboard URL для project/personal, reject/missing clipboard, отсутствие навигации, archive host call, menu opening, rename; CSS и cleanup script.
 - npm ci; vitest последовательно; typecheck; bb plugin build; git diff --check от документной базы.
-- Живой Chromium: desktop/mobile light/dark и wide touch; три кнопки видны без hover, не перекрываются, Copy пишет ссылку и не навигирует; menu открывается; Archive проверяется без мутации настоящих тредов. Один Settings в Top list, доступ к настройкам, fallback кнопка в скрытом Rail. Контраст count badge измерить численно.
+- Живой Chromium: desktop/mobile light/dark и wide touch; кнопки действий видны без hover (фактически 2 кнопки: Copy и menu ⋯ с Archive внутри), не перекрываются, Copy пишет ссылку и не навигирует; menu открывается; Archive проверяется без мутации настоящих тредов. Один Settings в Top list, доступ к настройкам, fallback кнопка в скрытом Rail. Контраст count badge измерить численно.
 - Проверить сессии только bb-addons перед выкладкой. Без других агентов/остановок. Advisor ровно один раз после проверок, устранить замечания, commit/push ветки и проверка remote SHA.
 
 Откат: path:<worktrees>/bb-addons-sidebar-complete/plugins/bb-plugin-compact-ui @adde8ff.

@@ -143,6 +143,7 @@ startServer({ webDriver: { async sendPrompt(options) {
   const env = {
     BB_CLI: cli, WEB_GEMINI_FAKE: "0", ARGON_FAKE: "0",
     WEB_GEMINI_STATE_DIR: state, WEB_GEMINI_POOL_FILE: pool, WEB_GEMINI_BACKENDS: "[]",
+    WEB_GEMINI_SESSION_CAP_MS: "120000",
     ...options.env,
   };
   const launch = { displayName: "Fixture", command: process.execPath, args, env };

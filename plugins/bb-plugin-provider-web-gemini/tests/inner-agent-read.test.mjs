@@ -219,6 +219,7 @@ startServer({ webDriver: { async sendPrompt(options) {
     BB_CLI: cli, WEB_GEMINI_FAKE: "0", ARGON_FAKE: "0",
     WEB_GEMINI_STATE_DIR: state, WEB_GEMINI_POOL_FILE: join(dir, "absent"),
     WEB_GEMINI_BACKENDS: JSON.stringify([{ id: "web-fixture", cdp: 19223, profileDir: dir, tier: "pro" }]),
+    WEB_GEMINI_SESSION_CAP_MS: "120000",
     ...(options.bindEnv ? { BB_THREAD_ID: threadId } : {}),
     ...options.env,
   });
@@ -1561,5 +1562,357 @@ test("research-подобный ход без дерева собирает ша
   assert.match(header, /<tool name="bb_thread_message"/);
   assert.match(header, /<tool name="bb_task_show"/);
   assert.match(header, /bb_\* — по указанным аргументам\./);
-  assert.match(header, /Помимо них доступны собственные возможности веб-интерфейса \(поиск в интернете, чтение страниц\): для актуальных данных из интернета используйте их как обычно\./);
+  assert.match(header.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini\./);
+  assert.doesNotMatch(header, /доступны только/);
+});
+
+test("research по явному признаку «задача без кода» в git-дереве собирает короткий пакет (PLUG-384)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const { tmp, repo } = setup(t);
+
+  const taskText = [
+    "# RES-2 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+  assert.ok(prep.root);
+
+  const packageOptions = { limit: 120_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  // Шапка ставит веб-поиск первым, без общесессионного «доступны только».
+  assert.match(packed.message.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini/);
+  assert.doesNotMatch(packed.message, /доступны только/);
+  assert.match(packed.message, /=== Task text ===/);
+  // Без repo-инструментов в шапке — только bb_* команды.
+  const header = packed.message.split("\n\n===")[0];
+  assert.doesNotMatch(header, /<tool name="read_file"/);
+  assert.doesNotMatch(header, /<tool name="list_dir"/);
+  assert.doesNotMatch(header, /<tool name="grep"/);
+  assert.doesNotMatch(header, /<tool name="git"/);
+  assert.doesNotMatch(header, /рабочая копия/);
+  assert.match(header, /<tool name="bb_task_show"/);
+  // Без git-секций, инвентаря быстрого агента и манифеста разрешений.
+  assert.doesNotMatch(packed.message, /Git status/);
+  assert.doesNotMatch(packed.message, /Git \S+ diff/);
+  assert.doesNotMatch(packed.message, /Дополнения быстрого агента/);
+  assert.doesNotMatch(packed.message, /Опись \/ Manifest/);
+  assert.doesNotMatch(packed.message, /"permissions"/);
+  // Короткий пакет: шапка + задача, а не десятки КБ инвентаря.
+  assert.ok(Buffer.byteLength(packed.message) < 8_000, "research package should be short");
+});
+
+test("та же git-копия без признака research сохраняет полный репо-пакет (PLUG-384)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const { tmp, repo } = setup(t);
+
+  const taskText = [
+    "# RES-3 · Задача по репозиторию",
+    "## Description",
+    "Разберись с состоянием дерева.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    "Обычные инструкции без пометок.",
+  ].join("\n\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, false);
+
+  const packageOptions = { limit: 120_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  assert.match(packed.message, /=== Git status \(index and worktree\) ===/);
+  assert.match(packed.message, /=== Опись \/ Manifest ===/);
+  assert.match(packed.message, /"permissions": ?"read-only"/);
+});
+
+test("роль ресерчера в системных инструкциях включает research-пакет (PLUG-384)", async (t) => {
+  const { prepareTask } = await import("../src/inner-context.mjs");
+  const { tmp, repo } = setup(t);
+
+  const taskText = [
+    "# RES-4 · Исследование",
+    "## Description",
+    "Собери сведения по вопросу.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+  ].join("\n\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: RU["role.body.researcher"],
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+});
+
+test("research-сессия держит лёгкий пакет на повторных ходах; обычная сессия — полный (PLUG-384)", async (t) => {
+  const repo = setup(t);
+  const app = fixture(t, repo, () => ({ text: "Готово." }));
+  const contentOf = (request) =>
+    (request.files ?? []).map((file) => file.text).join("\n") + "\n" + request.prompt;
+  const assertLight = (request) => {
+    const content = contentOf(request);
+    assert.match(request.prompt.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini/);
+    assert.doesNotMatch(content, /<tool name="read_file"/);
+    assert.doesNotMatch(content, /<tool name="git"/);
+    assert.doesNotMatch(content, /Git status/);
+    assert.doesNotMatch(content, /Git \S+ diff/);
+    assert.doesNotMatch(content, /Дополнения быстрого агента/);
+    assert.doesNotMatch(content, /Опись \/ Manifest/);
+    assert.doesNotMatch(content, /"permissions"/);
+  };
+
+  const researchTask = [
+    "# RES-5 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const session = await app.newSession();
+  const first = await app.prompt(session, researchTask);
+  assert.equal(first.result?.stopReason, "end_turn", JSON.stringify(first.error));
+  // Повторный ход той же сессии без маркера в тексте — всё равно лёгкий.
+  const second = await app.prompt(session, "А теперь сравни ещё два варианта.");
+  assert.equal(second.result?.stopReason, "end_turn", JSON.stringify(second.error));
+  const [req1, req2] = app.requests();
+  assertLight(req1);
+  assertLight(req2);
+
+  // Отрицательный контроль: обычная задача того же дерева без маркера
+  // (отдельный экземпляр провайдера — session/new на том же worktree иначе
+  // подхватывает запись research-сессии как алиас) — полный репо-пакет.
+  const app2 = fixture(t, repo, () => ({ text: "Готово." }));
+  const plain = await app2.newSession();
+  const repoTask = [
+    "# RES-6 · Задача по репозиторию",
+    "## Description",
+    "Разберись с состоянием дерева.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+  ].join("\n\n");
+  const third = await app2.prompt(plain, repoTask);
+  assert.equal(third.result?.stopReason, "end_turn", JSON.stringify(third.error));
+  const content = contentOf(app2.requests().at(-1));
+  assert.match(content, /<tool name="read_file"/);
+  assert.match(content, /=== Git status \(index and worktree\) ===/);
+  assert.match(content, /=== Опись \/ Manifest ===/);
+  assert.match(content, /"permissions": ?"read-only"/);
+});
+
+test("research-ход собирает явно приложенный resource_link на текст в лёгкий пакет (PLUG-384)", async (t) => {
+  const repo = setup(t);
+  repo.write("research/attached.txt", "PUBLIC-ATTACHMENT-ZQ9\n");
+  const app = fixture(t, repo, () => ({ text: "Готово." }));
+
+  const researchTask = [
+    "# RES-7 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const session = await app.newSession();
+  const link = {
+    type: "resource_link",
+    uri: pathToFileURL(join(repo.repo, "research/attached.txt")).href,
+    name: "attached",
+  };
+  const res = await app.prompt(session, researchTask, [link]);
+  assert.equal(res.result?.stopReason, "end_turn", JSON.stringify(res.error));
+
+  const [request] = app.requests();
+  const content = request.files.map((file) => file.text).join("\n") + "\n" + request.prompt;
+  // Явное вложение дошло веб-файлом — не потеряно молча.
+  assert.match(content, /PUBLIC-ATTACHMENT-ZQ9/);
+  // Пакет всё ещё лёгкий: без манифеста, git-секций и repo-инструментов;
+  // локальные файлы репозитория сами не подбираются.
+  assert.match(request.prompt.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini/);
+  assert.doesNotMatch(request.prompt, /<tool name="read_file"/);
+  assert.doesNotMatch(content, /Опись \/ Manifest|"permissions"|Git status|different HEAD/);
+});
+
+test("research-ход: resource_link вне корней сессии — явный отказ, а не молчаливая потеря (PLUG-384)", async (t) => {
+  const repo = setup(t);
+  const outside = join(repo.tmp, "outside.txt");
+  writeFileSync(outside, "OUTSIDE-CONTENT\n");
+  const app = fixture(t, repo, () => ({ text: "Готово." }));
+
+  const researchTask = [
+    "# RES-8 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const session = await app.newSession();
+  const link = { type: "resource_link", uri: pathToFileURL(outside).href, name: "outside" };
+  const res = await app.prompt(session, researchTask, [link]);
+  assert.ok(res.error, JSON.stringify(res.result));
+  assert.match(res.error.message, /mandatory ACP attachment/);
+  // Ход не доехал до веб-драйвера — обязательное вложение не «0 materials».
+  assert.equal(app.requests().length, 0);
+});
+
+test("research-ход: вызов repo-инструмента в цикле получает явный отказ (PLUG-384)", async (t) => {
+  const repo = setup(t);
+  const app = fixture(t, repo, (request) =>
+    request.count === 1
+      ? { text: '<tool name="read_file" path="docs/notes.txt"/>' }
+      : { text: "Готово." });
+
+  const researchTask = [
+    "# RES-9 · Публичное исследование",
+    "## Description",
+    "Исследуй только публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    RU["instr.noCode"],
+  ].join("\n\n");
+
+  const session = await app.newSession();
+  const res = await app.prompt(session, researchTask);
+  assert.equal(res.result?.stopReason, "end_turn", JSON.stringify(res.error));
+
+  const [, toolRound] = app.requests();
+  assert.match(toolRound.prompt, /=== tool: read_file/);
+  assert.match(toolRound.prompt, /error: repository tools are unavailable/);
+  // Локальный файл при этом не прочитан.
+  assert.doesNotMatch(toolRound.prompt, /different HEAD/);
+});
+
+test("collectTaskAttachments и taskTool в research-режиме: явные вложения собираются, отказы диагностируемы (PLUG-384)", async (t) => {
+  const { collectTaskAttachments, prepareTask, taskTool } = await import("../src/inner-context.mjs");
+  const { tmp, repo, write } = setup(t);
+  write("research/attached.txt", "PUBLIC-ATTACHMENT-ZQ9\n");
+  const signal = new AbortController().signal;
+
+  const taskText = [
+    "# RES-10 · Публичное исследование",
+    "## Description",
+    "Исследуй публичные источники.",
+    "## Attachments",
+    "None.",
+    "## Recent comments",
+    "None.",
+    "## Additional instructions",
+    [RU["instr.noCode"], interpolate(RU["instr.attachList"], { list: ["docs/notes.txt"] })].join("\n"),
+  ].join("\n\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+  assert.equal(prep.research, true);
+  assert.deepEqual(prep.repoFiles, ["docs/notes.txt"]);
+
+  const options = {
+    signal,
+    maxUploadBytes: 1_000_000,
+    maxUploadCount: 5,
+    spillDir: tmp,
+    validateUploads: (blocks) => ({ files: blocks.map((block) => fileURLToPath(block.uri)) }),
+  };
+  const link = { type: "resource_link", uri: pathToFileURL(join(repo, "research/attached.txt")).href };
+
+  // Явно приложенный текст собирается через ACP-валидацию.
+  const materials = await collectTaskAttachments(prep, [link], options);
+  assert.equal(materials.length, 1);
+  assert.equal(materials[0].source, "ACP attachment");
+  assert.match(materials[0].text, /PUBLIC-ATTACHMENT-ZQ9/);
+  // repoFiles из инструкций в light по-прежнему исключены.
+  assert.ok(!materials.some((item) => /different HEAD/.test(item.text)));
+
+  // Отказ валидации — явная ошибка, не «0 materials».
+  await assert.rejects(
+    collectTaskAttachments(prep, [link], { ...options, validateUploads: () => ({ error: "denied" }) }),
+    /mandatory ACP attachment/,
+  );
+  // Бинарное вложение — тоже явный отказ, не молчаливый пропуск.
+  await assert.rejects(
+    collectTaskAttachments(prep, [{ type: "image", path: join(repo, "picture.bin") }], options),
+    /mandatory attachment is binary/,
+  );
+
+  // Инструменты дерева в light — отказ.
+  for (const [name, args] of [
+    ["read_file", { path: "docs/notes.txt" }],
+    ["list_dir", { path: "." }],
+    ["grep", { pattern: "HEAD" }],
+    ["git", { args: "status" }],
+  ]) {
+    const result = await taskTool(prep, {}, { name, args, attrs: [] }, 60_000, signal);
+    assert.equal(result.ok, false, name);
+    assert.match(result.output, /^error: .*unavailable/, name);
+  }
+
+  // Репо-режим неизменён: тот же read_file читает рабочую копию.
+  const plain = await prepareTask({
+    text: taskText.replace(RU["instr.noCode"], "Обычные инструкции без пометок."),
+    system: null,
+    session: { cwd: repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo } },
+    stateDir: tmp,
+  });
+  assert.equal(plain.research, false);
+  const read = await taskTool(plain, {}, { name: "read_file", args: { path: "docs/notes.txt" }, attrs: [] }, 60_000, signal);
+  assert.equal(read.ok, true);
+  assert.match(read.output, /different HEAD/);
 });

@@ -148,6 +148,37 @@ if (argv.includes("models")) {
   process.exit(0);
 }
 
+// Early death before session init (PLUG-373): an account home carrying
+// `.fake-acp-early-exit` inside its .gemini dir makes `agy acp --gemini-dir`
+// print the file's content to stderr and exit 1 — the spawn-time refusal
+// shape (Verification Required / ToS / eligibility) that never reaches
+// JSON-RPC. `agy models` is unaffected (it exits above).
+const earlyExitFile =
+  geminiDir !== null ? join(geminiDir, ".fake-acp-early-exit") : null;
+if (earlyExitFile !== null && existsSync(earlyExitFile)) {
+  try {
+    process.stderr.write(readFileSync(earlyExitFile, "utf8"));
+  } catch {}
+  process.exit(1);
+}
+
+// `.fake-acp-silent-exit` (content: delay ms) — hold, then die writing
+// NOTHING: the macOS-race shape where the bridge's exit error carries no
+// stderr text and only the shim's own captured tail keeps the refusal.
+const silentExitFile =
+  geminiDir !== null ? join(geminiDir, ".fake-acp-silent-exit") : null;
+if (silentExitFile !== null && existsSync(silentExitFile)) {
+  const delayMs = Number(readFileSync(silentExitFile, "utf8").trim()) || 1500;
+  await sleep(delayMs);
+  process.exit(1);
+}
+
+// Optional startup stderr chatter (AGY_FAKE_STDERR_BANNER): lets harnesses
+// prove the shim's per-spawn stderr file exists and its lifecycle cleanup.
+if (process.env.AGY_FAKE_STDERR_BANNER) {
+  process.stderr.write(`${process.env.AGY_FAKE_STDERR_BANNER}\n`);
+}
+
 const configOptionsFor = () => [
   { id: "model", category: "model", type: "select",
     currentValue: catalogFor(homeLabel)[0]?.id ?? "fake-model",

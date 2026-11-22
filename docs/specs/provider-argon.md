@@ -2,8 +2,8 @@
 title: provider-web-gemini (ранее provider-argon) — ACP-провайдер веб-интерфейса Gemini
 status: approved
 owner: coordinator
-date: 2026-11-18
-revision: 26 (r26 — каноническое имя модели `neon`, `argon` остаётся псевдонимом обратной совместимости; слово владельца 20.11)
+date: 2026-11-22
+revision: 29 (r29 — r27: управляемые группы браузера Chrome/Xvfb, маркеры и .lock, реапер сирот, fail-closed flock, PLUG-374; r28: §4.5 каналы сбора генерируемых файлов, отсев телеметрии/RPC, magic-bytes и canvas-fallback, PLUG-376; r29: детект стола генерации no-progress вместо wall-clock дедлайна — фазовый SEND_DEADLINE, SESSION_CAP, STALL_MS и авторетрай стола с ротацией, PLUG-371)
 tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 ---
 
@@ -100,6 +100,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 - **Жизненный цикл процесса и сторожа**:
   - Журнал этапов: `slog(stage, extra)` дописывает строки вида `<ISO-ts> pid=<pid> <stage> <json>` в `acp-server.log` в каталоге состояния (`WEB_GEMINI_STATE_DIR` / `ARGON_STATE_DIR`) — по нему видна точная стадия зависшего или тихого хода (постановка в очередь, аренда, вызов драйвера, стриминг, ошибки).
   - Реапер сирот (только Linux): `reapOrphanAcpServers()` вызывается при старте сервера (`startServer`), сканирует `/proc` и шлёт `SIGTERM` другим процессам `acp-server.mjs` с `ppid == 1` (перерождённым на init), чтобы старые копии не держали профили Chrome и аренды.
+  - Уборка управляемых групп браузера (PLUG-374): `reapOrphanBrowserGroups()` вызывается при старте сервера (`startServer`) и периодически каждые 60 секунд (каждые 12 тиков 5-секундного таймера `ppidWatch`), убирая осиротевшие группы Chrome/Xvfb (§8). При штатном выходе `cleanShutdown()` вызывает `cleanupOwnBrowserGroups()`, которая убирает свои группы (`ownerPid === process.pid`), если на порту нет чужой активной аренды или внешних CDP-клиентов (собственные playwright-сокеты процесса исключаются через `socketInodesOf(process.pid)`).
   - Сторож родителя: таймер каждые 5 с сравнивает `process.ppid` с захваченным при старте `ownerPpid`; при смене родителя или `ppid === 1` (reparenting на init — родительский мост BB умер) пишет `process:reparented-exit` и вызывает `cleanShutdown()`. Таймер `unref`-нут и сам по себе процесс не держит.
   - Выход по смене кода: в том же 5-секундном цикле, когда нет активного хода (`!activePromptSessionId`), `checkStaleCode()` сравнивает `mtime` файла `acp-server.mjs` с зафиксированным при старте; обновление файла (новая версия плагина) → `server:stale-code-exit` и `cleanShutdown()` — процесс не продолжает работать на устаревшем коде и перезапускается мостом на следующем ходе.
 
@@ -107,8 +108,11 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 
 Все переменные окружения `ARGON_*` после переименования провайдера (PLUG-298) принимаются под целевыми именами `WEB_GEMINI_*`; прежние `ARGON_*` продолжают работать как фолбэк обратной совместимости (новое имя имеет приоритет).
 
-- Внешний дедлайн хода в `acp-server.mjs`: `SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000` (20 минут, предотвращает обрыв длинных глубоких ревью на `neon` high).
-- Внутренний потолок ожидания генерации в `src/gemini-driver.js`: `MAX_WAIT_MS = Number(process.env.GEMINI_MAX_WAIT_MS) || 900_000` (15 минут).
+- Фазовый дедлайн хода в `acp-server.mjs` (PLUG-371): `SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000` (20 минут) применяется к **негенерационным** стадиям хода (collect/delivery/verify/commit) и одновременно служит фазовым бюджетом авторетрая стола. При входе задачи в стадию `generation` дедлайн поднимается до `sessionCapAt`; при выходе из генерации и входе в `verify`/`commit` окно возвращается к `min(now + SEND_DEADLINE_MS, sessionCapAt)`. Перевзвод дедлайна выполняется **только при смене стадии** — повторный heartbeat той же стадии окно не сдвигает (`armAttemptDeadline` подписан на `task.onDeadlineChange` и перевзводит `deadlineTimer`, снимая подписку после `Promise.race`).
+- Абсолютный потолок длительности хода и цикла генерации: `SESSION_CAP_MS = Number(process.env.WEB_GEMINI_SESSION_CAP_MS || process.env.ARGON_SESSION_CAP_MS)` при `> 0`, иначе `4 * 3600_000` (4 часа). Пока у генерации есть прогресс, `SEND_DEADLINE_MS` к ней не применяется — медленные модели (`carbon`) могут рассуждать часами; цикл драйвера ограничен `while (Date.now() - streamStartTime < SESSION_CAP_MS)`.
+- Детект стола генерации в `src/gemini-driver.js` (PLUG-371): `STALL_MS = stallMs ?? Number(process.env.WEB_GEMINI_STALL_MS || process.env.ARGON_STALL_MS)` при `> 0`, иначе `120_000` (2 минуты). При `isGenerating` (видимый stop-button/busy) или потере target без контента (`lostWithoutContent`), а также при `awaitingContent` (стоп-кнопка ушла, но готового контента нет) отсутствие прогресса дольше `STALL_MS` бросает `generation stalled — no progress for <n>s` с кодом `WEB_GEMINI_STALLED` — классификация `transient`, `rotatable` (§3.4).
+- Авторетрай стола в рамках хода (PLUG-371): при `stalled` `runPrompt` делает **один** повтор, если остаётся `> 25%` фазового бюджета `SEND_DEADLINE_MS`; перед повтором `excludeBackendId = backend.id` — `pickBackendFromState` выбирает свободного соседа по пулу, при отсутствии соседа (`r.none`) допускается возврат на тот же аккаунт (`allowSameBackend`). При установленном `s.convId` (2+ раунд tool-loop) ретрай не запускается; без бюджета исход хода — `failed` с `reason: "stalled"`.
+- Прежний внутренний потолок ожидания генерации `MAX_WAIT_MS`/`GEMINI_MAX_WAIT_MS` из `src/gemini-driver.js` удалён (PLUG-371): его роль выполняют `STALL_MS` (отсутствие прогресса) и `SESSION_CAP_MS` (абсолютный потолок).
 - `WEB_GEMINI_MAX_TOOL_ROUNDS` / `ARGON_MAX_TOOL_ROUNDS`: максимальное количество раундов вызова инструментов за один ход (по умолчанию `8`).
 - `WEB_GEMINI_MAX_MESSAGE_BYTES` / `ARGON_MAX_MESSAGE_BYTES`: максимальный размер первого упакованного сообщения (по умолчанию `120_000` байт).
 - `WEB_GEMINI_TOOL_TIMEOUT_MS` / `ARGON_TOOL_TIMEOUT_MS`: таймаут выполнения каждого локального инструмента чтения (по умолчанию `15_000` мс / 15 с).
@@ -166,8 +170,8 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 
 ### 3.2 Аренда (`leases`) и защита от зависших замков
 
-- Один процесс Chrome (`cdpPort`) в один момент времени обслуживает не более одного активного хода (`leases[backendId] = { pid, acquiredMs }`).
-- Пока идёт ход, аренда удерживаемого бэкенда периодически продлевается каждые 60 секунд (периодический таймер обновляет `acquiredMs: Date.now()`), что предотвращает истечение аренды во время длинных ходов (вплоть до `SEND_DEADLINE_MS = 20` минут).
+- Один процесс Chrome (`cdpPort`) в один момент времени обслуживает не более одного активного хода (`leases[backendId] = { pid, acquiredMs, cdp }`). Поле `cdp` фиксирует строковый номер CDP-порта группы браузера (`String(b.cdp)`), что позволяет не-ACP читателям (включая конвейер `teardownGroup` и `stopChrome` в драйвере через `leaseBusyOnPort`) проверять занятость порта активной арендой без отдельной загрузки конфигурации пула backends. При захвате аренды в `acquireInState` вызывается `browserGroups.adoptGroup(STATE_DIR, b.cdp)`, чтобы перезаписать `ownerPid` и `ownerStartTime` маркера группы на текущий активный процесс ACP, благодаря чему реапер видит живого проверяемого владельца.
+- Пока идёт ход, аренда удерживаемого бэкенда периодически продлевается каждые 60 секунд (периодический таймер обновляет `acquiredMs: Date.now()`), что предотвращает истечение аренды во время длинных ходов (вплоть до `SESSION_CAP_MS = 4` часов).
 - При чтении состояния просроченные аренды (`now - acquiredMs >= LEASE_TTL_MS`, где `LEASE_TTL_MS = 10 * 60_000`) и аренды мёртвых процессов (`!isPidAlive(pid)`) автоматически очищаются. Таймаут `LEASE_TTL_MS = 10` минут срабатывает только для зависших или аварийно завершившихся процессов.
 - При закрытии `stdin` (`rl.on("close")`), а также по сигналам `SIGTERM` и `SIGINT`, `acp-server.mjs` прерывает активный ход (`activePrompt?.abort.abort()`), дожидается `releaseLease(activeBackendId)` и только затем завершает процесс. Это гарантирует отсутствие осиротевших аренд при перезапуске моста или отмене треда демоном BB.
 
@@ -210,7 +214,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
   | Текст квоты/лимита (`rate limit`, `quota`, `Limit resets …`, `лимит`) | DOM-текст меню | `rate-limit` | нет; кулдаун до reset (≤ 7 сут) | да |
   | Пункт отсутствует в меню выбора, уровень отключён/залочен, апсейл-диалог | DOM | `model-unavailable` | `model-unavailable`, 6 ч | да |
   | Таймаут селектора/навигации, `TimeoutError`, крэш страницы, CDP/network-сбой | сбой драйвера | `transient` | нет | да |
-  | Таймаут ожидания генерации (stream cap, `hung page`) | сбой драйвера | `transient` | нет | да |
+  | Таймаут ожидания генерации (stream cap, `hung page`); стол генерации `WEB_GEMINI_STALLED` (нет прогресса `STALL_MS`) | сбой драйвера | `transient` | нет | да |
   | Любая прочая ошибка | — | `transient` (default) | нет | нет — сразу вызывающему |
 
   Правило PLUG-286: ни один таймаут или сбой страницы не даёт `model-unavailable` без DOM-признака; `model-unavailable` ставится только по DOM-доказательству.
@@ -331,7 +335,9 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 
 - **Прикладывание файлов (`attachFile`):** до вставки текста промпта и до `waitForHistoryStabilization` каждый файл из `opts.files` прикладывается через веб-аплоадер Gemini: кнопка «+» (Upload & tools) → скрытый `input[type="file"]` в открытом меню (`setInputFiles`; запасной путь — видимый пункт «Upload files»/«Загрузить файлы» + `filechooser.setFiles`) → ожидание чипа превью и активной кнопки Send (до 15 с). Файлы никогда не идут через `insertText` — это снимает зависание textbox на больших пакетах (§4.1).
 - **Сбор сгенерированных файлов (`collectGeneratedFiles`):** post-turn, пока DOM текущего ответа ещё жив (до ephemeral-удаления беседы и парковки вкладки на `about:blank`), сканируется только целевой ответ хода через `findTurnTarget` — никогда `model-response:last-of-type`, иначе файлы прошлых ходов перекачивались бы повторно. Кандидаты внутри ответа: якоря `<a href>` с атрибутом `download`, подписью Download/Export/Скачать/Экспорт или файловым расширением в URL, и кнопки с теми же подписями — только на доменах белого списка `isAllowedDownloadHost` (`google.com`, `*.google.com`, `googleusercontent.com`, `*.googleusercontent.com`, `googleapis.com`, `*.googleapis.com`); ссылки и кнопки вне списка не кликаются и не выгружаются.
-- **Два канала скачивания:** прямой GET через `context.request` того же браузерного контекста (имя из `Content-Disposition`, атрибута `download` или пути URL; `content-length` проверяется до чтения тела) и клик по элементу с перехватом `page.waitForEvent('download')` (хост `download.url()` сверяется с `isAllowedDownloadHost`, когда доступен; `suggestedFilename` → `saveAs`). Сохранение атомарное — `<dest>.part` + `rename` — в `downloads/<sessionId>-<ts>-<n>-<name>`; имя проходит `sanitizeDownloadName` (≤120 символов, без `..`, сепараторов, `#` и управляющих символов).
+- **Каналы скачивания (PLUG-376):** для `<a href>`-кандидатов с разрешённым URL — прямой GET через `context.request` того же контекста (имя из `Content-Disposition`, атрибута `download` или пути URL; `content-length` проверяется до чтения тела). Для клик-кандидатов четыре канала буферизуют события слушателями с начала клика (события вне окна клика игнорируются accept-флагом): нативный `download`-ивент страницы, новая вкладка `ctx.on('page')` (`inspectNewPage` ждёт реальный `^https?` URL — `about:blank` пропускается), сетевой ответ `respFileCandidate` и хук `URL.createObjectURL` (fetch→blob; Blob удерживается для чтения `arrayBuffer`). Победитель — первый непустой результат (`firstNonNull`): `null` или ошибка одного канала не гасит остальные. Каскад клика — обычный `click` (5 с) → `force` (3 с) → `dispatchEvent`; дедлайн гонки `CLICK_WAIT_MS` (по умолчанию 10 с) отсчитывается после успешного клика. `cleanupWaiters` снимает слушателей и закрывает буферные вкладки-не-победители. Хост результата проверяется `classifyDlUrl` до и после редиректов: `allowed` по белому списку, `drive` по `DRIVE_GATE_HOST_RE` (`docs|drive|sheets|slides.google.com` — фиксируется причиной в `skipped`), прочее отклоняется. Сохранение атомарное — `<dest>.part` + `rename` — в `downloads/<sessionId>-<ts>-<n>-<name>`; имя проходит `sanitizeDownloadName` (≤120 символов, без `..`, сепараторов, `#` и управляющих символов).
+- **Отсев телеметрии и валидация контента:** `respFileCandidate` применяет строгий порядок — сначала отсев по URL и имени файла (`TELEMETRY_OR_RPC_URL_RE`: `batchexecute`, `gen_204`, `/log`, `telemetry`, `beacon`, `/collect`, `playlog`, `/_`, `rpcids=`; `isTelemetryOrRpcName`: `response.bin`), затем статус 2xx и белый список хостов, затем `Content-Disposition: attachment` или бинарный `content-type` (`image/*` кроме `svg`/`gif`/`icon`). `isValidResponseContent` дополнительно отклоняет JSON-конверт RPC (префиксы `)]}'`, `{`, `[`) при заявленном бинарном типе и проверяет magic bytes (PNG `\x89PNG`, JPEG `\xFF\xD8`, WebP `RIFF…WEBP`, GIF `GIF8`, zip/docx/xlsx/pptx `PK\x03\x04`). Служебный ответ Google с заголовком `attachment` (вроде `response.bin` от `batchexecute`) файлом не становится.
+- **Fallback для Imagen (PLUG-376):** когда все четыре канала после успешного клика пусты (кнопка «Скачать в полном размере» в Imagen не порождает событий сети), выполняется canvas-экстракция изображения из контейнера ответа (`canvas.toDataURL('image/png')` либо `img.src`), валидируется `data:image/` и записывается в `res.files`; при неуспехе причина фиксируется в `skipped` (`telemetry/rpc`, если был отсечён RPC, иначе `download did not materialize`).
 - **Лимиты и отказоустойчивость:** ≤ `WEB_GEMINI_MAX_DOWNLOAD_BYTES` / `ARGON_MAX_DOWNLOAD_BYTES` (по умолчанию 50 МБ) на файл, ≤ `WEB_GEMINI_MAX_DOWNLOAD_COUNT` / `ARGON_MAX_DOWNLOAD_COUNT` (по умолчанию 5) за ответ и потолок попыток `max(8, 2 × WEB_GEMINI_MAX_DOWNLOAD_COUNT / ARGON_MAX_DOWNLOAD_COUNT)` — длинный хвост неудачных кандидатов не растягивает ход. Превышение и ошибки кандидатов попадают в `skipped` и не роняют ход; сбой самого сканера — только `console.warn`. Отмена хода проверяется между кандидатами через `throwIfCancelled`. Результат — `res.files[]` (`{ path, name, mimeType, sizeBytes }`) и `res.skippedDownloads[]` (`{ name, reason }`), которые `acp-server.mjs` превращает в `resource_link`-чанки и текстовые пометки (§2.2 п.7, §2.4).
 
 ### 4.6 Выбор модели в веб-интерфейсе и маппинг пикера (PLUG-324)
@@ -383,10 +389,21 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
   13. Точный предикат замка и ops-очистку `lockedModels` (PLUG-282): `menuItemHasLockIcon` на DOM-фикстурах — видимый замок по каждому каналу (innerText/data-mat-icon-name/aria-label/class-токен) детектится, `'unlock'`/`'lock_open'`/`'mat-icon-lock-reset'`/скрытая иконка — нет; `upsellDialogConfirmsLock` — промо с ценой без план-CTA не замок и не дисмиссится, диалог с `Сменить план` — замок с дисмиссом, скрытый диалог игнорируется, помеченный `data-web-gemini-pre-click` диалог с CTA — не замок, вызовы без аргумента берут `globalThis.document` и не падают без него; e2e `selectModelAndThinking` — пункт с иконкой `unlock` кликается, промо-попап после клика не лочит, диалог-отклик с CTA лочит (`isLocked`/`lockedModel`), предсуществующий CTA-промо не лочит, выбравшаяся модель гасит замок; ops `node acp-server.mjs unlock <id|all> [model]` — точечное снятие модели, `all`, восстановление `tier` при снятии `carbon`, кулдаун и `parkedReason` не трогаются.
   14. Вырезание bb-контекста `<system_instructions>` из `session/prompt` (PLUG-285): предикат `isBbSystemInstructionsBlock` по началу текста с `trimStart`, отбрасывание таких блоков до склейки, сохранение метки внутри пользовательского текста и не-text блоков, edge «только контекст» → немедленный `end_turn` без аренды.
   15. Честную классификацию сбоев драйвера (PLUG-286): таймаут `waitForSelector` и `TimeoutError` по имени ошибки, крэш страницы/браузера, CDP и сетевые отказы → `transient` с `rotatable: true`, `parkedReason: null`, без кулдауна; «страница недоступна» без контекста модели — не `model-unavailable`; DOM-доказательства сохраняются (замок/апсейл → `model-locked`, отсутствие пункта в меню → `model-unavailable` 6 ч); повторные transient-сбои не паркуют аккаунт — исходная ошибка уходит вызывающему.
-  16. Веб-вложения файлов (PLUG-291): `collectUploadFiles` — приём `file://` `resource_link` и `image`/`localFile`, игнор URL и `resource`-блоков, дедуп по `realpath` до count-лимита, resolve относительных `path` от `s.cwd`, корни `cwd` + `additionalDirectories`/`roots`, отказы `outside session roots` / `not found` / `not a file` / `sensitive` / `too many upload files`, симлинк наружу; `pruneDir` — TTL и ограничение по числу файлов; `sanitizeDownloadName` и `isAllowedDownloadHost` (включая отказ `google.com.evil.com`); `collectGeneratedFiles` на mock-DOM — прямой URL через `context.request` и клик через `download`-событие, атомарные имена `<sessionId>-<ts>-<n>-<name>` без `.part`-остатков, пустой результат без DOM/каталога; `sendPrompt` — `attachFile` для каждого файла строго до вставки текста, `res.files`/`skippedDownloads` в результате; e2e FAKE — `file://` вне корней → `-32602`, внутри `cwd` → принят (§2.4, §4.5).
+  16. Веб-вложения файлов (PLUG-291): `collectUploadFiles` — приём `file://` `resource_link` и `image`/`localFile`, игнор URL и `resource`-блоков, дедуп по `realpath` до count-лимита, resolve относительных `path` от `s.cwd`, корни `cwd` + `additionalDirectories`/`roots`, отказы `outside session roots` / `not found` / `not a file` / `sensitive` / `too many upload files`, симлинк наружу; `pruneDir` — TTL и ограничение по числу файлов; `sanitizeDownloadName` и `isAllowedDownloadHost` (включая отказ `google.com.evil.com`); `collectGeneratedFiles` на mock-DOM — прямой URL через `context.request` и клик через `download`-событие, атомарные имена `<sessionId>-<ts>-<n>-<name>` без `.part`-остатков, пустой результат без DOM/каталога; каналы клика (PLUG-376): победитель `firstNonNull` — `null`/ошибка канала не гасит остальные, дедлайн после успешного клика, каскад `click`→`force`→`dispatchEvent`, снятие слушателей и закрытие буферных вкладок; `respFileCandidate` — `attachment`+`image/png` на `batchexecute` с JSON-конвертом отклоняется как telemetry/rpc до проверки disposition, отсев `response.bin`/gen_204/`rpcids=`, whitelist хостов и Drive-гейт; `isValidResponseContent` — magic bytes PNG/JPEG/WebP/GIF/PK и отказ JSON-конверта при бинарном типе; canvas-fallback Imagen при пустых каналах; `sendPrompt` — `attachFile` для каждого файла строго до вставки текста, `res.files`/`skippedDownloads` в результате; e2e FAKE — `file://` вне корней → `-32602`, внутри `cwd` → принят (§2.4, §4.5).
   17. Обратную совместимость переименования `provider-argon` → `provider-web-gemini` (PLUG-298): двойную регистрацию провайдеров — основной `acp-web-gemini` (`Gemini (Web)`, бейдж `Gemini`) и legacy-алиас `acp-argon` (`Gemini (Argon)`); приём переменных `WEB_GEMINI_*` (`WEB_GEMINI_FAKE`, `WEB_GEMINI_FAKE_DELAY_MS`, `WEB_GEMINI_STATE_DIR`, `WEB_GEMINI_POOL_FILE`, `WEB_GEMINI_USE_BUNDLED`) с фолбэком на `ARGON_*`; генерацию sessionId с префиксом `web-gemini-*` и регистрацию алиаса `argon-*` в `sessions` (`session/new` и `session/load`), чтобы клиенты, продолжающие сессии по старому префиксу, попадали в ту же сессию.
   18. Предикат завершения хода (PLUG-304): `checkTurnStatus` на DOM-фикстурах — инцидент «42 символа в `message-content` + spinner/thinking при отсутствии stop-кнопки» не завершает ход; сценарии паузы после thinking без action-кнопок, завершённого ответа с action-кнопками (Copy/Good response), avatar-изображения до появления `message-content`, наличия stop-кнопки, `aria-busy`/`shimmer`/`thinking-indicator`; двойной порог `isTurnComplete` (500 мс с action-кнопками / 5000 мс фолбэк) и сброс стабильности при росте текста; интеграционный `sendPrompt` — полный текст ответа вместо усечённого thinking-фрагмента, стриминг чанков `onChunk`, захват `convId` из URL (§4.2, §4.3).
   19. Маппинг переименованного пикера моделей (Neon/Carbon/Hydrogen) и детект Ultra-lock (PLUG-324): выбор пункта пикера «Deeper analysis | 4 Neon» (и RU-варианта «Глубокий анализ | 4 Neon») при `model: 'neon'` (или обратном алиасе `'argon'`); детектирование пункта «Code & complex work | 4 Carbon» со значением `upsell_MODE_CATEGORY_ULTRA` (и любым `upsell_*`) в `data-mode-id` как заблокированного (`isLocked: true`, `ModelUnavailable`) без совершения клика; сохранение обратной совместимости старых подписей («Argon», «Код и анализ», «Самые сложные задачи»); распознавание Neon (и обратного псевдонима `argon`) в `resolveModelId` как `neon`; поддержка fallback-кнопки пикера с Neon/Deeper analysis (тест fallback-пути `getPickerButton` через `evaluateHandle` и проверка regex-литерала) (§4.6).
+  20. Жизненный цикл управляемых групп браузера Chrome/Xvfb (PLUG-374, тесты 24–32):
+      - 24 (`browser-groups: marker/adopt/identity primitives`): базовые примитивы создания маркера (`recordGroup`), чтения (`readMarker`), усыновления (`adoptGroup`), идентификации группы (`identifyGroup`) и проверки соответствия живых процессов (`groupAliveMatches`, проверка флага `--remote-debugging-port`).
+      - 25 (`browser-groups: orphan reap, lease/CDP preservation, reparented groups`): уборка осиротевших групп процессов (включая Xvfb при погибшем Chrome) при смерти ACP; безусловное сохранение групп под активной арендой в реестре или с живыми CDP-клиентами (`ESTABLISHED`-соединения); корректное обнаружение и уборка сирот при унаследовании процессов user-systemd (`PPID != 1`).
+      - 26 (`browser-groups: clean-shutdown cleanup of own groups`): штатный выход процесса ACP (`cleanShutdown` → `cleanupOwnBrowserGroups`) с уборкой собственных групп при отсутствии чужой аренды и сторонних клиентов; исключение собственных Playwright-сокетов через `socketInodesOf(process.pid)`.
+      - 27 (`browser-groups: identity mismatch stays doubtful — no signal, marker kept`): защита от повторного использования PGID чужими процессами; несовпадение времени старта (`pgidStartTime`) или наличие неатрибутируемых процессов стека переводит группу в статус `'doubtful'` — сигналы не посылаются, маркер сохраняется с аннотацией `doubt.reason`.
+      - 28 (`browser-groups: stale-boot marker authorizes nothing — no signal, port free`): маркер с чужим или отсутствующим `bootId` (прошлая загрузка ОС) классифицируется как `'stale-boot'` и не авторизует посылку сигналов процессам текущей ОС; реапер удаляет только устаревший файл маркера, освобождая порт.
+      - 29 (`browser-groups: unreadable boot_id fails closed — no signal, no adopt, marker kept`): при нечитаемом `/proc/sys/kernel/random/boot_id` на Linux (`bootState === 'unknown'`) система переходит в fail-closed режим (`'boot-unknown'`) — запрет посылки сигналов, запрет `adoptGroup`, маркер сохраняется.
+      - 30 (`browser-groups: marker lock serializes writers — a concurrent fresh marker survives`): блокировка маркера сериализует параллельные операции записи и удаления; свежий маркер параллельного запуска не затирается отработавшим сносом.
+      - 31 (`browser-groups: kernel marker lock + unified stopChrome teardown`): использование блокировки ядра `flock(2)` на открытом файловом дескрипторе `<port>.lock`; отсутствие stale-steal; единый конвейер `teardownGroup` для реапера и `stopChrome` в драйвере.
+      - 32 (`browser-groups: no flock on linux fails closed — no in-process degrade`): при отсутствии утилиты `flock` на Linux или ошибке запуска операции завершаются с ошибкой `BG_LOCK_UNAVAILABLE`; тихий откат к внутрипроцессной блокировке запрещён.
+  21. Детект стола генерации и фазовые дедлайны (PLUG-371, тесты 33–34): `classifyFailure` относит `WEB_GEMINI_STALLED` к `transient`/`rotatable`; перевзвод дедлайна `createTaskTurn` строго при смене стадии (вход в `generation` поднимает окно до `sessionCapAt`, выход в `verify`/`commit` возвращает `min(now + SEND_DEADLINE_MS, sessionCapAt)`, повторный heartbeat окно не сдвигает); e2e через настоящий `acp-server.mjs` с подменённым драйвером и `bb` (`tests/fixtures/stall-server.mjs`, `fake-bb.sh`) — stall при `> 25%` фазового бюджета даёт один авторетрай с ротацией на соседний аккаунт и исходом `passed`, stall при `≤ 25%` — `failed` с `reason: "stalled"` без ретрая, генерация дольше `SEND_DEADLINE_MS` под `SESSION_CAP_MS` проходит, stall на раунде с `convId` ретрая не даёт.
 - Набор `tests/provider-web-gemini-tools.test.mjs` (47 тестов, офлайн) покрывает инструменты чтения веб-Gemini по спеке `provider-web-gemini-tools.md`: разбор текстового протокола вызовов инструментов, sandbox `cwd` (запрет `..`, абсолютных путей и симлинков наружу, чёрный список чувствительных файлов), белый список `git`-команд, маскировку секретов `[скрыто: <тип>]`, раунды tool-loop и лимит `WEB_GEMINI_MAX_TOOL_ROUNDS` / `ARGON_MAX_TOOL_ROUNDS`, упаковку первого сообщения (вложения файлов/тредов/задач, потолок `WEB_GEMINI_MAX_MESSAGE_BYTES` / `ARGON_MAX_MESSAGE_BYTES`).
 
 ---
@@ -426,3 +443,147 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 
 - `node acp-server.mjs unpark <id|all>` — снимает парковку и кулдаун: у целевых аккаунтов обнуляет `parkedReason` и `cooldownUntilMs`, у состояния удаляет `state.breaker`. `lockedModels` не трогает — это зона `unlock`.
 - `node acp-server.mjs unlock <id|all> [model]` — очищает `lockedModels`, записанные детектором замка (§3.4; до PLUG-282 ложный замок снимался только ручной правкой `accounts-state.json`). С `[model]` удаляет только эту модель из списка (аргумент нормализуется через `resolveModelId` с фолбэком на нижний регистр, чтобы псевдоним `argon` снимал `neon`-блок), без неё — весь список. Если снимается `"carbon"`, дополнительно удаляется записанный `e.tier` — `getAccountTier` возвращается к тарифу из конфигурации пула (§3.3). `cooldownUntilMs`, `parkedReason` и аренды команда не затрагивает — их снимает `unpark`.
+
+---
+
+## 8. Управляемые группы браузера (`src/browser-groups.cjs`, PLUG-374)
+
+Эксплуатационная проблема: процесс Chrome запускается драйвером через `xvfb-run` в отсоединённой группе процессов (`detached: true, unref()`). При падении или перезапуске родительского процесса ACP-сервера процессы Chrome и Xvfb усыновляются `systemd --user` (или `init`) и остаются работать на хосте, удерживая CDP-порт и ресурсы памяти/CPU без активной аренды в `accounts-state.json`.
+
+Модуль `src/browser-groups.cjs` реализует жизненный цикл и безопасную уборку таких групп.
+
+### 8.1 Идентичность и маркеры состояния
+
+- Каждая группа процессов браузера, запущенная драйвером, получает файл маркера `$STATE_DIR/browser-groups/<port>.json`.
+- Каталог групп: `$STATE_DIR/browser-groups/` (по умолчанию `~/.bb/plugins/provider-web-gemini/browser-groups/`, фолбэк `~/.bb/plugins/provider-argon/browser-groups/`).
+- Маркер содержит проверяемую идентичность группы и владельца (поле `mode` отражает реальный режим запуска из `driver.ensureChrome`: `"xvfb"`, `"native"` или `"visible"`; `profileDir` — каталог профиля внутри `userDataDir`):
+  ```json
+  {
+    "version": 1,
+    "port": "9222",
+    "pgid": 12345,
+    "pgidStartTime": 54321,
+    "ownerPid": 12000,
+    "ownerStartTime": 54000,
+    "bootId": "8f3b2c1a-...",
+    "mode": "xvfb",
+    "userDataDir": "<profile-user-data-dir>",
+    "profileDir": "Default",
+    "launchedMs": 1700000000000,
+    "adoptedMs": null,
+    "reaping": null,
+    "doubt": null
+  }
+  ```
+- **Идентичность до порта**: для защиты от переиспользования PGID чужими процессами в ОС фиксируется время старта лидера группы в тиках ядра (`pgidStartTime`, поле 22 `/proc/<pgid>/stat`), а также `ownerStartTime` процесса-владельца.
+- Процессы Chrome без маркера (запущенные пользователем или внешними службами) системой никогда не трогаются (строго сохраняются).
+
+### 8.2 Блокировка ядра `flock` и fail-closed `BG_LOCK_UNAVAILABLE`
+
+- Любые операции модификации маркеров (`recordGroup`, `adoptGroup`, `clearReaping`, `removeMarkerUnlocked`, конвейер `teardownGroup`) выполняются под межпроцессной блокировкой ядра:
+  - файл замка: `$STATE_DIR/browser-groups/<port>.lock`;
+  - блокировка накладывается через системную утилиту `flock` (`flock -x -w <seconds> 3`) на открытом файловом дескрипторе;
+  - блокировка удерживается открытым описанием файла (open file description) в ядре Linux. При падении или выходе процесса ядро автоматически снимает блокировку; stale-lock красть не требуется, и держатель блокировки не теряет её при кратковременных паузах;
+  - файл `<port>.lock` никогда не удаляется с диска (удаление привело бы к рассинхронизации inode между ожидающими процессами);
+  - таймаут ожидания блокировки задаётся переменной окружения `BG_MARKER_LOCK_WAIT_MS` (по умолчанию 10 000 мс / 10 с).
+- **Fail-closed на Linux**:
+  - на платформе Linux наличие рабочей утилиты `flock` (пакет `util-linux`) является строго обязательным;
+  - при отсутствии `flock` на `PATH` или ошибке вызова выбрасывается исключение с кодом `BG_LOCK_UNAVAILABLE` (`markerLockUnavailable`);
+  - тихий откат (деградация) к внутрипроцессному словарю на Linux запрещён — иначе параллельные процессы плагина работали бы без взаимной синхронизации;
+  - если при создании браузера в `driver.ensureChrome` запись маркера не удалась из-за `BG_LOCK_UNAVAILABLE`, только что запущенный процесс немедленно уничтожается (`process.kill(-proc.pid, 'SIGKILL')`), чтобы не оставить неуправляемую группу без маркера;
+  - внутрипроцессный реестр `heldMarkerLocks` служит защитой от повторного входа (reentrancy) в рамках одного процесса, а как фолбэк блокировки используется только на не-Linux платформах.
+- Чтение маркеров (`readMarker`, `listMarkers`, `isReaping`) выполняется lock-free, так как запись маркера на диск атомарна (запись в `.tmp`-файл с последующим `fs.renameSync`).
+
+### 8.3 Скоупинг загрузки (`boot_id`) и три состояния `bootState`
+
+PGID и jiffies старта процессов уникальны только в рамках одной загрузки операционной системы. Файлы на диске переживают перезагрузку хоста. Для исключения отправки сигналов чужим процессам после ребута маркеры снабжаются идентификатором загрузки ядра.
+
+- Источник: `/proc/sys/kernel/random/boot_id` (уникальный UUID, генерируемый ядром Linux при каждой загрузке).
+- Три состояния функции `bootState()`:
+  1. `'off'` — не-Linux окружение: `/proc` и `boot_id` отсутствуют, скоупинг загрузки не применяется (`markerMatchesBoot` возвращает `true`);
+  2. `'unknown'` — Linux, но файл `boot_id` не может быть прочитан (EACCES, повреждённый `/proc` в контейнере/песочнице): **FAIL CLOSED**. Маркер может принадлежать как текущей, так и чужой ОС. Функция `markerMatchesBoot` возвращает `null`, группа классифицируется как `'boot-unknown'`. Никакие сигналы не посылаются, группа не усыновляется, и маркер с диска не удаляется;
+  3. `<uuid>` — прочитанный UUID текущей загрузки.
+- Проверка `markerMatchesBoot(meta)`:
+  - `true` — маркер проверен и относится к текущей загрузке ядра (`meta.bootId === currentBootId`);
+  - `false` — маркер создан в другой загрузке (или не содержит `bootId`);
+  - `null` — неопределённое состояние (`boot-unknown`, fail-closed).
+- Маркеры прошлой загрузки классифицируются как `'stale-boot'`: они не дают права посылать сигналы процессам в ОС, так как текущий PGID может принадлежать чужому сервису. Реапер удаляет только устаревший файл маркера на диске, освобождая порт.
+
+### 8.4 Проверка идентичности группы (`identifyGroup`)
+
+Перед отправкой любых сигналов и перед усыновлением выполняется строгая проверка живых процессов группы:
+1. **Проверка `markerMatchesBoot`**: выполняется строго до интерпретации PID/PGID/портов. При `false` → `'stale-boot'` (`boot-mismatch` / `boot-unrecorded`), при `null` → `'boot-unknown'` (`boot-unreadable`, fail-closed).
+2. **Сканирование членов группы (`groupMembers`)**: через `/proc/*/stat` отбираются живые не-зомби процессы с `pgrp === meta.pgid` (состояние не `'Z'`). Сохраняются `{ pid, startTime, cmdline }`. Если живых членов нет → `'dead'` (`no-members`).
+3. **Атрибуция процесса браузерному стеку (`memberLooksOurs`)**:
+   - командная строка процесса проверяется регулярным выражением `GROUP_MEMBER_CMDLINE = /xvfb|chrome|chromium|crashpad/i`;
+   - время старта процесса не может предшествовать записанному времени старта лидера группы: `m.startTime >= meta.pgidStartTime` (при известном `pgidStartTime`);
+   - никаких проверок пути `userDataDir` или флага порта в `memberLooksOurs` не выполняется: атрибуция основана строго на принадлежности бинарника к семейству стека и монотонности времени старта.
+4. **Разделение на ветку живого лидера и ветку без лидера (`leader = members.find(m => m.pid === meta.pgid)`)**:
+   - **Ветка живого лидера (`leader` найден)**:
+     - Проверки лидера выполняются **строго ДО** проверки флага `--remote-debugging-port` (защита от переиспользования PGID чужой группой):
+       1. Если `meta.pgidStartTime == null` → статус `'doubtful'` (`leader-starttime-unrecorded`).
+       2. Если `leader.startTime !== meta.pgidStartTime` → статус `'doubtful'` (`leader-starttime-mismatch`).
+     - Если проверки пройдены:
+       - при наличии процесса с флагом `--remote-debugging-port=<port>` (`portFlagInCmdline`) → статус `'matched'` (`port-flag`);
+       - при отсутствии флага порта (например, Chrome упал или ещё не стартовал, но лидер `xvfb-run` жив): если все члены группы атрибутируемы (`members.every(m => memberLooksOurs(m, meta))`) → статус `'leftover'` (`attributable-members`), иначе → `'doubtful'` (`unattributed-members`). Таким образом, `'leftover'` возвращается и при живом лидере без флага порта, когда все оставшиеся члены атрибутируемы.
+     - *(Окно `MEMBER_LAUNCH_WINDOW_JIFFIES` в ветке живого лидера не применяется: подлинность лидера подтверждена точным совпадением `leader.startTime === meta.pgidStartTime`)*.
+   - **Ветка без лидера (leaderless, `leader` завершился)**:
+     - Выжившие процессы должны доказать принадлежность исходному запуску:
+       1. Если `meta.pgidStartTime == null` → статус `'doubtful'` (`starttime-unrecorded`).
+       2. Если хотя бы один член группы не атрибутируем (`!members.every(m => memberLooksOurs(m, meta))`) → статус `'doubtful'` (`unattributed-members`).
+       3. **Окно запуска (`MEMBER_LAUNCH_WINDOW_JIFFIES = 3000`)**: самое раннее время старта выживших членов `earliest = Math.min(...members.map(m => m.startTime ?? Infinity))` должно укладываться в окно запуска: `earliest - meta.pgidStartTime <= 3000` джиффи (~30 с при `USER_HZ = 100`). Если члены запустились позже окна запуска → статус `'doubtful'` (`members-postdate-launch`). Это окно применяется **только** в leaderless-ветке, защищая от чужой группы, переиспользовавшей PGID много позже старта нашего браузера.
+     - Если проверки пройдены:
+       - при наличии процесса с флагом `--remote-debugging-port=<port>` → статус `'matched'` (`port-flag`);
+       - при отсутствии флага порта (например, выжил только осиротевший `Xvfb`) → статус `'leftover'` (`attributable-members`).
+5. **Действия по результатам классификации**:
+   - При `'doubtful'` группе не посылаются никакие сигналы, маркер сохраняется и помечается полем `doubt: { reason, sinceMs }`.
+   - При `'dead'` или `'stale-boot'` удаляется устаревший файл маркера без отправки сигналов процессам.
+   - При `'boot-unknown'` сигналы не посылаются, маркер сохраняется (fail-closed).
+   - Сигналы (`SIGTERM` / `SIGKILL`) разрешено посылать **только** группам со статусом `'matched'` или `'leftover'` (`groupAliveMatches`).
+
+### 8.5 Усыновление (`adoptGroup`)
+
+Когда новый процесс ACP-сервера подключается к уже запущенному браузеру (при рестарте, при вызове `ensureChrome` в драйвере или при захвате аренды в `acquireInState`), он вызывает `browserGroups.adoptGroup(stateDir, port)`:
+- под `withMarkerLock` в маркере обновляются поля владельца: `ownerPid = process.pid`, `ownerStartTime = readProcStat(process.pid).startTime`, `adoptedMs = Date.now()`;
+- благодаря этому реапер сирот видит живого владельца и не сносит работающую группу.
+
+### 8.6 Гейты занятости: аренда, клиенты CDP и метка `reaping`
+
+Группа считается занятой и защищена от сноса при наличии хотя бы одного из условий:
+1. **Гейт активной аренды (`lease`)**: в `accounts-state.json` присутствует активная аренда на данный бэкенд/порт (`leases[backendId].cdp === port`, не просроченная по `LEASE_TTL_MS`, с живым `isPidAlive(l.pid)`).
+2. **Гейт живых CDP-клиентов (`cdp-clients`)**: функция `hasLiveCdpClients(port, { ignoreInodes })` проверяет `/proc/net/tcp` и `/proc/net/tcp6` на наличие установленных соединений (`state == '01'`, ESTABLISHED) к CDP-порту. При этом сокеты, принадлежащие самому вызывающему процессу (`ignoreInodes` из `socketInodesOf(process.pid)`), игнорируются, чтобы собственные соединения Playwright не блокировали штатную остановку/перезапуск браузера. Внешние клиенты (например, второй агент или фоновая сессия) блокируют снос.
+3. **Гейт старта владельца (`owner-starting`)**: если владелец группы жив (`ownerAlive`), а группа молодая (`launchedMs` или `adoptedMs` младше `DEFAULT_OWNER_GRACE_MS = 60_000` мс), реапер не трогает её, давая процессу Chrome время подняться и открыть порт. Для собственных групп процесса или при явном сносе владельцем (`ownOnly`) этот гейт не применяется.
+4. **Метка сноса `reaping` и защита от гонок**:
+   - перед отправкой сигналов сноса на маркер ставится отметка `reaping: { by: process.pid, sinceMs: Date.now() }` с TTL `REAPING_TTL_MS = 30_000` мс;
+   - функции выбора бэкенда `pickBackendFromState` и привязки `bindBackend` проверяют `reapingBusyUntil`: бэкенд с активной меткой сноса считается занятым и не выдаётся под новые сессии;
+   - драйвер в `ensureChrome` при обнаружении `isReaping(runningMeta)` отказывается от переиспользования погибающей группы и выполняет чистый рестарт;
+   - это предотвращает гонку, когда свежая аренда могла бы быть выдана на порт в момент отправки `SIGTERM` или ожидания завершения.
+
+### 8.7 Конвейер безопасного сноса (`teardownGroup`)
+
+Снос групп браузера унифицирован в функции `teardownGroup` для реапера и остановки драйвером (`stopChrome`):
+1. **Синхронизация**: захват внешнего замка реестра аренд (`withOuterLock` / `withLedgerLock`), затем блокировки маркера (`withMarkerLock`). Порядок захвата всегда строго внешний замок → замок маркера (предотвращение взаимных блокировок).
+2. **Проверка маркера и гейтов**: под замками проверяются `ownOnly`, `isReaping`, `ownerAlive` + `ownerGraceMs`, наличие аренды в реестре (`busy`) и наличие внешних клиентов CDP (`hasLiveCdpClients`). При срабатывании любого гейта операция возвращает `{ status: 'busy', reason }`.
+3. **Идентификация**: `identifyGroup(cur)`. При `'dead'` или `'stale-boot'` удаляется только файл маркера (`removeMarkerUnlocked`) и возвращается `{ status: 'absent' }`. При `'doubtful'` или `'boot-unknown'` группа пропускается (`{ status: 'skipped' }`).
+4. **Первый сигнал (`SIGTERM`)**: на маркер записывается отметка `reaping`, и всей группе посылается `SIGTERM` (`signalGroup(marked, 'SIGTERM')` через `process.kill(-pgid, 'SIGTERM')`).
+5. **Ожидание завершения**: замки отпускаются, запускается опрос `waitGroupGone(pgid, { graceMs: 1200 })` до исчезновения всех живых членов группы в `/proc`.
+6. **Эскалация до `SIGKILL` с перепроверкой**:
+   - если по истечении 1200 мс члены группы ещё живы, под теми же замками (outer + marker) повторно проверяются все условия: неизменность PGID, владельца, метки `reaping`, отсутствие свежей аренды, отсутствие подключившихся CDP-клиентов и соответствие идентичности (`groupAliveMatches`);
+   - если условия подтвердились — посылается `SIGKILL` (`process.kill(-pgid, 'SIGKILL')`);
+   - если хотя бы одно условие изменилось (например, пришёл клиент CDP) — эскалация ветируется (`escalation-vetoed`), метка `reaping` снимается (`clearReaping`), и группа остаётся жить.
+7. **Удаление маркера**: под `withMarkerLock` проверяется, что маркер не был переписан новым процессом, после чего файл маркера удаляется с диска.
+
+### 8.8 Реапер сирот и штатная уборка
+
+- **`reapOrphanBrowserGroups()`**:
+  - вызывается при старте `acp-server.mjs` и каждые 60 секунд сторожем `ppidWatch`;
+  - сканирует все маркеры в каталоге `$STATE_DIR/browser-groups/`;
+  - чистит маркеры `'dead'` и `'stale-boot'`;
+  - логирует `'boot-unknown'`;
+  - аннотирует `'doubtful'`;
+  - для осиротевших групп без живой аренды и без клиентов CDP вызывает `teardownGroup`.
+- **`cleanupOwnBrowserGroups()`**:
+  - вызывается при штатном завершении `cleanShutdown()` (закрытие stdin, `SIGTERM`, `SIGINT`, смена `ppid`, устаревание кода);
+  - находит маркеры, принадлежащие данному процессу (`ownerPid === process.pid`);
+  - вызывает `teardownGroup` с флагом `ownOnly: true` и исключением собственных playwright-сокетов (`ignoreInodes: socketInodesOf(process.pid)`);
+  - если порт не перехвачен чужой арендой и нет внешних клиентов, группа браузера штатно завершается, предотвращая утечку Chrome и Xvfb.

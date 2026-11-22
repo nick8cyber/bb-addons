@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,49 +12,51 @@ import {
   exportFavoritesJson,
   importFavoritesJson,
   getFavoritesCount,
-  type FavoritesState,
+  resolvePickerProvider,
 } from "./favorites-manager.js";
+import { normalizeModelKey } from "./store.js";
 import { StarFilledIcon, TrashIcon, PlusIcon } from "./icons.js";
 
 export function SettingsSection() {
-  const [state, setState] = useState<FavoritesState>(getState());
+  const state = useSyncExternalStore(subscribe, getState, getState);
   const [newProvider, setNewProvider] = useState("");
   const [newModel, setNewModel] = useState("");
   const [importJsonText, setImportJsonText] = useState("");
   const [showImport, setShowImport] = useState(false);
-
-  useEffect(() => {
-    return subscribe((next) => {
-      setState(next);
-    });
-  }, []);
 
   const totalCount = getFavoritesCount();
   const providerEntries = Object.entries(state.favorites).filter(([_, list]) => list.length > 0);
 
   const handleAddManual = (e: React.FormEvent) => {
     e.preventDefault();
-    const prov = newProvider.trim().toLowerCase();
-    const mod = newModel.trim();
-    if (!prov || !mod) {
-      toast.error("Укажите провайдера и название модели");
+    const prov = resolvePickerProvider(newProvider);
+    const mod = normalizeModelKey(newModel);
+    if (prov === "default" || !mod) {
+      toast.error("Укажите провайдера и подпись модели из списка BB");
       return;
     }
-    addFavorite(prov, mod);
+    void addFavorite(prov, mod).then((ok) => {
+      if (ok) toast.success(`Модель ${mod} добавлена в избранное`);
+    });
     setNewModel("");
-    toast.success(`Модель ${mod} добавлена в избранное для ${prov}`);
   };
 
   const handleRemove = (providerId: string, modelId: string) => {
-    removeFavorite(providerId, modelId);
-    toast.success(`Модель ${modelId} удалена из избранного`);
+    void removeFavorite(providerId, modelId).then((ok) => {
+      if (ok) toast.success(`Модель ${modelId} удалена из избранного`);
+    });
   };
 
   const handleClearAll = () => {
     if (confirm("Вы уверены, что хотите очистить весь список избранных моделей?")) {
-      clearFavorites();
-      toast.success("Все избранные модели очищены");
+      void clearFavorites().then((ok) => {
+        if (ok) toast.success("Все избранные модели очищены");
+      });
     }
+  };
+
+  const handleConfigToggle = (key: "pinToTop") => (e: React.ChangeEvent<HTMLInputElement>) => {
+    void updateConfig({ [key]: e.target.checked });
   };
 
   const handleExport = async () => {
@@ -72,14 +74,13 @@ export function SettingsSection() {
       toast.error("Вставьте JSON в поле ввода");
       return;
     }
-    const success = importFavoritesJson(importJsonText.trim());
-    if (success) {
-      toast.success("Избранные модели успешно импортированы!");
-      setShowImport(false);
-      setImportJsonText("");
-    } else {
-      toast.error("Неверный формат JSON");
-    }
+    void importFavoritesJson(importJsonText.trim()).then((success) => {
+      if (success) {
+        toast.success("Избранные модели успешно импортированы!");
+        setShowImport(false);
+        setImportJsonText("");
+      }
+    });
   };
 
   return (
@@ -100,23 +101,11 @@ export function SettingsSection() {
             <input
               type="checkbox"
               checked={state.pinToTop}
-              onChange={(e) => updateConfig({ pinToTop: e.target.checked })}
+              onChange={handleConfigToggle("pinToTop")}
               className="size-4 rounded border-border text-amber-500 focus:ring-amber-500"
             />
             <span className="text-xs text-foreground font-medium">
               Закреплять избранные модели поверх общего списка в выпадающем меню
-            </span>
-          </label>
-
-          <label className="flex items-center gap-2.5 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={state.showQuickBar}
-              onChange={(e) => updateConfig({ showQuickBar: e.target.checked })}
-              className="size-4 rounded border-border text-amber-500 focus:ring-amber-500"
-            />
-            <span className="text-xs text-foreground font-medium">
-              Показывать кнопку «⭐ Избранное» в панели действий поля ввода для быстрого выбора
             </span>
           </label>
         </div>
@@ -158,7 +147,7 @@ export function SettingsSection() {
             <textarea
               value={importJsonText}
               onChange={(e) => setImportJsonText(e.target.value)}
-              placeholder='Вставьте JSON в формате: {"favorites": {"codex": ["gpt-5.4"]}}'
+              placeholder='Вставьте JSON в формате: {"favorites": {"codex": ["6.2-Sol"]}}'
               className="w-full h-24 p-2 text-xs font-mono rounded border border-border bg-background"
             />
             <div className="flex justify-end gap-2">
@@ -234,7 +223,7 @@ export function SettingsSection() {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           <div>
             <label className="text-2xs text-muted-foreground block mb-1">
-              Провайдер (например: codex, claude-code, agy, pi)
+              Имя или ID провайдера из BB
             </label>
             <Input
               value={newProvider}
@@ -245,12 +234,12 @@ export function SettingsSection() {
           </div>
           <div>
             <label className="text-2xs text-muted-foreground block mb-1">
-              ID или имя модели (например: gpt-5.4, claude-3-7-sonnet)
+              Подпись модели как в списке BB, включая маршрут, если он показан
             </label>
             <Input
               value={newModel}
               onChange={(e) => setNewModel(e.target.value)}
-              placeholder="gpt-5.4"
+              placeholder="6.2-Sol или Model · route"
               className="h-8 text-xs"
             />
           </div>

@@ -37,6 +37,7 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(join(HERE, "package.json"));
+const browserGroups = require("./src/browser-groups.cjs");
 
 // Diagnostics must stay off stdout — it is the JSON-RPC channel.
 console.log = console.error;
@@ -69,8 +70,14 @@ const LEDGER_FILE = join(STATE_DIR, "accounts-state.json");
 const LOCK_FILE = join(STATE_DIR, "accounts-state.json.lock");
 const LOCK_STALE_MS = 5000;
 const LEASE_TTL_MS = 10 * 60_000;
+// A marked group younger than this with a live foreign owner is treated as
+// still launching (recordGroup precedes CDP readiness) — idle-reap skips it.
+const GROUP_STARTUP_GRACE_MS = 60_000;
 // 20 minutes (prevents timeout of long deep reviews on neon high).
 const SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000;
+// PLUG-371: абсолютный потолок хода — отдельный щедрый env (дефолт 4ч), только как страховка от вечного цикла.
+const rawSessionCapMs = Number(process.env.WEB_GEMINI_SESSION_CAP_MS || process.env.ARGON_SESSION_CAP_MS);
+const SESSION_CAP_MS = Number.isFinite(rawSessionCapMs) && rawSessionCapMs > 0 ? rawSessionCapMs : 4 * 3600_000;
 
 // PLUG-291: каталоги веб-вложений (исходящие uploads, входящие downloads) и
 // их чистка при старте — TTL 24ч и не более 20 файлов на каталог.
@@ -395,15 +402,24 @@ export function getAccountPriority(b, state) {
   return 10;
 }
 
-export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null, backends = BACKENDS) {
-  const isLeased = (b) => {
-    const l = state.leases && state.leases[b.id];
-    if (l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) {
-      return l.acquiredMs + LEASE_TTL_MS;
-    }
-    const e = accEntry(state, b.id);
-    return e && (e.inUseUntilMs ?? 0) > now && e.owner !== owner ? e.inUseUntilMs : 0;
-  };
+function leasedUntil(state, b, owner, now) {
+  const l = state.leases && state.leases[b.id];
+  if (l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) {
+    return l.acquiredMs + LEASE_TTL_MS;
+  }
+  const e = accEntry(state, b.id);
+  return e && (e.inUseUntilMs ?? 0) > now && e.owner !== owner ? e.inUseUntilMs : 0;
+}
+
+// A port whose browser-group marker is flagged `reaping` is off-limits for
+// new leases while the mark is fresh — the teardown owner frees it shortly.
+function reapingBusyUntil(stateDir, port, now) {
+  const meta = browserGroups.readMarker(stateDir, port);
+  return browserGroups.isReaping(meta, now) ? meta.reaping.sinceMs + browserGroups.REAPING_TTL_MS : 0;
+}
+
+export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null, backends = BACKENDS, stateDir = STATE_DIR) {
+  const isLeased = (b) => Math.max(leasedUntil(state, b, owner, now), reapingBusyUntil(stateDir, b.cdp, now));
 
   const req = requestedModel ? (resolveModelId(requestedModel) || requestedModel.toLowerCase()) : null;
   const candidates = backends.filter((b) => {
@@ -468,7 +484,17 @@ function acquireInState(state, b, owner, now) {
   e.inUseUntilMs = now + LEASE_TTL_MS;
   e.owner = owner;
   e.parkedReason = null;
-  state.leases[b.id] = { pid: process.pid, acquiredMs: now };
+  // `cdp` lets non-ACP readers (the driver's stopChrome teardown) map the
+  // lease to a browser-group port without loading the backend pool.
+  state.leases[b.id] = { pid: process.pid, acquiredMs: now, cdp: b.cdp };
+  // PLUG-374: the lease holder owns the browser group on this port — under
+  // the same lock, so reapers always see a live verifiable owner. A refusal
+  // (marker lock unavailable) must be recorded, not swallowed (заход 7).
+  try {
+    browserGroups.adoptGroup(STATE_DIR, b.cdp);
+  } catch (e) {
+    slog("lease:adopt-group-error", { cdp: b.cdp, error: String(e) });
+  }
 }
 
 /* ---------- parse reset time (§3.4) ---------- */
@@ -752,12 +778,12 @@ export function classifyFailure(err, authHint = null) {
     };
   }
 
-  // 2. transient (stream caps + driver/page faults, PLUG-286)
+  // 2. transient (stream caps + driver/page faults, PLUG-286, PLUG-371)
   if (
-    /generation still running after (?:540|900|\d+)s cap|stream_timeout|argon_stream_timeout|web_gemini_stream_timeout|hung page|stalled generation/i.test(
+    /generation still running after (?:540|900|\d+)s cap|stream_timeout|argon_stream_timeout|web_gemini_stream_timeout|hung page|stalled generation|generation stalled/i.test(
       message
     ) ||
-    (err && (err.code === "WEB_GEMINI_STREAM_TIMEOUT" || err.code === "ARGON_STREAM_TIMEOUT" || err.name === "TimeoutError")) ||
+    (err && (err.code === "WEB_GEMINI_STREAM_TIMEOUT" || err.code === "ARGON_STREAM_TIMEOUT" || err.code === "WEB_GEMINI_STALLED" || err.code === "ARGON_STALLED" || err.name === "TimeoutError")) ||
     DRIVER_TRANSIENT_RE.test(message)
   ) {
     return {
@@ -963,13 +989,157 @@ export function reapOrphanAcpServers() {
   return reaped;
 }
 
+// --- managed browser groups (PLUG-374) ---
+const backendsOnPort = (port, backends) =>
+  backends.filter((b) => String(b.cdp) === String(port));
+
+function hasLiveLeaseForPort(state, port, backends, now) {
+  for (const b of backendsOnPort(port, backends)) {
+    const l = state.leases && state.leases[b.id];
+    if (l && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) return true;
+  }
+  return false;
+}
+
+// The teardown itself is the shared browser-groups pipeline (заход 6):
+// decision, `reaping` mark, AND first signal inside the ledger lock AND the
+// per-port marker lock: no fresh lease and no concurrent marker write
+// (adoption, fresh launch, another reaper) can land between the checks and
+// SIGTERM, and the fresh mark keeps leases/adoptions out for the whole grace
+// window — the teardown can never race a lease someone just took (§3, з.5).
+// Lock order is always ledger → marker; nothing holding the marker lock ever
+// waits on the ledger.
+async function teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly = false, ignoreInodes = null }) {
+  const withOuterLock = (fn) => {
+    acquireLock(lockPath);
+    try {
+      return fn();
+    } finally {
+      releaseLock(lockPath);
+    }
+  };
+  const busy = (cur, now) => {
+    const state = loadState(ledgerPath);
+    return hasLiveLeaseForPort(state, cur.port, backends, now) ? "lease" : null;
+  };
+  const res = await browserGroups.teardownGroup({
+    stateDir,
+    port: meta.port,
+    meta,
+    withOuterLock,
+    busy,
+    ownOnly,
+    ignoreInodes,
+    ownerGraceMs: GROUP_STARTUP_GRACE_MS,
+  });
+  return res.status === "torn-down";
+}
+
+export async function reapOrphanBrowserGroups({ stateDir = STATE_DIR, ledgerPath = LEDGER_FILE, lockPath = LOCK_FILE, backends = BACKENDS } = {}) {
+  if (process.platform !== "linux") return 0;
+  let reaped = 0;
+  for (const meta of browserGroups.listMarkers(stateDir)) {
+    try {
+      const diag = {};
+      const identity = browserGroups.identifyGroup(meta, diag);
+      if (identity === "boot-unknown") {
+        // The marker's boot cannot be verified — it may be ours. Fail
+        // closed: no signals, no adoption, no marker deletion (заход 5).
+        slog("reaper:browser-group-boot-unknown", { port: meta.port, pgid: meta.pgid, reason: diag.reason });
+        continue;
+      }
+      if (identity === "dead") {
+        // Verify-and-unlink under the per-port lock: a marker rewritten
+        // meanwhile (fresh launch or adoption on the port) survives.
+        browserGroups.withMarkerLock(stateDir, meta.port, () => {
+          const cur = browserGroups.readMarker(stateDir, meta.port);
+          if (!cur || cur.pgid !== meta.pgid) return;
+          if (browserGroups.isReaping(cur)) return; // in-flight teardown owns it
+          if (browserGroups.identifyGroup(cur) !== "dead") return;
+          browserGroups.removeMarker(stateDir, meta.port);
+        });
+        continue;
+      }
+      if (identity === "stale-boot") {
+        // The marker describes a group that died with a previous boot — its
+        // pgid may now name a foreign group, so only the stale marker is
+        // cleaned; processes are never touched (заход 4). Re-verify under
+        // the marker lock so a marker rewritten meanwhile (fresh launch on
+        // the port) is never lost; 'null' (boot turned indeterminate) and
+        // 'true' (rewritten for this boot) both keep the marker (заход 5).
+        browserGroups.withMarkerLock(stateDir, meta.port, () => {
+          const cur = browserGroups.readMarker(stateDir, meta.port);
+          if (!cur || cur.pgid !== meta.pgid) return;
+          if (browserGroups.markerMatchesBoot(cur) !== false) return;
+          browserGroups.removeMarker(stateDir, meta.port);
+        });
+        slog("reaper:browser-group-stale", { port: meta.port, pgid: meta.pgid, reason: diag.reason });
+        continue;
+      }
+      if (identity === "doubtful") {
+        // Members survive that cannot be attributed to our browser stack —
+        // leave the group alone and keep the marker (annotated with the
+        // reason) for the next pass. The annotate is serialized: a rewrite
+        // since the snapshot is re-verified, not clobbered.
+        browserGroups.withMarkerLock(stateDir, meta.port, () => {
+          const cur = browserGroups.readMarker(stateDir, meta.port);
+          if (!cur || cur.pgid !== meta.pgid) return;
+          if (browserGroups.isReaping(cur)) return; // a teardown is in flight
+          const reDiag = {};
+          if (browserGroups.identifyGroup(cur, reDiag) !== "doubtful") return;
+          const reason = reDiag.reason || diag.reason || "unidentified";
+          cur.doubt = { reason, sinceMs: cur.doubt?.reason === reason ? cur.doubt.sinceMs : Date.now() };
+          try {
+            browserGroups.writeMarker(stateDir, cur);
+          } catch {}
+        });
+        slog("reaper:browser-group-doubtful", { port: meta.port, pgid: meta.pgid, ownerPid: meta.ownerPid, reason: diag.reason });
+        continue;
+      }
+      if (await teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends })) {
+        reaped++;
+        slog("reaper:browser-group", { port: meta.port, pgid: meta.pgid, ownerPid: meta.ownerPid });
+      }
+    } catch (e) {
+      slog("reaper:browser-group-error", { port: meta && meta.port, error: String(e) });
+    }
+  }
+  return reaped;
+}
+
+// Clean shutdown path: tear down groups this process owns — unless someone
+// else meanwhile leased the port or external CDP clients are still attached.
+// Our own CDP sockets are excluded: the playwright connection outlives the
+// last prompt and would otherwise mask the group as busy.
+export async function cleanupOwnBrowserGroups({ stateDir = STATE_DIR, ledgerPath = LEDGER_FILE, lockPath = LOCK_FILE, backends = BACKENDS } = {}) {
+  if (process.platform !== "linux") return 0;
+  const ownInodes = browserGroups.socketInodesOf(process.pid);
+  let cleaned = 0;
+  for (const meta of browserGroups.listMarkers(stateDir)) {
+    try {
+      if (meta.ownerPid !== process.pid) continue;
+      if (await teardownMarkedGroup(meta, { stateDir, ledgerPath, lockPath, backends, ownOnly: true, ignoreInodes: ownInodes })) {
+        cleaned++;
+        slog("shutdown:browser-group", { port: meta.port, pgid: meta.pgid });
+      }
+    } catch (e) {
+      slog("shutdown:browser-group-error", { port: meta && meta.port, error: String(e) });
+    }
+  }
+  return cleaned;
+}
+
 // Parent-death watchdog: reparented onto init/systemd means bridge parent died
 const ownerPpid = process.ppid;
+let ppidWatchTicks = 0;
 const ppidWatch = setInterval(() => {
   if (process.ppid !== ownerPpid || process.ppid === 1) {
     slog("process:reparented-exit", { ownerPpid, currentPpid: process.ppid });
     void cleanShutdown();
     return;
+  }
+  if (++ppidWatchTicks % 12 === 0) {
+    void reapOrphanBrowserGroups().catch(() => {});
   }
   if (!activePromptSessionId) {
     checkStaleCode();
@@ -1131,9 +1301,10 @@ function turnError(id, outcome, reason, stage = "preflight") {
   } });
 }
 
-function createTaskTurn(sessionId) {
+export function createTaskTurn(sessionId) {
   const controller = new AbortController();
   const started = Date.now();
+  const sessionCapAt = started + SESSION_CAP_MS;
   let deadline = started + SEND_DEADLINE_MS;
   const toolCallId = "gemini-turn-" + randomUUID();
   const update = (fields) => out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { toolCallId, ...fields } } });
@@ -1150,6 +1321,7 @@ function createTaskTurn(sessionId) {
     wake({ cancelled: true });
   };
   let timer;
+  let deadlineWatch = null;
   const setDeadline = (value) => {
     deadline = value;
     clearTimeout(timer);
@@ -1159,6 +1331,7 @@ function createTaskTurn(sessionId) {
       timer = setTimeout(() => stop("deadline exceeded"), remaining);
       timer.unref();
     }
+    deadlineWatch?.(deadline);
   };
   setDeadline(deadline);
   const progress = (status, message) => {
@@ -1177,14 +1350,30 @@ function createTaskTurn(sessionId) {
   const turn = {
     get stage() { return stage; },
     get deadline() { return deadline; },
+    get started() { return started; },
+    get sessionCapAt() { return sessionCapAt; },
     setDeadline, signal: controller.signal, aborted, stop, ownedFiles: [],
     pinnedSha: null,
     packageSha256: null,
+    get onDeadlineChange() { return deadlineWatch; },
+    set onDeadlineChange(fn) { deadlineWatch = typeof fn === "function" ? fn : null; },
     ping(next, extra) {
       if (closed || controller.signal.aborted) return;
+      const prevStage = stage;
       stage = typeof next === "object" ? next.stage : next;
       const data = typeof next === "object" ? next : (extra ? { stage, ...extra } : { stage });
       slog("task:stage", { sessionId, ...data });
+      // PLUG-371: дедлайн пересчитывается только при смене стадии — heartbeat
+      // ping той же стадии не должен сдвигать фазовый лимит. На время
+      // генерации действует потолок сессии, при выходе из неё и на
+      // verify/commit возвращается окно SEND_DEADLINE_MS.
+      if (stage !== prevStage) {
+        if (stage === "generation") {
+          setDeadline(sessionCapAt);
+        } else if (prevStage === "generation" || stage === "verify" || stage === "commit") {
+          setDeadline(Math.min(Date.now() + SEND_DEADLINE_MS, sessionCapAt));
+        }
+      }
       if (turn.journal && turn.journal.turn.stage !== stage) {
         turn.journal.turn.stage = stage;
         try {
@@ -1280,7 +1469,7 @@ async function probeAuthHint(backend) {
 }
 
 /* ---------- backend binding ---------- */
-async function bindBackend(s, sessionId, profile = s) {
+async function bindBackend(s, sessionId, profile = s, { allowSameBackend = false, excludeId = null } = {}) {
   const owner = `${process.pid}:${sessionId}`;
   const reqModel = profile.model
     ? (resolveModelId(profile.model) || profile.model.toLowerCase())
@@ -1309,6 +1498,8 @@ async function bindBackend(s, sessionId, profile = s) {
       if (activeLease && activeLease.pid !== process.pid && now - (activeLease.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(activeLease.pid)) {
         return { busyUntil: activeLease.acquiredMs + LEASE_TTL_MS, account: b.id };
       }
+      const reapUntil = reapingBusyUntil(STATE_DIR, b.cdp, now);
+      if (reapUntil > now) return { busyUntil: reapUntil, account: b.id };
       acquireInState(state, b, owner, now);
       return { ok: true };
     });
@@ -1328,14 +1519,17 @@ async function bindBackend(s, sessionId, profile = s) {
       const cool = e?.cooldownUntilMs ?? 0;
       const l = state.leases && state.leases[s.backend.id];
       const busy = l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid);
+      const reapUntil = reapingBusyUntil(STATE_DIR, s.backend.cdp, now);
+      const reaping = reapUntil > now;
 
-      if (cool <= now && !busy && !isLocked) {
+      if (cool <= now && !busy && !isLocked && !reaping) {
         acquireInState(state, s.backend, owner, now);
         return { backend: s.backend };
       }
       const prev = s.backend.id;
       if (s.convId) {
         if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
+        if (reaping) return { busyUntil: reapUntil, account: prev };
         if (isLocked) return { error: `account "${prev}" does not support model "${reqModel}" (tier: ${tier}); this conversation is pinned to it` };
         return { error: `account "${prev}" is in cooldown until ${new Date(cool).toISOString()}; this conversation is pinned to it` };
       }
@@ -1346,19 +1540,43 @@ async function bindBackend(s, sessionId, profile = s) {
       }
       if (r.busyUntil) return { busyUntil: r.busyUntil };
       if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
+      if (reaping) return { busyUntil: reapUntil, account: prev };
       if (r.none) {
+        if (allowSameBackend) {
+          const same = BACKENDS.find((b) => b.id === prev);
+          const coolUntil = accEntry(state, prev)?.cooldownUntilMs ?? 0;
+          if (same && !isLocked && coolUntil <= now && leasedUntil(state, same, owner, now) === 0) {
+            acquireInState(state, same, owner, now);
+            return { backend: same };
+          }
+        }
         return { error: reqModel === "carbon" ? "no accounts in pool with Carbon available" : "all accounts are in cooldown or busy and no sibling is free" };
       }
       return { error: `account "${prev}" is in cooldown until ${new Date(cool).toISOString()} and no sibling is free` };
     }
 
-    const r = pickBackendFromState(state, null, owner, now, reqModel);
+    const r = pickBackendFromState(state, excludeId, owner, now, reqModel);
     if (r.backend) {
       acquireInState(state, r.backend, owner, now);
       return { backend: r.backend };
     }
     if (r.busyUntil) return { busyUntil: r.busyUntil };
     if (r.none) {
+      // PLUG-371: ретрай стола — исключённый аккаунт возвращаем только когда
+      // свободных соседей в пуле совсем нет.
+      if (allowSameBackend && excludeId) {
+        const same = BACKENDS.find((b) => b.id === excludeId);
+        const e = same ? accEntry(state, same.id) : null;
+        const tier = same ? getAccountTier(same, state) : null;
+        const sameLocked = Boolean(same) && (
+          (reqModel && e?.lockedModels?.includes(reqModel)) ||
+          (reqModel === "carbon" && tier !== "ultra")
+        );
+        if (same && !sameLocked && (e?.cooldownUntilMs ?? 0) <= now && leasedUntil(state, same, owner, now) === 0) {
+          acquireInState(state, same, owner, now);
+          return { backend: same };
+        }
+      }
       return { error: reqModel === "carbon" ? "no accounts in pool with Carbon available" : "account pool is empty (no enabled backends)" };
     }
     if (r.cooledUntil) {
@@ -1515,9 +1733,13 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       }
 
       const maxAttempts = Math.min(BACKENDS.length, 3);
-      const turnDeadline = task?.deadline ?? Date.now() + SEND_DEADLINE_MS;
+      const turnStarted = task?.started ?? Date.now();
+      const turnDeadline = task?.deadline ?? (turnStarted + SEND_DEADLINE_MS);
+      const sessionCapAt = task?.sessionCapAt ?? (turnStarted + SESSION_CAP_MS);
       const waitDeadline = Math.min(Date.now() + 130_000, turnDeadline);
       let attempts = 0;
+      let stallRetries = 0;
+      let excludeBackendId = null;
       let lastErr = null;
       let streamedAny = false;
 
@@ -1606,7 +1828,9 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
             collected = await collectTask(context, attachments.blocks, materials, packageOptions);
             packed = packTask(context, collected, packageOptions);
-            if (context.settings.innerAgent && (context.root || context.pin)) {
+            // PLUG-384: публичный research без локального инвентаря —
+            // быстрый агент по дереву не запускается.
+            if (context.settings.innerAgent && (context.root || context.pin) && !context.research) {
               const agent = await gatherAgentContext(context, collected.core, {
                 signal: task.signal,
                 maxExtraBytes: context.settings.maxTotalBytes - packed.totalBytes - packageOptions.reserveBytes,
@@ -1671,7 +1895,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
 
       while (true) {
         if (s.cancelled || task?.signal.aborted) return { cancelled: true };
-        const bound = await bindBackend(s, sessionId, profile);
+        const bound = await bindBackend(s, sessionId, profile, { allowSameBackend: stallRetries > 0, excludeId: excludeBackendId });
         if (bound.error) {
           if (task?.resume?.convId && s.convId && !resumeFallbackDone) {
             // Прежний backend недоступен — повторная доставка в новый чат.
@@ -1826,6 +2050,10 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               try {
                 res = await sendWebPrompt(request);
               } catch (error) {
+                if (task && (error.code === "WEB_GEMINI_STALLED" || error.code === "ARGON_STALLED" || /generation stalled|stalled generation/i.test(error?.message || ""))) {
+                  budgets.contextBytes = Math.max(0, budgets.contextBytes - outboundBytes);
+                  persistJournal();
+                }
                 // §7.3: сохранённый разговор недоступен (редирект на новый
                 // чат) — одноразовая конвертация в повторную доставку
                 // сохранённого пакета с обменами хода.
@@ -2019,21 +2247,27 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         })();
         activeAttempt = attempt;
 
-        const remaining = turnDeadline - Date.now();
-        if (remaining <= 0) {
-          await releaseLease(backend.id);
-          activeBackendId = null;
-          activeAbort = null;
-          activeAttempt = null;
-          activePromptSessionId = null;
-          throw new Error(`turn exceeded ${SEND_DEADLINE_MS / 60000}min deadline`);
-        }
-
+        // PLUG-371: дедлайн попытки следует за task.deadline — при переходе в
+        // generation он растёт до потолка сессии, при выходе обратно сжимается
+        // до фазового окна (task.onDeadlineChange из createTaskTurn).
+        let attemptDeadlineIsCap = false;
+        let resolveDeadline;
+        const deadlineP = new Promise((res) => { resolveDeadline = res; });
         let deadlineTimer;
-        const deadlineP = new Promise((res) => {
-          deadlineTimer = setTimeout(() => res("deadline"), remaining);
+        const armAttemptDeadline = () => {
+          clearTimeout(deadlineTimer);
+          const limit = task ? task.deadline : turnDeadline;
+          attemptDeadlineIsCap = limit >= sessionCapAt;
+          const rem = limit - Date.now();
+          if (rem <= 0) {
+            resolveDeadline("deadline");
+            return;
+          }
+          deadlineTimer = setTimeout(() => resolveDeadline("deadline"), rem);
           deadlineTimer.unref?.();
-        });
+        };
+        if (task) task.onDeadlineChange = armAttemptDeadline;
+        armAttemptDeadline();
 
         const outcome = await Promise.race([
           attempt.then(() => "done", () => "failed"),
@@ -2043,6 +2277,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           deadlineP,
         ]);
         clearTimeout(deadlineTimer);
+        if (task) task.onDeadlineChange = null;
         s._cancelRes = null;
 
         if (outcome === "cancelled") {
@@ -2064,7 +2299,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           activeAbort = null;
           activeAttempt = null;
           activePromptSessionId = null;
-          throw new Error(`turn exceeded ${SEND_DEADLINE_MS / 60000}min deadline`);
+          throw new Error(`turn exceeded ${attemptDeadlineIsCap ? `${SESSION_CAP_MS / 3600000}h session cap` : `${SEND_DEADLINE_MS / 60000}min deadline`}`);
         }
 
         try {
@@ -2111,15 +2346,37 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           activePromptSessionId = null;
           attempts += 1;
 
+          const isStalled = Boolean(
+            err && (err.code === "WEB_GEMINI_STALLED" || err.code === "ARGON_STALLED" || /generation stalled|stalled generation/i.test(err.message || ""))
+          );
+
+          // PLUG-371: один авторетрай в рамках хода при stalled, если остаётся >25% бюджета SEND_DEADLINE.
+          // При s.convId ретрай запрещён — рестарт tool-loop ушёл бы в чужой начатый разговор.
+          const remainingPhaseBudget = (turnStarted + SEND_DEADLINE_MS) - Date.now();
+          const hasStallBudget = remainingPhaseBudget > 0.25 * SEND_DEADLINE_MS;
+          const canStallRetry = isStalled && stallRetries < 1 && hasStallBudget && !streamedAny && !s.convId && cooled !== "breaker";
+
           const canRotate =
-            profile.account === "auto" &&
-            attempts < maxAttempts &&
-            cls.rotatable &&
-            !s.convId &&
+            (canStallRetry || (
+              !isStalled &&
+              profile.account === "auto" &&
+              attempts < maxAttempts &&
+              cls.rotatable &&
+              !s.convId
+            )) &&
             !streamedAny &&
             cooled !== "breaker";
 
-          if (!canRotate) {
+          if (isStalled) {
+            if (canStallRetry) {
+              stallRetries += 1;
+              excludeBackendId = backend.id;
+              slog("task:stall-retry", { sessionId, attempt: attempts, remainingBudget: remainingPhaseBudget });
+            } else {
+              if (hint) err.authHint = hint;
+              throw err;
+            }
+          } else if (!canRotate) {
             if (hint) err.authHint = hint;
             throw err;
           }
@@ -2191,7 +2448,11 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
     if (!isExiting) {
       // PLUG-281: caller-side refusal — report verbatim, no driver framing.
       if (task) {
+        const isStalled = Boolean(
+          err && (err.code === "WEB_GEMINI_STALLED" || err.code === "ARGON_STALLED" || /generation stalled|stalled generation/i.test(err.message || ""))
+        );
         const reason = task.signal.reason === "deadline exceeded" && !err.message?.startsWith("recovery_required:") ? "deadline exceeded" :
+          isStalled ? "stalled" :
           err instanceof TaskTurnError ? err.message : "web model request failed at " + task.stage;
         if (tj && reason.startsWith("recovery_required:")) tj.turn.recoveryRequired = true;
         await task.finish("failed", reason);
@@ -2232,6 +2493,7 @@ async function cleanShutdown() {
       await releaseLease(activeBackendId);
       activeBackendId = null;
     }
+    await cleanupOwnBrowserGroups();
   } catch {}
   process.exit(0);
 }
@@ -2348,6 +2610,9 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
   const inputSha256 = sha256(JSON.stringify(normalizeInput(blocks)));
   const isContinue = blocks.every((block) => block.type === "text") && journal.isContinueText(text);
   const saved = session.journal ?? journal.findSessionRecord(STATE_DIR, sessionId);
+  // PLUG-384: флаг research живёт в записи сессии — следующий ход видит
+  // его в prepareTask и после рестарта провайдера, без маркера в тексте.
+  if (saved) session.journal = saved;
   const last = saved ? journal.listTurns(STATE_DIR, saved.key).at(-1) : null;
   if (last?.corrupt || (last && last.record.version !== journal.JOURNAL_VERSION)) {
     return { errorOutcome: "failed", reason: "recovery: saved turn journal is corrupt or has an unsupported version" };
@@ -2410,6 +2675,7 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
       model: session.model,
       thinking: session.thinking,
       account: session.account,
+      research: context.research,
     });
   }
   session.journal = entry;
@@ -2924,6 +3190,7 @@ function dispatchPrompt(msg, sess) {
 export function startServer({ webDriver } = {}) {
   if (webDriver) driver = webDriver;
   reapOrphanAcpServers();
+  void reapOrphanBrowserGroups().catch((e) => slog("reaper:browser-groups-error", { error: String(e) }));
   // §7.2/§9: чистка журнала (TTL/лимит записей) до чистки вложений — файлы,
   // нужные восстановлению активных ходов, защищены от pruneDir.
   try {

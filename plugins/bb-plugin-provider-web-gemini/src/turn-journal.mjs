@@ -125,6 +125,7 @@ export function createSessionRecord(stateDir, fields) {
     account: fields.account ?? "auto",
     convId: fields.convId ?? null,
     backendId: fields.backendId ?? null,
+    research: Boolean(fields.research),
     lastTurnNo: 0,
     createdAt: now,
     updatedAt: now,

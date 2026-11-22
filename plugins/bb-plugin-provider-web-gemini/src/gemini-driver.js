@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const profileManager = require('./profile-manager');
 const usageLimits = require('./usage-limits');
+const browserGroups = require('./browser-groups.cjs');
 const { isFileToolReply, verifyFileResponse } = require('./file-envelope.cjs');
 
 let driverHooks = null;
@@ -118,12 +119,46 @@ function getRunningChromeProfile(port) {
   }
 }
 
-async function stopChrome(port) {
-  const { execSync } = require('child_process');
-  try {
-    execSync(`pkill -f 'remote-debugging-port=${port ?? CDP_PORT}([[:space:]]|$)' || true`);
-    await new Promise((r) => setTimeout(r, 800));
-  } catch {}
+// Unified safe teardown (PLUG-374 заход 6): the same pipeline the reaper
+// uses — marker-locked identify → lease/CDP gates → SIGTERM → re-verify →
+// SIGKILL. A port gated by a live foreign lease, live CDP clients, or an
+// in-flight teardown reports busy and is retried — never signaled. Groups
+// with no marker (externally launched chrome) are never touched either:
+// the old global pkill-by-port-flag is gone from the automatic path
+// (contract §4).
+async function stopChrome(port, stateDir = null, { busyWaitMs = 30_000, pollMs = 300 } = {}) {
+  const p = String(port ?? CDP_PORT);
+  const dir = browserGroups.resolveStateDir(stateDir);
+  // Our own CDP/playwright sockets must not count as "live clients" — a
+  // lingering connection would veto our own restart forever.
+  const ownInodes = browserGroups.socketInodesOf(process.pid);
+  const deadline = Date.now() + busyWaitMs;
+  let res = { status: 'absent' };
+  for (;;) {
+    try {
+      res = await browserGroups.teardownGroup({
+        stateDir: dir,
+        port: p,
+        // Same ledger lock lease writers hold: a lease cannot slip between
+        // the check and the SIGTERM, exactly like the reaper (§3).
+        withOuterLock: (fn) => browserGroups.withLedgerLock(dir, fn),
+        // A live lease from ANOTHER process keeps the port busy; our own
+        // lease (ensureChrome under bindBackend) must not veto the restart.
+        busy: (cur, now) =>
+          browserGroups.leaseBusyOnPort(browserGroups.readLedger(dir), cur.port, now, {
+            excludePid: process.pid,
+          })
+            ? 'lease'
+            : null,
+        ignoreInodes: ownInodes,
+        ownerGraceMs: browserGroups.DEFAULT_OWNER_GRACE_MS,
+      });
+    } catch (e) {
+      res = { status: 'skipped', reason: `error:${String(e && e.message ? e.message : e).slice(0, 120)}` };
+    }
+    if (res.status !== 'busy' || Date.now() >= deadline) return res;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
 }
 
 async function ensureChrome(opts = {}) {
@@ -158,6 +193,7 @@ async function ensureChrome(opts = {}) {
   }
 
   const port = opts && typeof opts === 'object' && opts.port ? String(opts.port) : CDP_PORT;
+  const stateDir = opts && typeof opts === 'object' ? opts.stateDir : null;
   const targetProfile = profileManager.resolveProfile(requestedProfile);
   const currentProfile = getRunningChromeProfile(port);
   const currentMode = getRunningChromeMode(port);
@@ -170,7 +206,13 @@ async function ensureChrome(opts = {}) {
 
   const modeMatches = !targetMode || currentMode === targetMode;
 
-  if (cdpUp && !forceRestart && profileMatches && modeMatches) {
+  // A group mid-teardown (fresh `reaping` mark) is already doomed — never
+  // reuse it; fall through to stopChrome + respawn instead (PLUG-374).
+  const runningMeta = browserGroups.readMarker(stateDir, port);
+  if (cdpUp && !forceRestart && profileMatches && modeMatches && !browserGroups.isReaping(runningMeta)) {
+    // Reusing a group an earlier owner launched: point the marker at the
+    // current owner so reapers see a live verifiable identity (PLUG-374).
+    browserGroups.adoptGroup(stateDir, port);
     return targetProfile;
   }
 
@@ -181,7 +223,15 @@ async function ensureChrome(opts = {}) {
     );
   }
 
-  await stopChrome(port);
+  const stopped = await stopChrome(port, stateDir);
+  if (stopped.status !== 'torn-down' && stopped.status !== 'absent') {
+    // Busy or unverifiable: respawning would either race an in-flight
+    // teardown / a live session or collide with a group we must not kill.
+    throw new Error(
+      `chrome on :${port} cannot be restarted: ${stopped.status}` +
+        (stopped.reason ? ` (${stopped.reason})` : '')
+    );
+  }
 
   const { spawn } = require('child_process');
   const chromeBin = process.env.GEMINI_CHROME_BIN || process.env.CHROME_BIN || '/usr/bin/google-chrome-stable';
@@ -228,6 +278,26 @@ async function ensureChrome(opts = {}) {
   let spawnErr = null;
   proc.on('error', (e) => { spawnErr = e; });
   proc.unref();
+  // Mark the group before the readiness wait: a chrome that never opens CDP
+  // but stays alive (with its Xvfb) is exactly the orphan this tracks. If
+  // the marker cannot be written (marker lock unavailable, заход 7) the
+  // group is invisible to every reaper forever — kill the newborn rather
+  // than leak an unmanaged browser, and let the launch fail loudly.
+  try {
+    browserGroups.recordGroup({
+      stateDir,
+      port,
+      pgid: proc.pid,
+      mode: launchMode,
+      userDataDir: targetProfile.userDataDir,
+      profileDir: targetProfile.profileDir,
+    });
+  } catch (e) {
+    try {
+      process.kill(-proc.pid, 'SIGKILL');
+    } catch {}
+    throw e;
+  }
 
   const start = Date.now();
   while (Date.now() - start < 15000) {
@@ -823,6 +893,7 @@ function checkTurnStatus(doc, idx, promptPrefix) {
       isBusyOrThinking: false,
       hasFinishedContent: false,
       hasActionButtons: false,
+      targetTextLength: 0,
       currentText: null,
     };
   }
@@ -936,6 +1007,8 @@ function checkTurnStatus(doc, idx, promptPrefix) {
     isBusyOrThinking,
     hasFinishedContent,
     hasActionButtons,
+    childCount: target ? target.querySelectorAll('*').length : 0,
+    targetTextLength: target ? (target.innerText || '').length : 0,
     currentText,
   };
 }
@@ -1086,6 +1159,7 @@ async function sendPrompt({
   stateDir = null,
   verifyConversation = false,
   fileCapture = null,
+  stallMs = null,
 }) {
   const isStrict = Boolean(strict || strictModel);
   throwIfPromptTooLarge(prompt);
@@ -1104,9 +1178,9 @@ async function sendPrompt({
   };
   await throwIfCancelled();
   if (driverHooks?.ensureChrome) {
-    await driverHooks.ensureChrome({ headless, profile, restart, port });
+    await driverHooks.ensureChrome({ headless, profile, restart, port, stateDir });
   } else {
-    await ensureChrome({ headless, profile, restart, port });
+    await ensureChrome({ headless, profile, restart, port, stateDir });
   }
   await throwIfCancelled();
 
@@ -1339,10 +1413,15 @@ async function sendPrompt({
     const STABLE_DURATION_MS = Number(process.env.WEB_GEMINI_STABLE_DURATION_MS || process.env.ARGON_STABLE_DURATION_MS) || 500;
     const STABLE_FALLBACK_MS = Number(process.env.WEB_GEMINI_STABLE_NO_ACTIONS_MS || process.env.ARGON_STABLE_NO_ACTIONS_MS) || 5000;
     const POLL_INTERVAL_MS = 200;
-    const MAX_WAIT_MS = Number(process.env.GEMINI_MAX_WAIT_MS) || 900_000;
+    const rawSessionCap = Number(process.env.WEB_GEMINI_SESSION_CAP_MS || process.env.ARGON_SESSION_CAP_MS);
+    const SESSION_CAP_MS = Number.isFinite(rawSessionCap) && rawSessionCap > 0 ? rawSessionCap : 4 * 3600_000;
+    const rawStallMs = stallMs != null ? Number(stallMs) : Number(process.env.WEB_GEMINI_STALL_MS || process.env.ARGON_STALL_MS);
+    const STALL_MS = Number.isFinite(rawStallMs) && rawStallMs > 0 ? rawStallMs : 120_000;
     const streamStartTime = Date.now();
+    let lastProgressTime = streamStartTime;
+    let lastDomSignature = null;
 
-    while (Date.now() - streamStartTime < MAX_WAIT_MS) {
+    while (Date.now() - streamStartTime < SESSION_CAP_MS) {
       await throwIfCancelled();
       await page.waitForTimeout(POLL_INTERVAL_MS);
 
@@ -1365,12 +1444,15 @@ async function sendPrompt({
           if (!target) return null;
           const mc = target.querySelector('message-content');
           const src = mc ? 'mc' : 'raw';
+          const childCount = target.querySelectorAll('*').length;
           return {
             targetFound: true,
             hasStopButton: document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Остановить" i]') !== null,
             isBusyOrThinking: false,
             hasFinishedContent: (mc?.innerText || '').trim().length > 0,
             hasActionButtons: false,
+            childCount,
+            targetTextLength: (target.innerText || '').length,
             currentText: { src, text: ((mc || target).innerText || '') },
           };
         },
@@ -1382,15 +1464,37 @@ async function sendPrompt({
         }
       );
 
+      const stopButton = await safeQuery(
+        page,
+        'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
+      );
+
+      const hasStopButton = Boolean(status?.hasStopButton || stopButton);
+      const isBusyOrThinking = Boolean(status?.isBusyOrThinking);
+      const isGenerating = hasStopButton || isBusyOrThinking;
+
       if (!status || !status.targetFound) {
         stableStartTime = null;
+        // Цель потеряна и захваченного текста нет — ждать до потолка сессии
+        // бессмысленно: fail fast, как при застрявшей генерации.
+        const lostWithoutContent = !isGenerating && !(lastText && lastText.length);
+        if ((isGenerating || lostWithoutContent) && Date.now() - lastProgressTime >= STALL_MS) {
+          await stopGeneration(page);
+          const e = new Error(`generation stalled — no progress for ${Math.round(STALL_MS / 1000)}s`);
+          e.code = 'WEB_GEMINI_STALLED';
+          throw e;
+        }
         continue;
       }
 
+      let hadProgress = false;
       const currentText = status.currentText;
       if (currentText !== null && currentText.text.length) {
         if (currentText.src !== lastSrc || !currentText.text.startsWith(lastText)) {
           lastText = '';
+        }
+        if (currentText.src !== lastSrc) {
+          hadProgress = true;
         }
         lastSrc = currentText.src;
         if (currentText.text.length > lastText.length) {
@@ -1402,18 +1506,38 @@ async function sendPrompt({
           }
           lastText = currentText.text;
           stableStartTime = null;
+          hadProgress = true;
         }
       }
 
-      const stopButton = await safeQuery(
-        page,
-        'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
-      );
-
       const effectiveStatus = {
         ...status,
-        hasStopButton: status.hasStopButton || Boolean(stopButton),
+        hasStopButton,
       };
+
+      // targetTextLength ловит рост соседних model-thoughts на длинном
+      // "Thinking": текст ответа не меняется, но прогресс в DOM идёт.
+      const domSig = `${Boolean(effectiveStatus.hasStopButton)}:${Boolean(effectiveStatus.isBusyOrThinking)}:${Boolean(effectiveStatus.hasFinishedContent)}:${Boolean(effectiveStatus.hasActionButtons)}:${status.childCount ?? 0}:${status.targetTextLength ?? 0}:${currentText?.src ?? ''}`;
+      if (lastDomSignature === null) {
+        lastDomSignature = domSig;
+      } else if (domSig !== lastDomSignature) {
+        lastDomSignature = domSig;
+        hadProgress = true;
+      }
+
+      if (hadProgress) {
+        lastProgressTime = Date.now();
+      }
+
+      // Стол — и в активной генерации, и в послегенерационном лимбе:
+      // stop-кнопка ушла, но готового контента так и нет — не висеть до cap.
+      const awaitingContent = !isGenerating && !effectiveStatus.hasFinishedContent;
+      if ((isGenerating || awaitingContent) && Date.now() - lastProgressTime >= STALL_MS) {
+        await stopGeneration(page);
+        const e = new Error(`generation stalled — no progress for ${Math.round(STALL_MS / 1000)}s`);
+        e.code = 'WEB_GEMINI_STALLED';
+        throw e;
+      }
 
       if (!effectiveStatus.hasStopButton && !effectiveStatus.isBusyOrThinking && effectiveStatus.hasFinishedContent) {
         if (stableStartTime === null) {
@@ -1433,11 +1557,11 @@ async function sendPrompt({
     }
 
     // Hit the cap mid-generation → the answer is truncated, not complete.
-    if (Date.now() - streamStartTime >= MAX_WAIT_MS && (await safeQuery(page,
+    if (Date.now() - streamStartTime >= SESSION_CAP_MS && (await safeQuery(page,
       'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
     ))) {
       await stopGeneration(page);
-      const e = new Error(`generation still running after ${MAX_WAIT_MS / 1000}s cap — answer truncated`);
+      const e = new Error(`generation still running after ${SESSION_CAP_MS / 1000}s cap — answer truncated`);
       e.code = 'WEB_GEMINI_STREAM_TIMEOUT';
       throw e;
     }
@@ -2128,9 +2252,11 @@ function fileNameFromDisposition(disposition) {
  * Сбор файлов, которые Gemini Web сгенерировал в текущем ответе.
  * Сканируется только DOM ответа текущего хода (findTurnTarget), никогда
  * `model-response:last-of-type` — иначе файлы прошлых ходов качались бы
- * повторно. Два канала: прямые download-URL белого списка доменов через
- * context.request и кнопки Download/Export через download-событие (клик).
- * Ссылки вне белого списка не кликаются и не выгружаются.
+ * повторно. Каналы: прямые download-URL белого списка доменов через
+ * context.request и клик по кнопкам Download/Export с гонкой перехватов —
+ * download-событие, новая вкладка контекста, сетевой ответ с бинарным телом
+ * и fetch→blob (хук URL.createObjectURL). Ссылки вне белого списка не
+ * кликаются и не выгружаются.
  */
 function findGeneratedFileCandidates(target, { detectOnly = false, tagAttr = 'argon-dl' } = {}) {
   if (!target) return [];
@@ -2154,8 +2280,10 @@ function findGeneratedFileCandidates(target, { detectOnly = false, tagAttr = 'ar
   };
   const out = [];
   const seen = new Set();
+  const seenNodes = new Set();
   let seq = 0;
   for (const a of target.querySelectorAll('a[href]')) {
+    if (seenNodes.has(a)) continue;
     const href = a.href || a.getAttribute('href') || '';
     if (!href || seen.has(href)) continue;
     if (!okHost(href)) continue;
@@ -2169,6 +2297,7 @@ function findGeneratedFileCandidates(target, { detectOnly = false, tagAttr = 'ar
       if (!hasDl && !dlText && !FILE_EXT_RE.test(href)) continue;
     }
     seen.add(href);
+    seenNodes.add(a);
     const tag = `${tagAttr}-${seq++}`;
     if (a.setAttribute) a.setAttribute('data-argon-dl', tag);
     const label = ((a.getAttribute('aria-label') || '') + ' ' + (a.innerText || '')).trim();
@@ -2181,6 +2310,10 @@ function findGeneratedFileCandidates(target, { detectOnly = false, tagAttr = 'ar
     });
   }
   for (const b of target.querySelectorAll('button, [role="button"], a:not([href])')) {
+    // Дедуп по DOM-узлу: кнопка внутри уже размеченного якоря — один файл.
+    // Префикс tagAttr — чужие разметки прошлых сканов не считаем своими.
+    if (seenNodes.has(b)) continue;
+    if (b.closest && b.closest(`[data-argon-dl^="${tagAttr}-"]`)) continue;
     const hasDl = b.hasAttribute('download');
     if (detectOnly) {
       const isFileCard = Boolean(b.closest?.('.file-card, .file-chip, [data-file-id], [data-mime-type], [data-attachment-id]'));
@@ -2189,12 +2322,163 @@ function findGeneratedFileCandidates(target, { detectOnly = false, tagAttr = 'ar
       const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')).trim();
       if (!/download|скачать|export|экспорт/i.test(label)) continue;
     }
+    seenNodes.add(b);
     const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')).trim();
     const tag = `${tagAttr}-${seq++}`;
     if (b.setAttribute) b.setAttribute('data-argon-dl', tag);
     out.push({ kind: 'click', tag, name: label.slice(0, 120) });
   }
   return out;
+}
+
+// Хосты, куда Gemini ведёт экспортом через Google Docs/Drive — прямой файл
+// оттуда без интеграции с Drive не стянуть, фиксируем причину в skipped.
+const DRIVE_GATE_HOST_RE = /^(docs|drive|sheets|slides)\.google\.com$/i;
+
+// URL-шаблоны телеметрии и RPC эндпоинтов Google (batchexecute, gen_204, /log,
+// telemetry, beacon, /collect, playlog, RPC-эндпоинты google с /_/ или rpcids=,
+// а также служебные имена файлов вроде response.bin).
+// Ответы таких URL не должны приниматься как файлы даже при заголовке attachment (PLUG-376).
+const TELEMETRY_OR_RPC_URL_RE =
+  /gen_204|batchexecute|\/log\b|telemetry|beacon|\/collect|playlog|\/_\/|\/rpc\b|rpcids=|response\.bin/i;
+
+const isTelemetryOrRpcName = (name) => /(^|\b|[-_])response\.bin$/i.test(String(name || '').trim());
+
+// Проверка JSON-конверта: Google RPC / batchexecute возвращает тело, начинающееся
+// с )]}' (wrb.fr фреймы) либо JSON-объекта { / массива [ (PLUG-376).
+function isJsonEnvelope(buf) {
+  if (!buf || !buf.length) return false;
+  let offset = 0;
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    offset = 3;
+  }
+  while (
+    offset < buf.length &&
+    (buf[offset] === 0x20 || buf[offset] === 0x09 || buf[offset] === 0x0a || buf[offset] === 0x0d)
+  ) {
+    offset++;
+  }
+  if (offset >= buf.length) return false;
+  if (buf[offset] === 0x7b /* '{' */ || buf[offset] === 0x5b /* '[' */) return true;
+  if (
+    offset + 4 <= buf.length &&
+    buf.slice(offset, offset + 4).toString('ascii') === ")]}'"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// Признак бинарного типа (image/*, video/*, audio/*, zip/doc/pdf или бинарное расширение).
+function isBinaryMimeOrExt(mime, name) {
+  const m = String(mime || '').toLowerCase().split(';')[0].trim();
+  if (
+    /^(image\/|video\/|audio\/|application\/(octet-stream|zip|x-zip-compressed|pdf|msword|vnd\.|x-msdownload))/.test(
+      m
+    )
+  ) {
+    return true;
+  }
+  const ext = String(name || '').split('.').pop().toLowerCase();
+  return /^(png|jpe?g|webp|gif|zip|docx|xlsx|pptx|pdf|bin|tar|gz|mp4|webm|mp3)$/.test(ext);
+}
+
+// Валидация контента для сетевого ответа (PLUG-376 заход 3):
+// 1) JSON-конверт ()]}' или {) при заявленном бинарном типе — отказ (RPC-ответ).
+// 2) Для image/* и zip-семейства (docx/xlsx/pptx) — проверка magic bytes первых байт тела.
+function isValidResponseContent(body, mime, name) {
+  if (!body || !body.length) return false;
+  const m = String(mime || '').toLowerCase().split(';')[0].trim();
+  const n = String(name || '').toLowerCase();
+  const isBin = isBinaryMimeOrExt(m, n);
+
+  // Служебный файл response.bin — признак RPC-ответа
+  if (isTelemetryOrRpcName(n)) {
+    return false;
+  }
+
+  // JSON-конверт при бинарном типе — отклонять как RPC
+  if (isBin && isJsonEnvelope(body)) {
+    return false;
+  }
+
+  // PNG: \x89PNG
+  if (m === 'image/png' || n.endsWith('.png')) {
+    return (
+      body.length >= 4 &&
+      body[0] === 0x89 &&
+      body[1] === 0x50 &&
+      body[2] === 0x4e &&
+      body[3] === 0x47
+    );
+  }
+
+  // JPEG: \xFF\xD8
+  if (m === 'image/jpeg' || m === 'image/jpg' || n.endsWith('.jpg') || n.endsWith('.jpeg')) {
+    return body.length >= 2 && body[0] === 0xff && body[1] === 0xd8;
+  }
+
+  // WebP: RIFF....WEBP
+  if (m === 'image/webp' || n.endsWith('.webp')) {
+    return (
+      body.length >= 12 &&
+      body.slice(0, 4).toString('ascii') === 'RIFF' &&
+      body.slice(8, 12).toString('ascii') === 'WEBP'
+    );
+  }
+
+  // GIF: GIF8
+  if (m === 'image/gif' || n.endsWith('.gif')) {
+    return body.length >= 4 && body.slice(0, 4).toString('ascii') === 'GIF8';
+  }
+
+  // docx / xlsx / pptx / zip: PK\x03\x04
+  if (
+    /\.(docx|xlsx|pptx|zip)$/i.test(n) ||
+    /application\/(vnd\.openxmlformats|zip|x-zip-compressed)/i.test(m)
+  ) {
+    return (
+      body.length >= 4 &&
+      body[0] === 0x50 &&
+      body[1] === 0x4b &&
+      body[2] === 0x03 &&
+      body[3] === 0x04
+    );
+  }
+
+  // Общий случай image/* без конкретного подтипа
+  if (/^image\//i.test(m)) {
+    const isPng =
+      body.length >= 4 &&
+      body[0] === 0x89 &&
+      body[1] === 0x50 &&
+      body[2] === 0x4e &&
+      body[3] === 0x47;
+    const isJpg = body.length >= 2 && body[0] === 0xff && body[1] === 0xd8;
+    const isWebp =
+      body.length >= 12 &&
+      body.slice(0, 4).toString('ascii') === 'RIFF' &&
+      body.slice(8, 12).toString('ascii') === 'WEBP';
+    const isGif = body.length >= 4 && body.slice(0, 4).toString('ascii') === 'GIF8';
+    return isPng || isJpg || isWebp || isGif;
+  }
+
+  return true;
+}
+
+const EXT_BY_MIME = (() => {
+  const m = {};
+  for (const [ext, mime] of Object.entries(MIME_BY_EXT)) {
+    if (!(mime in m)) m[mime] = ext;
+  }
+  return m;
+})();
+
+function withExtFromMime(name, mime) {
+  const base = String(mime || '').split(';')[0].trim().toLowerCase();
+  if (!base || path.extname(String(name || ''))) return name;
+  const ext = EXT_BY_MIME[base];
+  return ext ? `${name}${ext}` : name;
 }
 
 async function collectGeneratedFiles(page, opts = {}) {
@@ -2207,8 +2491,9 @@ async function collectGeneratedFiles(page, opts = {}) {
   const nonce = `n${Date.now().toString(36)}`;
 
   let cands = null;
+  let scanMeta = {};
   try {
-    cands = await safeEval(
+    const scan = await safeEval(
       page,
       ({ idx, promptPrefix, fnSrc, candSrc, tagAttr, detectOnly }) => {
         if (!window.__argonFindTurnTarget && fnSrc) {
@@ -2219,17 +2504,63 @@ async function collectGeneratedFiles(page, opts = {}) {
         }
         const fn = window.__argonFindTurnTarget;
         const target = fn ? fn(document, idx, promptPrefix) : null;
-        if (!target) return [];
+        if (!target) return { candidates: [], meta: {} };
         const findCands = window.__argonFindGeneratedFileCandidates;
-        return findCands ? findCands(target, { detectOnly, tagAttr }) : [];
+        const candidates = findCands ? findCands(target, { detectOnly, tagAttr }) : [];
+        const meta = {};
+        try {
+          const txt = String(target.innerText || '');
+          // Экспорт, требующий подключённого Google Drive (xlsx/Docs/Sheets/Slides).
+          if (
+            /(подключ\w+|connect\w*|requires?|требуется|нужно|activate)\b[\s\S]{0,80}google drive/i.test(txt) ||
+            /google drive[\s\S]{0,80}(требуется|required|integration|интеграци|подключ)/i.test(txt)
+          ) {
+            meta.driveGate = true;
+          }
+          if (!candidates.length) {
+            // Inline-контент без экспорта: canvas/pdf viewer, видео-превью, blob-img.
+            const m =
+              target.querySelector &&
+              target.querySelector(
+                'video, canvas, embed, object, generated-image, generated-video, .file-card, .file-chip, [data-file-id], [data-mime-type], img[src^="blob:"], img[src*="googleusercontent"]'
+              );
+            if (m) {
+              meta.nonExportable = true;
+              meta.mediaKind = String(m.tagName || 'media').toLowerCase();
+            } else if (
+              // Асинхронная генерация (видео): файла в этом ходе ещё нет.
+              /вернитесь позже|займ(ёт|ет)\s+(?:ещё\s+)?(несколько|пару)\s+минут|come back (later|soon)|(may|might|could) take (a few|several|a couple)( more)? minutes/i.test(
+                txt
+              )
+            ) {
+              meta.nonExportable = true;
+              meta.mediaKind = 'async media';
+            }
+          }
+        } catch {}
+        return { candidates, meta };
       },
       { idx: opts.turnIndex ?? 0, promptPrefix: opts.promptPrefix || '', fnSrc: findTurnTarget.toString(), candSrc: findGeneratedFileCandidates.toString(), tagAttr: nonce, detectOnly: Boolean(opts.detectOnly) }
     );
+    cands = Array.isArray(scan) ? scan : (scan && scan.candidates) || null;
+    scanMeta = (scan && !Array.isArray(scan) && scan.meta) || {};
   } catch {
     return { files, skipped };
   }
 
-  if (!Array.isArray(cands) || !cands.length) return { files, skipped };
+  if (!Array.isArray(cands) || !cands.length) {
+    if (!opts.detectOnly) {
+      if (scanMeta.driveGate) {
+        skipped.push({ name: 'generated file', reason: 'requires Google Drive integration' });
+      } else if (scanMeta.nonExportable) {
+        skipped.push({
+          name: `generated ${scanMeta.mediaKind || 'media'}`,
+          reason: 'файл не экспортируем в этом ходе',
+        });
+      }
+    }
+    return { files, skipped };
+  }
   if (opts.detectOnly) return { files, skipped, hasGeneratedFile: true };
 
   try {
@@ -2257,52 +2588,699 @@ async function collectGeneratedFiles(page, opts = {}) {
   const attemptBudget = Math.max(8, maxCount * 2);
   let tries = 0;
 
-  const tryDownloadByClick = async (c, fallbackName) => {
-    const el = await safeQuery(page, `[data-argon-dl="${c.tag}"]`);
-    if (!el) {
-      skipNote(fallbackName || c.name || 'download', 'element gone');
+  const CLICK_WAIT_MS = typeof opts.clickWaitMs === 'number' ? opts.clickWaitMs : 10000;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const saveBufferToFile = (nameHint, mime, body) => {
+    if (body.length > maxBytes) {
+      skipNote(nameHint || 'file', `too large (${body.length} bytes > ${maxBytes})`);
+      return;
+    }
+    const name = sanitizeDownloadName(withExtFromMime(nameHint || 'file', mime));
+    const dest = destFor(name);
+    const tmp = `${dest}.part`;
+    fs.writeFileSync(tmp, body);
+    fs.renameSync(tmp, dest);
+    files.push({
+      path: dest,
+      name,
+      mimeType: String(mime || '').split(';')[0].trim() || mimeFromName(name),
+      sizeBytes: body.length,
+    });
+  };
+
+  const nameForFetched = (headers, url, fallback) =>
+    fileNameFromDisposition(headers && headers['content-disposition']) ||
+    fallback ||
+    nameFromUrl(url) ||
+    'file';
+
+  // Класс хоста URL скачивания: 'drive' — Google Docs/Drive (гейт, прямой
+  // файл без интеграции не стянуть), 'allowed' — белый список, 'denied' —
+  // посторонний хост, 'unknown' — хост определить не удалось.
+  const classifyDlUrl = (url) => {
+    const h = downloadUrlHost(url);
+    if (!h) return 'unknown';
+    if (DRIVE_GATE_HOST_RE.test(h)) return 'drive';
+    return isAllowedDownloadHost(h) ? 'allowed' : 'denied';
+  };
+
+  const dlHostNote = (url) => downloadUrlHost(url) || 'unknown';
+
+  // Кандидат «сетевой ответ = файл»: content-disposition=attachment или
+  // бинарный content-type, 2xx и хост белого списка. Фоновая телеметрия
+  // (batchexecute/gen_204/пиксели/RPC), служебные response.bin, иконки svg/gif
+  // и посторонние хосты до резолва победителя гасятся — не должны побеждать
+  // по клику экспорта (PLUG-376 заход 3). Порядок строгий: сначала отсев
+  // телеметрии/RPC по URL и имени, потом статус/whitelist, потом disposition/тип.
+  const respFileCandidate = (resp) => {
+    try {
+      const url = (resp.url && resp.url()) || '';
+      if (!url) return null;
+      // 1. Сначала отсев по URL/пути (batchexecute, gen_204, /log, telemetry, beacon,
+      // /collect, playlog, RPC-эндпоинты google, response.bin)
+      if (TELEMETRY_OR_RPC_URL_RE.test(url)) return null;
+
+      const hd = (resp.headers && resp.headers()) || {};
+      const cd = String(hd['content-disposition'] || '');
+      const dispName = fileNameFromDisposition(cd) || '';
+      if (isTelemetryOrRpcName(dispName) || isTelemetryOrRpcName(nameFromUrl(url))) return null;
+
+      // 2. Статус и хост белого списка / Drive-гейт
+      const h = downloadUrlHost(url);
+      if (!h) return null;
+      if (DRIVE_GATE_HOST_RE.test(h)) return { resp, url };
+      if (!isAllowedDownloadHost(h)) return null;
+      const st = typeof resp.status === 'function' ? resp.status() : null;
+      if (typeof st === 'number' && (st < 200 || st >= 300)) return null;
+
+      // 3. Заголовки: disposition=attachment или бинарный content-type
+      const ct = String(hd['content-type'] || '').toLowerCase();
+      if (/attachment/i.test(cd)) return { resp, url };
+      if (
+        /^(application\/(octet-stream|zip|x-zip-compressed|pdf|msword|vnd\.|x-msdownload)|video\/|audio\/)/.test(
+          ct
+        ) ||
+        /^image\/(?!svg|gif|x-icon|vnd\.microsoft\.icon)/.test(ct)
+      ) {
+        return { resp, url };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Победитель гонки каналов — первый НЕ-пустой результат; ошибка или
+  // таймаут отдельного канала не гасит остальные (ревью PLUG-376).
+  const firstNonNull = (promises) =>
+    new Promise((resolve) => {
+      if (!promises.length) return resolve(null);
+      let left = promises.length;
+      let done = false;
+      for (const pr of promises) {
+        Promise.resolve(pr).then(
+          (v) => {
+            if (done) return;
+            if (v) {
+              done = true;
+              resolve(v);
+              return;
+            }
+            if (--left === 0) resolve(null);
+          },
+          () => {
+            if (!done && --left === 0) resolve(null);
+          }
+        );
+      }
+    });
+
+  // Извлечённый URL (новая вкладка / сетевой ответ) стягивается через
+  // request-контекст браузера. Хост проверяется и до запроса, и после —
+  // req.get идёт по редиректам, финальный URL может уйти с белого списка
+  // или на Drive-гейт (ревью PLUG-376).
+  const fetchUrlToFile = async (url, fallbackName) => {
+    const name = fallbackName || nameFromUrl(url) || 'file';
+    const cls0 = classifyDlUrl(url);
+    if (cls0 === 'drive') {
+      skipNote(name, 'requires Google Drive integration');
+      return;
+    }
+    if (cls0 !== 'allowed') {
+      skipNote(name, `host not allowed (${dlHostNote(url)})`);
+      return;
+    }
+    const ctx = page.context && page.context();
+    const req = ctx && ctx.request;
+    if (!req || typeof req.get !== 'function') {
+      skipNote(name, 'no request context');
       return;
     }
     try {
-      const [dl] = await Promise.all([
-        page.waitForEvent('download', { timeout: 10000 }),
-        el.click({ timeout: 5000 }),
-      ]);
-      // У click-кандидатов href в DOM не было — хост download-события
-      // сверяем с белым списком здесь (ревью PLUG-291). Хост не
-      // определён (data:, blob без origin) — пропускаем проверку.
-      let dlHost = null;
-      try {
-        const u = dl.url && dl.url();
-        dlHost = u ? downloadUrlHost(u) : null;
-      } catch {}
-      if (dlHost && !isAllowedDownloadHost(dlHost)) {
-        skipNote(fallbackName || c.name || 'download', `host not allowed (${dlHost})`);
+      const resp = await req.get(url, { timeout: 15000 });
+      if (!resp.ok()) {
+        skipNote(name, `http ${resp.status()}`);
         return;
       }
-      const name = sanitizeDownloadName(
-        (dl.suggestedFilename && dl.suggestedFilename()) || fallbackName || c.name || 'file'
-      );
-      const dest = destFor(name);
-      await dl.saveAs(`${dest}.part`);
-      let st;
-      try {
-        st = fs.statSync(`${dest}.part`);
-      } catch {
-        skipNote(name, 'download did not materialize');
+      const finalUrl = (typeof resp.url === 'function' && resp.url()) || url;
+      const clsF = classifyDlUrl(finalUrl);
+      if (clsF === 'drive') {
+        skipNote(name, 'requires Google Drive integration');
         return;
       }
-      if (st.size > maxBytes) {
-        try {
-          fs.unlinkSync(`${dest}.part`);
-        } catch {}
-        skipNote(name, `too large (${st.size} bytes > ${maxBytes})`);
+      if (clsF !== 'allowed') {
+        skipNote(name, `host not allowed (${dlHostNote(finalUrl)})`);
         return;
       }
-      fs.renameSync(`${dest}.part`, dest);
-      files.push({ path: dest, name, mimeType: mimeFromName(name), sizeBytes: st.size });
+      const headers = resp.headers ? resp.headers() : {};
+      const cl = Number(headers['content-length'] || 0);
+      if (cl > maxBytes) {
+        skipNote(name, `too large (${cl} bytes > ${maxBytes})`);
+        return;
+      }
+      const body = await resp.body();
+      const ct = String(headers['content-type'] || '').toLowerCase();
+      const fetchedName = nameForFetched(headers, finalUrl, fallbackName);
+      if (isBinaryMimeOrExt(ct, fetchedName) && (isJsonEnvelope(body) || isTelemetryOrRpcName(fetchedName))) {
+        skipNote(fallbackName || fetchedName, 'telemetry/rpc');
+        return;
+      }
+      saveBufferToFile(fetchedName, headers['content-type'], body);
     } catch (e) {
-      skipNote(fallbackName || c.name || 'download', String((e && e.message) || e));
+      skipNote(name, String((e && e.message) || e));
+    }
+  };
+
+  const tryDownloadByClick = async (c, fallbackName) => {
+    const el = await safeQuery(page, `[data-argon-dl="${c.tag}"]`);
+    const candName = fallbackName || c.name || 'download';
+    if (!el) {
+      skipNote(candName, 'element gone');
+      return;
+    }
+    const ctx = (typeof page.context === 'function') ? page.context() : null;
+    const clickStart = Date.now();
+    let settled = false;
+    let telemetryReject = false;
+    // Перехватчики принимают события только с начала клика — фоновая
+    // телеметрия и чужие вкладки в общем контексте не должны побеждать.
+    let accept = false;
+    const dlEvents = [];
+    const pageEvents = [];
+    const respEvents = [];
+
+    // Канал fetch→blob: страница собирает blob и «кликает» по нему —
+    // download-ивента нет. Хукаем createObjectURL до клика; сам Blob
+    // держим в записи — revokeObjectURL байты уже не отбирает (ревью
+    // PLUG-376: паттерн create→click→revoke обгонял опрос по URL).
+    try {
+      await page.evaluate(({ since }) => {
+        try {
+          const rec = (window.__argonDlBlobs = []);
+          rec.since = since;
+          if (!window.__argonDlBlobHooked) {
+            window.__argonDlBlobHooked = true;
+            const orig = URL.createObjectURL.bind(URL);
+            URL.createObjectURL = (obj) => {
+              const u = orig(obj);
+              try {
+                (window.__argonDlBlobs || (window.__argonDlBlobs = [])).push({
+                  url: u,
+                  type: (obj && obj.type) || '',
+                  ts: Date.now(),
+                  blob: obj,
+                });
+              } catch {}
+              return u;
+            };
+          }
+        } catch {}
+      }, { since: clickStart });
+    } catch {}
+
+    // Подписки ставятся до первой попытки клика — событие, пришедшее во
+    // время клика, не теряется; снимаются в cleanupWaiters (утёкший
+    // слушатель контекста закрывал чужие вкладки — ревью PLUG-376).
+    let dlListener = null;
+    let respListener = null;
+    let pageListener = null;
+    if (typeof page.on === 'function') {
+      dlListener = (dl) => {
+        if (accept && !settled) dlEvents.push(dl);
+      };
+      respListener = (resp) => {
+        if (!accept || settled) return;
+        const cand = respFileCandidate(resp);
+        if (cand) {
+          respEvents.push(cand);
+        } else {
+          try {
+            const u = (resp.url && resp.url()) || '';
+            const hd = (resp.headers && resp.headers()) || {};
+            const cd = String(hd['content-disposition'] || '');
+            const ct = String(hd['content-type'] || '').toLowerCase();
+            const dispName = fileNameFromDisposition(cd) || '';
+            if (
+              (TELEMETRY_OR_RPC_URL_RE.test(u) ||
+                isTelemetryOrRpcName(dispName) ||
+                isTelemetryOrRpcName(nameFromUrl(u))) &&
+              (/attachment/i.test(cd) || isBinaryMimeOrExt(ct, u))
+            ) {
+              telemetryReject = true;
+            }
+          } catch {}
+        }
+      };
+      try {
+        page.on('download', dlListener);
+      } catch {
+        dlListener = null;
+      }
+      try {
+        page.on('response', respListener);
+      } catch {
+        respListener = null;
+      }
+    }
+    if (ctx) {
+      pageListener = (p) => {
+        if (accept && !settled) pageEvents.push(p);
+      };
+      try {
+        if (typeof ctx.on === 'function') ctx.on('page', pageListener);
+        else if (typeof ctx.once === 'function') ctx.once('page', pageListener);
+        else pageListener = null;
+      } catch {
+        pageListener = null;
+      }
+    }
+
+    // Надёжность клика: scrollIntoView → обычный → force → dispatchEvent —
+    // кнопки экспорта под оверлеями/в нестабильном состоянии падают на
+    // elementHandle.click (E2E PLUG-372).
+    try {
+      await (el.scrollIntoViewIfNeeded && el.scrollIntoViewIfNeeded({ timeout: 3000 }));
+    } catch {}
+    let clicked = false;
+    let clickErr = null;
+    accept = true;
+    for (const attempt of [
+      () => el.click({ timeout: 5000 }),
+      () => el.click({ force: true, timeout: 3000 }),
+      () =>
+        typeof el.dispatchEvent === 'function'
+          ? el.dispatchEvent('click')
+          : Promise.reject(new Error('no dispatchEvent')),
+    ]) {
+      try {
+        await attempt();
+        clicked = true;
+        break;
+      } catch (e) {
+        clickErr = e;
+      }
+    }
+    const cleanupWaiters = () => {
+      settled = true;
+      if (dlListener && typeof page.off === 'function') {
+        try {
+          page.off('download', dlListener);
+        } catch {}
+      }
+      if (respListener && typeof page.off === 'function') {
+        try {
+          page.off('response', respListener);
+        } catch {}
+      }
+      if (pageListener && ctx) {
+        try {
+          if (typeof ctx.off === 'function') ctx.off('page', pageListener);
+          else if (typeof ctx.removeListener === 'function') ctx.removeListener('page', pageListener);
+        } catch {}
+      }
+      // Вкладки из буфера, не ставшие победителем, закрываем — они
+      // пойманы в окно нашего клика.
+      while (pageEvents.length) {
+        const p = pageEvents.shift();
+        try {
+          if (p && p.close) p.close();
+        } catch {}
+      }
+    };
+    if (!clicked) {
+      cleanupWaiters();
+      skipNote(candName, String((clickErr && clickErr.message) || clickErr || 'click failed'));
+      return;
+    }
+
+    // Дедлайн гонки — после успешного клика: бюджет на скролл и ретраи
+    // клика из него не вычитается (ревью PLUG-376).
+    const deadline = Date.now() + CLICK_WAIT_MS;
+
+    // Новая вкладка: window.open стартует с about:blank, waitForLoadState
+    // резолвится до навигации — ждём реальный http(s) URL, параллельно
+    // гоним download-ивент вкладки; пустой/чужой URL — не победа.
+    const inspectNewPage = async (p) => {
+      const until = Math.min(deadline, Date.now() + 6000);
+      const urlP = (async () => {
+        while (!settled && Date.now() < until) {
+          let u = '';
+          try {
+            u = (p.url && p.url()) || '';
+          } catch {}
+          if (u && /^https?:/i.test(u)) return u;
+          try {
+            await (p.waitForLoadState &&
+              p.waitForLoadState('domcontentloaded', {
+                timeout: Math.min(1500, Math.max(1, until - Date.now())),
+              }));
+          } catch {}
+          await sleep(120);
+        }
+        return null;
+      })();
+      const dlP =
+        typeof p.waitForEvent === 'function'
+          ? p
+              .waitForEvent('download', { timeout: Math.max(1, until - Date.now()) })
+              .then((dl) => ({ dl }))
+              .catch(() => null)
+          : Promise.resolve(null);
+      // Берём первый НЕ-пустой результат — ошибка одного канала не
+      // обгоняет другой (about:blank urlP vs dlP).
+      let decided = false;
+      const first = await new Promise((resolve) => {
+        let left = 2;
+        const take = (v) => {
+          if (decided) return;
+          if (v) {
+            decided = true;
+            resolve(v);
+            return;
+          }
+          if (--left === 0) resolve(null);
+        };
+        urlP.then(take, () => take(null));
+        dlP.then(take, () => take(null));
+      });
+      if (settled || !first) {
+        try {
+          await (p.close && p.close());
+        } catch {}
+        return null;
+      }
+      if (first.dl) return { kind: 'download', dl: first.dl, page: p };
+      const cls = classifyDlUrl(first);
+      if (cls === 'allowed' || cls === 'drive') {
+        return { kind: 'page', page: p, url: first };
+      }
+      try {
+        await (p.close && p.close());
+      } catch {}
+      return null;
+    };
+
+    const waiters = [];
+    // 1) Нативное download-событие: буфер слушателя с момента клика
+    // (или прямой waitForEvent, если page.on в среде недоступен).
+    if (dlListener) {
+      waiters.push(
+        (async () => {
+          while (!settled && Date.now() < deadline) {
+            if (dlEvents.length) return { kind: 'download', dl: dlEvents[0] };
+            await sleep(60);
+          }
+          return null;
+        })()
+      );
+    } else if (typeof page.waitForEvent === 'function') {
+      waiters.push(
+        page
+          .waitForEvent('download', { timeout: Math.max(1, deadline - Date.now()) })
+          .then((dl) => ({ kind: 'download', dl }))
+          .catch(() => null)
+      );
+    }
+    // 2) Новые вкладки контекста из буфера — экспорт открывает viewer/файл
+    // в новой странице; URL забираем и стягиваем через request-контекст.
+    if (pageListener) {
+      waiters.push(
+        (async () => {
+          const seenPages = new Set();
+          while (!settled && Date.now() < deadline) {
+            while (pageEvents.length) {
+              const p = pageEvents.shift();
+              if (seenPages.has(p)) continue;
+              seenPages.add(p);
+              const r = await inspectNewPage(p);
+              if (r) return r;
+            }
+            await sleep(80);
+          }
+          return null;
+        })()
+      );
+    }
+    // 3) Сетевой ответ-файл из буфера (валидность проверена в слушателе).
+    if (respListener) {
+      waiters.push(
+        (async () => {
+          while (!settled && Date.now() < deadline) {
+            if (respEvents.length) return { kind: 'response', ...respEvents[0] };
+            await sleep(60);
+          }
+          return null;
+        })()
+      );
+    }
+    // 4) fetch→blob: опрос blob-URL, записанных хуком после клика.
+    waiters.push(
+      (async () => {
+        while (!settled && Date.now() < deadline) {
+          try {
+            const list = await page.evaluate(
+              ({ since }) =>
+                Array.isArray(window.__argonDlBlobs)
+                  ? window.__argonDlBlobs
+                      .filter((e) => e && e.url && e.ts >= since)
+                      .map((e) => ({ url: e.url, type: e.type, ts: e.ts }))
+                  : [],
+              { since: clickStart - 500 }
+            );
+            const hit = (list || []).find((e) => typeof e.url === 'string' && e.url.startsWith('blob:'));
+            if (hit) return { kind: 'blob', entry: hit };
+          } catch {
+            return null;
+          }
+          await sleep(200);
+        }
+        return null;
+      })()
+    );
+
+    const winner = await firstNonNull(waiters);
+    cleanupWaiters();
+
+    try {
+      if (!winner) {
+        // Fallback для изображений (PLUG-376 заход 3, расширение PLUG-380):
+        // клик по «Скачать в полном размере» в Imagen не порождает событий сети
+        // или новой вкладки — пробуем canvas-экстракцию / data: URI изображения
+        // из контейнера сообщения (механизм downloadGeneratedMedia).
+        let canvasSaved = false;
+        try {
+          const imgMedia = await safeEval(
+            page,
+            ({ tag, idx, promptPrefix }) => {
+              const btn = document.querySelector(`[data-argon-dl="${tag}"]`);
+              let root = btn ? btn.closest('generated-image, .image-container, message-content, model-response') : null;
+              if (!root && window.__argonFindTurnTarget) {
+                root = window.__argonFindTurnTarget(document, idx, promptPrefix);
+              }
+              if (!root) {
+                root = document.querySelector('model-response:last-of-type');
+              }
+              if (!root) return null;
+              const img = root.querySelector(
+                'generated-image img, img.image, .image-container img, img[src*="blob:"], img[src*="googleusercontent"], img'
+              );
+              if (!img) return null;
+              try {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth || img.width || 1024;
+                canvas.height = img.naturalHeight || img.height || 1024;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                const dataUrl = canvas.toDataURL('image/png');
+                if (dataUrl && dataUrl.startsWith('data:image/')) {
+                  return { dataUrl, alt: img.alt || '' };
+                }
+              } catch {}
+              if (img.src && typeof img.src === 'string') {
+                return { src: img.src, alt: img.alt || '' };
+              }
+              return null;
+            },
+            { tag: c.tag, idx: opts.turnIndex ?? 0, promptPrefix: opts.promptPrefix || '' }
+          );
+
+          if (imgMedia && imgMedia.dataUrl && imgMedia.dataUrl.startsWith('data:image/')) {
+            const base64 = imgMedia.dataUrl.split(',')[1];
+            if (base64) {
+              const body = Buffer.from(base64, 'base64');
+              if (isValidResponseContent(body, 'image/png', candName)) {
+                saveBufferToFile(candName, 'image/png', body);
+                canvasSaved = true;
+              }
+            }
+          } else if (imgMedia && imgMedia.src) {
+            if (imgMedia.src.startsWith('data:image/')) {
+              const base64 = imgMedia.src.split(',')[1];
+              if (base64) {
+                const body = Buffer.from(base64, 'base64');
+                if (isValidResponseContent(body, 'image/png', candName)) {
+                  saveBufferToFile(candName, 'image/png', body);
+                  canvasSaved = true;
+                }
+              }
+            } else if (/^https?:/i.test(imgMedia.src)) {
+              const host = downloadUrlHost(imgMedia.src);
+              if (host && isAllowedDownloadHost(host)) {
+                await fetchUrlToFile(imgMedia.src, candName);
+                canvasSaved = true;
+              }
+            }
+          }
+        } catch {}
+
+        if (!canvasSaved) {
+          if (telemetryReject) {
+            skipNote(candName, 'telemetry/rpc');
+          } else {
+            skipNote(candName, 'download did not materialize');
+          }
+        }
+      } else if (winner.kind === 'download') {
+        const dl = winner.dl;
+        // У click-кандидатов href в DOM не было — хост download-события
+        // сверяем с белым списком здесь (ревью PLUG-291). Хост не
+        // определён (data:, blob без origin) — пропускаем проверку.
+        let dlHost = null;
+        try {
+          const u = dl.url && dl.url();
+          dlHost = u ? downloadUrlHost(u) : null;
+        } catch {}
+        if (dlHost && DRIVE_GATE_HOST_RE.test(dlHost)) {
+          skipNote(candName, 'requires Google Drive integration');
+        } else if (dlHost && !isAllowedDownloadHost(dlHost)) {
+          skipNote(candName, `host not allowed (${dlHost})`);
+        } else {
+          const name = sanitizeDownloadName(
+            (dl.suggestedFilename && dl.suggestedFilename()) || candName || 'file'
+          );
+          const dest = destFor(name);
+          await dl.saveAs(`${dest}.part`);
+          let st;
+          try {
+            st = fs.statSync(`${dest}.part`);
+          } catch {
+            skipNote(name, 'download did not materialize');
+            return;
+          }
+          if (st.size > maxBytes) {
+            try {
+              fs.unlinkSync(`${dest}.part`);
+            } catch {}
+            skipNote(name, `too large (${st.size} bytes > ${maxBytes})`);
+            return;
+          }
+          fs.renameSync(`${dest}.part`, dest);
+          files.push({ path: dest, name, mimeType: mimeFromName(name), sizeBytes: st.size });
+        }
+      } else if (winner.kind === 'page') {
+        const p = winner.page;
+        try {
+          // URL и хост уже завалидированы в inspectNewPage (allowed|drive).
+          if (classifyDlUrl(winner.url) === 'drive') {
+            skipNote(candName, 'requires Google Drive integration');
+          } else {
+            await fetchUrlToFile(winner.url, candName);
+          }
+        } finally {
+          try {
+            await (p.close && p.close());
+          } catch {}
+        }
+      } else if (winner.kind === 'response') {
+        const resp = winner.resp;
+        // Хост ответа уже проверен в слушателе (allowed|drive, 2xx).
+        if (classifyDlUrl(winner.url) === 'drive') {
+          skipNote(candName, 'requires Google Drive integration');
+        } else {
+          let body = null;
+          let headers = {};
+          try {
+            headers = (resp.headers && resp.headers()) || {};
+            body = await resp.body();
+          } catch {}
+          if (body && body.length) {
+            const ct = String(headers['content-type'] || '').toLowerCase();
+            const candNameOrFetched = nameForFetched(headers, winner.url, candName);
+            if (!isValidResponseContent(body, ct, candNameOrFetched)) {
+              skipNote(candName, 'telemetry/rpc');
+            } else {
+              saveBufferToFile(
+                candNameOrFetched,
+                headers['content-type'],
+                body
+              );
+            }
+          } else if (winner.url) {
+            await fetchUrlToFile(winner.url, candName);
+          } else {
+            skipNote(candName, 'download did not materialize');
+          }
+        }
+      } else if (winner.kind === 'blob') {
+        const entry = winner.entry;
+        const host = downloadUrlHost(entry.url);
+        if (host && !isAllowedDownloadHost(host)) {
+          skipNote(candName, `host not allowed (${host})`);
+        } else {
+          // Байты читаем из сохранённого Blob — переживает revokeObjectURL;
+          // запасной путь — fetch(blob: URL) по старой схеме (ревью PLUG-376).
+          const data = await page
+            .evaluate(async ({ url, lim }) => {
+              try {
+                let buf = null;
+                let mime = '';
+                const rec = (window.__argonDlBlobs || []).find((e) => e && e.url === url);
+                const blob = rec && rec.blob;
+                if (blob && typeof blob.arrayBuffer === 'function') {
+                  if ((blob.size || 0) > lim) return { tooLarge: blob.size };
+                  mime = blob.type || '';
+                  buf = await blob.arrayBuffer();
+                } else {
+                  const r = await fetch(url);
+                  const cl = Number((r.headers && r.headers.get('content-length')) || 0);
+                  if (cl > lim) return { tooLarge: cl };
+                  mime = (r.headers && r.headers.get('content-type')) || '';
+                  buf = await r.arrayBuffer();
+                }
+                if (!buf || buf.byteLength > lim) {
+                  return { tooLarge: buf ? buf.byteLength : 0 };
+                }
+                const bytes = new Uint8Array(buf);
+                let s = '';
+                for (let i = 0; i < bytes.length; i += 0x8000) {
+                  s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+                }
+                return { b64: btoa(s), mime };
+              } catch {
+                return null;
+              }
+            }, { url: entry.url, lim: maxBytes })
+            .catch(() => null);
+          if (data && data.tooLarge != null) {
+            skipNote(candName, `too large (${data.tooLarge} bytes > ${maxBytes})`);
+          } else if (data && data.b64) {
+            const body = Buffer.from(data.b64, 'base64');
+            saveBufferToFile(candName, data.mime || entry.type, body);
+          } else {
+            skipNote(candName, 'blob fetch failed');
+          }
+        }
+      }
+    } catch (e) {
+      skipNote(candName, String((e && e.message) || e));
+    } finally {
+      // Вкладка, отдавшая download-ивент, тоже закрывается.
+      if (winner && winner.page && typeof winner.page.close === 'function') {
+        try {
+          await winner.page.close();
+        } catch {}
+      }
     }
   };
 
@@ -2324,59 +3302,70 @@ async function collectGeneratedFiles(page, opts = {}) {
     }
     tries += 1;
     if (c.kind === 'link') {
-      let done = false;
-      try {
-        const ctx = page.context && page.context();
-        const req = ctx && ctx.request;
-        if (!req) throw new Error('no request context');
-        const resp = await req.get(c.href, { timeout: 15000 });
-        if (!resp.ok()) {
+      const linkName = c.name || nameFromUrl(c.href) || 'file';
+      const hrefCls = classifyDlUrl(c.href);
+      // Белый список DOM-скана пропускает *.google.com — ссылку на
+      // Docs/Drive viewer нельзя стягивать как файл (ревью PLUG-376).
+      if (hrefCls === 'drive') {
+        skipNote(linkName, 'requires Google Drive integration');
+      } else if (hrefCls !== 'allowed') {
+        skipNote(linkName, `host not allowed (${dlHostNote(c.href)})`);
+      } else {
+        try {
+          const ctx = page.context && page.context();
+          const req = ctx && ctx.request;
+          if (!req) throw new Error('no request context');
+          const resp = await req.get(c.href, { timeout: 15000 });
+          // req.get идёт по редиректам — финальный хост проверяем тоже.
+          const finalUrl = (typeof resp.url === 'function' && resp.url()) || c.href;
+          const fCls = classifyDlUrl(finalUrl);
+          if (fCls === 'drive') {
+            skipNote(linkName, 'requires Google Drive integration');
+          } else if (fCls !== 'allowed') {
+            skipNote(linkName, `host not allowed (${dlHostNote(finalUrl)})`);
+          } else if (!resp.ok()) {
+            if (c.canClick) {
+              await tryDownloadByClick(c);
+            } else {
+              skipNote(linkName, `http ${resp.status()}`);
+            }
+          } else {
+            const headers = resp.headers();
+            const cl = Number(headers['content-length'] || 0);
+            if (cl > maxBytes) {
+              skipNote(linkName, `too large (${cl} bytes > ${maxBytes})`);
+            } else {
+              const body = await resp.body();
+              if (body.length > maxBytes) {
+                skipNote(linkName, `too large (${body.length} bytes > ${maxBytes})`);
+              } else {
+                const name = sanitizeDownloadName(
+                  fileNameFromDisposition(headers['content-disposition']) ||
+                    c.name ||
+                    nameFromUrl(finalUrl) ||
+                    'file'
+                );
+                const dest = destFor(name);
+                const tmp = `${dest}.part`;
+                fs.writeFileSync(tmp, body);
+                fs.renameSync(tmp, dest);
+                files.push({
+                  path: dest,
+                  name,
+                  mimeType: String(headers['content-type'] || '').split(';')[0].trim() || mimeFromName(name),
+                  sizeBytes: body.length,
+                });
+              }
+            }
+          }
+        } catch (e) {
           if (c.canClick) {
             await tryDownloadByClick(c);
           } else {
-            skipNote(c.name || nameFromUrl(c.href) || 'file', `http ${resp.status()}`);
-          }
-          done = true;
-        } else {
-          const headers = resp.headers();
-          const cl = Number(headers['content-length'] || 0);
-          if (cl > maxBytes) {
-            skipNote(c.name || nameFromUrl(c.href) || 'file', `too large (${cl} bytes > ${maxBytes})`);
-            done = true;
-          } else {
-            const body = await resp.body();
-            if (body.length > maxBytes) {
-              skipNote(c.name || nameFromUrl(c.href) || 'file', `too large (${body.length} bytes > ${maxBytes})`);
-            } else {
-              const name = sanitizeDownloadName(
-                fileNameFromDisposition(headers['content-disposition']) ||
-                  c.name ||
-                  nameFromUrl(c.href) ||
-                  'file'
-              );
-              const dest = destFor(name);
-              const tmp = `${dest}.part`;
-              fs.writeFileSync(tmp, body);
-              fs.renameSync(tmp, dest);
-              files.push({
-                path: dest,
-                name,
-                mimeType: String(headers['content-type'] || '').split(';')[0].trim() || mimeFromName(name),
-                sizeBytes: body.length,
-              });
-            }
-            done = true;
+            skipNote(linkName, String((e && e.message) || e));
           }
         }
-      } catch (e) {
-        if (c.canClick) {
-          await tryDownloadByClick(c);
-        } else {
-          skipNote(c.name || nameFromUrl(c.href) || 'file', String((e && e.message) || e));
-        }
-        done = true;
       }
-      void done;
     } else {
       await tryDownloadByClick(c);
     }
@@ -2550,6 +3539,11 @@ module.exports = {
   isAllowedDownloadHost,
   downloadUrlHost,
   downloadGeneratedMedia,
+  TELEMETRY_OR_RPC_URL_RE,
+  isTelemetryOrRpcName,
+  isJsonEnvelope,
+  isBinaryMimeOrExt,
+  isValidResponseContent,
   listConversations,
   listConversationsInternal,
   getConversationTranscript,

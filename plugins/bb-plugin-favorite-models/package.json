@@ -2,7 +2,7 @@
   "name": "bb-plugin-favorite-models",
   "version": "0.1.0",
   "type": "module",
-  "description": "Добавление моделей провайдеров в избранное через звёздочку и быстрое переключение.",
+  "description": "Добавление моделей провайдеров в избранное через звёздочку и закрепление вверху списка.",
   "engines": {
     "bb": ">=0.39",
     "bbPluginSdk": ">=0.4.8"
@@ -15,6 +15,11 @@
     },
     "server": "./server.ts",
     "app": "./app.tsx"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "bb plugin build ."
   },
   "dependencies": {
     "@get-bb/plugin-sdk": "0.4.87",
@@ -43,9 +48,11 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "hono": "^4.11.9",
+    "jsdom": "^30.0.1",
     "sonner": "^1.7.4",
     "tailwind-merge": "^3.4.0",
     "typescript": "^5.7.0",
-    "vaul": "^1.1.2"
+    "vaul": "^1.1.2",
+    "vitest": "^3.2.7"
   }
 }
