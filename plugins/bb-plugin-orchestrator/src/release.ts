@@ -732,9 +732,10 @@ async function acceptTask(
   const roleOf = (level: string) =>
     level === AUDIT_LEVEL ? "release-audit" : levelRole(policy, level);
 
-  const executor = deps.store
-    .delegationsByTask(key)
-    .find((d) => roleOf(d.level) === "executor" && d.status === "done");
+  const taskDelegations = deps.store.delegationsByTask(key);
+  let executor = taskDelegations.find(
+    (d) => roleOf(d.level) === "executor" && d.status === "done",
+  );
   if (!executor) missing.push(t("rel.missingNoDone"));
   // §4.1 r28.1: a «задача без кода» round that produced no commits has
   // nothing to publish — a hard refusal before the sha/review gate.
@@ -743,10 +744,46 @@ async function acceptTask(
     executor.no_code === 1 &&
     (executor.result_commits ?? 0) === 0
   ) {
-    throw new OrchestratorError(
-      "release-refused",
-      t("rel.noCode", { key }),
-    );
+    // Legacy / verification candidate selection (§31.9, release §2):
+    // If the latest executor round was a verifier (no_code=1, result_commits=0) confirming a SHA,
+    // and that SHA has an accepted review record, bind the candidate to the original code artifact
+    // and project while preserving the confirmed SHA, worktree/branch, and thread.
+    const candidateSha = executor.result_sha;
+    const acceptedReview = candidateSha
+      ? deps.store.getLatestAcceptedReview?.(key, candidateSha)
+      : null;
+    const sourceCodeExecutor = acceptedReview
+      ? taskDelegations.find(
+          (d) =>
+            d.id !== executor!.id &&
+            roleOf(d.level) === "executor" &&
+            d.status === "done" &&
+            (d.result_commits ?? 0) > 0,
+        ) ??
+        taskDelegations.find(
+          (d) =>
+            d.id !== executor!.id &&
+            roleOf(d.level) === "executor" &&
+            d.status === "done" &&
+            d.no_code === 0,
+        )
+      : null;
+
+    if (candidateSha && acceptedReview && sourceCodeExecutor) {
+      executor = {
+        ...executor,
+        no_code: 0,
+        result_commits: sourceCodeExecutor.result_commits ?? 1,
+        project_id: sourceCodeExecutor.project_id ?? executor.project_id,
+        coordinator_thread_id:
+          executor.coordinator_thread_id ?? sourceCodeExecutor.coordinator_thread_id,
+      };
+    } else {
+      throw new OrchestratorError(
+        "release-refused",
+        t("rel.noCode", { key }),
+      );
+    }
   }
 
   // §17.3 (Б4): the review gate is bound to the published sha — a
@@ -763,12 +800,15 @@ async function acceptTask(
   if (executor && !requiredSha) {
     missing.push(t("rel.missingNoSha"));
   } else if (executor && executor.merge_status !== "merged") {
-    const review = deps.store
-      .delegationsByTask(key)
-      .find(
-        (d) =>
-          roleOf(d.level) === "auditor" && d.continue_from === requiredSha,
-      );
+    const review = taskDelegations.find(
+      (d) =>
+        roleOf(d.level) === "auditor" &&
+        (d.continue_from === requiredSha ||
+          (Boolean(d.continue_from) &&
+            Boolean(requiredSha) &&
+            (d.continue_from!.startsWith(requiredSha!.slice(0, 8)) ||
+              requiredSha!.startsWith(d.continue_from!.slice(0, 8))))),
+    );
     if (!review) {
       missing.push(
         t("rel.missingNoReview", { sha7: requiredSha!.slice(0, 7) }),

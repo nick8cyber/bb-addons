@@ -866,6 +866,182 @@ test("§31.9 Connected standard release in shadow mode: accepted task without gr
   );
 });
 
+test("§31.9 Release candidate selection: reproduces live records #1553/#1744/#1745 (verifier confirms SHA bound to source code)", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, spawnCalls, db } = makeDeps(repo);
+  (deps as any).workGraphMode = "shadow";
+  (deps as any).stepsDeps.workGraphMode = "shadow";
+
+  let VERIFIED_SHA = "f".repeat(40);
+  try {
+    VERIFIED_SHA = gitR(repo, ["rev-parse", "HEAD"]);
+  } catch {}
+
+  // Clean out delegations seeded by makeDeps
+  db.prepare("DELETE FROM delegations WHERE task_key = 'PLUG-1'").run();
+
+  // 1. #1553: source code executor (commits: 1, sha: old)
+  const exec1553 = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "c",
+    preset: "c",
+    provider: "p",
+    noCode: false,
+  });
+  store.setThreadInfo(exec1553.id, "thr_1553");
+  store.setStatus(exec1553.id, "done");
+  store.setRoundResult(exec1553.id, {
+    branch: "bb/plug-1-old",
+    sha: "c81e23fa893e99d9b221173e9337424fad9f3b45",
+    commits: 1,
+    dirty: false,
+  });
+
+  // 2. #1744: auditor review on VERIFIED_SHA with OK verdict
+  const rev1744 = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+    continueFrom: VERIFIED_SHA,
+  });
+  store.setThreadInfo(rev1744.id, "thr_rev");
+  store.setStatus(rev1744.id, "running");
+  store.setStatusIf(rev1744.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+
+  // 3. #1745: verifier round confirming VERIFIED_SHA with no_code=1, result_commits=0
+  const exec1745 = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "c",
+    preset: "c",
+    provider: "p",
+    noCode: true,
+  });
+  store.setThreadInfo(exec1745.id, "thr_exec");
+  store.setStatus(exec1745.id, "done");
+  store.setRoundResult(exec1745.id, {
+    branch: "feat-x",
+    sha: VERIFIED_SHA,
+    commits: 0,
+    dirty: false,
+  });
+
+  // Standard release must succeed, resolving transition contract on VERIFIED_SHA and reaching auditing
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  assert.equal(spawnCalls.length, 1);
+
+  // 4. Refusal preserved for true no-code task (no source code executor with commits)
+  const { repo: repoNoCode } = makeRepo();
+  const { deps: depsNoCode, store: storeNoCode, db: dbNoCode } = makeDeps(repoNoCode);
+  (depsNoCode as any).workGraphMode = "shadow";
+  (depsNoCode as any).stepsDeps.workGraphMode = "shadow";
+  dbNoCode.prepare("DELETE FROM delegations WHERE task_key = 'PLUG-1'").run();
+
+  const revOnly = storeNoCode.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+    continueFrom: VERIFIED_SHA,
+  });
+  storeNoCode.setThreadInfo(revOnly.id, "thr_rev");
+  storeNoCode.setStatus(revOnly.id, "running");
+  storeNoCode.setStatusIf(revOnly.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+
+  const execNoCodeOnly = storeNoCode.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "c",
+    preset: "c",
+    provider: "p",
+    noCode: true,
+  });
+  storeNoCode.setThreadInfo(execNoCodeOnly.id, "thr_exec");
+  storeNoCode.setStatus(execNoCodeOnly.id, "done");
+  storeNoCode.setRoundResult(execNoCodeOnly.id, {
+    branch: "feat-x",
+    sha: VERIFIED_SHA,
+    commits: 0,
+    dirty: false,
+  });
+
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, depsNoCode),
+    (e: any) => e.code === "release-refused" && (e.message.includes("rel.noCode") || e.message.includes("задача без кода")),
+  );
+
+  // 5. Refusal preserved for foreign / unreviewed SHA on verifier delegation
+  const { repo: repoForeign } = makeRepo();
+  const { deps: depsForeign, store: storeForeign, db: dbForeign } = makeDeps(repoForeign);
+  (depsForeign as any).workGraphMode = "shadow";
+  (depsForeign as any).stepsDeps.workGraphMode = "shadow";
+  dbForeign.prepare("DELETE FROM delegations WHERE task_key = 'PLUG-1'").run();
+
+  // Code executor
+  const execForeignCode = storeForeign.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "c",
+    preset: "c",
+    provider: "p",
+    noCode: false,
+  });
+  storeForeign.setThreadInfo(execForeignCode.id, "thr_exec_c");
+  storeForeign.setStatus(execForeignCode.id, "done");
+  storeForeign.setRoundResult(execForeignCode.id, {
+    branch: "feat-x",
+    sha: "1111111111111111111111111111111111111111",
+    commits: 1,
+    dirty: false,
+  });
+
+  // Verifier confirming an unreviewed SHA (2222...)
+  const execForeignVerifier = storeForeign.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "c",
+    preset: "c",
+    provider: "p",
+    noCode: true,
+  });
+  storeForeign.setThreadInfo(execForeignVerifier.id, "thr_exec");
+  storeForeign.setStatus(execForeignVerifier.id, "done");
+  storeForeign.setRoundResult(execForeignVerifier.id, {
+    branch: "feat-x",
+    sha: "2222222222222222222222222222222222222222",
+    commits: 0,
+    dirty: false,
+  });
+
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, depsForeign),
+    (e: any) => e.code === "release-refused",
+  );
+});
+
 // §25 (r33.4): the caller gate is the orchestrator ROLE — a thread that
 // became orchestrator releases another coordinator's delegation; the
 // `coordinator_thread_id` author match is gone.
