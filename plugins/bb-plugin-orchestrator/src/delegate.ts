@@ -673,7 +673,8 @@ export async function runDelegate(
   const isVerificationNode =
     taskRow?.node === "release" ||
     taskRow?.node === "checks" ||
-    taskRow?.node === "review";
+    taskRow?.node === "review" ||
+    Boolean(store.activeReleaseByTask(taskKey));
   const effectiveNoCode = isArchitectNode || isVerificationNode ? true : (params.noCode ?? false);
 
   // §31.9: Prevent direct delegation while waiting at owner_gate
@@ -959,7 +960,8 @@ export async function dispatchToRoute(
     const isVerificationNode =
       taskRow?.node === "release" ||
       taskRow?.node === "checks" ||
-      taskRow?.node === "review";
+      taskRow?.node === "review" ||
+      Boolean(store.activeReleaseByTask(row.task_key));
     if (!isVerificationNode) {
       const mode =
         typeof deps.workGraphMode === "function"

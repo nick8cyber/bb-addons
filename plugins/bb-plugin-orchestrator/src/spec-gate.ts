@@ -262,6 +262,27 @@ export function resolveTaskSpecContract(
     }
   }
 
+  // 5. From existing delegations and review evidence (legacy / manual tasks where task_queue row doesn't exist)
+  const normKey = normalizeTaskKey(taskKey);
+  const targetSha =
+    params?.targetSha ??
+    params?.publishedSha ??
+    params?.preparedBaseSha ??
+    params?.baseSha;
+  const acceptedReview = (store as any).getLatestAcceptedReview?.(normKey, targetSha);
+  if (acceptedReview) {
+    const revSha = acceptedReview.reviewedSha;
+    const projId = acceptedReview.delegation.project_id ?? "proj";
+    const approvalId = `appr:transition:${projId}:${normKey}:${revSha.slice(0, 12)}:${acceptedReview.delegation.created_at || 1}`;
+    return {
+      kind: "mechanical",
+      projectId: projId,
+      mechanicalBasis: `Accepted review on ${revSha} (delegation #${acceptedReview.delegation.id})`,
+      specSha: revSha,
+      approvalId,
+    };
+  }
+
   return null;
 }
 
@@ -738,7 +759,10 @@ export async function verifyReleaseDocumentsGate(
 ): Promise<void> {
   const contract =
     input.contract ??
-    resolveTaskSpecContract(input.taskKey, input.store);
+    resolveTaskSpecContract(input.taskKey, input.store, undefined, {
+      ...input,
+      targetSha: input.publishedSha,
+    });
 
   const enforced = isSpecBeforeCodeEnforced({
     workGraphMode: input.workGraphMode,
@@ -767,6 +791,23 @@ export async function verifyReleaseDocumentsGate(
         "spec-gate-violation",
         `spec-gate-violation: принятие ${contract.approvalId} не принадлежит выкладываемой задаче ${input.taskKey}`,
       );
+    }
+    if (isTransition) {
+      const apprSha = parts[4];
+      if (
+        apprSha &&
+        apprSha !== "base" &&
+        apprSha !== "sha" &&
+        /^[0-9a-fA-F]{4,40}$/.test(apprSha) &&
+        input.publishedSha &&
+        !input.publishedSha.toLowerCase().startsWith(apprSha.toLowerCase()) &&
+        !apprSha.toLowerCase().startsWith(input.publishedSha.slice(0, 8).toLowerCase())
+      ) {
+        throw new OrchestratorError(
+          "spec-gate-violation",
+          `spec-gate-violation: принятие ${contract.approvalId} привязано к коммиту ${apprSha}, а публикуется другой коммит ${input.publishedSha.slice(0, 8)}`,
+        );
+      }
     }
   }
 

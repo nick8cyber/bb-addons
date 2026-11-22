@@ -1429,7 +1429,7 @@ test("§31.9 Audit Scenario (4): upgrade compatibility - legacy tasks without co
   assert.equal(spawnedThreads.length, 0, "0 threads spawned for unapproved legacy task");
 });
 
-test("§31.9 Architect Incident (PLUG-371): existing task with accepted review in release node bypasses code gate for verifier delegation", async () => {
+test("§31.9 Architect Incident (PLUG-371): live no-row path without task_queue or contract row resolves proof from delegations and reviews", async () => {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
@@ -1443,46 +1443,47 @@ test("§31.9 Architect Incident (PLUG-371): existing task with accepted review i
   run(["commit", "-m", "feat: legacy code"]);
   const codeSha = run(["rev-parse", "HEAD"]).trim();
 
-  // Existing task PLUG-371: in release node with accepted review and result_sha, but no row in task_spec_contracts
-  store.insertTask({
+  // Exactly matching live PLUG-371 DB state:
+  // count(task_queue) = 0 and count(task_spec_contracts) = 0
+  assert.equal(store.listAllTasks().length, 0);
+  assert.equal(store.getSpecContract("PLUG-371"), null);
+
+  // Delegation #1745: executor round produced codeSha
+  const exec = store.insert({
     taskKey: "PLUG-371",
-    projectId: "proj_plug",
-    coordinatorThreadId: "thr_coord",
-    route: "simple",
+    projectId: "proj_z6bxvt43zb",
+    coordinatorThreadId: "thr_ctphpsrvcg",
     level: "simple",
-    confirmationMode: "auto",
+    route: "oc-nemotron-lightning",
+    preset: "oc-nemotron",
+    provider: "acp-opencode",
+    continueFrom: codeSha,
   });
-  store.transitionTask({
+  store.setStatus(exec.id, "done");
+  store.setRoundResult(exec.id, {
+    branch: "main",
+    sha: codeSha,
+    commits: 1,
+    dirty: false,
+  });
+
+  // Delegation #1744: review round for codeSha with OK verdict
+  const rev = store.insert({
     taskKey: "PLUG-371",
-    expectedNode: "start",
-    expectedStatus: "queued",
-    toNode: "release",
-    toStatus: "running",
-    actor: "coordinator",
-    reason: "release-started",
-    updates: {
-      result_sha: codeSha,
-      payload: JSON.stringify({
-        review_verdict: "OK",
-        code_done: true,
-      }),
-    },
+    projectId: "proj_z6bxvt43zb",
+    coordinatorThreadId: "thr_ctphpsrvcg",
+    level: "review",
+    route: "gemini",
+    preset: "gemini-38-wt",
+    provider: "agy",
+    continueFrom: codeSha,
+  });
+  store.setStatus(rev.id, "running");
+  store.setStatusIf(rev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
   });
 
-  const task = store.getTask("PLUG-371")!;
-
-  // 1. Verifier code-delegation in release node must NOT throw spec-gate-violation
-  await verifySpecBeforeCodeGate({
-    taskKey: "PLUG-371",
-    store,
-    cmd,
-    repoRoot: repoDir,
-    role: "executor",
-    workGraphMode: "shadow",
-    task,
-  });
-
-  // 2. Release documents gate must also succeed for legacy transition task
+  // 1. Release documents gate on reviewed SHA succeeds without task_queue row or contract row
   await verifyReleaseDocumentsGate({
     taskKey: "PLUG-371",
     store,
@@ -1491,6 +1492,67 @@ test("§31.9 Architect Incident (PLUG-371): existing task with accepted review i
     publishedSha: codeSha,
     workGraphMode: "shadow",
   });
+
+  // 2. Release documents gate on a DIFFERENT SHA rejects with spec-gate-violation
+  const diffSha = "1111111111111111111111111111111111111111";
+  await assert.rejects(
+    verifyReleaseDocumentsGate({
+      taskKey: "PLUG-371",
+      store,
+      cmd,
+      repoRoot: repoDir,
+      publishedSha: diffSha,
+      workGraphMode: "shadow",
+    }),
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+
+  // 3. Release documents gate on a NEW task without review evidence rejects with spec-gate-violation
+  await assert.rejects(
+    verifyReleaseDocumentsGate({
+      taskKey: "PLUG-NEW",
+      store,
+      cmd,
+      repoRoot: repoDir,
+      publishedSha: codeSha,
+      workGraphMode: "shadow",
+    }),
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+
+  // 4. Code launch gate on reviewed SHA passes
+  await verifySpecBeforeCodeGate({
+    taskKey: "PLUG-371",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    role: "executor",
+    workGraphMode: "shadow",
+    preparedBaseSha: codeSha,
+  });
+
+  // 5. Code launch gate on a DIFFERENT SHA rejects with spec-gate-violation
+  await assert.rejects(
+    verifySpecBeforeCodeGate({
+      taskKey: "PLUG-371",
+      store,
+      cmd,
+      repoRoot: repoDir,
+      role: "executor",
+      workGraphMode: "shadow",
+      preparedBaseSha: diffSha,
+    }),
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
 });
 
 test("§31.9 Project resolution: specBeforeCode undefined in layer falls back to workGraphMode", async () => {

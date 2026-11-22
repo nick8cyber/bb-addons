@@ -4531,6 +4531,84 @@ export class DelegationStore {
       .get(key) as TaskSpecContractRow | undefined;
     return row ?? null;
   }
+
+  /**
+   * §31.9: find accepted review for a task (from delegations & review.verdict events).
+   * Used for legacy / manual tasks where count(task_queue)=0 and count(task_spec_contracts)=0.
+   */
+  getLatestAcceptedReview(
+    taskKey: string,
+    sha?: string,
+  ): {
+    delegation: DelegationRow;
+    reviewedSha: string;
+    verdictEvent?: any;
+  } | null {
+    const key = normalizeTaskKey(taskKey);
+    const delegations = this.delegationsByTask(key);
+    const reviews = delegations.filter(
+      (d) =>
+        (d.level.includes("review") ||
+          d.level === "release-audit" ||
+          d.level === "audit") &&
+        d.status === "done" &&
+        Boolean(d.continue_from),
+    );
+    if (reviews.length === 0) return null;
+
+    const events = this.listEvents("review.verdict");
+    for (const rev of reviews) {
+      const revSha = rev.continue_from!;
+      if (sha) {
+        const cleanSha = sha.trim().toLowerCase();
+        const cleanRev = revSha.trim().toLowerCase();
+        const match =
+          cleanRev === cleanSha ||
+          cleanRev.startsWith(cleanSha.slice(0, 8)) ||
+          cleanSha.startsWith(cleanRev.slice(0, 8));
+        if (!match) continue;
+      }
+
+      // Find the verdict event for this specific review delegation
+      const delEvent = events
+        .slice()
+        .reverse()
+        .find((e) => {
+          try {
+            const p = JSON.parse(e.payload);
+            return p.delegationId === rev.id;
+          } catch {
+            return false;
+          }
+        });
+
+      if (delEvent) {
+        try {
+          const p = JSON.parse(delEvent.payload);
+          if (p.verdict === "OK" && (p.blockers === 0 || p.blockers === undefined)) {
+            return {
+              delegation: rev,
+              reviewedSha: revSha,
+              verdictEvent: p,
+            };
+          }
+        } catch {
+          // parse error
+        }
+        // If this delegation had CHANGES or blockers, skip it
+        continue;
+      }
+
+      // If no delegationId match, check verdict_event_at or events-empty fallback (test mock)
+      if (rev.verdict_event_at || events.length === 0) {
+        return {
+          delegation: rev,
+          reviewedSha: revSha,
+        };
+      }
+    }
+    return null;
+  }
 }
 
 

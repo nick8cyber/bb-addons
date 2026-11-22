@@ -826,6 +826,46 @@ test("release happy path: приёмка → sync → скан → аудит р
   assert.equal(store.threadRole("thr_audit")?.role, "release-auditor");
 });
 
+test("§31.9 Connected standard release in shadow mode: accepted task without graph succeeds, new task / different sha rejects", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, spawnCalls } = makeDeps(repo);
+  (deps as any).workGraphMode = "shadow";
+  (deps as any).stepsDeps.workGraphMode = "shadow";
+
+  // Verify DB state: count(task_queue) = 0, count(task_spec_contracts) = 0
+  assert.equal(store.listAllTasks().length, 0);
+  assert.equal(store.getSpecContract("PLUG-1"), null);
+
+  // 1. Accepted task without task_queue or task_spec_contracts:
+  // Must pass verifyReleaseDocumentsGate at line 2980 and reach auditing
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  assert.equal(spawnCalls.length, 1);
+
+  // 2. Different SHA: if published commit differs from reviewed commit, must reject
+  const { repo: repo2 } = makeRepo();
+  const { deps: deps2, store: store2 } = makeDeps(repo2);
+  (deps2 as any).workGraphMode = "shadow";
+  (deps2 as any).stepsDeps.workGraphMode = "shadow";
+  const exec2 = store2.delegationsByTask("PLUG-1").find(d => d.level !== "review")!;
+  store2.setRoundResult(exec2.id, {
+    branch: "feat-x",
+    sha: "1111111111111111111111111111111111111111",
+    commits: 1,
+    dirty: false,
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2),
+    (e: any) => e.code === "release-refused" || e.code === "spec-gate-violation",
+  );
+
+  // 3. New task without any delegation or review records: must reject
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-NEW", caller: COORD }, deps),
+    (e: any) => Boolean(e),
+  );
+});
+
 // §25 (r33.4): the caller gate is the orchestrator ROLE — a thread that
 // became orchestrator releases another coordinator's delegation; the
 // `coordinator_thread_id` author match is gone.
