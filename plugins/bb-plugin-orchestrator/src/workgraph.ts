@@ -27,7 +27,7 @@ import {
   normalizeTaskKey,
 } from "./store.js";
 import { verdictDetailsInBody } from "./release.js";
-import { verifySpecBeforeCodeGate, resolveTaskSpecContract } from "./spec-gate.js";
+import { verifySpecBeforeCodeGate, resolveTaskSpecContract, parseContractFromText, type SpecContract } from "./spec-gate.js";
 import {
   checkRouteLimits,
   type RouteLimitsCheckResult,
@@ -4023,7 +4023,9 @@ export async function runRunQueue(
             advancedCount++;
           }
         } catch (e) {
-          if ((e as any)?.code === "spec-gate-violation") throw e;
+          if ((e as any)?.code === "spec-gate-violation") {
+            deps.log?.warn?.(`orchestrator: task ${task.task_key} failed spec-before-code gate: ${(e as any).message}`);
+          }
         }
       }
 
@@ -4129,7 +4131,9 @@ export async function runRunQueue(
             advancedCount++;
           }
         } catch (e) {
-          if ((e as any)?.code === "spec-gate-violation") throw e;
+          if ((e as any)?.code === "spec-gate-violation") {
+            deps.log?.warn?.(`orchestrator: task ${pt.task_key} failed spec-before-code gate: ${(e as any).message}`);
+          }
         }
       }
 
@@ -4279,7 +4283,7 @@ export async function runRunQueue(
               store: deps.store,
               cmd: deps.cmd,
               repoRoot: tRepo?.repoRoot ?? repoRoot,
-              workGraphMode: deps.workGraphMode,
+              workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               task: t,
               payload,
@@ -4289,8 +4293,10 @@ export async function runRunQueue(
               const blockedEval = {
                 command: "run-queue",
                 evaluated_at: Date.now(),
+                would_transition: shadowEval.would_transition,
                 would_reject: "spec-gate-violation",
                 would_block: { reason: "spec-gate-violation" },
+                note: "вычислено, но не подключено",
                 current_node: t.node,
                 current_status: t.status,
               };
@@ -4300,12 +4306,11 @@ export async function runRunQueue(
                   shadow_eval: blockedEval,
                 }),
               });
-              throw err;
             }
           }
         }
       } catch (e) {
-        if ((e as any)?.code === "spec-gate-violation") throw e;
+        // Continue loop in shadow evaluation
       }
     }
 
@@ -4450,7 +4455,7 @@ export async function runRunQueue(
               store: deps.store,
               cmd: deps.cmd,
               repoRoot: tRepo?.repoRoot ?? repoRoot,
-              workGraphMode: deps.workGraphMode,
+              workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               task: t,
               payload,
@@ -4460,8 +4465,10 @@ export async function runRunQueue(
               const blockedEval = {
                 command: "run-queue",
                 evaluated_at: Date.now(),
+                would_transition: wouldTrans,
                 would_reject: "spec-gate-violation",
                 would_block: { reason: "spec-gate-violation" },
+                note: "вычислено, но не подключено",
                 current_node: t.node,
                 current_status: t.status,
               };
@@ -4471,12 +4478,11 @@ export async function runRunQueue(
                   shadow_eval: blockedEval,
                 }),
               });
-              throw err;
             }
           }
         }
       } catch (e) {
-        if ((e as any)?.code === "spec-gate-violation") throw e;
+        // Continue loop in shadow evaluation
       }
     }
   }
@@ -4499,12 +4505,13 @@ async function dispatchTaskNode(
   repoRoot: string,
 ): Promise<void> {
   if (node === "code") {
+    const taskMode = deps.getWorkGraphMode?.(task.project_id) ?? deps.workGraphMode ?? "off";
     await verifySpecBeforeCodeGate({
       taskKey: task.task_key,
       store: deps.store,
       cmd: deps.cmd,
       repoRoot,
-      workGraphMode: deps.workGraphMode,
+      workGraphMode: taskMode,
       policy: deps.policy,
       task,
     });
@@ -4652,7 +4659,8 @@ async function startQueuedTask(
 
   let acceptanceSha: string | null = task.acceptance_sha;
   if (resolution.action?.commitAcceptance) {
-    if (payload.acceptance_text && branch) {
+    const accText = payload.acceptance_text ?? (task.confirmation_mode === "auto" ? `Kind: mechanical\nBasis: Task ${normKey} automated run` : null);
+    if (accText && branch) {
       if (!deps.cmd) {
         const reason = "git-failed: missing cmd runner for acceptance commit";
         const failTr = resolveTransition({
@@ -4686,7 +4694,7 @@ async function startQueuedTask(
           repoRoot,
           branch,
           task.task_key,
-          String(payload.acceptance_text),
+          String(accText),
         );
       } catch (e: any) {
         const reason = `git-failed: ${e?.message ?? e}`;
@@ -4855,6 +4863,88 @@ async function startQueuedTask(
     cleanedPayload.checks_run = checksRun;
     if (tdd.outcome === "skipped_new_test") {
       startReason = `${resolution.reason} [tdd: skipped_new_test (${(tdd.newTestFiles ?? []).join(", ")})]`;
+    }
+  }
+
+  // §31.9: For routes without owner gate (auto mode for fix/simple), persist contract with approvalId
+  if (
+    (task.route === "fix" || task.route === "simple") &&
+    task.confirmation_mode === "auto"
+  ) {
+    const existingContract = deps.store.getSpecContract(task.task_key);
+    if (!existingContract?.approval_id) {
+      const parsed = payload.acceptance_text
+        ? parseContractFromText(String(payload.acceptance_text))
+        : null;
+      const contractToSave: SpecContract = parsed ?? {
+        kind: task.route === "simple" ? "mechanical" : "bugfix",
+        mechanicalBasis:
+          task.route === "simple"
+            ? String(payload.acceptance_text ?? `Task ${normKey} acceptance contract`)
+            : undefined,
+        specPath:
+          task.route === "fix"
+            ? `docs/specs/acceptance/${normKey}.md`
+            : undefined,
+        specSection: task.route === "fix" ? "§31.9" : undefined,
+        specSha: acceptanceSha ?? undefined,
+      };
+      const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${(contractToSave.specSha || acceptanceSha || "base").slice(0, 12)}:${now}`;
+      deps.store.saveSpecContract(
+        {
+          ...contractToSave,
+          taskKey: task.task_key,
+          projectId: task.project_id ?? undefined,
+          approvalId,
+        },
+        now,
+      );
+      cleanedPayload.approval_id = approvalId;
+    }
+  }
+
+  // §31.9: verify spec-before-code gate BEFORE transitioning to code
+  if (resolution.toNode === "code" || resolution.action?.dispatchNode === "code") {
+    const taskMode =
+      deps.getWorkGraphMode?.(task.project_id) ??
+      resolveWorkGraphMode(
+        task.project_id,
+        deps.workGraphMode,
+        deps.workGraphProjects,
+      );
+    try {
+      await verifySpecBeforeCodeGate({
+        taskKey: task.task_key,
+        store: deps.store,
+        cmd: deps.cmd,
+        repoRoot,
+        workGraphMode: taskMode,
+        policy: deps.policy,
+        task: { ...task, payload: JSON.stringify(cleanedPayload), acceptance_sha: acceptanceSha },
+        payload: cleanedPayload,
+      });
+    } catch (gateErr: any) {
+      if (gateErr?.code === "spec-gate-violation") {
+        if (taskMode === "shadow") {
+          const blockedEval = {
+            command: "run-queue",
+            evaluated_at: now,
+            would_reject: "spec-gate-violation",
+            would_block: { reason: gateErr.message },
+            current_node: task.node,
+            current_status: task.status,
+          };
+          cleanedPayload.shadow_eval = blockedEval;
+          deps.store.updateTask(task.task_key, {
+            payload: JSON.stringify(cleanedPayload),
+          });
+        } else {
+          deps.log?.warn?.(`orchestrator: task ${task.task_key} refused by spec gate: ${gateErr.message}`);
+          return false;
+        }
+      } else {
+        throw gateErr;
+      }
     }
   }
 
@@ -6179,19 +6269,21 @@ async function advanceActiveTask(
         }, now);
         if (tr.ok && tr.task) {
           if (verdict === "OK" && blockers === 0) {
-            const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
-            if (approvedContract) {
-              const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
-              const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha.slice(0, 12)}:${now}`;
-              deps.store.saveSpecContract(
-                {
-                  ...approvedContract,
-                  taskKey: task.task_key,
-                  projectId: task.project_id ?? undefined,
-                  approvalId,
-                },
-                now,
-              );
+            if (task.confirmation_mode === "auto") {
+              const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
+              if (approvedContract) {
+                const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
+                const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha.slice(0, 12)}:${now}`;
+                deps.store.saveSpecContract(
+                  {
+                    ...approvedContract,
+                    taskKey: task.task_key,
+                    projectId: task.project_id ?? undefined,
+                    approvalId,
+                  },
+                  now,
+                );
+              }
             }
           } else if (verdict === "CHANGES") {
             deps.store.revokeSpecContractApproval(task.task_key, now);
@@ -6871,19 +6963,21 @@ async function advanceActiveTask(
         }, now);
         if (tr.ok && tr.task) {
           if (verdict === "OK" && blockers === 0) {
-            const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
-            if (approvedContract) {
-              const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
-              const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha.slice(0, 12)}:${now}`;
-              deps.store.saveSpecContract(
-                {
-                  ...approvedContract,
-                  taskKey: task.task_key,
-                  projectId: task.project_id ?? undefined,
-                  approvalId,
-                },
-                now,
-              );
+            if (task.confirmation_mode === "auto") {
+              const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
+              if (approvedContract) {
+                const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
+                const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha.slice(0, 12)}:${now}`;
+                deps.store.saveSpecContract(
+                  {
+                    ...approvedContract,
+                    taskKey: task.task_key,
+                    projectId: task.project_id ?? undefined,
+                    approvalId,
+                  },
+                  now,
+                );
+              }
             }
           } else if (verdict === "CHANGES") {
             deps.store.revokeSpecContractApproval(task.task_key, now);

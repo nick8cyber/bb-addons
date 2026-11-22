@@ -854,7 +854,7 @@ export function resolveProject(
     prProvider: layer.prProvider ?? { type: "github", raw: undefined },
     prBody: layer.prBody ?? DEFAULT_PR_BODY,
     requireNote: layer.requireNote === true,
-    specBeforeCode: layer.specBeforeCode === true,
+    specBeforeCode: typeof layer.specBeforeCode === "boolean" ? layer.specBeforeCode : undefined,
   };
 }
 

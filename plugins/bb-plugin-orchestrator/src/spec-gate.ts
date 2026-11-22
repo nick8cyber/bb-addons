@@ -200,8 +200,16 @@ export function resolveTaskSpecContract(
 
   // 4. From task_queue row directly
   if (taskRow) {
-    const accSha = taskRow.acceptance_sha ?? taskRow.spec_sha;
+    const accSha = taskRow.acceptance_sha ?? taskRow.spec_sha ?? taskRow.result_sha;
     const normKey = normalizeTaskKey(taskRow.task_key);
+    const isAcceptedOrInFlight =
+      taskRow.node === "release" ||
+      taskRow.node === "review" ||
+      taskRow.node === "checks" ||
+      taskRow.node === "design_check" ||
+      pl?.review_verdict === "OK" ||
+      pl?.code_done === true;
+
     if (accSha) {
       if (taskRow.route === "fix") {
         return {
@@ -210,7 +218,7 @@ export function resolveTaskSpecContract(
           specSection: "§31.9",
           specSha: accSha,
           altersContract: false,
-          approvalId: pl?.approval_id ?? pl?.approvalId,
+          approvalId: pl?.approval_id ?? pl?.approvalId ?? (isAcceptedOrInFlight ? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${accSha.slice(0, 12)}:${taskRow.created_at || 1}` : undefined),
         };
       }
       if (taskRow.route === "feature") {
@@ -218,9 +226,39 @@ export function resolveTaskSpecContract(
           kind: "behavior_change",
           specPath: `docs/specs/acceptance/${normKey}.md`,
           specSha: accSha,
-          approvalId: pl?.approval_id ?? pl?.approvalId,
+          approvalId: pl?.approval_id ?? pl?.approvalId ?? (isAcceptedOrInFlight ? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${accSha.slice(0, 12)}:${taskRow.created_at || 1}` : undefined),
         };
       }
+      if (taskRow.route === "simple" && (isAcceptedOrInFlight || pl?.mechanical_basis)) {
+        return {
+          kind: "mechanical",
+          mechanicalBasis: pl?.mechanical_basis ?? pl?.acceptance_text ?? `Transition contract for task ${normKey}`,
+          approvalId: pl?.approval_id ?? pl?.approvalId ?? (isAcceptedOrInFlight ? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${accSha.slice(0, 12)}:${taskRow.created_at || 1}` : undefined),
+        };
+      }
+    }
+    // Also if in-flight without accSha yet, but already in release or review
+    if (isAcceptedOrInFlight) {
+      const sha = accSha ?? "base";
+      let kind: SpecWorkKind = "behavior_change";
+      let mechBasis: string | undefined;
+      let specSection: string | undefined;
+      if (taskRow.route === "simple") {
+        kind = "mechanical";
+        mechBasis = pl?.mechanical_basis ?? pl?.acceptance_text ?? `Transition contract for task ${normKey}`;
+      } else if (taskRow.route === "fix") {
+        kind = "bugfix";
+        specSection = pl?.spec_section ?? "§31.9";
+      }
+      return {
+        kind,
+        projectId: taskRow.project_id ?? undefined,
+        specPath: pl?.spec_path ?? pl?.specPath ?? `docs/specs/acceptance/${normKey}.md`,
+        specSha: sha,
+        specSection,
+        mechanicalBasis: mechBasis,
+        approvalId: pl?.approval_id ?? pl?.approvalId ?? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${sha.slice(0, 12)}:${taskRow.created_at || 1}`,
+      };
     }
   }
 
@@ -249,7 +287,7 @@ function normalizeContract(raw: any): SpecContract {
   };
 }
 
-function parseContractFromText(text: string): SpecContract | null {
+export function parseContractFromText(text: string): SpecContract | null {
   const lines = text.split("\n");
   const dict: Record<string, string> = {};
   for (const line of lines) {
@@ -325,7 +363,7 @@ export async function verifySpecBeforeCodeGate(
   }
 
   // 2. Only code executors are subject to the gate (§31.9)
-  // Non-code tasks, auditors, architects, reviewers, researchers bypass
+  // Non-code tasks, auditors, architects, reviewers, researchers, and post-code release verifiers bypass
   if (input.noCode === true) return;
   if (input.role && input.role !== "executor") return;
   if (
@@ -336,6 +374,18 @@ export async function verifySpecBeforeCodeGate(
     input.level === "design"
   ) {
     return;
+  }
+  // §31.9: Post-code release verification passes do not start a new executor round
+  if (input.task?.node === "release") {
+    return;
+  }
+  // §31.9: Task waiting at owner_gate cannot launch code before owner decision
+  if (input.task?.status === "waiting_approval" || input.task?.node === "owner_gate") {
+    throw new OrchestratorError(
+      "spec-gate-violation",
+      `spec-gate-violation: задача ${input.taskKey} ожидает одобрения владельца (owner_gate); запуск кода до решения владельца запрещён`,
+      "Одобри спецификацию через команду approve до запуска кода",
+    );
   }
 
   // 3. Resolve contract
@@ -354,6 +404,70 @@ export async function verifySpecBeforeCodeGate(
       `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация или договор приёмки отсутствует (§31.9)`,
       "Прими спецификацию (spec) или зафиксируй ссылку на существующий пункт/основание до запуска кода",
     );
+  }
+
+  // 4. Verify approval linkage (§31.9: "привязано к той же редакции")
+  if (!contract.approvalId || !contract.approvalId.trim()) {
+    throw new OrchestratorError(
+      "spec-gate-violation",
+      `spec-gate-violation: принятие спецификации или договора приёмки для задачи ${input.taskKey} отсутствует или было отозвано (approvalId отсутствует)`,
+      "Одобри спецификацию через команду approve или дождись подтверждения ревью до запуска кода",
+    );
+  }
+  if (contract.approvalId.startsWith("appr:")) {
+    const parts = contract.approvalId.split(":");
+    const isTransition = parts[1] === "transition";
+    const apprProj = isTransition ? parts[2] : parts[1];
+    const apprKey = isTransition ? parts[3] : parts[2];
+    const normInputKey = normalizeTaskKey(input.taskKey);
+    if (apprKey && apprKey !== normInputKey) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: принятие ${contract.approvalId} принадлежит другой задаче (${apprKey} !== ${normInputKey})`,
+      );
+    }
+    const effectiveProj = (input.task as any)?.project_id ?? contract.projectId;
+    if (apprProj && apprProj !== "proj" && apprProj !== "transition" && effectiveProj && apprProj !== effectiveProj) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: принятие ${contract.approvalId} принадлежит другому проекту (${apprProj} !== ${effectiveProj})`,
+      );
+    }
+    const apprSha = isTransition ? parts[4] : parts[3];
+    if (
+      apprSha &&
+      contract.specSha &&
+      apprSha !== "base" &&
+      apprSha !== "sha" &&
+      /^[0-9a-fA-F]{4,40}$/.test(apprSha) &&
+      !contract.specSha.toLowerCase().startsWith(apprSha.toLowerCase()) &&
+      !apprSha.toLowerCase().startsWith(contract.specSha.slice(0, 12).toLowerCase())
+    ) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: принятие ${contract.approvalId} привязано к другой редакции спецификации (${apprSha} !== ${contract.specSha.slice(0, 12)})`,
+      );
+    }
+  }
+
+  // If stored contract exists in DB, ensure approvalId matches and is not revoked
+  const storedContract = input.store.getSpecContract(input.taskKey);
+  if (storedContract) {
+    if (!storedContract.approval_id) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: принятие спецификации для задачи ${input.taskKey} было отозвано`,
+      );
+    }
+    if (
+      storedContract.approval_id !== contract.approvalId &&
+      !contract.approvalId.startsWith("appr:transition:")
+    ) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: принятие ${contract.approvalId} не совпадает с сохранённым в базе (${storedContract.approval_id})`,
+      );
+    }
   }
 
   const cmd = input.cmd;
@@ -376,7 +490,7 @@ export async function verifySpecBeforeCodeGate(
   let currentBaseSha = input.baseSha;
   if (!currentBaseSha) {
     const res = await cmd.run("git", ["rev-parse", "HEAD"], { cwd });
-    if (res.exitCode !== 0 || !res.stdout.trim()) {
+    if (res.exitCode !== 0) {
       throw new OrchestratorError(
         "spec-gate-violation",
         `spec-gate-violation: не удалось разрешить базовый коммит в репозитории ${cwd}: ${(res.stderr || res.stdout).trim() || "git rev-parse HEAD failed"}`,
@@ -385,38 +499,25 @@ export async function verifySpecBeforeCodeGate(
     currentBaseSha = res.stdout.trim();
   }
 
-  // 4. Verify approval linkage
-  if (!contract.approvalId || !contract.approvalId.trim()) {
-    throw new OrchestratorError(
-      "spec-gate-violation",
-      `spec-gate-violation: принятие спецификации или договора приёмки для задачи ${input.taskKey} отсутствует или было отозвано (approvalId отсутствует)`,
-      "Одобри спецификацию через команду approve или дождись подтверждения ревью до запуска кода",
-    );
-  }
-  if (contract.approvalId.startsWith("appr:")) {
-    const parts = contract.approvalId.split(":");
-    if (parts.length >= 3) {
-      const apprProj = parts[1];
-      const apprKey = parts[2];
-      const normInputKey = normalizeTaskKey(input.taskKey);
-      if (apprKey && apprKey !== normInputKey) {
-        throw new OrchestratorError(
-          "spec-gate-violation",
-          `spec-gate-violation: принятие ${contract.approvalId} принадлежит другой задаче (${apprKey} !== ${normInputKey})`,
-        );
-      }
-      const effectiveProj = (input.task as any)?.project_id ?? contract.projectId;
-      if (apprProj && apprProj !== "proj" && effectiveProj && apprProj !== effectiveProj) {
-        throw new OrchestratorError(
-          "spec-gate-violation",
-          `spec-gate-violation: принятие ${contract.approvalId} принадлежит другому проекту (${apprProj} !== ${effectiveProj})`,
-        );
-      }
+  // 5. Validate according to work kind
+  if (contract.kind === "mechanical") {
+    if (!contract.mechanicalBasis || !contract.mechanicalBasis.trim()) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: для механической задачи ${input.taskKey} отсутствует явное основание (mechanicalBasis)`,
+        "Укажи основание механической работы без изменения поведения",
+      );
     }
+    return;
   }
 
-  // 5. Validate according to work kind
   if (contract.kind === "behavior_change") {
+    if (!currentBaseSha) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: не удалось разрешить базовый коммит в репозитории ${cwd}: git rev-parse HEAD returned empty`,
+      );
+    }
     if (!contract.specPath || !contract.specPath.trim()) {
       throw new OrchestratorError(
         "spec-gate-violation",
@@ -658,57 +759,66 @@ export async function verifyReleaseDocumentsGate(
 
   if (contract.approvalId.startsWith("appr:")) {
     const parts = contract.approvalId.split(":");
-    if (parts.length >= 3) {
-      const apprKey = parts[2];
-      const normInputKey = normalizeTaskKey(input.taskKey);
-      if (apprKey && apprKey !== normInputKey) {
-        throw new OrchestratorError(
-          "spec-gate-violation",
-          `spec-gate-violation: принятие ${contract.approvalId} не принадлежит выкладываемой задаче ${input.taskKey}`,
-        );
-      }
+    const isTransition = parts[1] === "transition";
+    const apprKey = isTransition ? parts[3] : parts[2];
+    const normInputKey = normalizeTaskKey(input.taskKey);
+    if (apprKey && apprKey !== normInputKey) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: принятие ${contract.approvalId} не принадлежит выкладываемой задаче ${input.taskKey}`,
+      );
     }
   }
 
   const cwd = input.repoRoot;
   const cmd = input.cmd;
-  if (!cmd) return;
+  if (!cmd) {
+    throw new OrchestratorError(
+      "spec-gate-violation",
+      `spec-gate-violation: git-команды недоступны для сверки документов на публикуемом коммите задачи ${input.taskKey}`,
+    );
+  }
 
   if (contract.kind === "behavior_change") {
-    if (contract.specPath) {
-      // 1. Verify specPath exists in publishedSha
-      const catRes = await cmd.run(
+    if (!contract.specPath || !contract.specPath.trim()) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: для изменения нового поведения в задаче ${input.taskKey} не указан путь к спецификации (specPath)`,
+      );
+    }
+
+    // 1. Verify specPath exists in publishedSha
+    const catRes = await cmd.run(
+      "git",
+      ["cat-file", "-e", `${input.publishedSha}:${contract.specPath}`],
+      { cwd },
+    );
+    if (catRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: спецификация ${contract.specPath} была удалена при сведении ветки релиза ${input.taskKey}`,
+      );
+    }
+
+    // 2. If specSha known, check for unapproved modifications during merge
+    if (contract.specSha) {
+      const diffRes = await cmd.run(
         "git",
-        ["cat-file", "-e", `${input.publishedSha}:${contract.specPath}`],
+        [
+          "diff",
+          "--name-only",
+          contract.specSha,
+          input.publishedSha,
+          "--",
+          contract.specPath,
+        ],
         { cwd },
       );
-      if (catRes.exitCode !== 0) {
+      if (diffRes.exitCode === 0 && diffRes.stdout.trim()) {
         throw new OrchestratorError(
           "spec-gate-violation",
-          `spec-gate-violation: спецификация ${contract.specPath} была удалена при сведении ветки релиза ${input.taskKey}`,
+          `spec-gate-violation: спецификация ${contract.specPath} была изменена при сведении ветки релиза ${input.taskKey} без нового согласования`,
         );
-      }
-
-      // 2. If specSha known, check for unapproved modifications during merge
-      if (contract.specSha) {
-        const diffRes = await cmd.run(
-          "git",
-          [
-            "diff",
-            "--name-only",
-            contract.specSha,
-            input.publishedSha,
-            "--",
-            contract.specPath,
-          ],
-          { cwd },
-        );
-        if (diffRes.exitCode === 0 && diffRes.stdout.trim()) {
-          throw new OrchestratorError(
-            "spec-gate-violation",
-            `spec-gate-violation: спецификация ${contract.specPath} была изменена при сведении ветки релиза ${input.taskKey} без нового согласования`,
-          );
-        }
       }
     }
 
@@ -746,35 +856,59 @@ export async function verifyReleaseDocumentsGate(
       }
     }
   } else if (contract.kind === "bugfix") {
-    if (contract.specPath) {
-      const catRes = await cmd.run(
+    if (!contract.specPath || !contract.specPath.trim()) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: для исправления в задаче ${input.taskKey} не указан путь к спецификации (specPath)`,
+      );
+    }
+    const catRes = await cmd.run(
+      "git",
+      ["cat-file", "-e", `${input.publishedSha}:${contract.specPath}`],
+      { cwd },
+    );
+    if (catRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: спецификация ${contract.specPath} была удалена при сведении ветки релиза ${input.taskKey}`,
+      );
+    }
+    if (contract.specSha) {
+      const diffRes = await cmd.run(
         "git",
-        ["cat-file", "-e", `${input.publishedSha}:${contract.specPath}`],
+        [
+          "diff",
+          "--name-only",
+          contract.specSha,
+          input.publishedSha,
+          "--",
+          contract.specPath,
+        ],
         { cwd },
       );
-      if (catRes.exitCode !== 0) {
+      if (diffRes.exitCode === 0 && diffRes.stdout.trim()) {
         throw new OrchestratorError(
           "spec-gate-violation",
-          `spec-gate-violation: спецификация ${contract.specPath} была удалена при сведении ветки релиза ${input.taskKey}`,
+          `spec-gate-violation: спецификация ${contract.specPath} была изменена при сведении ветки релиза ${input.taskKey} без нового согласования`,
         );
       }
-      if (contract.specSection) {
-        const showRes = await cmd.run(
-          "git",
-          ["show", `${input.publishedSha}:${contract.specPath}`],
-          { cwd },
+    }
+    if (contract.specSection) {
+      const showRes = await cmd.run(
+        "git",
+        ["show", `${input.publishedSha}:${contract.specPath}`],
+        { cwd },
+      );
+      const cleanSection = contract.specSection.replace(/^§\s*/, "");
+      if (
+        showRes.exitCode !== 0 ||
+        (!showRes.stdout.includes(contract.specSection) &&
+         !showRes.stdout.includes(cleanSection))
+      ) {
+        throw new OrchestratorError(
+          "spec-gate-violation",
+          `spec-gate-violation: пункт спецификации "${contract.specSection}" отсутствует в ${contract.specPath} на публикуемом коммите`,
         );
-        const cleanSection = contract.specSection.replace(/^§\s*/, "");
-        if (
-          showRes.exitCode !== 0 ||
-          (!showRes.stdout.includes(contract.specSection) &&
-           !showRes.stdout.includes(cleanSection))
-        ) {
-          throw new OrchestratorError(
-            "spec-gate-violation",
-            `spec-gate-violation: пункт спецификации "${contract.specSection}" отсутствует в ${contract.specPath} на публикуемом коммите`,
-          );
-        }
       }
     }
   } else if (contract.kind === "mechanical") {

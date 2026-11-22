@@ -670,26 +670,37 @@ export async function runDelegate(
     role === "architect" ||
     taskRow?.node === "design" ||
     taskRow?.node === "design_check";
-  const effectiveNoCode = isArchitectNode ? true : (params.noCode ?? false);
+  const isVerificationNode =
+    taskRow?.node === "release" ||
+    taskRow?.node === "checks" ||
+    taskRow?.node === "review";
+  const effectiveNoCode = isArchitectNode || isVerificationNode ? true : (params.noCode ?? false);
 
-  // §31.9 (ADR-0032): If spec contract provided in params, persist it
+  // §31.9: Prevent direct delegation while waiting at owner_gate
+  if (role === "executor" && !effectiveNoCode && (taskRow?.status === "waiting_approval" || taskRow?.node === "owner_gate")) {
+    throw new OrchestratorError(
+      "spec-gate-violation",
+      `spec-gate-violation: задача ${taskKey} ожидает одобрения владельца (owner_gate); запуск кода до решения владельца запрещён`,
+    );
+  }
+
+  // §31.9 (ADR-0032): If spec contract provided in params with approval, persist it
   if (params.specContract) {
     const key = normalizeTaskKey(taskKey);
     const existing = store.getSpecContract(key);
     const now = deps.now ? deps.now() : Date.now();
-    const approvalId =
-      params.specContract.approvalId ??
-      existing?.approval_id ??
-      `appr:${params.caller.projectId}:${key}:${(params.specContract.specSha || "base").slice(0, 12)}:${now}`;
-    store.saveSpecContract(
-      {
-        ...params.specContract,
-        taskKey: key,
-        projectId: params.caller.projectId,
-        approvalId,
-      },
-      now,
-    );
+    const approvalId = params.specContract.approvalId ?? existing?.approval_id;
+    if (approvalId) {
+      store.saveSpecContract(
+        {
+          ...params.specContract,
+          taskKey: key,
+          projectId: params.caller.projectId,
+          approvalId,
+        },
+        now,
+      );
+    }
   }
 
   // §31.9 (ADR-0032): spec-before-code gate before creating delegation row
@@ -944,27 +955,44 @@ export async function dispatchToRoute(
 
   // §31.9 (ADR-0032): Unified check before code launch across all routes / reissues / fallbacks
   if (role === "executor" && !row.no_code) {
-    const mode =
-      typeof deps.workGraphMode === "function"
-        ? (deps.workGraphMode as any)(row.project_id)
-        : deps.workGraphMode;
-    const taskRepoRoot =
-      deps.repoRoot ??
-      (deps.resolveRepoRoot ? await deps.resolveRepoRoot(row) : undefined);
-    await verifySpecBeforeCodeGate({
-      taskKey: row.task_key,
-      role,
-      noCode: Boolean(row.no_code),
-      level: row.level,
-      contract: opts.specContract,
-      store,
-      cmd: deps.cmd,
-      policy,
-      preparedBaseSha: opts.from,
-      workGraphMode: mode,
-      specBeforeCode: opts.specBeforeCode,
-      repoRoot: taskRepoRoot,
-    });
+    const taskRow = store.getTask(row.task_key);
+    const isVerificationNode =
+      taskRow?.node === "release" ||
+      taskRow?.node === "checks" ||
+      taskRow?.node === "review";
+    if (!isVerificationNode) {
+      const mode =
+        typeof deps.workGraphMode === "function"
+          ? (deps.workGraphMode as any)(row.project_id)
+          : deps.workGraphMode;
+      const taskRepoRoot =
+        deps.repoRoot ??
+        (deps.resolveRepoRoot ? await deps.resolveRepoRoot(row) : undefined);
+      try {
+        await verifySpecBeforeCodeGate({
+          taskKey: row.task_key,
+          role,
+          noCode: Boolean(row.no_code),
+          level: row.level,
+          contract: opts.specContract,
+          store,
+          cmd: deps.cmd,
+          policy,
+          preparedBaseSha: opts.from,
+          workGraphMode: mode,
+          specBeforeCode: opts.specBeforeCode,
+          repoRoot: taskRepoRoot,
+          task: taskRow,
+        });
+      } catch (err: any) {
+        if (err?.code === "spec-gate-violation") {
+          if (opts.onDispatchFailure === "fail") {
+            store.setStatus(row.id, "failed");
+          }
+        }
+        throw err;
+      }
+    }
   }
 
   /**

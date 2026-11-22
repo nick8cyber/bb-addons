@@ -24,6 +24,7 @@ import {
   verifySpecBeforeCodeGate,
   verifyReleaseDocumentsGate,
   resolveTaskSpecContract,
+  isSpecBeforeCodeEnforced,
   type SpecContract,
 } from "../src/spec-gate.js";
 import { runRunQueue, runApprove, runReject } from "../src/workgraph.js";
@@ -265,16 +266,27 @@ test("§31.9 Favorite Models: run-queue in shadow mode rejects with spec-gate-vi
     },
   };
 
-  // Run run-queue in shadow mode without spec contract -> must reject with spec-gate-violation
+  // Verify gate rejects without spec contract
   await assert.rejects(
     async () => {
-      await runRunQueue(runQueueDeps);
+      await verifySpecBeforeCodeGate({
+        taskKey: "FAVORITE-1",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        workGraphMode: "shadow",
+        role: "executor",
+        policy: parsePolicy(POLICY_TEXT).policy,
+      });
     },
     (err: any) => {
       assert.equal(err.code, "spec-gate-violation");
       return true;
     },
   );
+
+  // In shadow mode, run-queue passively evaluates without throwing and records would_reject
+  await runRunQueue(runQueueDeps);
 
   // Verify shadow_eval recorded would_reject
   const task = store.getTask("FAVORITE-1")!;
@@ -797,11 +809,13 @@ test("§31.9 Blocker 2: simple route with arbitrary text or single SHA without c
 
   await assert.rejects(
     async () => {
-      await runRunQueue({
+      await verifySpecBeforeCodeGate({
+        taskKey: "SIMPLE-ARB-1",
         store,
         cmd,
         repoRoot: repoDir,
         workGraphMode: "shadow",
+        role: "executor",
         policy: parsePolicy(POLICY_TEXT).policy,
       });
     },
@@ -810,6 +824,17 @@ test("§31.9 Blocker 2: simple route with arbitrary text or single SHA without c
       return true;
     },
   );
+
+  await runRunQueue({
+    store,
+    cmd,
+    repoRoot: repoDir,
+    workGraphMode: "shadow",
+    policy: parsePolicy(POLICY_TEXT).policy,
+  });
+  const t1 = store.getTask("SIMPLE-ARB-1")!;
+  const p1 = JSON.parse(t1.payload ?? "{}");
+  assert.equal(p1.shadow_eval?.would_reject, "spec-gate-violation");
   assert.equal(spawnedThreads.length, 0, "0 threads spawned for arbitrary acceptance text");
 
   // 2. Task with single acceptance_sha on simple route without classification
@@ -828,11 +853,13 @@ test("§31.9 Blocker 2: simple route with arbitrary text or single SHA without c
 
   await assert.rejects(
     async () => {
-      await runRunQueue({
+      await verifySpecBeforeCodeGate({
+        taskKey: "SIMPLE-SHA-1",
         store,
         cmd,
         repoRoot: repoDir,
         workGraphMode: "shadow",
+        role: "executor",
         policy: parsePolicy(POLICY_TEXT).policy,
       });
     },
@@ -841,6 +868,17 @@ test("§31.9 Blocker 2: simple route with arbitrary text or single SHA without c
       return true;
     },
   );
+
+  await runRunQueue({
+    store,
+    cmd,
+    repoRoot: repoDir,
+    workGraphMode: "shadow",
+    policy: parsePolicy(POLICY_TEXT).policy,
+  });
+  const t2 = store.getTask("SIMPLE-SHA-1")!;
+  const p2 = JSON.parse(t2.payload ?? "{}");
+  assert.equal(p2.shadow_eval?.would_reject, "spec-gate-violation");
   assert.equal(spawnedThreads.length, 0, "0 threads spawned for single SHA without classification");
 });
 
@@ -1389,4 +1427,98 @@ test("§31.9 Audit Scenario (4): upgrade compatibility - legacy tasks without co
   assert.match(res.stderr + res.stdout, /spec-gate-violation/);
   // Crucial requirement: mandatory refusal happens strictly BEFORE creating a thread
   assert.equal(spawnedThreads.length, 0, "0 threads spawned for unapproved legacy task");
+});
+
+test("§31.9 Architect Incident (PLUG-371): existing task with accepted review in release node bypasses code gate for verifier delegation", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-plug371-");
+  const { run, cmd } = initGitRepo(repoDir);
+
+  mkdirSync(join(repoDir, "src"), { recursive: true });
+  writeFileSync(join(repoDir, "src/index.ts"), "export const ok = 1;\n");
+  run(["add", "."]);
+  run(["commit", "-m", "feat: legacy code"]);
+  const codeSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Existing task PLUG-371: in release node with accepted review and result_sha, but no row in task_spec_contracts
+  store.insertTask({
+    taskKey: "PLUG-371",
+    projectId: "proj_plug",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  });
+  store.transitionTask({
+    taskKey: "PLUG-371",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "release",
+    toStatus: "running",
+    actor: "coordinator",
+    reason: "release-started",
+    updates: {
+      result_sha: codeSha,
+      payload: JSON.stringify({
+        review_verdict: "OK",
+        code_done: true,
+      }),
+    },
+  });
+
+  const task = store.getTask("PLUG-371")!;
+
+  // 1. Verifier code-delegation in release node must NOT throw spec-gate-violation
+  await verifySpecBeforeCodeGate({
+    taskKey: "PLUG-371",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    role: "executor",
+    workGraphMode: "shadow",
+    task,
+  });
+
+  // 2. Release documents gate must also succeed for legacy transition task
+  await verifyReleaseDocumentsGate({
+    taskKey: "PLUG-371",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    publishedSha: codeSha,
+    workGraphMode: "shadow",
+  });
+});
+
+test("§31.9 Project resolution: specBeforeCode undefined in layer falls back to workGraphMode", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-unset-config-");
+  const { cmd } = initGitRepo(repoDir);
+
+  // When specBeforeCode is not specified in project, isSpecBeforeCodeEnforced honors workGraphMode
+  const projectWithoutSpecConfig: any = { id: "proj_unset" };
+
+  assert.equal(
+    isSpecBeforeCodeEnforced({
+      project: projectWithoutSpecConfig,
+      workGraphMode: "shadow",
+      specBeforeCode: undefined,
+    }),
+    true,
+  );
+
+  assert.equal(
+    isSpecBeforeCodeEnforced({
+      project: projectWithoutSpecConfig,
+      workGraphMode: "off",
+      specBeforeCode: undefined,
+    }),
+    false,
+  );
 });
