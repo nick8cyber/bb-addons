@@ -219,6 +219,7 @@ startServer({ webDriver: { async sendPrompt(options) {
     BB_CLI: cli, WEB_GEMINI_FAKE: "0", ARGON_FAKE: "0",
     WEB_GEMINI_STATE_DIR: state, WEB_GEMINI_POOL_FILE: join(dir, "absent"),
     WEB_GEMINI_BACKENDS: JSON.stringify([{ id: "web-fixture", cdp: 19223, profileDir: dir, tier: "pro" }]),
+    WEB_GEMINI_SESSION_CAP_MS: "120000",
     ...(options.bindEnv ? { BB_THREAD_ID: threadId } : {}),
     ...options.env,
   });

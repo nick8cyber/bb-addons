@@ -893,6 +893,7 @@ function checkTurnStatus(doc, idx, promptPrefix) {
       isBusyOrThinking: false,
       hasFinishedContent: false,
       hasActionButtons: false,
+      targetTextLength: 0,
       currentText: null,
     };
   }
@@ -1006,6 +1007,8 @@ function checkTurnStatus(doc, idx, promptPrefix) {
     isBusyOrThinking,
     hasFinishedContent,
     hasActionButtons,
+    childCount: target ? target.querySelectorAll('*').length : 0,
+    targetTextLength: target ? (target.innerText || '').length : 0,
     currentText,
   };
 }
@@ -1156,6 +1159,7 @@ async function sendPrompt({
   stateDir = null,
   verifyConversation = false,
   fileCapture = null,
+  stallMs = null,
 }) {
   const isStrict = Boolean(strict || strictModel);
   throwIfPromptTooLarge(prompt);
@@ -1409,10 +1413,15 @@ async function sendPrompt({
     const STABLE_DURATION_MS = Number(process.env.WEB_GEMINI_STABLE_DURATION_MS || process.env.ARGON_STABLE_DURATION_MS) || 500;
     const STABLE_FALLBACK_MS = Number(process.env.WEB_GEMINI_STABLE_NO_ACTIONS_MS || process.env.ARGON_STABLE_NO_ACTIONS_MS) || 5000;
     const POLL_INTERVAL_MS = 200;
-    const MAX_WAIT_MS = Number(process.env.GEMINI_MAX_WAIT_MS) || 900_000;
+    const rawSessionCap = Number(process.env.WEB_GEMINI_SESSION_CAP_MS || process.env.ARGON_SESSION_CAP_MS);
+    const SESSION_CAP_MS = Number.isFinite(rawSessionCap) && rawSessionCap > 0 ? rawSessionCap : 4 * 3600_000;
+    const rawStallMs = stallMs != null ? Number(stallMs) : Number(process.env.WEB_GEMINI_STALL_MS || process.env.ARGON_STALL_MS);
+    const STALL_MS = Number.isFinite(rawStallMs) && rawStallMs > 0 ? rawStallMs : 120_000;
     const streamStartTime = Date.now();
+    let lastProgressTime = streamStartTime;
+    let lastDomSignature = null;
 
-    while (Date.now() - streamStartTime < MAX_WAIT_MS) {
+    while (Date.now() - streamStartTime < SESSION_CAP_MS) {
       await throwIfCancelled();
       await page.waitForTimeout(POLL_INTERVAL_MS);
 
@@ -1435,12 +1444,15 @@ async function sendPrompt({
           if (!target) return null;
           const mc = target.querySelector('message-content');
           const src = mc ? 'mc' : 'raw';
+          const childCount = target.querySelectorAll('*').length;
           return {
             targetFound: true,
             hasStopButton: document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Остановить" i]') !== null,
             isBusyOrThinking: false,
             hasFinishedContent: (mc?.innerText || '').trim().length > 0,
             hasActionButtons: false,
+            childCount,
+            targetTextLength: (target.innerText || '').length,
             currentText: { src, text: ((mc || target).innerText || '') },
           };
         },
@@ -1452,15 +1464,37 @@ async function sendPrompt({
         }
       );
 
+      const stopButton = await safeQuery(
+        page,
+        'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
+      );
+
+      const hasStopButton = Boolean(status?.hasStopButton || stopButton);
+      const isBusyOrThinking = Boolean(status?.isBusyOrThinking);
+      const isGenerating = hasStopButton || isBusyOrThinking;
+
       if (!status || !status.targetFound) {
         stableStartTime = null;
+        // Цель потеряна и захваченного текста нет — ждать до потолка сессии
+        // бессмысленно: fail fast, как при застрявшей генерации.
+        const lostWithoutContent = !isGenerating && !(lastText && lastText.length);
+        if ((isGenerating || lostWithoutContent) && Date.now() - lastProgressTime >= STALL_MS) {
+          await stopGeneration(page);
+          const e = new Error(`generation stalled — no progress for ${Math.round(STALL_MS / 1000)}s`);
+          e.code = 'WEB_GEMINI_STALLED';
+          throw e;
+        }
         continue;
       }
 
+      let hadProgress = false;
       const currentText = status.currentText;
       if (currentText !== null && currentText.text.length) {
         if (currentText.src !== lastSrc || !currentText.text.startsWith(lastText)) {
           lastText = '';
+        }
+        if (currentText.src !== lastSrc) {
+          hadProgress = true;
         }
         lastSrc = currentText.src;
         if (currentText.text.length > lastText.length) {
@@ -1472,18 +1506,38 @@ async function sendPrompt({
           }
           lastText = currentText.text;
           stableStartTime = null;
+          hadProgress = true;
         }
       }
 
-      const stopButton = await safeQuery(
-        page,
-        'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
-      );
-
       const effectiveStatus = {
         ...status,
-        hasStopButton: status.hasStopButton || Boolean(stopButton),
+        hasStopButton,
       };
+
+      // targetTextLength ловит рост соседних model-thoughts на длинном
+      // "Thinking": текст ответа не меняется, но прогресс в DOM идёт.
+      const domSig = `${Boolean(effectiveStatus.hasStopButton)}:${Boolean(effectiveStatus.isBusyOrThinking)}:${Boolean(effectiveStatus.hasFinishedContent)}:${Boolean(effectiveStatus.hasActionButtons)}:${status.childCount ?? 0}:${status.targetTextLength ?? 0}:${currentText?.src ?? ''}`;
+      if (lastDomSignature === null) {
+        lastDomSignature = domSig;
+      } else if (domSig !== lastDomSignature) {
+        lastDomSignature = domSig;
+        hadProgress = true;
+      }
+
+      if (hadProgress) {
+        lastProgressTime = Date.now();
+      }
+
+      // Стол — и в активной генерации, и в послегенерационном лимбе:
+      // stop-кнопка ушла, но готового контента так и нет — не висеть до cap.
+      const awaitingContent = !isGenerating && !effectiveStatus.hasFinishedContent;
+      if ((isGenerating || awaitingContent) && Date.now() - lastProgressTime >= STALL_MS) {
+        await stopGeneration(page);
+        const e = new Error(`generation stalled — no progress for ${Math.round(STALL_MS / 1000)}s`);
+        e.code = 'WEB_GEMINI_STALLED';
+        throw e;
+      }
 
       if (!effectiveStatus.hasStopButton && !effectiveStatus.isBusyOrThinking && effectiveStatus.hasFinishedContent) {
         if (stableStartTime === null) {
@@ -1503,11 +1557,11 @@ async function sendPrompt({
     }
 
     // Hit the cap mid-generation → the answer is truncated, not complete.
-    if (Date.now() - streamStartTime >= MAX_WAIT_MS && (await safeQuery(page,
+    if (Date.now() - streamStartTime >= SESSION_CAP_MS && (await safeQuery(page,
       'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
     ))) {
       await stopGeneration(page);
-      const e = new Error(`generation still running after ${MAX_WAIT_MS / 1000}s cap — answer truncated`);
+      const e = new Error(`generation still running after ${SESSION_CAP_MS / 1000}s cap — answer truncated`);
       e.code = 'WEB_GEMINI_STREAM_TIMEOUT';
       throw e;
     }
