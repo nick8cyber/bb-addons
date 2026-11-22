@@ -1753,6 +1753,7 @@ test("§31.9 Opus Audit Round 2 Blocker 5: two different 40-char SHAs sharing 8-
     provider: "p",
     continueFrom: SHA_B,
   });
+  store.setStatus(rev.id, "running");
   store.setStatusIf(rev.id, "running", "done", {
     reviewVerdict: { verdict: "OK", blockers: 0 },
   });
@@ -2243,8 +2244,9 @@ test("§31.9 Opus Audit Round 5 Blocker 2: mechanical contract requires non-empt
   assert.ok(err, "strict mode release without review should fail for mechanical task");
 
   // With completed review delegation, release succeeds
-  db.prepare(`INSERT INTO delegations (task_key, coordinator_thread_id, level, route, preset, provider, status, continue_from, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run("MECH-1", "thr_c", "review", "review-opus", "opus", "claude-code", "done", P, 1000, 1000);
+  const delRow = db.prepare(`INSERT INTO delegations (task_key, coordinator_thread_id, level, route, preset, provider, status, continue_from, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`).get("MECH-1", "thr_c", "review", "review-opus", "opus", "claude-code", "done", P, 1000, 1000) as { id: number };
+  db.prepare("INSERT INTO events (kind, payload, created_at) VALUES (?, ?, ?)").run("review.verdict", JSON.stringify({ delegationId: delRow.id, verdict: "OK", blockers: 0 }), 1000);
   await verifyReleaseDocumentsGate({ taskKey: "MECH-1", store, cmd, repoRoot: d, publishedSha: P, workGraphMode: "strict" });
 });
 
@@ -2430,18 +2432,61 @@ test("§31.9 Opus Audit Round 7 Blocker 1 / R7-1: multi-doc owner-approved spec 
 test("§31.9 Opus Audit Round 7 Blocker 2 / R7-2: watchdog reissue checks contract without failing on missing cmd", async () => {
   const db = new Database(":memory:"); for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
+  const { createWatchdog } = await import("../src/watchdog.js");
+  const { parsePolicy } = await import("../src/policy.js");
 
-  // 1. Task without approved contract in shadow mode: has no valid approvalId
-  store.insertTask({ taskKey: "NO-CONTRACT", projectId: "p1", coordinatorThreadId: "thr_c", route: "feature", level: "complex", confirmationMode: "manual" } as any);
-  const noContract = resolveTaskSpecContract("NO-CONTRACT", store, { workGraphMode: "shadow" });
-  assert.ok(!noContract?.approvalId, "task without approved contract must have no approvalId");
+  const policyLoad = parsePolicy(JSON.stringify({
+    version: 1,
+    limits: { maxActive: 5 },
+    levels: {
+      complex: { chain: ["c1", "c2"], autoFallback: true },
+    },
+    routes: {
+      c1: { preset: "p1", provider: "pv1" },
+      c2: { preset: "p2", provider: "pv2" },
+    },
+  }));
 
-  // 2. Task with valid approved contract: returns contract
-  store.insertTask({ taskKey: "OK-CONTRACT", projectId: "p1", coordinatorThreadId: "thr_c", route: "feature", level: "complex", confirmationMode: "manual" } as any);
-  store.saveSpecContract({ taskKey: "OK-CONTRACT", kind: "behavior_change", specPath: "docs/specs/a.md", approvalId: "appr:p1:OK-CONTRACT:base:1" }, 1);
-  const okContract = resolveTaskSpecContract("OK-CONTRACT", store, { workGraphMode: "shadow" });
-  assert.ok(okContract, "task with contract must resolve");
-  assert.equal(okContract?.approvalId, "appr:p1:OK-CONTRACT:base:1");
+  // 1. Task without approved contract in shadow mode: watchdog refuses before store.reissue
+  store.insertTask({
+    taskKey: "NO-APP-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "manual",
+  } as any);
+
+  const row = store.insert({
+    taskKey: "NO-APP-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "c1",
+    preset: "p1",
+    provider: "pv1",
+  });
+  store.setStatus(row.id, "running");
+  db.prepare("UPDATE delegations SET thread_id = ? WHERE id = ?").run("thr_fake", row.id);
+
+  let dispatched = false;
+  const wd = createWatchdog({
+    store,
+    loadPolicy: async () => policyLoad,
+    dispatch: async () => { dispatched = true; return { ok: true } as any; },
+    threads: { get: async () => ({ id: "thr_fake", status: "idle" }), output: async () => ({ output: "" }), stop: async () => {} } as any,
+    workGraphMode: () => "shadow",
+    enqueue: (fn: any) => fn(),
+  } as any);
+
+  await wd.onTurnFailed({ threadId: "thr_fake", errorInfo: { category: "rate-limit" } });
+
+  const delegations = store.delegationsByTask("NO-APP-1");
+  assert.equal(delegations.length, 1, "no new delegation row should be created");
+  assert.equal(dispatched, false, "no dispatch should be launched");
+  const delRow = store.get(row.id);
+  const setupErrors = delRow?.setup_errors ? JSON.parse(delRow.setup_errors) : [];
+  assert.ok(setupErrors.some((e: any) => e.step === "spec-before-code-gate"), "spec-before-code-gate error recorded in setupErrors");
 });
 
 test("§31.9 Opus Audit Round 7 Blocker 3 / R7-3: executor gate on task at node=release without contract is rejected", async () => {
@@ -2458,13 +2503,47 @@ test("§31.9 Opus Audit Round 7 Blocker 3 / R7-3: executor gate on task at node=
   );
 });
 
-test("§31.9 Opus Audit Round 7 Non-blocker 7 / R7-4: sectionExistsInMarkdown requires heading or symbol, ignores substring in text", async () => {
+test("§31.9 Opus Audit Round 8 Non-blocker 5 / R7-4: sectionExistsInMarkdown requires heading or symbol, ignores substring in text", async () => {
   const { sectionExistsInMarkdown } = await import("../src/spec-gate.js");
-  const docWithHeading = "# Title\n\n## §2 Core Requirements\n\nSome text.";
-  const docWithBareHeading = "# Title\n\n## 2 Core Requirements\n\nSome text.";
-  const docWithRandomNumber = "# Title\n\nHere is 200 items and error code 2 in a sentence.\n";
 
-  assert.equal(sectionExistsInMarkdown(docWithHeading, "§2"), true, "matches ## §2");
-  assert.equal(sectionExistsInMarkdown(docWithBareHeading, "§2"), true, "matches ## 2");
-  assert.equal(sectionExistsInMarkdown(docWithRandomNumber, "§2"), false, "must NOT match random number 2 in paragraph");
+  // Valid matches
+  assert.equal(sectionExistsInMarkdown("# Title\n\n## §2 Core Requirements\n\nSome text.", "§2"), true, "matches ## §2");
+  assert.equal(sectionExistsInMarkdown("# Title\n\n## 2 Core Requirements\n\nSome text.", "§2"), true, "matches ## 2 with §2 query");
+  assert.equal(sectionExistsInMarkdown("# Title\n\n## 2 Core Requirements\n\nSome text.", "2"), true, "matches ## 2 with 2 query");
+  assert.equal(sectionExistsInMarkdown("# Title\n\n### §5.1 Details\n\nSome text.", "§5.1"), true, "matches ### §5.1");
+  assert.equal(sectionExistsInMarkdown("# Title\n\n### 5.1 Details\n\nSome text.", "5.1"), true, "matches ### 5.1");
+
+  // False matches that MUST be rejected
+  assert.equal(sectionExistsInMarkdown("# Title\n\n## §20 Other\n\nSome text.", "§2"), false, "must NOT match §20 when looking for §2");
+  assert.equal(sectionExistsInMarkdown("# Title\n\nHere is 200 items and error code 2 in a sentence.\n", "§2"), false, "must NOT match random number 2 in paragraph with §2");
+  assert.equal(sectionExistsInMarkdown("# Title\n\nHere is 200 items and error code 2 in a sentence.\n", "2"), false, "must NOT match random number 2 in paragraph with 2");
+  assert.equal(sectionExistsInMarkdown("# Title\n\nRelease version v5.1 is out.\n", "§5.1"), false, "must NOT match v5.1 in paragraph");
+  assert.equal(sectionExistsInMarkdown("# Title\n\n### §5.1.2 Sub-details\n", "§5.1"), false, "must NOT match §5.1.2 when looking for §5.1");
+});
+
+test("§31.9 Opus Audit Round 8 Blocker 1: CHANGES review verdict followed by pruneEvents returns null", async () => {
+  const db = new Database(":memory:"); for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const SHA = "a".repeat(40);
+  const del = store.insert({
+    taskKey: "REV-CH-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_c",
+    level: "review",
+    route: "r",
+    preset: "p",
+    provider: "pr",
+    continueFrom: SHA,
+  });
+  store.setStatus(del.id, "running");
+  store.setStatusIf(del.id, "running", "done", {
+    reviewVerdict: { verdict: "CHANGES", blockers: 3 },
+  });
+
+  // 1. Before pruning, verdict event has CHANGES -> getLatestAcceptedReview returns null
+  assert.equal(store.getLatestAcceptedReview("REV-CH-1", SHA), null);
+
+  // 2. Prune events (delete review.verdict event) -> must STILL return null, NOT treat done delegation as accepted!
+  db.prepare("DELETE FROM events WHERE kind = 'review.verdict'").run();
+  assert.equal(store.getLatestAcceptedReview("REV-CH-1", SHA), null, "after pruning events, review without OK verdict must NOT be accepted");
 });

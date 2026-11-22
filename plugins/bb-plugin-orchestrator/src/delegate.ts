@@ -957,6 +957,15 @@ export async function dispatchToRoute(
       ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
       : (deps.project ?? null);
     try {
+      let resolvedBaseSha = opts.from;
+      if (resolvedBaseSha && deps.cmd && taskRepoRoot && !/^[0-9a-fA-F]{40}$/.test(resolvedBaseSha)) {
+        try {
+          const rev = await deps.cmd.run("git", ["rev-parse", resolvedBaseSha], { cwd: taskRepoRoot });
+          if (rev.exitCode === 0 && rev.stdout.trim().length === 40) {
+            resolvedBaseSha = rev.stdout.trim();
+          }
+        } catch {}
+      }
       await verifySpecBeforeCodeGate({
         taskKey: row.task_key,
         role,
@@ -966,7 +975,7 @@ export async function dispatchToRoute(
         cmd: deps.cmd,
         policy,
         project: proj,
-        preparedBaseSha: opts.from,
+        preparedBaseSha: resolvedBaseSha,
         workGraphMode: mode,
         specBeforeCode: opts.specBeforeCode,
         repoRoot: taskRepoRoot,

@@ -990,7 +990,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           : (deps as any).workGraphMode;
         if (mode === "strict" || mode === "shadow") {
           const taskRow = store.getTask(row.task_key);
-          const contract = resolveTaskSpecContract(row.task_key, store, {
+          const contract = resolveTaskSpecContract(row.task_key, store, null, {
             workGraphMode: mode,
             task: taskRow,
           });

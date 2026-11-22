@@ -29,10 +29,10 @@ export function sectionExistsInMarkdown(content: string, section?: string): bool
   if (!section || !content) return false;
   const cleanSection = section.replace(/^§\s*/, "").trim();
   if (!cleanSection) return false;
-  if (content.includes(section)) return true;
   const escapedClean = cleanSection.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (new RegExp(`§\\s*${escapedClean}\\b`, "m").test(content)) return true;
-  const headingRegex = new RegExp(`(^|\\n)#+\\s*(?:§\\s*)?${escapedClean}\\b`, "m");
+  const sectionSymbolRegex = new RegExp(`§\\s*${escapedClean}(?![\\d.])`, "m");
+  if (sectionSymbolRegex.test(content)) return true;
+  const headingRegex = new RegExp(`(^|\\n)#+\\s*(?:§\\s*)?${escapedClean}(?![\\d.])`, "m");
   return headingRegex.test(content);
 }
 
@@ -650,7 +650,13 @@ export async function verifySpecBeforeCodeGate(
       }
 
       // 2b. Race condition: base branch moved between preparation and spawn
-      const prepSha = contract.preparedBaseSha ?? input.preparedBaseSha;
+      let prepSha = contract.preparedBaseSha ?? input.preparedBaseSha;
+      if (prepSha && !/^[0-9a-fA-F]{40}$/.test(prepSha)) {
+        const rev = await cmd.run("git", ["rev-parse", prepSha], { cwd });
+        if (rev.exitCode === 0 && rev.stdout.trim().length === 40) {
+          prepSha = rev.stdout.trim();
+        }
+      }
       if (prepSha && prepSha !== currentBaseSha) {
         const diffPaths = [...specFiles, ...adrFiles];
         const diffRes = await cmd.run(

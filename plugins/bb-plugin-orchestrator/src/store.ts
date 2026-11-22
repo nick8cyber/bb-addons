@@ -4635,11 +4635,6 @@ export class DelegationStore {
         } catch {
           // parse error
         }
-      } else if (events.length === 0) {
-        return {
-          delegation: rev,
-          reviewedSha: revSha,
-        };
       }
     }
     return null;
