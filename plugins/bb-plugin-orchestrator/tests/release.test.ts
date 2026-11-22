@@ -872,35 +872,36 @@ test("§31.9 Release candidate selection: reproduces live records #1553/#1744/#1
   (deps as any).workGraphMode = "shadow";
   (deps as any).stepsDeps.workGraphMode = "shadow";
 
-  let VERIFIED_SHA = "f".repeat(40);
-  try {
-    VERIFIED_SHA = gitR(repo, ["rev-parse", "HEAD"]);
-  } catch {}
+  // Base commit in repo (original release artifact)
+  const PREV_SHA = gitR(repo, ["rev-parse", "HEAD"]);
+
+  // Create successor commit with test-only changes
+  mkdirSync(join(repo, "tests"), { recursive: true });
+  writeFileSync(join(repo, "tests", "candidate.test.ts"), "test('ok', () => {});\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "test: add test file"]);
+  const VERIFIED_SHA = gitR(repo, ["rev-parse", "HEAD"]);
 
   // Clean out delegations seeded by makeDeps
   db.prepare("DELETE FROM delegations WHERE task_key = 'PLUG-1'").run();
 
-  // 1. #1553: source code executor (commits: 1, sha: old)
-  const exec1553 = store.insert({
+  // 1. Release artifact (like release #333) for PLUG-1 in proj_main
+  const rel = store.insertRelease({
     taskKey: "PLUG-1",
     projectId: "proj_main",
     coordinatorThreadId: "thr_coord",
-    level: "complex",
-    route: "c",
-    preset: "c",
-    provider: "p",
-    noCode: false,
+    repoPath: repo,
+    branch: "feat-x",
+    targetAction: "push",
+    targetBranch: "main",
+    repoRoot: repo,
   });
-  store.setThreadInfo(exec1553.id, "thr_1553");
-  store.setStatus(exec1553.id, "done");
-  store.setRoundResult(exec1553.id, {
-    branch: "bb/plug-1-old",
-    sha: "c81e23fa893e99d9b221173e9337424fad9f3b45",
-    commits: 1,
-    dirty: false,
+  store.updateRelease(rel.id, {
+    headSha: PREV_SHA,
+    status: "failed",
   });
 
-  // 2. #1744: auditor review on VERIFIED_SHA with OK verdict
+  // 2. #1744: auditor review on VERIFIED_SHA with OK verdict in proj_main
   const rev1744 = store.insert({
     taskKey: "PLUG-1",
     projectId: "proj_main",
@@ -917,7 +918,7 @@ test("§31.9 Release candidate selection: reproduces live records #1553/#1744/#1
     reviewVerdict: { verdict: "OK", blockers: 0 },
   });
 
-  // 3. #1745: verifier round confirming VERIFIED_SHA with no_code=1, result_commits=0
+  // 3. #1745: verifier round confirming VERIFIED_SHA with no_code=1, result_commits=0 in proj_main
   const exec1745 = store.insert({
     taskKey: "PLUG-1",
     projectId: "proj_main",
@@ -941,63 +942,24 @@ test("§31.9 Release candidate selection: reproduces live records #1553/#1744/#1
   const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   assert.equal(res.status, "auditing");
   assert.equal(spawnCalls.length, 1);
+});
 
-  // 4. Refusal preserved for true no-code task (no source code executor with commits)
-  const { repo: repoNoCode } = makeRepo();
-  const { deps: depsNoCode, store: storeNoCode, db: dbNoCode } = makeDeps(repoNoCode);
-  (depsNoCode as any).workGraphMode = "shadow";
-  (depsNoCode as any).stepsDeps.workGraphMode = "shadow";
-  dbNoCode.prepare("DELETE FROM delegations WHERE task_key = 'PLUG-1'").run();
+test("§31.9 Release candidate negative: old done-round and OK on candidate, but without proven transfer or in other project -> reject", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, db } = makeDeps(repo);
+  (deps as any).workGraphMode = "shadow";
+  (deps as any).stepsDeps.workGraphMode = "shadow";
 
-  const revOnly = storeNoCode.insert({
-    taskKey: "PLUG-1",
-    projectId: "proj_main",
-    coordinatorThreadId: "thr_coord",
-    level: "review",
-    route: "r",
-    preset: "r",
-    provider: "p",
-    continueFrom: VERIFIED_SHA,
-  });
-  storeNoCode.setThreadInfo(revOnly.id, "thr_rev");
-  storeNoCode.setStatus(revOnly.id, "running");
-  storeNoCode.setStatusIf(revOnly.id, "running", "done", {
-    reviewVerdict: { verdict: "OK", blockers: 0 },
-  });
+  const BASE_SHA = gitR(repo, ["rev-parse", "HEAD"]);
+  writeFileSync(join(repo, "src_production.ts"), "export const prod = 1;\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: production change"]);
+  const CANDIDATE_SHA = gitR(repo, ["rev-parse", "HEAD"]);
 
-  const execNoCodeOnly = storeNoCode.insert({
-    taskKey: "PLUG-1",
-    projectId: "proj_main",
-    coordinatorThreadId: "thr_coord",
-    level: "simple",
-    route: "c",
-    preset: "c",
-    provider: "p",
-    noCode: true,
-  });
-  storeNoCode.setThreadInfo(execNoCodeOnly.id, "thr_exec");
-  storeNoCode.setStatus(execNoCodeOnly.id, "done");
-  storeNoCode.setRoundResult(execNoCodeOnly.id, {
-    branch: "feat-x",
-    sha: VERIFIED_SHA,
-    commits: 0,
-    dirty: false,
-  });
+  db.prepare("DELETE FROM delegations WHERE task_key = 'PLUG-1'").run();
 
-  await assert.rejects(
-    runRelease({ taskKey: "PLUG-1", caller: COORD }, depsNoCode),
-    (e: any) => e.code === "release-refused" && (e.message.includes("rel.noCode") || e.message.includes("задача без кода")),
-  );
-
-  // 5. Refusal preserved for foreign / unreviewed SHA on verifier delegation
-  const { repo: repoForeign } = makeRepo();
-  const { deps: depsForeign, store: storeForeign, db: dbForeign } = makeDeps(repoForeign);
-  (depsForeign as any).workGraphMode = "shadow";
-  (depsForeign as any).stepsDeps.workGraphMode = "shadow";
-  dbForeign.prepare("DELETE FROM delegations WHERE task_key = 'PLUG-1'").run();
-
-  // Code executor
-  const execForeignCode = storeForeign.insert({
+  // Old done-round exists on task
+  const oldExec = store.insert({
     taskKey: "PLUG-1",
     projectId: "proj_main",
     coordinatorThreadId: "thr_coord",
@@ -1007,17 +969,34 @@ test("§31.9 Release candidate selection: reproduces live records #1553/#1744/#1
     provider: "p",
     noCode: false,
   });
-  storeForeign.setThreadInfo(execForeignCode.id, "thr_exec_c");
-  storeForeign.setStatus(execForeignCode.id, "done");
-  storeForeign.setRoundResult(execForeignCode.id, {
-    branch: "feat-x",
-    sha: "1111111111111111111111111111111111111111",
+  store.setThreadInfo(oldExec.id, "thr_old");
+  store.setStatus(oldExec.id, "done");
+  store.setRoundResult(oldExec.id, {
+    branch: "feat-old",
+    sha: BASE_SHA,
     commits: 1,
     dirty: false,
   });
 
-  // Verifier confirming an unreviewed SHA (2222...)
-  const execForeignVerifier = storeForeign.insert({
+  // Review OK on CANDIDATE_SHA
+  const rev = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+    continueFrom: CANDIDATE_SHA,
+  });
+  store.setThreadInfo(rev.id, "thr_rev");
+  store.setStatus(rev.id, "running");
+  store.setStatusIf(rev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+
+  // Verifier on CANDIDATE_SHA
+  const verifier = store.insert({
     taskKey: "PLUG-1",
     projectId: "proj_main",
     coordinatorThreadId: "thr_coord",
@@ -1027,19 +1006,116 @@ test("§31.9 Release candidate selection: reproduces live records #1553/#1744/#1
     provider: "p",
     noCode: true,
   });
-  storeForeign.setThreadInfo(execForeignVerifier.id, "thr_exec");
-  storeForeign.setStatus(execForeignVerifier.id, "done");
-  storeForeign.setRoundResult(execForeignVerifier.id, {
+  store.setThreadInfo(verifier.id, "thr_exec");
+  store.setStatus(verifier.id, "done");
+  store.setRoundResult(verifier.id, {
     branch: "feat-x",
-    sha: "2222222222222222222222222222222222222222",
+    sha: CANDIDATE_SHA,
     commits: 0,
     dirty: false,
   });
 
+  // Case A: No release artifact exists (only old done-round) -> must reject
   await assert.rejects(
-    runRelease({ taskKey: "PLUG-1", caller: COORD }, depsForeign),
-    (e: any) => e.code === "release-refused",
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: any) => e.code === "release-refused" && (e.message.includes("rel.noCode") || e.message.includes("задача без кода")),
   );
+
+  // Case B: Release artifact exists, but in a different project -> must reject
+  const relDiffProject = store.insertRelease({
+    taskKey: "PLUG-1",
+    projectId: "proj_other",
+    coordinatorThreadId: "thr_coord",
+    repoPath: repo,
+    branch: "feat-x",
+    targetAction: "push",
+    targetBranch: "main",
+    repoRoot: repo,
+  });
+  store.updateRelease(relDiffProject.id, {
+    headSha: BASE_SHA,
+    status: "failed",
+  });
+
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: any) => e.code === "release-refused" && (e.message.includes("rel.noCode") || e.message.includes("задача без кода")),
+  );
+
+  // Case C: Release artifact exists in same project, but transfer has production changes (not test/doc) -> must reject
+  db.prepare("UPDATE releases SET project_id = 'proj_main' WHERE id = ?").run(relDiffProject.id);
+
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: any) => e.code === "release-refused" && (e.message.includes("rel.noCode") || e.message.includes("задача без кода")),
+  );
+});
+
+test("§31.9 Review gate canonical SHA matching: two different full 40-char SHAs sharing prefix must NOT match; short ref resolves in repo", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, spawnCalls, db } = makeDeps(repo);
+  (deps as any).workGraphMode = "shadow";
+  (deps as any).stepsDeps.workGraphMode = "shadow";
+
+  // Create second commit
+  writeFileSync(join(repo, "b.txt"), "b\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "commit b"]);
+  const FULL_SHA_2 = gitR(repo, ["rev-parse", "HEAD"]);
+
+  db.prepare("DELETE FROM delegations WHERE task_key = 'PLUG-1'").run();
+
+  // Executor is on FULL_SHA_2
+  const exec = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "c",
+    preset: "c",
+    provider: "p",
+    noCode: false,
+  });
+  store.setThreadInfo(exec.id, "thr_exec");
+  store.setStatus(exec.id, "done");
+  store.setRoundResult(exec.id, {
+    branch: "feat-x",
+    sha: FULL_SHA_2,
+    commits: 1,
+    dirty: false,
+  });
+
+  // Review is on a synthetic full 40-char SHA that shares the first 8 characters with FULL_SHA_2
+  const FAKE_PREFIX_SHA = FULL_SHA_2.slice(0, 8) + "0".repeat(32);
+  const revPrefix = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+    continueFrom: FAKE_PREFIX_SHA,
+  });
+  store.setThreadInfo(revPrefix.id, "thr_rev");
+  store.setStatus(revPrefix.id, "running");
+  store.setStatusIf(revPrefix.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+
+  // Case A: Different 40-char SHA sharing 8-char prefix MUST NOT match -> must reject
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: any) => e.code === "release-refused" && (e.message.includes("rel.missingNoReview") || e.message.includes("нет ревью")),
+  );
+
+  // Case B: Valid short ref (e.g. 10 chars) of FULL_SHA_2 resolves in repo and matches
+  const SHORT_REF = FULL_SHA_2.slice(0, 10);
+  db.prepare("UPDATE delegations SET continue_from = ? WHERE id = ?").run(SHORT_REF, revPrefix.id);
+
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  assert.equal(spawnCalls.length, 1);
 });
 
 // §25 (r33.4): the caller gate is the orchestrator ROLE — a thread that

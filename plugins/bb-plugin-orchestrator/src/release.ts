@@ -744,39 +744,88 @@ async function acceptTask(
     executor.no_code === 1 &&
     (executor.result_commits ?? 0) === 0
   ) {
-    // Legacy / verification candidate selection (§31.9, release §2):
-    // If the latest executor round was a verifier (no_code=1, result_commits=0) confirming a SHA,
-    // and that SHA has an accepted review record, bind the candidate to the original code artifact
-    // and project while preserving the confirmed SHA, worktree/branch, and thread.
+    // Release candidate provenance & successor contract (§31.9, release §2):
+    // For transferred/legacy work on a fresh base where the verifier confirms a SHA (no_code=1, result_commits=0),
+    // candidate selection requires:
+    // 1. An existing release artifact for this task in the same project (store.latestReleaseByTask(key)).
+    // 2. An accepted review strictly on candidateSha in the same project.
+    // 3. Proven transfer from the release artifact to candidateSha:
+    //    either identical, git ancestry, or tree diff restricted to non-production (tests/docs/fixtures) files.
     const candidateSha = executor.result_sha;
-    const acceptedReview = candidateSha
-      ? deps.store.getLatestAcceptedReview?.(key, candidateSha)
-      : null;
-    const sourceCodeExecutor = acceptedReview
-      ? taskDelegations.find(
-          (d) =>
-            d.id !== executor!.id &&
-            roleOf(d.level) === "executor" &&
-            d.status === "done" &&
-            (d.result_commits ?? 0) > 0,
-        ) ??
-        taskDelegations.find(
-          (d) =>
-            d.id !== executor!.id &&
-            roleOf(d.level) === "executor" &&
-            d.status === "done" &&
-            d.no_code === 0,
-        )
-      : null;
+    let transferProven = false;
+    let artifactProjectId: string | undefined;
 
-    if (candidateSha && acceptedReview && sourceCodeExecutor) {
+    const prevRelease = deps.store.latestReleaseByTask(key);
+    if (
+      candidateSha &&
+      candidateSha.length === 40 &&
+      prevRelease?.head_sha &&
+      prevRelease.project_id &&
+      (!executor.project_id || executor.project_id === prevRelease.project_id)
+    ) {
+      artifactProjectId = prevRelease.project_id;
+      const acceptedReview = deps.store.getLatestAcceptedReview?.(key, candidateSha);
+      const reviewProjectMatches =
+        acceptedReview &&
+        (!acceptedReview.delegation.project_id ||
+          acceptedReview.delegation.project_id === artifactProjectId);
+
+      if (
+        reviewProjectMatches &&
+        acceptedReview.reviewedSha === candidateSha &&
+        acceptedReview.delegation.status === "done"
+      ) {
+        if (prevRelease.head_sha === candidateSha) {
+          transferProven = true;
+        } else {
+          // Resolve working copy to verify git tree relationship
+          const execThread = executor.thread_id
+            ? await deps.threads.get({ threadId: executor.thread_id }).catch(() => null)
+            : null;
+          const repo = execThread?.environmentPath ?? prevRelease.repo_root ?? prevRelease.repo_path;
+          if (repo) {
+            const chkPrev = await deps.cmd.run(
+              "git",
+              ["-C", repo, "cat-file", "-e", `${prevRelease.head_sha}^{commit}`],
+              { timeoutMs: 10_000 },
+            );
+            const chkCand = await deps.cmd.run(
+              "git",
+              ["-C", repo, "cat-file", "-e", `${candidateSha}^{commit}`],
+              { timeoutMs: 10_000 },
+            );
+            if (chkPrev.exitCode === 0 && chkCand.exitCode === 0) {
+              const diffRes = await deps.cmd.run(
+                "git",
+                ["-C", repo, "diff", "--name-only", prevRelease.head_sha, candidateSha],
+                { timeoutMs: 10_000 },
+              );
+              if (diffRes.exitCode === 0) {
+                const changedFiles = diffRes.stdout
+                  .trim()
+                  .split("\n")
+                  .map((s) => s.trim())
+                  .filter(Boolean);
+                const isTestOrDocFile = (file: string) =>
+                  /((^|\/)(tests?|fixtures|docs|specs?)\/|\.(test|spec)\.[a-zA-Z0-9]+$|\.md$)/i.test(file);
+                if (changedFiles.length > 0 && changedFiles.every(isTestOrDocFile)) {
+                  transferProven = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (transferProven && artifactProjectId) {
       executor = {
         ...executor,
         no_code: 0,
-        result_commits: sourceCodeExecutor.result_commits ?? 1,
-        project_id: sourceCodeExecutor.project_id ?? executor.project_id,
+        result_commits: 1,
+        project_id: artifactProjectId,
         coordinator_thread_id:
-          executor.coordinator_thread_id ?? sourceCodeExecutor.coordinator_thread_id,
+          executor.coordinator_thread_id ?? prevRelease?.coordinator_thread_id,
       };
     } else {
       throw new OrchestratorError(
@@ -800,15 +849,34 @@ async function acceptTask(
   if (executor && !requiredSha) {
     missing.push(t("rel.missingNoSha"));
   } else if (executor && executor.merge_status !== "merged") {
-    const review = taskDelegations.find(
-      (d) =>
-        roleOf(d.level) === "auditor" &&
-        (d.continue_from === requiredSha ||
-          (Boolean(d.continue_from) &&
-            Boolean(requiredSha) &&
-            (d.continue_from!.startsWith(requiredSha!.slice(0, 8)) ||
-              requiredSha!.startsWith(d.continue_from!.slice(0, 8))))),
+    // Exact canonical full Git SHA match without prefix diluting
+    let review = taskDelegations.find(
+      (d) => roleOf(d.level) === "auditor" && d.continue_from === requiredSha,
     );
+    // If not found, resolve valid short hex ref (7-39 hex chars) in repo
+    if (!review && requiredSha) {
+      const execThread = executor.thread_id
+        ? await deps.threads.get({ threadId: executor.thread_id }).catch(() => null)
+        : null;
+      const repo = execThread?.environmentPath ?? null;
+      if (repo) {
+        for (const d of taskDelegations) {
+          if (roleOf(d.level) !== "auditor" || !d.continue_from) continue;
+          const ref = d.continue_from.trim();
+          if (ref.length >= 7 && ref.length < 40 && /^[0-9a-fA-F]+$/.test(ref)) {
+            const res = await deps.cmd.run(
+              "git",
+              ["-C", repo, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+              { timeoutMs: 10_000 },
+            );
+            if (res.exitCode === 0 && res.stdout.trim() === requiredSha) {
+              review = d;
+              break;
+            }
+          }
+        }
+      }
+    }
     if (!review) {
       missing.push(
         t("rel.missingNoReview", { sha7: requiredSha!.slice(0, 7) }),
