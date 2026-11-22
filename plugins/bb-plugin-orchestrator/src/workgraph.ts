@@ -2192,18 +2192,23 @@ export async function runApprove(
 
   const approvedContract = resolveTaskSpecContract(key, deps.store, payloadObj, { task: res.task! });
   if (approvedContract) {
-    const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
-    const approvalId = `appr:${task.project_id ?? "proj"}:${key}:${specSha.slice(0, 12)}:${now}`;
+    const specSha: string = String(
+      (payloadObj?.spec_sha ?? payloadObj?.specSha) ??
+      (approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base")
+    );
+    const approvalId = `appr:${task.project_id ?? "proj"}:${key}:${specSha}:${now}`;
     deps.store.saveSpecContract(
       {
         ...approvedContract,
         taskKey: key,
         projectId: task.project_id ?? undefined,
+        specSha,
         approvalId,
       },
       now,
     );
     payloadObj.approval_id = approvalId;
+    payloadObj.spec_sha = specSha;
     deps.store.updateTask(key, { payload: JSON.stringify(payloadObj) });
   }
 
@@ -6291,13 +6296,17 @@ async function advanceActiveTask(
             if (task.confirmation_mode === "auto") {
               const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
               if (approvedContract) {
-                const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
+                const specSha: string = String(
+                  ((payload as any)?.spec_sha ?? (payload as any)?.specSha) ??
+                  (approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base")
+                );
                 const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
                 deps.store.saveSpecContract(
                   {
                     ...approvedContract,
                     taskKey: task.task_key,
                     projectId: task.project_id ?? undefined,
+                    specSha,
                     approvalId,
                   },
                   now,
@@ -6987,13 +6996,17 @@ async function advanceActiveTask(
             if (task.confirmation_mode === "auto") {
               const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
               if (approvedContract) {
-                const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
+                const specSha: string = String(
+                  ((payload as any)?.spec_sha ?? (payload as any)?.specSha) ??
+                  (approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base")
+                );
                 const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
                 deps.store.saveSpecContract(
                   {
                     ...approvedContract,
                     taskKey: task.task_key,
                     projectId: task.project_id ?? undefined,
+                    specSha,
                     approvalId,
                   },
                   now,

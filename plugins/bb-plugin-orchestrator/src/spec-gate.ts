@@ -106,16 +106,30 @@ export function resolveTaskSpecContract(
   // 2. Persisted in task_spec_contracts table
   const row = store.getSpecContract(taskKey);
   if (row) {
+    const taskRow = params?.task ?? store.getTask(taskKey);
+    const pl = payload ?? (() => {
+      if (!taskRow?.payload) return null;
+      try {
+        return JSON.parse(taskRow.payload);
+      } catch {
+        return null;
+      }
+    })();
+    const freshSha = pl?.spec_sha ?? pl?.specSha;
+    const freshPath = pl?.spec_path ?? pl?.specPath;
+    const freshSection = pl?.spec_section ?? pl?.specSection;
+    const freshAdr = pl?.adr_path ?? pl?.adrPath;
+    const freshMechBasis = pl?.mechanical_basis ?? pl?.mechanicalBasis;
     return {
       kind: row.kind,
       projectId: row.project_id ?? undefined,
-      specPath: row.spec_path ?? undefined,
-      specSha: row.spec_sha ?? undefined,
-      specSection: row.spec_section ?? undefined,
-      adrPath: row.adr_path ?? undefined,
+      specPath: (row.approval_id ? row.spec_path : (freshPath ?? row.spec_path)) ?? undefined,
+      specSha: (row.approval_id ? row.spec_sha : (freshSha ?? row.spec_sha)) ?? undefined,
+      specSection: (row.approval_id ? row.spec_section : (freshSection ?? row.spec_section)) ?? undefined,
+      adrPath: (row.approval_id ? row.adr_path : (freshAdr ?? row.adr_path)) ?? undefined,
       isArchitectural: Boolean(row.is_architectural),
       altersContract: Boolean(row.alters_contract),
-      mechanicalBasis: row.mechanical_basis ?? undefined,
+      mechanicalBasis: (row.approval_id ? row.mechanical_basis : (freshMechBasis ?? row.mechanical_basis)) ?? undefined,
       approvalId: row.approval_id ?? undefined,
       preparedBaseSha: row.prepared_base_sha ?? undefined,
     };
@@ -198,8 +212,8 @@ export function resolveTaskSpecContract(
     }
   }
 
-  // 4. From task_queue row directly
-  if (taskRow) {
+  // 4. From task_queue row directly (only for release, never for code execution)
+  if (params?.forRelease && taskRow) {
     const accSha = taskRow.acceptance_sha ?? taskRow.spec_sha ?? taskRow.result_sha;
     const normKey = normalizeTaskKey(taskRow.task_key);
     const isAcceptedOrInFlight =
@@ -218,7 +232,7 @@ export function resolveTaskSpecContract(
           specSection: "§31.9",
           specSha: accSha,
           altersContract: false,
-          approvalId: pl?.approval_id ?? pl?.approvalId ?? (isAcceptedOrInFlight ? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${accSha.slice(0, 12)}:${taskRow.created_at || 1}` : undefined),
+          approvalId: pl?.approval_id ?? pl?.approvalId ?? (isAcceptedOrInFlight ? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${accSha}:${taskRow.created_at || 1}` : undefined),
         };
       }
       if (taskRow.route === "feature") {
@@ -226,14 +240,14 @@ export function resolveTaskSpecContract(
           kind: "behavior_change",
           specPath: `docs/specs/acceptance/${normKey}.md`,
           specSha: accSha,
-          approvalId: pl?.approval_id ?? pl?.approvalId ?? (isAcceptedOrInFlight ? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${accSha.slice(0, 12)}:${taskRow.created_at || 1}` : undefined),
+          approvalId: pl?.approval_id ?? pl?.approvalId ?? (isAcceptedOrInFlight ? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${accSha}:${taskRow.created_at || 1}` : undefined),
         };
       }
       if (taskRow.route === "simple" && (isAcceptedOrInFlight || pl?.mechanical_basis)) {
         return {
           kind: "mechanical",
           mechanicalBasis: pl?.mechanical_basis ?? pl?.acceptance_text ?? `Transition contract for task ${normKey}`,
-          approvalId: pl?.approval_id ?? pl?.approvalId ?? (isAcceptedOrInFlight ? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${accSha.slice(0, 12)}:${taskRow.created_at || 1}` : undefined),
+          approvalId: pl?.approval_id ?? pl?.approvalId ?? (isAcceptedOrInFlight ? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${accSha}:${taskRow.created_at || 1}` : undefined),
         };
       }
     }

@@ -1802,3 +1802,272 @@ test("§31.9 Opus Audit Round 2 Blocker 5: two different 40-char SHAs sharing 8-
     },
   );
 });
+
+test("§31.9 Opus Audit Round 3 Blocker 2: simple task in review/checks node without contract is rejected by code gate", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const repoDir = makeTempDir("audit-r3-b2-");
+  const { cmd } = initGitRepo(repoDir);
+
+  // Task in review node with no contract in task_spec_contracts and no acceptance text
+  store.insertTask({
+    taskKey: "LEG-REV-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_c",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  });
+  store.updateTask("LEG-REV-1", { node: "review", status: "running" });
+
+  // Code gate must NOT resolve contract from task_queue row when !forRelease
+  const contractForCode = resolveTaskSpecContract("LEG-REV-1", store, null, { forRelease: false });
+  assert.equal(contractForCode, null, "resolveTaskSpecContract for code must NOT synthesize contract from queue row");
+
+  // Code gate must reject execution
+  await assert.rejects(
+    verifySpecBeforeCodeGate({
+      taskKey: "LEG-REV-1",
+      role: "executor",
+      level: "simple",
+      store,
+      cmd,
+      repoRoot: repoDir,
+      workGraphMode: "shadow",
+    }),
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+
+  // But for release verification (forRelease: true), transition contract can be resolved
+  const contractForRel = resolveTaskSpecContract("LEG-REV-1", store, null, { forRelease: true });
+  assert.ok(contractForRel, "resolveTaskSpecContract for release resolves transition contract");
+  assert.equal(contractForRel?.kind, "mechanical");
+});
+
+test("§31.9 Opus Audit Round 3 Blocker 3: approval revocation resets spec_sha and re-approval binds to new spec version", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const repoDir = makeTempDir("audit-r3-b3-");
+  const { cmd } = initGitRepo(repoDir);
+
+  const specPath = "docs/specs/feature-x.md";
+  const specFullPath = join(repoDir, specPath);
+  mkdirSync(join(repoDir, "docs/specs"), { recursive: true });
+
+  // 1. Spec v1 commit
+  writeFileSync(specFullPath, "# Spec v1\nInitial specification content\n");
+  execFileSync("git", ["add", specPath], { cwd: repoDir });
+  execFileSync("git", ["commit", "-m", "spec v1"], { cwd: repoDir });
+  const shaV1 = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+
+  // Task setup in owner_gate with v1
+  store.insertTask({
+    taskKey: "SPEC-CYCLE-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_c",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "manual",
+    payload: JSON.stringify({ spec_path: specPath, spec_sha: shaV1, gate_stage: "pre_code" }),
+  });
+  store.updateTask("SPEC-CYCLE-1", { node: "owner_gate", status: "waiting_approval" });
+
+  // Approve v1 via runApprove
+  await runApprove("SPEC-CYCLE-1", "Approved v1", {
+    store,
+    ctx: { cwd: repoDir } as any,
+    workGraphMode: "strict",
+    now: () => 1000,
+  });
+
+  // Verify contract is approved for shaV1
+  let contract = store.getSpecContract("SPEC-CYCLE-1");
+  assert.ok(contract?.approval_id);
+  assert.equal(contract?.spec_sha, shaV1);
+
+  // verifySpecBeforeCodeGate succeeds for shaV1
+  await verifySpecBeforeCodeGate({
+    taskKey: "SPEC-CYCLE-1",
+    role: "executor",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    workGraphMode: "strict",
+  });
+
+  // 2. Task returned to spec (e.g. rejection or design remark), revoking approval
+  store.revokeSpecContractApproval("SPEC-CYCLE-1", 2000);
+  contract = store.getSpecContract("SPEC-CYCLE-1");
+  assert.equal(contract?.approval_id, null, "approval_id must be reset to null");
+  assert.equal(contract?.spec_sha, null, "spec_sha must be reset to null");
+
+  // 3. Edit spec to v2
+  writeFileSync(specFullPath, "# Spec v2\nUpdated specification content\n");
+  execFileSync("git", ["add", specPath], { cwd: repoDir });
+  execFileSync("git", ["commit", "-m", "spec v2"], { cwd: repoDir });
+  const shaV2 = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+  assert.notEqual(shaV1, shaV2);
+
+  // Update task payload with fresh spec_sha and place back in owner_gate
+  store.updateTask("SPEC-CYCLE-1", {
+    node: "owner_gate",
+    status: "waiting_approval",
+    payload: JSON.stringify({ spec_path: specPath, spec_sha: shaV2, gate_stage: "pre_code" }),
+  });
+
+  // 4. Re-approve v2
+  await runApprove("SPEC-CYCLE-1", "Approved v2", {
+    store,
+    ctx: { cwd: repoDir } as any,
+    workGraphMode: "strict",
+    now: () => 3000,
+  });
+
+  // Verify contract was re-approved with shaV2 and full SHA in approvalId
+  contract = store.getSpecContract("SPEC-CYCLE-1");
+  assert.equal(contract?.spec_sha, shaV2, "contract must now have fresh shaV2");
+  assert.ok(contract?.approval_id?.includes(shaV2), "approval_id must contain full shaV2");
+
+  // 5. verifySpecBeforeCodeGate succeeds with shaV2!
+  await verifySpecBeforeCodeGate({
+    taskKey: "SPEC-CYCLE-1",
+    role: "executor",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    workGraphMode: "strict",
+  });
+});
+
+test("§31.9 Opus Audit Non-blocker 6: runDelegate and runRunQueue pass resolveProject end-to-end", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const repoDir = makeTempDir("audit-nb6-");
+  const { cmd } = initGitRepo(repoDir);
+
+  let resolveProjectCalled = 0;
+  const resolveProject = (pid: string): any => {
+    resolveProjectCalled++;
+    if (pid === "proj-off") {
+      return { excluded: false, specBeforeCode: false };
+    }
+    return { excluded: false, specBeforeCode: true };
+  };
+
+  // 1. runRunQueue passes resolveProject to verifySpecBeforeCodeGate
+  store.insertTask({
+    taskKey: "TASK-PROJ-OFF",
+    projectId: "proj-off",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  });
+
+  const qRes = await runRunQueue({
+    store,
+    cmd,
+    repoRoot: repoDir,
+    mergeBaseBranch: "main",
+    workGraphMode: "shadow",
+    autoAdvance: true,
+    policy: null,
+    resolveProject,
+  } as any);
+
+  assert.ok(resolveProjectCalled > 0, "runRunQueue must call resolveProject");
+  const taskAfter = store.getTask("TASK-PROJ-OFF");
+  assert.equal(taskAfter?.node, "code", "Task with specBeforeCode: false bypassed gate and advanced to code");
+
+  // 2. runDelegate passes resolveProject to verifySpecBeforeCodeGate
+  const resolveProjectDelegateCalls: string[] = [];
+  const fakePolicy = parsePolicy(POLICY_TEXT);
+  const delRes = await runDelegate(
+    {
+      taskKey: "TASK-PROJ-OFF",
+      level: "simple",
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinate work",
+        originPluginId: null,
+        projectId: "proj-off",
+      },
+    },
+    {
+      store,
+      loadPolicy: async () => fakePolicy,
+      probes: {
+        roleByThreadId: () => undefined,
+        delegationByThreadId: (id: number) => store.byThreadId(String(id)),
+        hasFreshDispatching: () => false,
+      },
+      threads: {
+        spawn: async () => ({ id: "thr_exec_off" }),
+        list: async () => [],
+        getPluginMetadata: async () => null,
+        update: async () => ({}),
+        stop: async () => ({}),
+        updatePluginMetadata: async () => ({}),
+      },
+      workGraphMode: () => "shadow",
+      resolveProject: (pid: string) => {
+        resolveProjectDelegateCalls.push(pid);
+        return { excluded: false, specBeforeCode: false };
+      },
+      repoRoot: repoDir,
+      cmd,
+      bbCli: {
+        run: async (args: string[]) => {
+          const key = args.join(" ");
+          if (key.startsWith("tasks show")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                task: { id: "t1", key: args[2] ?? "TASK-PROJ-OFF", title: "Task", description: "desc", status: "todo" },
+                project: { linkedBbProjectId: "proj-off" },
+              }),
+              stderr: "",
+            };
+          }
+          if (key.startsWith("tasks preset show")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                preset: {
+                  providerId: "acp-opencode",
+                  modelId: "m1",
+                  reasoningLevel: "medium",
+                  serviceTier: null,
+                  permissionMode: "full",
+                  environmentKind: "project-default",
+                  instructions: "",
+                },
+              }),
+              stderr: "",
+            };
+          }
+          if (key.startsWith("thread show")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({ thread: { parentThreadId: "thr_coord", visibility: "hidden" } }),
+              stderr: "",
+            };
+          }
+          return { exitCode: 0, stdout: "{}", stderr: "" };
+        },
+      } as any,
+      unavailableRoutes: new Set(),
+      policy: fakePolicy,
+    } as any,
+  );
+
+  assert.ok(resolveProjectDelegateCalls.includes("proj-off"), "runDelegate must call resolveProject with task's projectId");
+  assert.ok(delRes.delegationId, "delegation succeeded because specBeforeCode: false was resolved");
+});

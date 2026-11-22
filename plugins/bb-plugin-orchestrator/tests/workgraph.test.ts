@@ -2910,7 +2910,7 @@ test("§34.5 (ADR-0037 / Reviewer Non-blocker 4 & 5): startQueuedTask with isOnl
   await cmd.run("git", ["branch", branch, "main"], { cwd: tmpRepo });
 
   const normKey = "TEST-ONLY-ACC";
-  const content = "## Тесты договора приёмки\n```bash\nnpm test tests/new.test.ts\n```\n";
+  const content = "Kind: mechanical\nBasis: Routine test maintenance\n\n## Тесты договора приёмки\n```bash\nnpm test tests/new.test.ts\n```\n";
   const accSha1 = await commitAcceptanceContract(cmd, tmpRepo, branch, normKey, content);
 
   // Non-blocker 5: Calling commitAcceptanceContract again with identical content returns the same SHA without committing again!

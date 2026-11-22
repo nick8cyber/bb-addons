@@ -4517,7 +4517,7 @@ export class DelegationStore {
     const info = this.db
       .prepare(
         `UPDATE task_spec_contracts
-         SET approval_id = NULL, updated_at = ?
+         SET approval_id = NULL, spec_sha = NULL, updated_at = ?
          WHERE task_key = ?`,
       )
       .run(now, key);
@@ -4592,7 +4592,7 @@ export class DelegationStore {
       if (delEvent) {
         try {
           const p = JSON.parse(delEvent.payload);
-          if (p.verdict === "OK" && (p.blockers === 0 || p.blockers === undefined)) {
+          if (p.verdict === "OK" && p.blockers === 0) {
             return {
               delegation: rev,
               reviewedSha: revSha,

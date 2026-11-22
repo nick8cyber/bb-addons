@@ -452,6 +452,7 @@ test("7) Тест на смешанную очередь: одновременн
       route: "simple",
       level: "simple",
       confirmationMode: "auto",
+      payload: JSON.stringify({ acceptance_text: "Kind: mechanical\nBasis: Strict test maintenance" }),
     },
     t0,
   );
@@ -587,6 +588,7 @@ test("runRunQueue: задачи проектов в режиме 'off' не пр
       route: "simple",
       level: "simple",
       confirmationMode: "auto",
+      payload: JSON.stringify({ acceptance_text: "Kind: mechanical\nBasis: Strict maintenance" }),
     },
     t0,
   );
@@ -992,7 +994,7 @@ test("connected server run-queue resolver: недоступный контекс
     confirmationMode: "auto",
     route: "simple",
     level: "simple",
-    payload: JSON.stringify({ acceptance_text: "Valid project task criteria" }),
+    payload: JSON.stringify({ acceptance_text: "Kind: mechanical\nBasis: Valid project task criteria" }),
   });
 
   // Call run-queue with a caller cwd pointing to a fake process dir

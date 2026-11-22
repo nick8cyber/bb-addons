@@ -625,7 +625,7 @@ test("5в Honest path: complete pipeline start -> done across all nodes", async 
     "--mode",
     "auto",
     "--acceptance",
-    "Pass tests",
+    "Kind: mechanical\nBasis: Pass tests",
     "--json",
   ]);
 
@@ -699,7 +699,7 @@ test("5в Failure: executor stalled/failed/quota transitions to stalled, zero-co
     "--mode",
     "auto",
     "--acceptance",
-    "Criteria",
+    "Kind: mechanical\nBasis: Criteria",
     "--json",
   ]);
 
@@ -777,7 +777,7 @@ test("5в Step skip: strict mode blocks direct delegate, merge, and release", as
     "--route",
     "simple",
     "--acceptance",
-    "Criteria",
+    "Kind: mechanical\nBasis: Criteria",
     "--json",
   ]);
 
@@ -819,7 +819,7 @@ test("5в Checks failure: failing checks test loops back to code and blocks afte
     level: "simple",
     priority: 10,
     confirmationMode: "auto",
-    payload: JSON.stringify({ acceptance_text: "Checks failure loop acceptance criteria" }),
+    payload: JSON.stringify({ acceptance_text: "Kind: mechanical\nBasis: Checks failure loop acceptance criteria" }),
   });
 
   // start -> code
