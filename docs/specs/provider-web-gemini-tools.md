@@ -2,7 +2,7 @@
 title: provider-web-gemini-tools — Инструменты чтения для веб-провайдера Gemini
 status: approved
 owner: coordinator
-date: 2026-11-21
+date: 2026-11-22
 revision: 10 (r10 — лимиты хода переведены на фазовую модель r29: SEND_DEADLINE для негенерационных стадий, SESSION_CAP как потолок генерации, STALL_MS как детект no-progress; PLUG-371)
 tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini, tools]
 ---
