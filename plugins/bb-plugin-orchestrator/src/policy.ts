@@ -84,6 +84,8 @@ export interface Policy {
   checks?: PolicyChecksConfig;
   /** §31.7 (r34.2): Configuration for route limits on fix/simple routes. */
   routeLimits?: RouteLimitsConfig;
+  /** §31.9 (ADR-0032): spec-before-code gate enforcement flag */
+  specBeforeCode?: boolean;
 }
 
 /** §31.7: Route boundaries configuration for fix and simple routes. */
@@ -807,6 +809,7 @@ export function parsePolicy(
         : {}),
       ...(checks && Object.keys(checks).length > 0 ? { checks } : {}),
       ...(routeLimits && Object.keys(routeLimits).length > 0 ? { routeLimits } : {}),
+      ...(typeof raw.specBeforeCode === "boolean" ? { specBeforeCode: raw.specBeforeCode } : {}),
       levels,
       routes,
     },

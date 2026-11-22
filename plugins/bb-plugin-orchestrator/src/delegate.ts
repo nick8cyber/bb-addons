@@ -945,47 +945,40 @@ export async function dispatchToRoute(
   // §31.9 (ADR-0032): Unified check before code launch across all routes / reissues / fallbacks
   if (role === "executor" && !row.no_code) {
     const taskRow = store.getTask(row.task_key);
-    const isVerificationNode =
-      taskRow?.node === "release" ||
-      taskRow?.node === "checks" ||
-      taskRow?.node === "review" ||
-      Boolean(store.activeReleaseByTask(row.task_key));
-    if (!isVerificationNode) {
-      const mode =
-        typeof deps.workGraphMode === "function"
-          ? (deps.workGraphMode as any)(row.project_id)
-          : deps.workGraphMode;
-      const taskRepoRoot =
-        deps.repoRoot ??
-        (deps.resolveRepoRoot ? await deps.resolveRepoRoot(row) : undefined);
-      const effectiveProj = row.project_id ?? taskRow?.project_id;
-      const proj = effectiveProj && deps.resolveProject
-        ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
-        : (deps.project ?? null);
-      try {
-        await verifySpecBeforeCodeGate({
-          taskKey: row.task_key,
-          role,
-          noCode: Boolean(row.no_code),
-          level: row.level,
-          store,
-          cmd: deps.cmd,
-          policy,
-          project: proj,
-          preparedBaseSha: opts.from,
-          workGraphMode: mode,
-          specBeforeCode: opts.specBeforeCode,
-          repoRoot: taskRepoRoot,
-          task: taskRow,
-        });
-      } catch (err: any) {
-        if (err?.code === "spec-gate-violation") {
-          if (opts.onDispatchFailure === "fail") {
-            store.setStatus(row.id, "failed");
-          }
+    const mode =
+      typeof deps.workGraphMode === "function"
+        ? (deps.workGraphMode as any)(row.project_id)
+        : deps.workGraphMode;
+    const taskRepoRoot =
+      deps.repoRoot ??
+      (deps.resolveRepoRoot ? await deps.resolveRepoRoot(row) : undefined);
+    const effectiveProj = row.project_id ?? taskRow?.project_id;
+    const proj = effectiveProj && deps.resolveProject
+      ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
+      : (deps.project ?? null);
+    try {
+      await verifySpecBeforeCodeGate({
+        taskKey: row.task_key,
+        role,
+        noCode: Boolean(row.no_code),
+        level: row.level,
+        store,
+        cmd: deps.cmd,
+        policy,
+        project: proj,
+        preparedBaseSha: opts.from,
+        workGraphMode: mode,
+        specBeforeCode: opts.specBeforeCode,
+        repoRoot: taskRepoRoot,
+        task: taskRow,
+      });
+    } catch (err: any) {
+      if (err?.code === "spec-gate-violation") {
+        if (opts.onDispatchFailure === "fail") {
+          store.setStatus(row.id, "failed");
         }
-        throw err;
       }
+      throw err;
     }
   }
 

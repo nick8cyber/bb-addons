@@ -65,7 +65,7 @@ import {
 import { DEFAULT_HANDOFF_PATH } from "./roles.js";
 import { isPluginUiFile, pluginNameForPaths } from "./staged.js";
 import { T_RU, type T } from "./i18n/index.js";
-import { verifySpecBeforeCodeGate } from "./spec-gate.js";
+import { resolveTaskSpecContract } from "./spec-gate.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
 export const BUILTIN_QUOTA_PATTERNS = [
@@ -985,34 +985,29 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (nextName && nextRoute) {
       const role = levelRole(info.policy, row.level);
       if (role === "executor" && !row.no_code) {
-        try {
-          const mode = typeof (deps as any).workGraphMode === "function"
-            ? (deps as any).workGraphMode(row.project_id)
-            : (deps as any).workGraphMode;
-          await verifySpecBeforeCodeGate({
-            taskKey: row.task_key,
-            role,
-            noCode: Boolean(row.no_code),
-            level: row.level,
-            store,
-            cmd: (deps as any).cmd,
-            repoRoot: (deps as any).repoRoot ?? (deps as any).cachedPumpRepoRoot ?? process.cwd(),
-            policy: info.policy,
+        const mode = typeof (deps as any).workGraphMode === "function"
+          ? (deps as any).workGraphMode(row.project_id)
+          : (deps as any).workGraphMode;
+        if (mode === "strict" || mode === "shadow") {
+          const taskRow = store.getTask(row.task_key);
+          const contract = resolveTaskSpecContract(row.task_key, store, {
             workGraphMode: mode,
-            task: store.getTask(row.task_key),
+            task: taskRow,
           });
-        } catch (gateErr) {
-          store.addSetupError(row.id, "spec-before-code-gate", message(gateErr));
-          await report(
-            row,
-            t("wd.reissueRefused", {
-              outcome: outcomeText,
-              task: row.task_key,
-              next: nextName,
-              error: message(gateErr),
-            }),
-          );
-          return;
+          if (!contract || !contract.approvalId || !contract.approvalId.startsWith("appr:")) {
+            const errMsg = `spec-gate-violation: задача ${row.task_key} не имеет согласованного договора спецификации`;
+            store.addSetupError(row.id, "spec-before-code-gate", errMsg);
+            await report(
+              row,
+              t("wd.reissueRefused", {
+                outcome: outcomeText,
+                task: row.task_key,
+                next: nextName,
+                error: errMsg,
+              }),
+            );
+            return;
+          }
         }
       }
 

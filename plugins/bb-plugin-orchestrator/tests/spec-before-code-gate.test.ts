@@ -2389,3 +2389,82 @@ test("§31.9 Opus Audit Round 6 Blocker 4 / R6-6: multi-doc spec commit stores a
     "ADR deleted / 2nd spec changed at merge must block release",
   );
 });
+
+test("§31.9 Opus Audit Round 7 Blocker 1 / R7-1: multi-doc owner-approved spec passes pre-code gate on unchanged base", async () => {
+  const d = makeTempDir("orch-r7-multi-");
+  const { run, cmd } = initGitRepo(d);
+  mkdirSync(join(d, "docs/specs/acceptance"), { recursive: true });
+  mkdirSync(join(d, "docs/adr"), { recursive: true });
+  writeFileSync(join(d, "docs/specs/acceptance/F-1.md"), "acc\n");
+  run(["add", "."]); run(["commit", "-qm", "acc"]);
+  const A = run(["rev-parse", "HEAD"]).trim();
+  writeFileSync(join(d, "docs/adr/0001-x.md"), "adr\n");
+  writeFileSync(join(d, "docs/specs/a-graph.md"), "a\n");
+  writeFileSync(join(d, "docs/specs/b-release.md"), "b\n");
+  run(["add", "."]); run(["commit", "-qm", "spec"]);
+  const S = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:"); for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  store.insertTask({ taskKey: "F-1", projectId: "p1", coordinatorThreadId: "thr_c", route: "feature", level: "complex", confirmationMode: "manual" } as any);
+  store.updateTask("F-1", { node: "owner_gate", status: "waiting_approval", spec_sha: S, acceptance_sha: A, payload: JSON.stringify({ acceptance_text: "free text", spec_sha: S }) } as any);
+  await runApprove("F-1", "ok", { store, ctx: { cwd: d, isOwner: true, projectId: "p1" } as any, workGraphMode: "shadow", now: () => 1000 } as any);
+
+  store.updateTask("F-1", { node: "code", status: "running" } as any);
+  // Pre-code gate must PASS without throwing spec-gate-violation for multi-file spec
+  await assert.doesNotReject(
+    verifySpecBeforeCodeGate({
+      taskKey: "F-1",
+      role: "executor",
+      level: "complex",
+      store,
+      cmd,
+      repoRoot: d,
+      baseSha: S,
+      workGraphMode: "shadow",
+      task: store.getTask("F-1"),
+    }),
+  );
+});
+
+test("§31.9 Opus Audit Round 7 Blocker 2 / R7-2: watchdog reissue checks contract without failing on missing cmd", async () => {
+  const db = new Database(":memory:"); for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // 1. Task without approved contract in shadow mode: has no valid approvalId
+  store.insertTask({ taskKey: "NO-CONTRACT", projectId: "p1", coordinatorThreadId: "thr_c", route: "feature", level: "complex", confirmationMode: "manual" } as any);
+  const noContract = resolveTaskSpecContract("NO-CONTRACT", store, { workGraphMode: "shadow" });
+  assert.ok(!noContract?.approvalId, "task without approved contract must have no approvalId");
+
+  // 2. Task with valid approved contract: returns contract
+  store.insertTask({ taskKey: "OK-CONTRACT", projectId: "p1", coordinatorThreadId: "thr_c", route: "feature", level: "complex", confirmationMode: "manual" } as any);
+  store.saveSpecContract({ taskKey: "OK-CONTRACT", kind: "behavior_change", specPath: "docs/specs/a.md", approvalId: "appr:p1:OK-CONTRACT:base:1" }, 1);
+  const okContract = resolveTaskSpecContract("OK-CONTRACT", store, { workGraphMode: "shadow" });
+  assert.ok(okContract, "task with contract must resolve");
+  assert.equal(okContract?.approvalId, "appr:p1:OK-CONTRACT:base:1");
+});
+
+test("§31.9 Opus Audit Round 7 Blocker 3 / R7-3: executor gate on task at node=release without contract is rejected", async () => {
+  const db = new Database(":memory:"); for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  store.insertTask({ taskKey: "R-1", projectId: "p1", coordinatorThreadId: "thr_c", route: "feature", level: "complex", confirmationMode: "auto" } as any);
+  store.updateTask("R-1", { node: "release", status: "running" } as any);
+
+  // Even when task is at node=release, an executor without contract MUST be rejected
+  await assert.rejects(
+    verifySpecBeforeCodeGate({ taskKey: "R-1", role: "executor", level: "complex", store, cmd: undefined, repoRoot: "", workGraphMode: "shadow", task: store.getTask("R-1") }),
+    /spec-gate-violation/,
+    "executor at release node without contract must be rejected",
+  );
+});
+
+test("§31.9 Opus Audit Round 7 Non-blocker 7 / R7-4: sectionExistsInMarkdown requires heading or symbol, ignores substring in text", async () => {
+  const { sectionExistsInMarkdown } = await import("../src/spec-gate.js");
+  const docWithHeading = "# Title\n\n## §2 Core Requirements\n\nSome text.";
+  const docWithBareHeading = "# Title\n\n## 2 Core Requirements\n\nSome text.";
+  const docWithRandomNumber = "# Title\n\nHere is 200 items and error code 2 in a sentence.\n";
+
+  assert.equal(sectionExistsInMarkdown(docWithHeading, "§2"), true, "matches ## §2");
+  assert.equal(sectionExistsInMarkdown(docWithBareHeading, "§2"), true, "matches ## 2");
+  assert.equal(sectionExistsInMarkdown(docWithRandomNumber, "§2"), false, "must NOT match random number 2 in paragraph");
+});
