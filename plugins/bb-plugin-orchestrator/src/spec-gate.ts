@@ -257,30 +257,33 @@ export function resolveTaskSpecContract(
         specSha: sha,
         specSection,
         mechanicalBasis: mechBasis,
-        approvalId: pl?.approval_id ?? pl?.approvalId ?? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${sha.slice(0, 12)}:${taskRow.created_at || 1}`,
+        approvalId: pl?.approval_id ?? pl?.approvalId ?? `appr:transition:${taskRow.project_id ?? "proj"}:${normKey}:${sha}:${taskRow.created_at || 1}`,
       };
     }
   }
 
   // 5. From existing delegations and review evidence (legacy / manual tasks where task_queue row doesn't exist)
-  const normKey = normalizeTaskKey(taskKey);
-  const targetSha =
-    params?.targetSha ??
-    params?.publishedSha ??
-    params?.preparedBaseSha ??
-    params?.baseSha;
-  const acceptedReview = (store as any).getLatestAcceptedReview?.(normKey, targetSha);
-  if (acceptedReview) {
-    const revSha = acceptedReview.reviewedSha;
-    const projId = acceptedReview.delegation.project_id ?? "proj";
-    const approvalId = `appr:transition:${projId}:${normKey}:${revSha.slice(0, 12)}:${acceptedReview.delegation.created_at || 1}`;
-    return {
-      kind: "mechanical",
-      projectId: projId,
-      mechanicalBasis: `Accepted review on ${revSha} (delegation #${acceptedReview.delegation.id})`,
-      specSha: revSha,
-      approvalId,
-    };
+  // Only allowed during release verification, never for code execution (§31.9)
+  if (params?.forRelease) {
+    const normKey = normalizeTaskKey(taskKey);
+    const targetSha =
+      params?.targetSha ??
+      params?.publishedSha ??
+      params?.preparedBaseSha ??
+      params?.baseSha;
+    const acceptedReview = (store as any).getLatestAcceptedReview?.(normKey, targetSha);
+    if (acceptedReview) {
+      const revSha = acceptedReview.reviewedSha;
+      const projId = acceptedReview.delegation.project_id ?? "proj";
+      const approvalId = `appr:transition:${projId}:${normKey}:${revSha}:${acceptedReview.delegation.created_at || 1}`;
+      return {
+        kind: "mechanical",
+        projectId: projId,
+        mechanicalBasis: `Accepted review on ${revSha} (delegation #${acceptedReview.delegation.id})`,
+        specSha: revSha,
+        approvalId,
+      };
+    }
   }
 
   return null;
@@ -460,14 +463,24 @@ export async function verifySpecBeforeCodeGate(
       contract.specSha &&
       apprSha !== "base" &&
       apprSha !== "sha" &&
-      /^[0-9a-fA-F]{4,40}$/.test(apprSha) &&
-      !contract.specSha.toLowerCase().startsWith(apprSha.toLowerCase()) &&
-      !apprSha.toLowerCase().startsWith(contract.specSha.slice(0, 12).toLowerCase())
+      /^[0-9a-fA-F]{4,40}$/.test(apprSha)
     ) {
-      throw new OrchestratorError(
-        "spec-gate-violation",
-        `spec-gate-violation: принятие ${contract.approvalId} привязано к другой редакции спецификации (${apprSha} !== ${contract.specSha.slice(0, 12)})`,
-      );
+      const cleanAppr = apprSha.toLowerCase();
+      const cleanSpec = contract.specSha.toLowerCase();
+      if (cleanAppr !== cleanSpec) {
+        if (cleanAppr.length === 40 && cleanSpec.length === 40) {
+          throw new OrchestratorError(
+            "spec-gate-violation",
+            `spec-gate-violation: принятие ${contract.approvalId} привязано к другой редакции спецификации (${apprSha} !== ${contract.specSha})`,
+          );
+        }
+        if (!cleanSpec.startsWith(cleanAppr) && !cleanAppr.startsWith(cleanSpec)) {
+          throw new OrchestratorError(
+            "spec-gate-violation",
+            `spec-gate-violation: принятие ${contract.approvalId} привязано к другой редакции спецификации (${apprSha} !== ${contract.specSha})`,
+          );
+        }
+      }
     }
   }
 
@@ -762,6 +775,7 @@ export async function verifyReleaseDocumentsGate(
     resolveTaskSpecContract(input.taskKey, input.store, undefined, {
       ...input,
       targetSha: input.publishedSha,
+      forRelease: true,
     });
 
   const enforced = isSpecBeforeCodeEnforced({
@@ -799,14 +813,24 @@ export async function verifyReleaseDocumentsGate(
         apprSha !== "base" &&
         apprSha !== "sha" &&
         /^[0-9a-fA-F]{4,40}$/.test(apprSha) &&
-        input.publishedSha &&
-        !input.publishedSha.toLowerCase().startsWith(apprSha.toLowerCase()) &&
-        !apprSha.toLowerCase().startsWith(input.publishedSha.slice(0, 8).toLowerCase())
+        input.publishedSha
       ) {
-        throw new OrchestratorError(
-          "spec-gate-violation",
-          `spec-gate-violation: принятие ${contract.approvalId} привязано к коммиту ${apprSha}, а публикуется другой коммит ${input.publishedSha.slice(0, 8)}`,
-        );
+        const cleanAppr = apprSha.toLowerCase();
+        const cleanPub = input.publishedSha.toLowerCase();
+        if (cleanAppr !== cleanPub) {
+          if (cleanAppr.length === 40 && cleanPub.length === 40) {
+            throw new OrchestratorError(
+              "spec-gate-violation",
+              `spec-gate-violation: принятие ${contract.approvalId} привязано к коммиту ${apprSha}, а публикуется другой коммит ${input.publishedSha}`,
+            );
+          }
+          if (!cleanPub.startsWith(cleanAppr) && !cleanAppr.startsWith(cleanPub)) {
+            throw new OrchestratorError(
+              "spec-gate-violation",
+              `spec-gate-violation: принятие ${contract.approvalId} привязано к коммиту ${apprSha}, а публикуется другой коммит ${input.publishedSha}`,
+            );
+          }
+        }
       }
     }
   }

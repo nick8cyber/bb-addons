@@ -45,6 +45,7 @@ import {
   type DelegationRow,
   type DelegationStore,
 } from "./store.js";
+import type { ResolvedProject } from "./release-config.js";
 import {
   isCoordinator,
   isR33NewThread,
@@ -247,6 +248,10 @@ export interface DelegateDeps {
   workGraphMode?: WorkGraphMode | ((projectId?: string) => WorkGraphMode);
   repoRoot?: string;
   resolveRepoRoot?: (row: DelegationRow) => Promise<string | undefined>;
+  project?: ResolvedProject | null;
+  resolveProject?: (
+    projectId: string,
+  ) => Promise<ResolvedProject | null> | ResolvedProject | null;
 }
 
 /**
@@ -281,6 +286,10 @@ export interface DispatchStepsDeps {
   workGraphMode?: WorkGraphMode | ((projectId?: string) => WorkGraphMode);
   repoRoot?: string;
   resolveRepoRoot?: (row: DelegationRow) => Promise<string | undefined>;
+  project?: ResolvedProject | null;
+  resolveProject?: (
+    projectId: string,
+  ) => Promise<ResolvedProject | null> | ResolvedProject | null;
 }
 
 export interface DispatchStepsResult {
@@ -710,6 +719,10 @@ export async function runDelegate(
       typeof deps.workGraphMode === "function"
         ? (deps.workGraphMode as any)(params.caller.projectId)
         : deps.workGraphMode;
+    const effectiveProj = params.caller.projectId ?? taskRow?.project_id;
+    const proj = effectiveProj && deps.resolveProject
+      ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
+      : (deps.project ?? null);
     await verifySpecBeforeCodeGate({
       taskKey,
       role,
@@ -719,6 +732,7 @@ export async function runDelegate(
       store,
       cmd: deps.cmd,
       policy,
+      project: proj,
       preparedBaseSha: params.from,
       workGraphMode: mode,
       specBeforeCode: params.specBeforeCode,
@@ -970,6 +984,10 @@ export async function dispatchToRoute(
       const taskRepoRoot =
         deps.repoRoot ??
         (deps.resolveRepoRoot ? await deps.resolveRepoRoot(row) : undefined);
+      const effectiveProj = row.project_id ?? taskRow?.project_id;
+      const proj = effectiveProj && deps.resolveProject
+        ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
+        : (deps.project ?? null);
       try {
         await verifySpecBeforeCodeGate({
           taskKey: row.task_key,
@@ -980,6 +998,7 @@ export async function dispatchToRoute(
           store,
           cmd: deps.cmd,
           policy,
+          project: proj,
           preparedBaseSha: opts.from,
           workGraphMode: mode,
           specBeforeCode: opts.specBeforeCode,

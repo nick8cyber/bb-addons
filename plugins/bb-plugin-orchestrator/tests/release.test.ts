@@ -574,7 +574,10 @@ function makeDeps(repo: string, overrides: Partial<{
     continueFrom: RESULT_SHA,
   });
   store.setThreadInfo(rev.id, "thr_rev");
-  store.setStatus(rev.id, "done");
+  store.setStatus(rev.id, "running");
+  store.setStatusIf(rev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
   /** Re-bind a review's sha — merged tests point it at `merged_sha`. */
   const bindReview = (sha: string, id = rev.id) =>
     db.prepare("UPDATE delegations SET continue_from = ? WHERE id = ?")

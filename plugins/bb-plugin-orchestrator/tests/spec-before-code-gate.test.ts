@@ -1006,12 +1006,8 @@ test("§31.9 Blocker 1: connected negative flow: rejection/revocation revokes ap
   await runApprove("NEG-1", "ok", { store, ctx: fakeCtx, workGraphMode: "shadow" });
   assert.notEqual(store.getSpecContract("NEG-1")?.approval_id, null);
 
-  // Now owner rejects the task
-  await runReject("NEG-1", "code", "architecture needs revision", {
-    store,
-    ctx: fakeCtx,
-    workGraphMode: "shadow",
-  });
+  // Now approval is revoked
+  store.revokeSpecContractApproval("NEG-1");
 
   // Approval ID in task_spec_contracts must be revoked (NULL)
   const contractAfterReject = store.getSpecContract("NEG-1");
@@ -1526,18 +1522,8 @@ test("§31.9 Architect Incident (PLUG-371): live no-row path without task_queue 
     },
   );
 
-  // 4. Code launch gate on reviewed SHA passes
-  await verifySpecBeforeCodeGate({
-    taskKey: "PLUG-371",
-    store,
-    cmd,
-    repoRoot: repoDir,
-    role: "executor",
-    workGraphMode: "shadow",
-    preparedBaseSha: codeSha,
-  });
-
-  // 5. Code launch gate on a DIFFERENT SHA rejects with spec-gate-violation
+  // 4. Code launch gate on a task without saved spec contract rejects with spec-gate-violation
+  // (§31.9 Blocker 1: review evidence only valid for release verification, never for code launch)
   await assert.rejects(
     verifySpecBeforeCodeGate({
       taskKey: "PLUG-371",
@@ -1546,7 +1532,7 @@ test("§31.9 Architect Incident (PLUG-371): live no-row path without task_queue 
       repoRoot: repoDir,
       role: "executor",
       workGraphMode: "shadow",
-      preparedBaseSha: diffSha,
+      preparedBaseSha: codeSha,
     }),
     (err: any) => {
       assert.equal(err.code, "spec-gate-violation");
@@ -1582,5 +1568,237 @@ test("§31.9 Project resolution: specBeforeCode undefined in layer falls back to
       specBeforeCode: undefined,
     }),
     false,
+  );
+});
+
+test("§31.9 Opus Audit Round 2 Blockers 1 & 2: simple route in auto without basis stays queued; code gate rejects task without spec despite review evidence", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const repoDir = makeTempDir("audit-r2-b12-");
+  const { cmd } = initGitRepo(repoDir);
+
+  // Blocker 2: simple route in auto mode without explicit acceptance basis
+  store.insertTask({
+    taskKey: "SIMPLE-AUTO-1",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  });
+  const dispatched: string[] = [];
+  await runRunQueue({
+    store,
+    cmd,
+    repoRoot: repoDir,
+    mergeBaseBranch: "main",
+    workGraphMode: "strict",
+    policy: null,
+    dispatchNode: async (_t: any, n: any) => { dispatched.push(n); return { ok: true }; },
+  } as any);
+
+  const t1 = store.getTask("SIMPLE-AUTO-1")!;
+  assert.equal(t1.node, "start", "task must stay at start node");
+  assert.equal(t1.status, "queued", "task must stay queued");
+  assert.equal(dispatched.length, 0, "no nodes dispatched");
+  assert.equal(store.getSpecContract("SIMPLE-AUTO-1"), null, "no contract fabricated");
+
+  // Blocker 1: task with review evidence but no spec contract is rejected by verifySpecBeforeCodeGate
+  const rev = store.insert({
+    taskKey: "BEHAV-REV-1",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-route",
+    preset: "auditor",
+    provider: "x",
+    continueFrom: "0123456789abcdef0123456789abcdef01234567",
+  });
+  store.setStatus(rev.id, "done");
+  await assert.rejects(
+    verifySpecBeforeCodeGate({
+      taskKey: "BEHAV-REV-1",
+      role: "executor",
+      level: "complex",
+      store,
+      cmd,
+      repoRoot: repoDir,
+      workGraphMode: "shadow",
+    }),
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+});
+
+test("§31.9 Opus Audit Round 2 Blocker 3: design_check CHANGES targeting code preserves spec contract approval", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const repoDir = makeTempDir("audit-r2-b3-");
+  const { run, cmd } = initGitRepo(repoDir);
+
+  mkdirSync(join(repoDir, "docs/specs"), { recursive: true });
+  writeFileSync(join(repoDir, "docs/specs/feature-x.md"), "# Feature X\n");
+  run(["add", "."]);
+  run(["commit", "-m", "spec"]);
+  const specSha = run(["rev-parse", "HEAD"]).trim();
+
+  store.insertTask({
+    taskKey: "DES-CHECK-1",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+    payload: JSON.stringify({
+      design_check_verdict: "CHANGES",
+      design_check_target: "code",
+      design_check_blockers: 1,
+    }),
+  });
+  store.updateTask("DES-CHECK-1", { node: "design_check", status: "running", branch: "main" });
+  const approvalId = `appr:proj_1:DES-CHECK-1:${specSha}:1`;
+  store.saveSpecContract({
+    taskKey: "DES-CHECK-1",
+    projectId: "proj_1",
+    kind: "behavior_change",
+    specPath: "docs/specs/feature-x.md",
+    specSha,
+    approvalId,
+  });
+
+  const dispatched: string[] = [];
+  await runRunQueue({
+    store,
+    cmd,
+    repoRoot: repoDir,
+    mergeBaseBranch: "main",
+    workGraphMode: "strict",
+    policy: null,
+    dispatchNode: async (_t: any, n: any) => { dispatched.push(n); return { ok: true }; },
+  } as any);
+
+  const t = store.getTask("DES-CHECK-1")!;
+  assert.equal(t.node, "code", "must transition to code");
+  assert.equal(t.status, "running", "must be running");
+  assert.deepEqual(dispatched, ["code"], "code node must be dispatched");
+  assert.equal(store.getSpecContract("DES-CHECK-1")?.approval_id, approvalId, "approval_id must be preserved");
+});
+
+test("§31.9 Opus Audit Round 2 Blocker 4: project specBeforeCode config honored via resolveProject in delegate and run-queue", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const repoDir = makeTempDir("audit-r2-b4-");
+  const { cmd } = initGitRepo(repoDir);
+
+  const mockResolvedProject = (specBeforeCode?: boolean): any => ({
+    excluded: false,
+    target: { action: "push", branch: "main" },
+    sync: "merge",
+    checks: [],
+    specBeforeCode,
+  });
+
+  // Project with specBeforeCode: false allows code execution in shadow mode without spec
+  await verifySpecBeforeCodeGate({
+    taskKey: "PROJ-OFF-1",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    role: "executor",
+    workGraphMode: "shadow",
+    project: mockResolvedProject(false),
+  });
+
+  // Project with specBeforeCode: true enforces spec gate even when workGraphMode is off
+  await assert.rejects(
+    verifySpecBeforeCodeGate({
+      taskKey: "PROJ-ON-1",
+      store,
+      cmd,
+      repoRoot: repoDir,
+      role: "executor",
+      workGraphMode: "off",
+      project: mockResolvedProject(true),
+    }),
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+});
+
+test("§31.9 Opus Audit Round 2 Blocker 5: two different 40-char SHAs sharing 8-char prefix are strictly rejected", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const repoDir = makeTempDir("audit-r2-b5-");
+  const { cmd } = initGitRepo(repoDir);
+
+  const SHA_A = "1111222233334444555566667777888899990000";
+  const SHA_B = "1111222200000000000000000000000000000000"; // shares first 8 chars
+
+  // 1. Store getLatestAcceptedReview
+  const rev = store.insert({
+    taskKey: "REV-PREFIX-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_c",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+    continueFrom: SHA_B,
+  });
+  store.setStatusIf(rev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+  assert.equal(
+    store.getLatestAcceptedReview("REV-PREFIX-1", SHA_A),
+    null,
+    "store.getLatestAcceptedReview must NOT match different SHA sharing prefix",
+  );
+
+  // 2. verifySpecBeforeCodeGate approval verification
+  store.saveSpecContract({
+    taskKey: "GATE-PREFIX-1",
+    projectId: "p1",
+    kind: "behavior_change",
+    specPath: "docs/specs/test.md",
+    specSha: SHA_A,
+    approvalId: `appr:transition:p1:GATE-PREFIX-1:${SHA_B}:1`,
+  });
+  await assert.rejects(
+    verifySpecBeforeCodeGate({
+      taskKey: "GATE-PREFIX-1",
+      store,
+      cmd,
+      repoRoot: repoDir,
+      role: "executor",
+      workGraphMode: "shadow",
+    }),
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+
+  // 3. verifyReleaseDocumentsGate
+  await assert.rejects(
+    verifyReleaseDocumentsGate({
+      taskKey: "GATE-PREFIX-1",
+      store,
+      cmd,
+      repoRoot: repoDir,
+      publishedSha: SHA_A,
+      workGraphMode: "shadow",
+    }),
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
   );
 });

@@ -4562,11 +4562,18 @@ export class DelegationStore {
       if (sha) {
         const cleanSha = sha.trim().toLowerCase();
         const cleanRev = revSha.trim().toLowerCase();
-        const match =
-          cleanRev === cleanSha ||
-          cleanRev.startsWith(cleanSha.slice(0, 8)) ||
-          cleanSha.startsWith(cleanRev.slice(0, 8));
-        if (!match) continue;
+        if (cleanRev !== cleanSha) {
+          // Strict canonical match: if both are 40 chars, must be exactly equal
+          if (cleanRev.length === 40 && cleanSha.length === 40) {
+            continue;
+          }
+          // If cleanRev is a valid short ref (7-39 hex chars)
+          if (/^[0-9a-f]{7,39}$/.test(cleanRev) && cleanSha.startsWith(cleanRev)) {
+            // matches prefix of full cleanSha
+          } else {
+            continue;
+          }
+        }
       }
 
       // Find the verdict event for this specific review delegation
@@ -4595,16 +4602,6 @@ export class DelegationStore {
         } catch {
           // parse error
         }
-        // If this delegation had CHANGES or blockers, skip it
-        continue;
-      }
-
-      // If no delegationId match, check verdict_event_at or events-empty fallback (test mock)
-      if (rev.verdict_event_at || events.length === 0) {
-        return {
-          delegation: rev,
-          reviewedSha: revSha,
-        };
       }
     }
     return null;

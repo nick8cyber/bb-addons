@@ -1605,6 +1605,7 @@ export async function createPlugin(
         log: bb.log,
         workGraphMode: (pid?: string) => getWorkGraphMode(pid ?? taskPid),
         repoRoot: wtCtx?.repoRoot,
+        resolveProject: (pid: string) => releaseConfig.config ? resolveProject(releaseConfig.config, pid) : null,
       });
     });
 
@@ -1714,6 +1715,7 @@ export async function createPlugin(
       const wt = await resolveWorktreeContext(row.coordinator_thread_id, row.project_id ?? undefined, undefined).catch(() => null);
       return wt?.repoRoot;
     },
+    resolveProject: (pid: string) => releaseConfig.config ? resolveProject(releaseConfig.config, pid) : null,
   };
   const watchdogThreads: WatchdogThreads = {
     get: (a) => bb.sdk.threads.get(a),
@@ -1993,6 +1995,7 @@ export async function createPlugin(
       repoRoot,
       cmd,
       bbCli,
+      resolveProject: (pid: string) => releaseConfig.config ? resolveProject(releaseConfig.config, pid) : null,
       t,
       requestOwnerGateInteraction,
       log: bb.log,
@@ -4698,6 +4701,7 @@ abandoned: ${res.reported
             cmd: cmdRunner,
             bbCli,
             t,
+            resolveProject: (pid: string) => releaseConfig.config ? resolveProject(releaseConfig.config, pid) : null,
             requestOwnerGateInteraction,
             log: bb.log,
             resolveTaskRepoContext: async (task) => {
