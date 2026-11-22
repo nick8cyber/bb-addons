@@ -18,7 +18,7 @@
 В архитектуре BB строки интерфейса зашиты непосредственно в JSX-компоненты React, каталоги локалей отсутствуют. Плагин функционирует как контент-скрипт в контексте браузера:
 - Обходит текстовые узлы с помощью `TreeWalker`.
 - Подменяет текст узлов, строго совпавших со встроенным словарем (`DICTIONARY` в `src/dictionary.ts`, свыше 3100 словарных статей).
-- Отслеживает асинхронные перерисовки React через `MutationObserver` (наблюдение за `childList` и `characterData`).
+- Отслеживает асинхронные перерисовки React через `MutationObserver`: наблюдает `childList`, `characterData` и `attributes` (`attributeFilter: [...TRANSLATABLE_ATTRIBUTES]` по `src/translator.ts:116,128`) — иначе не работал бы перевод `aria-label`, `placeholder`, `title` и др.
 
 ### 2.2. Защита от циклов и полная обратимость (Revert)
 - Переводчик сохраняет оригинальные английские значения в `WeakMap<Text, string>` и `WeakMap<Element, Map<string, string | null>>`.
