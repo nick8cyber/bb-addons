@@ -40,7 +40,11 @@ import {
   type PolicyLoad,
   type PolicyRoute,
 } from "./policy.js";
-import type { DelegationRow, DelegationStore } from "./store.js";
+import {
+  normalizeTaskKey,
+  type DelegationRow,
+  type DelegationStore,
+} from "./store.js";
 import {
   isCoordinator,
   isR33NewThread,
@@ -240,8 +244,9 @@ export interface DelegateDeps {
   /** §18.1: human-facing texts — the language catalog. */
   t?: T;
   log?: { warn?: (msg: string) => void; info?: (msg: string) => void };
-  workGraphMode?: WorkGraphMode | (() => WorkGraphMode);
+  workGraphMode?: WorkGraphMode | ((projectId?: string) => WorkGraphMode);
   repoRoot?: string;
+  resolveRepoRoot?: (row: DelegationRow) => Promise<string | undefined>;
 }
 
 /**
@@ -273,8 +278,9 @@ export interface DispatchStepsDeps {
    * step needs the same filter as `pickRoute`. */
   unavailableRoutes?: () => ReadonlySet<string>;
   t?: T;
-  workGraphMode?: WorkGraphMode | (() => WorkGraphMode);
+  workGraphMode?: WorkGraphMode | ((projectId?: string) => WorkGraphMode);
   repoRoot?: string;
+  resolveRepoRoot?: (row: DelegationRow) => Promise<string | undefined>;
 }
 
 export interface DispatchStepsResult {
@@ -666,11 +672,31 @@ export async function runDelegate(
     taskRow?.node === "design_check";
   const effectiveNoCode = isArchitectNode ? true : (params.noCode ?? false);
 
+  // §31.9 (ADR-0032): If spec contract provided in params, persist it
+  if (params.specContract) {
+    const key = normalizeTaskKey(taskKey);
+    const existing = store.getSpecContract(key);
+    const now = deps.now ? deps.now() : Date.now();
+    const approvalId =
+      params.specContract.approvalId ??
+      existing?.approval_id ??
+      `appr:${params.caller.projectId}:${key}:${(params.specContract.specSha || "base").slice(0, 12)}:${now}`;
+    store.saveSpecContract(
+      {
+        ...params.specContract,
+        taskKey: key,
+        projectId: params.caller.projectId,
+        approvalId,
+      },
+      now,
+    );
+  }
+
   // §31.9 (ADR-0032): spec-before-code gate before creating delegation row
   if (role === "executor" && !effectiveNoCode) {
     const mode =
       typeof deps.workGraphMode === "function"
-        ? deps.workGraphMode()
+        ? (deps.workGraphMode as any)(params.caller.projectId)
         : deps.workGraphMode;
     await verifySpecBeforeCodeGate({
       taskKey,
@@ -920,8 +946,11 @@ export async function dispatchToRoute(
   if (role === "executor" && !row.no_code) {
     const mode =
       typeof deps.workGraphMode === "function"
-        ? deps.workGraphMode()
+        ? (deps.workGraphMode as any)(row.project_id)
         : deps.workGraphMode;
+    const taskRepoRoot =
+      deps.repoRoot ??
+      (deps.resolveRepoRoot ? await deps.resolveRepoRoot(row) : undefined);
     await verifySpecBeforeCodeGate({
       taskKey: row.task_key,
       role,
@@ -934,7 +963,7 @@ export async function dispatchToRoute(
       preparedBaseSha: opts.from,
       workGraphMode: mode,
       specBeforeCode: opts.specBeforeCode,
-      repoRoot: deps.repoRoot,
+      repoRoot: taskRepoRoot,
     });
   }
 

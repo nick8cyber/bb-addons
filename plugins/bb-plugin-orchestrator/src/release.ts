@@ -25,6 +25,7 @@ import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
 import { verifyReleaseDocumentsGate } from "./spec-gate.js";
+import type { WorkGraphMode } from "./workgraph.js";
 import {
   acquireCopyLock,
   restoreCopy,
@@ -235,6 +236,7 @@ export interface ReleaseDeps {
   hostname?: string;
   now?: () => number;
   markCoordinatorAction?: (threadId: string | undefined | null) => void;
+  workGraphMode?: WorkGraphMode | ((projectId?: string) => WorkGraphMode);
   log?: {
     info?(m: string): void;
     warn?(m: string): void;
@@ -2965,6 +2967,16 @@ async function runReleaseSteps(
     deps.store.addReleasePipelineShas(release.id, pipelineShas);
 
     // §2 / §31.9: verify accepted spec documents on exact postSyncSha
+    const effectiveWorkGraphMode =
+      typeof deps.workGraphMode === "function"
+        ? (deps.workGraphMode as any)(executor.project_id)
+        : deps.workGraphMode ??
+          (deps.stepsDeps?.workGraphMode
+            ? typeof deps.stepsDeps.workGraphMode === "function"
+              ? (deps.stepsDeps.workGraphMode as any)(executor.project_id)
+              : deps.stepsDeps.workGraphMode
+            : undefined);
+
     await verifyReleaseDocumentsGate({
       taskKey,
       store: deps.store,
@@ -2972,6 +2984,7 @@ async function runReleaseSteps(
       repoRoot: repo,
       publishedSha: postSyncSha,
       project,
+      workGraphMode: effectiveWorkGraphMode,
     });
     // §17.3 (ревью PLUG-214): the tip the gate vetted — the checks
     // window (up to CHECK_TIMEOUT_MS) is long enough for a revived

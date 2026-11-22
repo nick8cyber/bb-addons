@@ -27,7 +27,7 @@ import {
   normalizeTaskKey,
 } from "./store.js";
 import { verdictDetailsInBody } from "./release.js";
-import { verifySpecBeforeCodeGate } from "./spec-gate.js";
+import { verifySpecBeforeCodeGate, resolveTaskSpecContract } from "./spec-gate.js";
 import {
   checkRouteLimits,
   type RouteLimitsCheckResult,
@@ -1742,6 +1742,7 @@ export async function runReject(
         `не удалось отклонить задачу ${key}: конфликт CAS`,
       );
     }
+    deps.store.revokeSpecContractApproval(key, now);
     return { ok: true, task: res.task! };
   }
 
@@ -1786,6 +1787,7 @@ export async function runReject(
         `не удалось отклонить задачу ${key}: конфликт CAS`,
       );
     }
+    deps.store.revokeSpecContractApproval(key, now);
     return { ok: true, task: res.task! };
   }
 
@@ -2181,6 +2183,23 @@ export async function runApprove(
       "transition-failed",
       `не удалось одобрить задачу ${key}: конфликт CAS`,
     );
+  }
+
+  const approvedContract = resolveTaskSpecContract(key, deps.store, payloadObj, { task: res.task! });
+  if (approvedContract) {
+    const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
+    const approvalId = `appr:${task.project_id ?? "proj"}:${key}:${specSha.slice(0, 12)}:${now}`;
+    deps.store.saveSpecContract(
+      {
+        ...approvedContract,
+        taskKey: key,
+        projectId: task.project_id ?? undefined,
+        approvalId,
+      },
+      now,
+    );
+    payloadObj.approval_id = approvalId;
+    deps.store.updateTask(key, { payload: JSON.stringify(payloadObj) });
   }
 
   return { ok: true, task: res.task! };
@@ -4254,11 +4273,12 @@ export async function runRunQueue(
 
         if (res.allowed && res.toNode === "code") {
           try {
+            const tRepo = deps.resolveTaskRepoContext ? await Promise.resolve(deps.resolveTaskRepoContext(t)).catch(() => null) : null;
             await verifySpecBeforeCodeGate({
               taskKey: t.task_key,
               store: deps.store,
               cmd: deps.cmd,
-              repoRoot,
+              repoRoot: tRepo?.repoRoot ?? repoRoot,
               workGraphMode: deps.workGraphMode,
               policy: deps.policy,
               task: t,
@@ -4424,11 +4444,12 @@ export async function runRunQueue(
 
         if (t.node === "code" || wouldTrans?.to_node === "code") {
           try {
+            const tRepo = deps.resolveTaskRepoContext ? await Promise.resolve(deps.resolveTaskRepoContext(t)).catch(() => null) : null;
             await verifySpecBeforeCodeGate({
               taskKey: t.task_key,
               store: deps.store,
               cmd: deps.cmd,
-              repoRoot,
+              repoRoot: tRepo?.repoRoot ?? repoRoot,
               workGraphMode: deps.workGraphMode,
               policy: deps.policy,
               task: t,
@@ -6157,6 +6178,24 @@ async function advanceActiveTask(
           timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
         }, now);
         if (tr.ok && tr.task) {
+          if (verdict === "OK" && blockers === 0) {
+            const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
+            if (approvedContract) {
+              const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
+              const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha.slice(0, 12)}:${now}`;
+              deps.store.saveSpecContract(
+                {
+                  ...approvedContract,
+                  taskKey: task.task_key,
+                  projectId: task.project_id ?? undefined,
+                  approvalId,
+                },
+                now,
+              );
+            }
+          } else if (verdict === "CHANGES") {
+            deps.store.revokeSpecContractApproval(task.task_key, now);
+          }
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
           if (resolution.action?.dispatchNode) {
@@ -6831,6 +6870,24 @@ async function advanceActiveTask(
           timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
         }, now);
         if (tr.ok && tr.task) {
+          if (verdict === "OK" && blockers === 0) {
+            const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
+            if (approvedContract) {
+              const specSha = approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base";
+              const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha.slice(0, 12)}:${now}`;
+              deps.store.saveSpecContract(
+                {
+                  ...approvedContract,
+                  taskKey: task.task_key,
+                  projectId: task.project_id ?? undefined,
+                  approvalId,
+                },
+                now,
+              );
+            }
+          } else if (verdict === "CHANGES") {
+            deps.store.revokeSpecContractApproval(task.task_key, now);
+          }
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
           if (resolution.action?.dispatchNode) {

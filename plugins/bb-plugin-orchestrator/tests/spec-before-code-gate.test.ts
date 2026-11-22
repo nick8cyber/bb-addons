@@ -3,6 +3,9 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+
+const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
+delete process.env.BB_THREAD_ID;
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -23,12 +26,13 @@ import {
   resolveTaskSpecContract,
   type SpecContract,
 } from "../src/spec-gate.js";
-import { runRunQueue } from "../src/workgraph.js";
+import { runRunQueue, runApprove, runReject } from "../src/workgraph.js";
 import { runDelegate, dispatchToRoute } from "../src/delegate.js";
 import { OrchestratorError } from "../src/errors.js";
 
 const POLICY_TEXT = JSON.stringify({
   version: 1,
+  specBeforeCode: true,
   limits: { maxActive: 5 },
   levels: {
     simple: { chain: ["simple", "simple-fallback"] },
@@ -388,6 +392,7 @@ test("§31.9 Foreign SHA: rejects when specSha is not in git history", async () 
     kind: "behavior_change",
     specPath: "docs/specs/my-spec.md",
     specSha: "0123456789abcdef0123456789abcdef01234567", // Non-existent foreign commit
+    approvalId: "appr:proj_1:FOREIGN-1:sha:1",
   };
 
   await assert.rejects(
@@ -432,6 +437,7 @@ test("§31.9 Architectural change without ADR: rejects with spec-gate-violation"
     specPath: "docs/specs/my-arch.md",
     specSha,
     isArchitectural: true,
+    approvalId: `appr:proj_1:ARCH-1:${specSha.slice(0, 12)}:1`,
     // adrPath is missing!
   };
 
@@ -480,6 +486,7 @@ test("§31.9 Positive execution: behavior change with valid spec and ADR passes 
     specSha,
     isArchitectural: true,
     adrPath: "docs/adr/001-feat.md",
+    approvalId: `appr:proj_1:FEAT-1:${specSha.slice(0, 12)}:1`,
   };
 
   // Must not throw
@@ -516,6 +523,7 @@ test("§31.9 Positive execution: bugfix referencing existing spec and section pa
     specPath: "docs/specs/graph.md",
     specSection: "§31.9",
     altersContract: false,
+    approvalId: "appr:proj_1:FIX-1:base:1",
   };
 
   // Must not throw
@@ -542,6 +550,7 @@ test("§31.9 Positive execution: mechanical work with rationale passes gate", as
   const contract: SpecContract = {
     kind: "mechanical",
     mechanicalBasis: "Refactoring internal types without changing behavioral contracts",
+    approvalId: "appr:proj_1:MECH-1:base:1",
   };
 
   // Must not throw
@@ -577,6 +586,7 @@ test("§31.9 Bugfix altering contract: rejects with spec-gate-violation", async 
     specPath: "docs/specs/api.md",
     specSection: "Section 4",
     altersContract: true, // Requires changing the contract!
+    approvalId: "appr:proj_1:FIX-ALTER-1:base:1",
   };
 
   await assert.rejects(
@@ -627,6 +637,7 @@ test("§31.9 Race condition: base branch moving between prep and spawn triggers 
     specPath: "docs/specs/auth.md",
     specSha: prepBaseSha,
     preparedBaseSha: prepBaseSha,
+    approvalId: `appr:proj_1:RACE-1:${prepBaseSha.slice(0, 12)}:1`,
   };
 
   await assert.rejects(
@@ -675,6 +686,7 @@ test("orchestrator-release §2: deletion or unapproved modification of spec duri
     kind: "behavior_change",
     specPath: "docs/specs/rel-feat.md",
     specSha: acceptedSpecSha,
+    approvalId: `appr:proj_1:REL-1:${acceptedSpecSha.slice(0, 12)}:1`,
   });
 
   // Scenario A: spec document was deleted during merge
@@ -690,6 +702,7 @@ test("orchestrator-release §2: deletion or unapproved modification of spec duri
         cmd,
         repoRoot: repoDir,
         publishedSha: publishedShaDeleted,
+        workGraphMode: "shadow",
       });
     },
     (err: any) => {
@@ -717,6 +730,7 @@ test("orchestrator-release §2: deletion or unapproved modification of spec duri
         cmd,
         repoRoot: repoDir,
         publishedSha: publishedShaModified,
+        workGraphMode: "shadow",
       });
     },
     (err: any) => {
@@ -737,5 +751,642 @@ test("orchestrator-release §2: deletion or unapproved modification of spec duri
     cmd,
     repoRoot: repoDir,
     publishedSha: cleanPublishedSha,
+    workGraphMode: "shadow",
   });
+});
+
+// ── 10. Blocker 2: simple route without accepted classification gives 0 spawns ─
+
+test("§31.9 Blocker 2: simple route with arbitrary text or single SHA without classification rejects and produces 0 spawns", async () => {
+  const spawnedThreads: any[] = [];
+  const fake = fakeCli();
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    dataDir: makeTempDir("orch-spec-simple-nochk-"),
+    settings: {
+      policy: POLICY_TEXT,
+      language: "ru",
+      workGraph: "shadow",
+    },
+    sdk: {
+      threads: {
+        get: async () => makeThreadResponse({ id: "thr_coord" }),
+        spawn: async (args) => {
+          spawnedThreads.push(args);
+          return { threadId: "thr_spawned" };
+        },
+      },
+    },
+  });
+
+  const { store } = await createPlugin(host.bb, { bbCli: fake.cli });
+
+  // 1. Task with arbitrary acceptance text on simple route
+  store.insertTask({
+    taskKey: "SIMPLE-ARB-1",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+    payload: JSON.stringify({ acceptance_text: "Arbitrary text without any kind or spec specification" }),
+  });
+
+  const repoDir = makeTempDir("orch-simple-arb-");
+  const { cmd } = initGitRepo(repoDir);
+
+  await assert.rejects(
+    async () => {
+      await runRunQueue({
+        store,
+        cmd,
+        repoRoot: repoDir,
+        workGraphMode: "shadow",
+        policy: parsePolicy(POLICY_TEXT).policy,
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+  assert.equal(spawnedThreads.length, 0, "0 threads spawned for arbitrary acceptance text");
+
+  // 2. Task with single acceptance_sha on simple route without classification
+  store.insertTask({
+    taskKey: "SIMPLE-SHA-1",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+    payload: JSON.stringify({}),
+  });
+  store.updateTask("SIMPLE-SHA-1", {
+    acceptance_sha: "1234567890123456789012345678901234567890",
+  });
+
+  await assert.rejects(
+    async () => {
+      await runRunQueue({
+        store,
+        cmd,
+        repoRoot: repoDir,
+        workGraphMode: "shadow",
+        policy: parsePolicy(POLICY_TEXT).policy,
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+  assert.equal(spawnedThreads.length, 0, "0 threads spawned for single SHA without classification");
+});
+
+// ── 11. Blocker 1: connected positive flow ─────────────────────────────────────
+
+test("§31.9 Blocker 1: connected positive flow: approval stores contract -> launch verifies exact saved contract -> release verifies exact same contract", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-pos-flow-");
+  const { run, cmd } = initGitRepo(repoDir);
+
+  mkdirSync(join(repoDir, "docs/specs"), { recursive: true });
+  writeFileSync(join(repoDir, "docs/specs/pos-flow.md"), "# Flow Spec\n");
+  run(["add", "."]);
+  run(["commit", "-m", "docs: initial spec"]);
+  const acceptedSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Enqueue task at owner_gate waiting for approval
+  store.insertTask({
+    taskKey: "FLOW-1",
+    projectId: "proj_flow",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "manual",
+    payload: JSON.stringify({
+      gate_stage: "pre_code",
+      spec_path: "docs/specs/pos-flow.md",
+      spec_sha: acceptedSha,
+    }),
+  });
+  store.updateTask("FLOW-1", {
+    node: "owner_gate",
+    status: "waiting_approval",
+  });
+
+  // Verify task_spec_contracts is initially empty
+  assert.equal(store.getSpecContract("FLOW-1"), null);
+
+  // Step 1: Owner calls runApprove
+  const fakeCtx: any = { isOwner: true, projectId: "proj_flow" };
+  const approveRes = await runApprove("FLOW-1", "approved by owner", {
+    store,
+    ctx: fakeCtx,
+    workGraphMode: "shadow",
+  });
+  assert.equal(approveRes.ok, true);
+
+  // Contract must now be saved in task_spec_contracts with approvalId
+  const savedContract = store.getSpecContract("FLOW-1");
+  assert.notEqual(savedContract, null);
+  assert.equal(savedContract!.kind, "behavior_change");
+  assert.equal(savedContract!.spec_path, "docs/specs/pos-flow.md");
+  assert.equal(savedContract!.spec_sha, acceptedSha);
+  assert.notEqual(savedContract!.approval_id, null);
+  assert.match(savedContract!.approval_id!, /^appr:proj_flow:FLOW-1:/);
+
+  // Step 2: Code launch verifies exact saved contract
+  // Must NOT throw
+  await verifySpecBeforeCodeGate({
+    taskKey: "FLOW-1",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    workGraphMode: "shadow",
+    role: "executor",
+  });
+
+  // Step 3: Release verifies exact same contract on published SHA
+  mkdirSync(join(repoDir, "src"), { recursive: true });
+  writeFileSync(join(repoDir, "src/code.ts"), "export const x = 1;\n");
+  run(["add", "."]);
+  run(["commit", "-m", "feat: implement code"]);
+  const publishedSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Must NOT throw
+  await verifyReleaseDocumentsGate({
+    taskKey: "FLOW-1",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    publishedSha,
+    workGraphMode: "shadow",
+  });
+});
+
+// ── 12. Blocker 1: connected negative flow ─────────────────────────────────────
+
+test("§31.9 Blocker 1: connected negative flow: rejection/revocation revokes approval and blocks launch and release", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-neg-flow-");
+  const { run, cmd } = initGitRepo(repoDir);
+
+  mkdirSync(join(repoDir, "docs/specs"), { recursive: true });
+  writeFileSync(join(repoDir, "docs/specs/neg-flow.md"), "# Neg Spec\n");
+  run(["add", "."]);
+  run(["commit", "-m", "docs: neg spec"]);
+  const acceptedSha = run(["rev-parse", "HEAD"]).trim();
+
+  store.insertTask({
+    taskKey: "NEG-1",
+    projectId: "proj_neg",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "manual",
+    payload: JSON.stringify({
+      gate_stage: "pre_code",
+      spec_path: "docs/specs/neg-flow.md",
+      spec_sha: acceptedSha,
+    }),
+  });
+  store.updateTask("NEG-1", {
+    node: "owner_gate",
+    status: "waiting_approval",
+  });
+
+  // Approve first
+  const fakeCtx: any = { isOwner: true, projectId: "proj_neg" };
+  await runApprove("NEG-1", "ok", { store, ctx: fakeCtx, workGraphMode: "shadow" });
+  assert.notEqual(store.getSpecContract("NEG-1")?.approval_id, null);
+
+  // Now owner rejects the task
+  await runReject("NEG-1", "code", "architecture needs revision", {
+    store,
+    ctx: fakeCtx,
+    workGraphMode: "shadow",
+  });
+
+  // Approval ID in task_spec_contracts must be revoked (NULL)
+  const contractAfterReject = store.getSpecContract("NEG-1");
+  assert.equal(contractAfterReject?.approval_id, null);
+
+  // Launch must reject
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "NEG-1",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        workGraphMode: "shadow",
+        role: "executor",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /approvalId отсутствует/);
+      return true;
+    },
+  );
+
+  // Release must also reject
+  await assert.rejects(
+    async () => {
+      await verifyReleaseDocumentsGate({
+        taskKey: "NEG-1",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        publishedSha: acceptedSha,
+        workGraphMode: "shadow",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /approvalId отсутствует/);
+      return true;
+    },
+  );
+
+  // Release without any contract at all must also reject when enforced
+  await assert.rejects(
+    async () => {
+      await verifyReleaseDocumentsGate({
+        taskKey: "NO-CONTRACT-1",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        publishedSha: acceptedSha,
+        workGraphMode: "shadow",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+});
+
+// ── 13. Blocker 3: connected tests (two repos, inaccessible git, drift) ────────
+
+test("§31.9 Blocker 3: two repositories: task repository is used for git checks, not coordinator cwd", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // Repo A = coordinator cwd (does NOT have spec)
+  const repoA = makeTempDir("orch-spec-repo-a-");
+  const { run: runA, cmd: cmdA } = initGitRepo(repoA);
+
+  // Repo B = actual task repository (HAS accepted spec)
+  const repoB = makeTempDir("orch-spec-repo-b-");
+  const { run: runB, cmd: cmdB } = initGitRepo(repoB);
+
+  mkdirSync(join(repoB, "docs/specs"), { recursive: true });
+  writeFileSync(join(repoB, "docs/specs/repo-b.md"), "# Repo B Spec\n");
+  runB(["add", "."]);
+  runB(["commit", "-m", "docs: repo b spec"]);
+  const specShaB = runB(["rev-parse", "HEAD"]).trim();
+
+  store.saveSpecContract({
+    taskKey: "MULTI-REPO-1",
+    projectId: "proj_b",
+    kind: "behavior_change",
+    specPath: "docs/specs/repo-b.md",
+    specSha: specShaB,
+    approvalId: `appr:proj_b:MULTI-REPO-1:${specShaB.slice(0, 12)}:1`,
+  });
+
+  // Verifying with Repo B as confirmed repoRoot passes
+  await verifySpecBeforeCodeGate({
+    taskKey: "MULTI-REPO-1",
+    store,
+    cmd: cmdB,
+    repoRoot: repoB,
+    workGraphMode: "shadow",
+    role: "executor",
+  });
+
+  // If Repo A were mistakenly used, it must fail because spec is not in Repo A
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "MULTI-REPO-1",
+        store,
+        cmd: cmdA,
+        repoRoot: repoA,
+        workGraphMode: "shadow",
+        role: "executor",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+});
+
+test("§31.9 Blocker 3: missing or inaccessible git base explicitly refuses with spec-gate-violation", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.saveSpecContract({
+    taskKey: "NOGIT-1",
+    projectId: "proj_1",
+    kind: "mechanical",
+    mechanicalBasis: "Refactoring internal utilities",
+    approvalId: "appr:proj_1:NOGIT-1:base:1",
+  });
+
+  // 1. Missing repoRoot entirely
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "NOGIT-1",
+        store,
+        workGraphMode: "shadow",
+        role: "executor",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /репозиторий задачи NOGIT-1 не определён или недоступен/);
+      return true;
+    },
+  );
+
+  // 2. Non-existent repo directory with failing git command
+  const fakeCmd: CmdRunner = {
+    run: async () => ({ exitCode: 128, stdout: "", stderr: "fatal: not a git repository" }),
+  };
+
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "NOGIT-1",
+        store,
+        cmd: fakeCmd,
+        repoRoot: "/non/existent/path",
+        workGraphMode: "shadow",
+        role: "executor",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /не удалось разрешить базовый коммит/);
+      return true;
+    },
+  );
+});
+
+test("§31.9 Blocker 3: spec modified in base after acceptance is detected via git diff and rejects with spec-gate-violation", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-drift-");
+  const { run, cmd } = initGitRepo(repoDir);
+
+  mkdirSync(join(repoDir, "docs/specs"), { recursive: true });
+  writeFileSync(join(repoDir, "docs/specs/drift.md"), "# Accepted Spec v1\n");
+  run(["add", "."]);
+  run(["commit", "-m", "docs: accept v1"]);
+  const acceptedSha = run(["rev-parse", "HEAD"]).trim();
+
+  store.saveSpecContract({
+    taskKey: "DRIFT-1",
+    projectId: "proj_1",
+    kind: "behavior_change",
+    specPath: "docs/specs/drift.md",
+    specSha: acceptedSha,
+    approvalId: `appr:proj_1:DRIFT-1:${acceptedSha.slice(0, 12)}:1`,
+  });
+
+  // Now someone changes drift.md in a new base commit before code starts
+  writeFileSync(join(repoDir, "docs/specs/drift.md"), "# Drifted Spec without re-approval\n");
+  run(["add", "."]);
+  run(["commit", "-m", "docs: modify spec in base"]);
+  const driftedBaseSha = run(["rev-parse", "HEAD"]).trim();
+
+  // verifySpecBeforeCodeGate must detect the diff and reject
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "DRIFT-1",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        baseSha: driftedBaseSha,
+        workGraphMode: "shadow",
+        role: "executor",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /была изменена по сравнению с принятой версией/);
+      return true;
+    },
+  );
+});
+
+// ── 16. Audit Contract Scenarios: (1) Auto flow, (2) Project overrides, (3) No-code/research, (4) Upgrade compatibility ──
+
+test("§31.9 Audit Scenario (1): auto confirmation mode persists contract and passes launch and release", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-auto-flow-");
+  const { run, cmd } = initGitRepo(repoDir);
+
+  mkdirSync(join(repoDir, "docs/specs"), { recursive: true });
+  writeFileSync(join(repoDir, "docs/specs/auto-spec.md"), "# Auto Spec\n");
+  run(["add", "."]);
+  run(["commit", "-m", "docs: initial auto spec"]);
+  const acceptedSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Task in auto mode: spec_review OK transitions to code and saves contract
+  store.insertTask({
+    taskKey: "AUTO-1",
+    projectId: "proj_auto",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+    payload: JSON.stringify({
+      spec_path: "docs/specs/auto-spec.md",
+      spec_sha: acceptedSha,
+    }),
+  });
+  store.updateTask("AUTO-1", {
+    node: "owner_gate",
+    status: "waiting_approval",
+  });
+
+  // Auto approve simulation via runApprove
+  const fakeCtx: any = { isOwner: true, projectId: "proj_auto" };
+  const approveRes = await runApprove("AUTO-1", "auto approved", {
+    store,
+    ctx: fakeCtx,
+    workGraphMode: "shadow",
+  });
+  assert.equal(approveRes.ok, true);
+
+  const saved = store.getSpecContract("AUTO-1");
+  assert.notEqual(saved, null);
+  assert.equal(saved?.spec_path, "docs/specs/auto-spec.md");
+  assert.notEqual(saved?.approval_id, null);
+
+  // Launch verifies saved contract
+  await verifySpecBeforeCodeGate({
+    taskKey: "AUTO-1",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    workGraphMode: "shadow",
+    role: "executor",
+  });
+
+  // Release verifies same contract
+  mkdirSync(join(repoDir, "src"), { recursive: true });
+  writeFileSync(join(repoDir, "src/index.ts"), "export const ok = true;\n");
+  run(["add", "."]);
+  run(["commit", "-m", "feat: code done"]);
+  const pubSha = run(["rev-parse", "HEAD"]).trim();
+
+  await verifyReleaseDocumentsGate({
+    taskKey: "AUTO-1",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    publishedSha: pubSha,
+    workGraphMode: "shadow",
+  });
+});
+
+test("§31.9 Audit Scenario (2): project overrides and projects outside requirement continue normal operations", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-override-");
+  const { cmd } = initGitRepo(repoDir);
+
+  // Project with specBeforeCode: false is outside requirement -> normal code launch proceeds without contract
+  const unconstrainedProject: any = { id: "proj_legacy", specBeforeCode: false };
+  await verifySpecBeforeCodeGate({
+    taskKey: "UNCONSTRAINED-1",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    project: unconstrainedProject,
+    role: "executor",
+    specBeforeCode: false,
+  });
+
+  // Project with specBeforeCode: true enforces gate -> rejects before thread spawn
+  const enforcedProject: any = { id: "proj_enforced", specBeforeCode: true };
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "ENFORCED-1",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        project: enforcedProject,
+        role: "executor",
+        specBeforeCode: true,
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+});
+
+test("§31.9 Audit Scenario (3): non-code operations (architect, research, noCode) bypass gate and run normally", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-nocode-");
+  const { cmd } = initGitRepo(repoDir);
+
+  // 1. role: architect (design node) does not require spec contract
+  await verifySpecBeforeCodeGate({
+    taskKey: "ARCH-TASK-1",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    role: "architect",
+    workGraphMode: "shadow",
+  });
+
+  // 2. role: researcher does not require spec contract
+  await verifySpecBeforeCodeGate({
+    taskKey: "RES-TASK-1",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    role: "researcher",
+    workGraphMode: "shadow",
+  });
+
+  // 3. noCode: true does not require spec contract
+  await verifySpecBeforeCodeGate({
+    taskKey: "NOCODE-TASK-1",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    role: "executor",
+    noCode: true,
+    workGraphMode: "shadow",
+  });
+});
+
+test("§31.9 Audit Scenario (4): upgrade compatibility - legacy tasks without contract in DB reject before spawning thread", async () => {
+  const spawnedThreads: any[] = [];
+  const fake = fakeCli();
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    dataDir: makeTempDir("orch-spec-upgrade-compat-"),
+    settings: {
+      policy: POLICY_TEXT,
+      language: "ru",
+      workGraph: "shadow",
+    },
+    sdk: {
+      threads: {
+        get: async () => makeThreadResponse({ id: "thr_coord" }),
+        spawn: async (args) => {
+          spawnedThreads.push(args);
+          return { threadId: "thr_spawned" };
+        },
+      },
+    },
+  });
+
+  await createPlugin(host.bb, { bbCli: fake.cli });
+
+  // Upgraded system receives delegation for legacy task without spec contract
+  const res = await host.harness.runCli(
+    ["delegate", "LEGACY-1", "--level", "simple", "--json"],
+    { threadId: "thr_coord" },
+  );
+
+  assert.notEqual(res.exitCode, 0);
+  assert.match(res.stderr + res.stdout, /spec-gate-violation/);
+  // Crucial requirement: mandatory refusal happens strictly BEFORE creating a thread
+  assert.equal(spawnedThreads.length, 0, "0 threads spawned for unapproved legacy task");
 });

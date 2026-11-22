@@ -1584,6 +1584,8 @@ export async function createPlugin(
           `calling thread ${input.threadId} is not readable: ${describeError(e)}`,
         );
       }
+      const taskPid = (await resolveTaskProjectId(store, input.taskKey, { bbCli })) ?? caller.projectId;
+      const wtCtx = await resolveWorktreeContext(input.threadId, taskPid, undefined).catch(() => null);
       return runDelegate({ ...input, caller }, {
         store,
         bbCli,
@@ -1601,7 +1603,8 @@ export async function createPlugin(
         policy: stepsDeps.policy,
         unavailableRoutes: stepsDeps.unavailableRoutes,
         log: bb.log,
-        workGraphMode: () => getWorkGraphMode(),
+        workGraphMode: (pid?: string) => getWorkGraphMode(pid ?? taskPid),
+        repoRoot: wtCtx?.repoRoot,
       });
     });
 
@@ -1706,7 +1709,11 @@ export async function createPlugin(
     t,
     now: () => Date.now(),
     unavailableRoutes: () => new Set(policyLoad.unavailableRoutes),
-    workGraphMode: () => getWorkGraphMode(),
+    workGraphMode: (pid?: string) => getWorkGraphMode(pid),
+    resolveRepoRoot: async (row: DelegationRow) => {
+      const wt = await resolveWorktreeContext(row.coordinator_thread_id, row.project_id ?? undefined, undefined).catch(() => null);
+      return wt?.repoRoot;
+    },
   };
   const watchdogThreads: WatchdogThreads = {
     get: (a) => bb.sdk.threads.get(a),
@@ -1806,6 +1813,7 @@ export async function createPlugin(
     kbConfig: () => currentKb.config,
     markCoordinatorAction: (threadId: string | undefined | null) =>
       watchdog.markCoordinatorAction(threadId),
+    workGraphMode: (pid?: string) => getWorkGraphMode(pid),
     log: bb.log,
     t,
   };

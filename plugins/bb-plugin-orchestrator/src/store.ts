@@ -458,6 +458,8 @@ export const MIGRATIONS: readonly string[] = [
     updated_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_task_spec_contracts_task ON task_spec_contracts(task_key)`,
+  // §31.9 (ADR-0032 update): add project_id column to task_spec_contracts
+  `ALTER TABLE task_spec_contracts ADD COLUMN project_id TEXT DEFAULT NULL`,
 ];
 
 export type CommandRunStatus =
@@ -871,6 +873,7 @@ export interface TaskTransitionRow {
 
 export interface TaskSpecContractRow {
   task_key: string;
+  project_id: string | null;
   kind: "behavior_change" | "bugfix" | "mechanical";
   spec_path: string | null;
   spec_sha: string | null;
@@ -4454,6 +4457,7 @@ export class DelegationStore {
   saveSpecContract(
     contract: {
       taskKey: string;
+      projectId?: string | null;
       kind: "behavior_change" | "bugfix" | "mechanical";
       specPath?: string | null;
       specSha?: string | null;
@@ -4471,11 +4475,12 @@ export class DelegationStore {
     this.db
       .prepare(
         `INSERT INTO task_spec_contracts (
-          task_key, kind, spec_path, spec_sha, spec_section, adr_path,
+          task_key, project_id, kind, spec_path, spec_sha, spec_section, adr_path,
           is_architectural, alters_contract, mechanical_basis, approval_id,
           prepared_base_sha, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(task_key) DO UPDATE SET
+          project_id = COALESCE(excluded.project_id, task_spec_contracts.project_id),
           kind = excluded.kind,
           spec_path = excluded.spec_path,
           spec_sha = excluded.spec_sha,
@@ -4490,6 +4495,7 @@ export class DelegationStore {
       )
       .run(
         key,
+        contract.projectId ?? null,
         contract.kind,
         contract.specPath ?? null,
         contract.specSha ?? null,
@@ -4504,6 +4510,18 @@ export class DelegationStore {
         now,
       );
     return this.getSpecContract(key)!;
+  }
+
+  revokeSpecContractApproval(taskKey: string, now: number = Date.now()): boolean {
+    const key = normalizeTaskKey(taskKey);
+    const info = this.db
+      .prepare(
+        `UPDATE task_spec_contracts
+         SET approval_id = NULL, updated_at = ?
+         WHERE task_key = ?`,
+      )
+      .run(now, key);
+    return info.changes > 0;
   }
 
   getSpecContract(taskKey: string): TaskSpecContractRow | null {

@@ -70,6 +70,8 @@ export interface ReleaseProjectLayer {
   prBody?: string;
   /** §18.6: обязательная заметка — без --kb/--no-kb шаг 1 отказывает. */
   requireNote?: boolean;
+  /** §31.9: гейт «спека до кода» перед запуском кода и выкладкой */
+  specBeforeCode?: boolean;
 }
 
 export type PostPublishOn = "published" | "merged";
@@ -211,6 +213,8 @@ export interface ResolvedProject {
   prBody: string;
   /** §18.6: обязательная заметка --kb/--no-kb на шаге 1 (default false). */
   requireNote: boolean;
+  /** §31.9: гейт «спека до кода» перед запуском кода и выкладкой */
+  specBeforeCode?: boolean;
 }
 
 export interface ResolvedPostPublishCommand {
@@ -373,6 +377,13 @@ function parseLayer(
       err(`${path}.threadIds`, t("rc.isBool"));
     } else {
       layer.threadIds = value.threadIds;
+    }
+  }
+  if (value.specBeforeCode !== undefined) {
+    if (typeof value.specBeforeCode !== "boolean") {
+      err(`${path}.specBeforeCode`, t("rc.isBool"));
+    } else {
+      layer.specBeforeCode = value.specBeforeCode;
     }
   }
   for (const key of ["allowedTrailers", "allowedEmails"] as const) {
@@ -843,6 +854,7 @@ export function resolveProject(
     prProvider: layer.prProvider ?? { type: "github", raw: undefined },
     prBody: layer.prBody ?? DEFAULT_PR_BODY,
     requireNote: layer.requireNote === true,
+    specBeforeCode: layer.specBeforeCode === true,
   };
 }
 
