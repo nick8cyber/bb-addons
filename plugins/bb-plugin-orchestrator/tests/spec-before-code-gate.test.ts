@@ -7,7 +7,7 @@ import test from "node:test";
 const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
 delete process.env.BB_THREAD_ID;
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { makeTempDir } from "./helpers/temp.js";
 import {
@@ -2124,4 +2124,268 @@ test("§31.9 Opus Audit Non-blocker 6: runDelegate and runRunQueue pass resolveP
 
   assert.ok(resolveProjectDelegateCalls.includes("proj-off"), "runDelegate must call resolveProject with task's projectId");
   assert.ok(delRes.delegationId, "delegation succeeded because specBeforeCode: false was resolved");
+});
+
+// ── 16. Opus Audit Round 5 Blockers (1, 2, 3) ────────────────────────────────
+
+function makeAuditR5Repo() {
+  const d = makeTempDir("r5-audit-repo-");
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: d });
+  execFileSync("git", ["config", "user.email", "a@b"], { cwd: d });
+  execFileSync("git", ["config", "user.name", "a"], { cwd: d });
+  mkdirSync(join(d, "docs/specs/acceptance"), { recursive: true });
+  writeFileSync(join(d, "docs/specs/acceptance/LEG-F-1.md"), "acc\n");
+  execFileSync("git", ["add", "."], { cwd: d });
+  execFileSync("git", ["commit", "-qm", "acc"], { cwd: d });
+  const A = execFileSync("git", ["rev-parse", "HEAD"], { cwd: d, encoding: "utf8" }).trim();
+  writeFileSync(join(d, "code.ts"), "x\n");
+  execFileSync("git", ["add", "."], { cwd: d });
+  execFileSync("git", ["commit", "-qm", "code"], { cwd: d });
+  const P = execFileSync("git", ["rev-parse", "HEAD"], { cwd: d, encoding: "utf8" }).trim();
+  return { d, A, P };
+}
+
+for (const mode of ["shadow", "off"] as const) {
+  test(`§31.9 Opus Audit Round 5 Blocker 3: in-flight legacy task, acceptance_sha!=published, mode=${mode}`, async () => {
+    const db = new Database(":memory:");
+    for (const m of MIGRATIONS) db.exec(m);
+    const store = new DelegationStore(db);
+    const { d, A, P } = makeAuditR5Repo();
+    const { cmd } = initGitRepo(d);
+    store.insertTask({
+      taskKey: "LEG-F-1",
+      projectId: "p1",
+      coordinatorThreadId: "thr_c",
+      route: "feature",
+      level: "complex",
+      confirmationMode: "manual",
+    } as any);
+    store.updateTask("LEG-F-1", { node: "release", status: "running", acceptance_sha: A } as any);
+    const c = resolveTaskSpecContract("LEG-F-1", store, undefined, { forRelease: true, targetSha: P });
+    assert.ok(c);
+    let err: any = null;
+    try {
+      await verifyReleaseDocumentsGate({ taskKey: "LEG-F-1", store, cmd, repoRoot: d, publishedSha: P, workGraphMode: mode });
+    } catch (e) {
+      err = e;
+    }
+    assert.equal(err, null, `verifyReleaseDocumentsGate must pass in mode ${mode}`);
+  });
+}
+
+test("§31.9 Opus Audit Round 5 Blocker 1: real feature path: free-form acceptance, spec node delivered, owner approves, then code gate", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const { d, A } = makeAuditR5Repo();
+  const { cmd } = initGitRepo(d);
+  store.insertTask({
+    taskKey: "FEAT-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_c",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "manual",
+    payload: JSON.stringify({ acceptance_text: "Избранные модели сохраняются между сессиями\nКритерий 1 — кнопка звезды" }),
+  } as any);
+  store.updateTask("FEAT-1", {
+    node: "owner_gate",
+    status: "waiting_approval",
+    spec_sha: A,
+    acceptance_sha: A,
+    payload: JSON.stringify({ acceptance_text: "Избранные модели сохраняются между сессиями", spec_sha: A }),
+  } as any);
+
+  await runApprove("FEAT-1", "ok", {
+    store,
+    ctx: { cwd: d, isOwner: true, projectId: "p1" } as any,
+    workGraphMode: "shadow",
+    now: () => 1000,
+  } as any);
+
+  const contract = store.getSpecContract("FEAT-1");
+  assert.ok(contract?.approval_id, "contract must be approved");
+  assert.equal(contract?.spec_path, "docs/specs/acceptance/LEG-F-1.md");
+
+  let err: any = null;
+  try {
+    await verifySpecBeforeCodeGate({ taskKey: "FEAT-1", role: "executor", store, cmd, repoRoot: d, workGraphMode: "shadow", task: store.getTask("FEAT-1") });
+  } catch (e) {
+    err = e;
+  }
+  assert.equal(err, null, "verifySpecBeforeCodeGate must pass after owner approval");
+});
+
+test("§31.9 Opus Audit Round 5 Blocker 2: mechanical contract requires non-empty basis and is checked by reviewer", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const { d, A, P } = makeAuditR5Repo();
+  const { cmd } = initGitRepo(d);
+
+  store.saveSpecContract({
+    taskKey: "MECH-1",
+    kind: "mechanical",
+    mechanicalBasis: "Refactoring without changes",
+    approvalId: "appr:p1:MECH-1:base:1000",
+  });
+
+  // verifySpecBeforeCodeGate passes with basis
+  await verifySpecBeforeCodeGate({ taskKey: "MECH-1", role: "executor", store, cmd, repoRoot: d, workGraphMode: "strict" });
+
+  // verifyReleaseDocumentsGate in strict mode requires review
+  let err: any = null;
+  try {
+    await verifyReleaseDocumentsGate({ taskKey: "MECH-1", store, cmd, repoRoot: d, publishedSha: P, workGraphMode: "strict" });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, "strict mode release without review should fail for mechanical task");
+
+  // With completed review delegation, release succeeds
+  db.prepare(`INSERT INTO delegations (task_key, coordinator_thread_id, level, route, preset, provider, status, continue_from, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run("MECH-1", "thr_c", "review", "review-opus", "opus", "claude-code", "done", P, 1000, 1000);
+  await verifyReleaseDocumentsGate({ taskKey: "MECH-1", store, cmd, repoRoot: d, publishedSha: P, workGraphMode: "strict" });
+});
+
+test("§31.9 Opus Audit Round 6 Blocker 1: real in-flight legacy tasks (feature, fix, simple) at release in shadow pass gate", async () => {
+  for (const route of ["feature", "fix", "simple"] as const) {
+    const db = new Database(":memory:");
+    for (const m of MIGRATIONS) db.exec(m);
+    const store = new DelegationStore(db);
+    const key = `LEG-${route.toUpperCase()}-1`;
+    const d = makeTempDir(`audit-r6-b1-${route}-`);
+    const { run, cmd } = initGitRepo(d);
+    mkdirSync(join(d, "docs/specs/acceptance"), { recursive: true });
+    writeFileSync(join(d, `docs/specs/acceptance/${key}.md`), "acc\n");
+    run(["add", "."]);
+    run(["commit", "-qm", "acc"]);
+    const A = run(["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(d, "code.ts"), "x\n");
+    run(["add", "."]);
+    run(["commit", "-qm", "code"]);
+    const P = run(["rev-parse", "HEAD"]).trim();
+
+    store.insertTask({ taskKey: key, projectId: "p1", coordinatorThreadId: "thr_c", route, level: "complex", confirmationMode: "manual" } as any);
+    store.updateTask(key, {
+      node: "release",
+      status: "running",
+      acceptance_sha: A,
+      payload: JSON.stringify({ acceptance_text: "Free acceptance text", review_verdict: "OK", code_done: true }),
+    } as any);
+    const c = resolveTaskSpecContract(key, store, undefined, { forRelease: true, targetSha: P });
+    assert.ok(c, `contract resolved for ${route}`);
+    assert.ok(c.approvalId, `approvalId resolved for ${route}`);
+    await verifyReleaseDocumentsGate({ taskKey: key, store, cmd, repoRoot: d, publishedSha: P, workGraphMode: "shadow" });
+  }
+});
+
+test("§31.9 Opus Audit Round 6 Blocker 2: caller-supplied contract with fake or unapproved approvalId is rejected", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const key = "FAV-1";
+  const { d, P } = makeAuditR5Repo();
+  const { cmd } = initGitRepo(d);
+  store.insertTask({ taskKey: key, projectId: "p1", coordinatorThreadId: "thr_c", route: "feature", level: "complex", confirmationMode: "manual" } as any);
+  store.updateTask(key, { node: "code", status: "running", payload: JSON.stringify({ acceptance_text: "Favorite models" }) } as any);
+
+  // Fake approvalId format rejected
+  await assert.rejects(
+    verifySpecBeforeCodeGate({
+      taskKey: key, role: "executor", store, cmd, repoRoot: d, workGraphMode: "shadow", task: store.getTask(key),
+      contract: { kind: "mechanical", mechanicalBasis: "x", approvalId: "whatever" },
+    }),
+    /spec-gate-violation/,
+  );
+
+  // Unapproved contract on manual task rejected even with valid appr: prefix
+  await assert.rejects(
+    verifySpecBeforeCodeGate({
+      taskKey: key, role: "executor", store, cmd, repoRoot: d, workGraphMode: "shadow", task: store.getTask(key),
+      contract: { kind: "behavior_change", specPath: "docs/specs/acceptance/LEG-F-1.md", specSha: P, approvalId: `appr:p1:${key}:${P}:1` },
+    }),
+    /spec-gate-violation/,
+  );
+});
+
+test("§31.9 Opus Audit Round 6 Blocker 2 / R6-3: owner-approved contract cannot be overwritten by caller while keeping owner approval_id", () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  store.saveSpecContract({ taskKey: "OWN-1", kind: "behavior_change", specPath: "docs/specs/x.md", specSha: "a".repeat(40), approvalId: "appr:p1:OWN-1:" + "a".repeat(40) + ":1" }, 1);
+  const existing = store.getSpecContract("OWN-1");
+  const caller = { kind: "mechanical" as const, mechanicalBasis: "rename" };
+  const approvalId = (caller as any).approvalId ?? existing?.approval_id;
+  store.saveSpecContract({ ...caller, taskKey: "OWN-1", projectId: "p1", approvalId } as any, 2);
+  const after = store.getSpecContract("OWN-1");
+  assert.equal(after?.kind, "behavior_change", "owner-approved kind must not be replaced by caller");
+});
+
+test("§31.9 Opus Audit Round 6 Non-blocker 3 / R6-4: simple task with payload mechanical_basis + free acceptance_text resolves as mechanical", () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  store.insertTask({ taskKey: "S-1", projectId: "p1", coordinatorThreadId: "thr_c", route: "simple", level: "simple", confirmationMode: "auto" } as any);
+  const c = resolveTaskSpecContract("S-1", store, { acceptance_text: "переименовать функцию", mechanical_basis: "rename only" });
+  assert.equal(c?.kind, "mechanical");
+});
+
+test("§31.9 Opus Audit Round 6 Non-blocker 2 / R6-5: mechanical release in shadow requires review verdict", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const { d, P } = makeAuditR5Repo();
+  const { cmd } = initGitRepo(d);
+  store.saveSpecContract({ taskKey: "M-1", kind: "mechanical", mechanicalBasis: "x", approvalId: "appr:p1:M-1:base:1" }, 1);
+  await assert.rejects(
+    verifyReleaseDocumentsGate({ taskKey: "M-1", store, cmd, repoRoot: d, publishedSha: P, workGraphMode: "shadow" }),
+    /spec-gate-violation/,
+    "shadow must require review verdict",
+  );
+});
+
+test("§31.9 Opus Audit Round 6 Blocker 4 / R6-6: multi-doc spec commit stores all spec docs + ADR, verifies at release", async () => {
+  const d = makeTempDir("orch-r6b-");
+  const { run, cmd } = initGitRepo(d);
+  mkdirSync(join(d, "docs/specs/acceptance"), { recursive: true });
+  mkdirSync(join(d, "docs/adr"), { recursive: true });
+  writeFileSync(join(d, "docs/specs/acceptance/F-1.md"), "acc\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "acc"]);
+  const A = run(["rev-parse", "HEAD"]).trim();
+  writeFileSync(join(d, "docs/adr/0001-x.md"), "adr\n");
+  writeFileSync(join(d, "docs/specs/a-graph.md"), "a\n");
+  writeFileSync(join(d, "docs/specs/b-release.md"), "b\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "spec"]);
+  const S = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  store.insertTask({ taskKey: "F-1", projectId: "p1", coordinatorThreadId: "thr_c", route: "feature", level: "complex", confirmationMode: "manual" } as any);
+  store.updateTask("F-1", { node: "owner_gate", status: "waiting_approval", spec_sha: S, acceptance_sha: A, payload: JSON.stringify({ acceptance_text: "free text", spec_sha: S }) } as any);
+  await runApprove("F-1", "ok", { store, ctx: { cwd: d, isOwner: true, projectId: "p1" } as any, workGraphMode: "shadow", now: () => 1000 } as any);
+
+  const c = store.getSpecContract("F-1");
+  assert.ok(c?.spec_path?.includes("docs/specs/a-graph.md"), "first spec stored");
+  assert.ok(c?.spec_path?.includes("docs/specs/b-release.md"), "second spec stored");
+  assert.equal(c?.adr_path, "docs/adr/0001-x.md", "ADR path stored");
+  assert.equal(c?.is_architectural, 1, "is_architectural set");
+
+  // Deleting ADR and changing second spec at merge must block release
+  rmSync(join(d, "docs/adr/0001-x.md"));
+  writeFileSync(join(d, "docs/specs/b-release.md"), "CHANGED\n");
+  writeFileSync(join(d, "code.ts"), "x\n");
+  run(["add", "-A"]);
+  run(["commit", "-qm", "code+merge"]);
+  const P = run(["rev-parse", "HEAD"]).trim();
+  store.updateTask("F-1", { node: "release", status: "running" } as any);
+
+  await assert.rejects(
+    verifyReleaseDocumentsGate({ taskKey: "F-1", store, cmd, repoRoot: d, publishedSha: P, workGraphMode: "shadow" }),
+    /spec-gate-violation/,
+    "ADR deleted / 2nd spec changed at merge must block release",
+  );
 });

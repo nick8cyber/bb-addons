@@ -3092,6 +3092,7 @@ async function runReleaseSteps(
       repoRoot: repo,
       publishedSha: postSyncSha,
       project,
+      policy: (deps as any).policy ?? null,
       workGraphMode: effectiveWorkGraphMode,
     });
     // §17.3 (ревью PLUG-214): the tip the gate vetted — the checks

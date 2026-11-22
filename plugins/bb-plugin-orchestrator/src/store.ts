@@ -4481,16 +4481,32 @@ export class DelegationStore {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(task_key) DO UPDATE SET
           project_id = COALESCE(excluded.project_id, task_spec_contracts.project_id),
-          kind = excluded.kind,
-          spec_path = excluded.spec_path,
-          spec_sha = excluded.spec_sha,
-          spec_section = excluded.spec_section,
-          adr_path = excluded.adr_path,
-          is_architectural = excluded.is_architectural,
-          alters_contract = excluded.alters_contract,
-          mechanical_basis = excluded.mechanical_basis,
+          kind = CASE
+            WHEN task_spec_contracts.approval_id IS NOT NULL AND (excluded.approval_id = task_spec_contracts.approval_id OR excluded.approval_id IS NULL) AND excluded.kind != task_spec_contracts.kind
+            THEN task_spec_contracts.kind
+            ELSE excluded.kind
+          END,
+          spec_path = CASE
+            WHEN task_spec_contracts.approval_id IS NOT NULL AND (excluded.approval_id = task_spec_contracts.approval_id OR excluded.approval_id IS NULL) AND task_spec_contracts.spec_path IS NOT NULL AND excluded.spec_path IS NULL
+            THEN task_spec_contracts.spec_path
+            ELSE COALESCE(excluded.spec_path, task_spec_contracts.spec_path)
+          END,
+          spec_sha = CASE
+            WHEN task_spec_contracts.approval_id IS NOT NULL AND (excluded.approval_id = task_spec_contracts.approval_id OR excluded.approval_id IS NULL) AND task_spec_contracts.spec_sha IS NOT NULL AND excluded.spec_sha IS NULL
+            THEN task_spec_contracts.spec_sha
+            ELSE COALESCE(excluded.spec_sha, task_spec_contracts.spec_sha)
+          END,
+          spec_section = COALESCE(excluded.spec_section, task_spec_contracts.spec_section),
+          adr_path = COALESCE(excluded.adr_path, task_spec_contracts.adr_path),
+          is_architectural = COALESCE(excluded.is_architectural, task_spec_contracts.is_architectural),
+          alters_contract = COALESCE(excluded.alters_contract, task_spec_contracts.alters_contract),
+          mechanical_basis = CASE
+            WHEN task_spec_contracts.approval_id IS NOT NULL AND (excluded.approval_id = task_spec_contracts.approval_id OR excluded.approval_id IS NULL) AND task_spec_contracts.kind != 'mechanical'
+            THEN task_spec_contracts.mechanical_basis
+            ELSE COALESCE(excluded.mechanical_basis, task_spec_contracts.mechanical_basis)
+          END,
           approval_id = excluded.approval_id,
-          prepared_base_sha = excluded.prepared_base_sha,
+          prepared_base_sha = COALESCE(excluded.prepared_base_sha, task_spec_contracts.prepared_base_sha),
           updated_at = excluded.updated_at`,
       )
       .run(

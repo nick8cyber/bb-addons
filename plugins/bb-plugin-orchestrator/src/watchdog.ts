@@ -65,6 +65,7 @@ import {
 import { DEFAULT_HANDOFF_PATH } from "./roles.js";
 import { isPluginUiFile, pluginNameForPaths } from "./staged.js";
 import { T_RU, type T } from "./i18n/index.js";
+import { verifySpecBeforeCodeGate } from "./spec-gate.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
 export const BUILTIN_QUOTA_PATTERNS = [
@@ -982,6 +983,39 @@ export function createWatchdog(deps: WatchdogDeps) {
       }
     }
     if (nextName && nextRoute) {
+      const role = levelRole(info.policy, row.level);
+      if (role === "executor" && !row.no_code) {
+        try {
+          const mode = typeof (deps as any).workGraphMode === "function"
+            ? (deps as any).workGraphMode(row.project_id)
+            : (deps as any).workGraphMode;
+          await verifySpecBeforeCodeGate({
+            taskKey: row.task_key,
+            role,
+            noCode: Boolean(row.no_code),
+            level: row.level,
+            store,
+            cmd: (deps as any).cmd,
+            repoRoot: (deps as any).repoRoot ?? (deps as any).cachedPumpRepoRoot ?? process.cwd(),
+            policy: info.policy,
+            workGraphMode: mode,
+            task: store.getTask(row.task_key),
+          });
+        } catch (gateErr) {
+          store.addSetupError(row.id, "spec-before-code-gate", message(gateErr));
+          await report(
+            row,
+            t("wd.reissueRefused", {
+              outcome: outcomeText,
+              task: row.task_key,
+              next: nextName,
+              error: message(gateErr),
+            }),
+          );
+          return;
+        }
+      }
+
       // §5.4 rev 15: the task may already carry an active delegation (the
       // coordinator re-delegated manually while the stop retried) — the
       // unique index then refuses the insert; the row keeps its outcome

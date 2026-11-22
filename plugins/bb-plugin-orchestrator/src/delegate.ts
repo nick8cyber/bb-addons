@@ -62,7 +62,7 @@ import {
 } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
 import { T_RU, type T } from "./i18n/index.js";
-import { verifySpecBeforeCodeGate, type SpecContract } from "./spec-gate.js";
+import { verifySpecBeforeCodeGate, resolveTaskSpecContract, type SpecContract } from "./spec-gate.js";
 import type { WorkGraphMode } from "./workgraph.js";
 
 export interface SetupError {
@@ -89,8 +89,6 @@ export interface DelegateParams {
    * instructions, the files' bytes are never inlined. */
   attach?: string[];
   caller: ThreadFacts;
-  /** §31.9: Acceptance contract for spec-before-code gate */
-  specContract?: SpecContract;
   specBeforeCode?: boolean;
 }
 
@@ -679,12 +677,11 @@ export async function runDelegate(
     role === "architect" ||
     taskRow?.node === "design" ||
     taskRow?.node === "design_check";
-  const isVerificationNode =
-    taskRow?.node === "release" ||
-    taskRow?.node === "checks" ||
-    taskRow?.node === "review" ||
-    Boolean(store.activeReleaseByTask(taskKey));
-  const effectiveNoCode = isArchitectNode || isVerificationNode ? true : (params.noCode ?? false);
+  const isVerificationRole =
+    role === "auditor" ||
+    role === "architect" ||
+    role === "researcher";
+  const effectiveNoCode = isArchitectNode || isVerificationRole ? true : (params.noCode ?? false);
 
   // §31.9: Prevent direct delegation while waiting at owner_gate
   if (role === "executor" && !effectiveNoCode && (taskRow?.status === "waiting_approval" || taskRow?.node === "owner_gate")) {
@@ -692,25 +689,6 @@ export async function runDelegate(
       "spec-gate-violation",
       `spec-gate-violation: задача ${taskKey} ожидает одобрения владельца (owner_gate); запуск кода до решения владельца запрещён`,
     );
-  }
-
-  // §31.9 (ADR-0032): If spec contract provided in params with approval, persist it
-  if (params.specContract) {
-    const key = normalizeTaskKey(taskKey);
-    const existing = store.getSpecContract(key);
-    const now = deps.now ? deps.now() : Date.now();
-    const approvalId = params.specContract.approvalId ?? existing?.approval_id;
-    if (approvalId) {
-      store.saveSpecContract(
-        {
-          ...params.specContract,
-          taskKey: key,
-          projectId: params.caller.projectId,
-          approvalId,
-        },
-        now,
-      );
-    }
   }
 
   // §31.9 (ADR-0032): spec-before-code gate before creating delegation row
@@ -728,7 +706,6 @@ export async function runDelegate(
       role,
       noCode: effectiveNoCode,
       level,
-      contract: params.specContract,
       store,
       cmd: deps.cmd,
       policy,
@@ -809,7 +786,6 @@ export async function runDelegate(
         // §17.2 (PLUG-211 С4): a manual delegate owns the refusal comment.
         commentOnRefusal: true,
         from: params.from,
-        specContract: params.specContract,
         specBeforeCode: params.specBeforeCode,
       },
       {
@@ -911,8 +887,6 @@ interface DispatchOpts {
   busyGate?: () => Promise<"queued" | "busy-expired" | null>;
   /** §20.1 п.5: routes already skipped in this dispatch. */
   _skipped?: { route: string; reason: string }[];
-  /** §31.9: Acceptance contract for spec-before-code gate */
-  specContract?: SpecContract;
   specBeforeCode?: boolean;
 }
 
@@ -994,7 +968,6 @@ export async function dispatchToRoute(
           role,
           noCode: Boolean(row.no_code),
           level: row.level,
-          contract: opts.specContract,
           store,
           cmd: deps.cmd,
           policy,
@@ -1167,8 +1140,15 @@ export async function dispatchToRoute(
   const attachLine = spec.paths.length
     ? t("instr.attachList", { list: spec.paths.join(", ") })
     : undefined;
+  const contractForTask = resolveTaskSpecContract(row.task_key, store, null);
+  const mechanicalPrompt =
+    role === "auditor" &&
+    contractForTask?.kind === "mechanical" &&
+    contractForTask.mechanicalBasis
+      ? `Внимание: задача заявлена как механическая работа без изменения поведения (§31.9).\nЗаявленное основание: "${contractForTask.mechanicalBasis}".\nПроверь по фактическому диффу, что изменения действительно носят исключительно механический характер и не изменяют поведение системы.`
+      : undefined;
   const extra =
-    [opts.instructions?.trim(), attachLine?.trim()]
+    [opts.instructions?.trim(), attachLine?.trim(), mechanicalPrompt?.trim()]
       .filter(Boolean)
       .join("\n\n") || undefined;
   const instructions = mergeDispatchInstructions(

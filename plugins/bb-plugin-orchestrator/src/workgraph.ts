@@ -2190,7 +2190,59 @@ export async function runApprove(
     );
   }
 
-  const approvedContract = resolveTaskSpecContract(key, deps.store, payloadObj, { task: res.task! });
+  let approvedContract = resolveTaskSpecContract(key, deps.store, payloadObj, { task: res.task! });
+  if (
+    !approvedContract ||
+    !approvedContract.specPath ||
+    approvedContract.specPath.includes("/acceptance/")
+  ) {
+    const targetSha = res.task?.spec_sha ?? task.spec_sha;
+    const proj = task.project_id && (deps as any).resolveProject
+      ? await Promise.resolve((deps as any).resolveProject(task.project_id)).catch(() => null)
+      : (deps as any).project ?? null;
+    const repoRoot = deps.ctx?.cwd ?? proj?.repoPath ?? proj?.repoRoot ?? process.cwd();
+    if (targetSha && !targetSha.startsWith("sha-") && repoRoot) {
+      try {
+        const cmdRunner = (deps as any).cmd ?? {
+          run: async (file: string, args: string[], opts?: any) => {
+            const { execFileSync } = await import("node:child_process");
+            try {
+              const stdout = execFileSync(file, args, { cwd: opts?.cwd, encoding: "utf8" });
+              return { exitCode: 0, stdout, stderr: "" };
+            } catch (e: any) {
+              return { exitCode: e.status ?? 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+            }
+          },
+        };
+        const diffRes = await cmdRunner.run(
+          "git",
+          ["diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root", targetSha],
+          { cwd: repoRoot },
+        );
+        if (diffRes.exitCode === 0) {
+          const files = diffRes.stdout.split("\n").map((s: string) => s.trim()).filter(Boolean);
+          const specFiles = files.filter(
+            (f: string) => f.startsWith("docs/specs/") && f.endsWith(".md") && !f.includes("/acceptance/"),
+          );
+          if (specFiles.length === 0) {
+            specFiles.push(...files.filter((f: string) => f.startsWith("docs/") && f.endsWith(".md") && !f.startsWith("docs/adr/")));
+          }
+          const adrFiles = files.filter((f: string) => f.startsWith("docs/adr/") && f.endsWith(".md"));
+          const isArch = Boolean(adrFiles.length > 0 || approvedContract?.isArchitectural);
+          if (specFiles.length > 0 || adrFiles.length > 0) {
+            approvedContract = {
+              ...(approvedContract ?? { kind: "behavior_change" }),
+              specPath: specFiles.join(", ") || approvedContract?.specPath,
+              specSha: targetSha,
+              adrPath: adrFiles.join(", ") || approvedContract?.adrPath,
+              isArchitectural: isArch,
+            };
+          }
+        }
+      } catch {}
+    }
+  }
+
   if (approvedContract) {
     const specSha: string = String(
       res.task!.spec_sha ||
@@ -2207,12 +2259,20 @@ export async function runApprove(
         taskKey: key,
         projectId: task.project_id ?? undefined,
         specSha,
+        isArchitectural: approvedContract.isArchitectural,
         approvalId,
       },
       now,
     );
     payloadObj.approval_id = approvalId;
     payloadObj.spec_sha = specSha;
+    if (approvedContract.specPath) {
+      payloadObj.spec_path = approvedContract.specPath;
+    }
+    if (approvedContract.adrPath) {
+      payloadObj.adr_path = approvedContract.adrPath;
+    }
+    payloadObj.is_architectural = approvedContract.isArchitectural;
     deps.store.updateTask(key, { payload: JSON.stringify(payloadObj) });
   }
 
@@ -5878,25 +5938,66 @@ async function advanceActiveTask(
         }
 
         let filesOutsideDocs = false;
+        let detectedSpecFiles: string[] = [];
+        let detectedAdrFiles: string[] = [];
         if (deps.cmd && specSha && !specSha.startsWith("sha-")) {
           try {
-            let diffRes = await deps.cmd.run(
+            let branchRes = await deps.cmd.run(
               "git",
               ["diff", "--name-only", `${mergeBaseBranch}...${specSha}`],
               { cwd: repoRoot },
             );
-            if (diffRes.exitCode !== 0) {
-              diffRes = await deps.cmd.run(
+            if (branchRes.exitCode !== 0) {
+              branchRes = await deps.cmd.run(
                 "git",
                 ["diff", "--name-only", `${specSha}~1`, specSha],
                 { cwd: repoRoot },
               );
             }
-            if (diffRes.exitCode === 0) {
-              const files = diffRes.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
+            if (branchRes.exitCode !== 0) {
+              branchRes = await deps.cmd.run(
+                "git",
+                ["diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root", specSha],
+                { cwd: repoRoot },
+              );
+            }
+            if (branchRes.exitCode === 0) {
+              const files = branchRes.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
               filesOutsideDocs = files.some(
                 (f) => !f.startsWith("docs/") && !f.endsWith(".md"),
               );
+              detectedSpecFiles = files.filter(
+                (f) => f.startsWith("docs/specs/") && f.endsWith(".md") && !f.includes("/acceptance/"),
+              );
+              if (detectedSpecFiles.length === 0) {
+                detectedSpecFiles = files.filter(
+                  (f) => f.startsWith("docs/") && f.endsWith(".md") && !f.startsWith("docs/adr/"),
+                );
+              }
+              detectedAdrFiles = files.filter(
+                (f) => f.startsWith("docs/adr/") && f.endsWith(".md"),
+              );
+            }
+            if (detectedSpecFiles.length === 0 && detectedAdrFiles.length === 0) {
+              const treeRes = await deps.cmd.run(
+                "git",
+                ["diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root", specSha],
+                { cwd: repoRoot },
+              );
+              if (treeRes.exitCode === 0) {
+                const files = treeRes.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
+                detectedSpecFiles = files.filter(
+                  (f) => f.startsWith("docs/specs/") && f.endsWith(".md") && !f.includes("/acceptance/"),
+                );
+                if (detectedSpecFiles.length === 0) {
+                  detectedSpecFiles = files.filter(
+                    (f) => f.startsWith("docs/") && f.endsWith(".md") && !f.startsWith("docs/adr/"),
+                  );
+                }
+                detectedAdrFiles = files.filter(
+                  (f) => f.startsWith("docs/adr/") && f.endsWith(".md"),
+                );
+              }
             }
           } catch {}
         }
@@ -5978,6 +6079,9 @@ async function advanceActiveTask(
             ...payload,
             ...(resolution.action?.setPayload ?? {}),
             spec_sha: specSha,
+            ...(detectedSpecFiles.length > 0 ? { spec_path: detectedSpecFiles.join(", ") } : {}),
+            ...(detectedAdrFiles.length > 0 ? { adr_path: detectedAdrFiles.join(", ") } : {}),
+            is_architectural: detectedAdrFiles.length > 0,
             last_executor_route: specRoute,
             last_executor_provider: specProvider,
             last_executor_model: specModel,
