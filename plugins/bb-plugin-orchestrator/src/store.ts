@@ -4521,6 +4521,23 @@ export class DelegationStore {
          WHERE task_key = ?`,
       )
       .run(now, key);
+    try {
+      const task = this.getTask(key);
+      if (task) {
+        let newPayload = task.payload;
+        if (task.payload) {
+          try {
+            const p = JSON.parse(task.payload);
+            delete p.approval_id;
+            delete p.approvalId;
+            delete p.spec_sha;
+            delete p.specSha;
+            newPayload = JSON.stringify(p);
+          } catch {}
+        }
+        this.updateTask(key, { payload: newPayload, spec_sha: null });
+      }
+    } catch {}
     return info.changes > 0;
   }
 

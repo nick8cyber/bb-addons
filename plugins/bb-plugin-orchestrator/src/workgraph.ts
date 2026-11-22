@@ -2193,8 +2193,12 @@ export async function runApprove(
   const approvedContract = resolveTaskSpecContract(key, deps.store, payloadObj, { task: res.task! });
   if (approvedContract) {
     const specSha: string = String(
-      (payloadObj?.spec_sha ?? payloadObj?.specSha) ??
-      (approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base")
+      res.task!.spec_sha ||
+      task.spec_sha ||
+      approvedContract.specSha ||
+      (payloadObj?.spec_sha ?? payloadObj?.specSha) ||
+      task.acceptance_sha ||
+      "base"
     );
     const approvalId = `appr:${task.project_id ?? "proj"}:${key}:${specSha}:${now}`;
     deps.store.saveSpecContract(
@@ -5973,6 +5977,7 @@ async function advanceActiveTask(
           payload: JSON.stringify({
             ...payload,
             ...(resolution.action?.setPayload ?? {}),
+            spec_sha: specSha,
             last_executor_route: specRoute,
             last_executor_provider: specProvider,
             last_executor_model: specModel,
@@ -6297,8 +6302,12 @@ async function advanceActiveTask(
               const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
               if (approvedContract) {
                 const specSha: string = String(
-                  ((payload as any)?.spec_sha ?? (payload as any)?.specSha) ??
-                  (approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base")
+                  tr.task?.spec_sha ||
+                  task.spec_sha ||
+                  approvedContract.specSha ||
+                  ((payload as any)?.spec_sha ?? (payload as any)?.specSha) ||
+                  task.acceptance_sha ||
+                  "base"
                 );
                 const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
                 deps.store.saveSpecContract(
@@ -6997,8 +7006,12 @@ async function advanceActiveTask(
               const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
               if (approvedContract) {
                 const specSha: string = String(
-                  ((payload as any)?.spec_sha ?? (payload as any)?.specSha) ??
-                  (approvedContract.specSha || task.acceptance_sha || task.spec_sha || "base")
+                  tr.task?.spec_sha ||
+                  task.spec_sha ||
+                  approvedContract.specSha ||
+                  ((payload as any)?.spec_sha ?? (payload as any)?.specSha) ||
+                  task.acceptance_sha ||
+                  "base"
                 );
                 const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
                 deps.store.saveSpecContract(

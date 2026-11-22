@@ -1944,6 +1944,60 @@ test("§31.9 Opus Audit Round 3 Blocker 3: approval revocation resets spec_sha a
   });
 });
 
+test("§31.9 Opus Audit Round 4 Blocker 3: real path re-approval when column spec_sha updated and payload retained", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const repoDir = makeTempDir("audit-r4-b3-");
+  const { cmd } = initGitRepo(repoDir);
+
+  const specPath = "docs/specs/feature-r4.md";
+  const specFullPath = join(repoDir, specPath);
+  mkdirSync(join(repoDir, "docs/specs"), { recursive: true });
+
+  writeFileSync(specFullPath, "# Spec v1\nInitial specification content\n");
+  execFileSync("git", ["add", specPath], { cwd: repoDir });
+  execFileSync("git", ["commit", "-m", "spec v1"], { cwd: repoDir });
+  const shaA = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+
+  store.insertTask({
+    taskKey: "SPEC-R4-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_c",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "manual",
+    payload: JSON.stringify({ spec_path: specPath, gate_stage: "pre_code" }),
+  });
+  store.updateTask("SPEC-R4-1", { node: "owner_gate", status: "waiting_approval", spec_sha: shaA } as any);
+
+  await runApprove("SPEC-R4-1", "ok", { store, ctx: { cwd: repoDir } as any, workGraphMode: "strict", now: () => 1000 });
+  await verifySpecBeforeCodeGate({ taskKey: "SPEC-R4-1", role: "executor", store, cmd, repoRoot: repoDir, workGraphMode: "strict" });
+
+  // return to spec (as runReject code->spec does)
+  store.revokeSpecContractApproval("SPEC-R4-1", 2000);
+
+  // spec node round 2: writes column spec_sha=B, keeps payload (or spreads old payload)
+  writeFileSync(specFullPath, "# Spec v2\nUpdated specification content\n");
+  execFileSync("git", ["add", specPath], { cwd: repoDir });
+  execFileSync("git", ["commit", "-m", "spec v2"], { cwd: repoDir });
+  const shaB = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+
+  const pl = JSON.parse(store.getTask("SPEC-R4-1")!.payload!);
+  store.updateTask("SPEC-R4-1", {
+    node: "owner_gate",
+    status: "waiting_approval",
+    spec_sha: shaB,
+    payload: JSON.stringify({ ...pl, spec_done: false }),
+  } as any);
+
+  await runApprove("SPEC-R4-1", "ok2", { store, ctx: { cwd: repoDir } as any, workGraphMode: "strict", now: () => 3000 });
+  const contract = store.getSpecContract("SPEC-R4-1");
+  assert.equal(contract?.spec_sha, shaB, "re-approved contract must have shaB");
+
+  await verifySpecBeforeCodeGate({ taskKey: "SPEC-R4-1", role: "executor", store, cmd, repoRoot: repoDir, workGraphMode: "strict" });
+});
+
 test("§31.9 Opus Audit Non-blocker 6: runDelegate and runRunQueue pass resolveProject end-to-end", async () => {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);

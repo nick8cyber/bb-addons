@@ -115,11 +115,11 @@ export function resolveTaskSpecContract(
         return null;
       }
     })();
-    const freshSha = pl?.spec_sha ?? pl?.specSha;
-    const freshPath = pl?.spec_path ?? pl?.specPath;
-    const freshSection = pl?.spec_section ?? pl?.specSection;
-    const freshAdr = pl?.adr_path ?? pl?.adrPath;
-    const freshMechBasis = pl?.mechanical_basis ?? pl?.mechanicalBasis;
+    const freshSha = taskRow?.spec_sha ?? pl?.spec_sha ?? pl?.specSha;
+    const freshPath = taskRow?.spec_path ?? pl?.spec_path ?? pl?.specPath;
+    const freshSection = taskRow?.spec_section ?? pl?.spec_section ?? pl?.specSection;
+    const freshAdr = taskRow?.adr_path ?? pl?.adr_path ?? pl?.adrPath;
+    const freshMechBasis = taskRow?.mechanical_basis ?? pl?.mechanical_basis ?? pl?.mechanicalBasis;
     return {
       kind: row.kind,
       projectId: row.project_id ?? undefined,
@@ -177,9 +177,9 @@ export function resolveTaskSpecContract(
 
     // In feature route, spec node deliverables
     if (typeof pl.spec_path === "string" || typeof pl.specPath === "string") {
-      const sp = (pl.spec_path ?? pl.specPath) as string;
-      const sha = (pl.spec_sha ?? pl.specSha) as string | undefined;
-      const adr = (pl.adr_path ?? pl.adrPath) as string | undefined;
+      const sp = (taskRow?.spec_path ?? pl.spec_path ?? pl.specPath) as string;
+      const sha = (taskRow?.spec_sha ?? pl.spec_sha ?? pl.specSha) as string | undefined;
+      const adr = (taskRow?.adr_path ?? pl.adr_path ?? pl.adrPath) as string | undefined;
       const isArch = Boolean(pl.is_architectural ?? pl.isArchitectural);
       return {
         kind: "behavior_change",
