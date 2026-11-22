@@ -75,6 +75,9 @@ const LEASE_TTL_MS = 10 * 60_000;
 const GROUP_STARTUP_GRACE_MS = 60_000;
 // 20 minutes (prevents timeout of long deep reviews on neon high).
 const SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000;
+// PLUG-371: абсолютный потолок хода — отдельный щедрый env (дефолт 4ч), только как страховка от вечного цикла.
+const rawSessionCapMs = Number(process.env.WEB_GEMINI_SESSION_CAP_MS || process.env.ARGON_SESSION_CAP_MS);
+const SESSION_CAP_MS = Number.isFinite(rawSessionCapMs) && rawSessionCapMs > 0 ? rawSessionCapMs : 4 * 3600_000;
 
 // PLUG-291: каталоги веб-вложений (исходящие uploads, входящие downloads) и
 // их чистка при старте — TTL 24ч и не более 20 файлов на каталог.
@@ -399,6 +402,15 @@ export function getAccountPriority(b, state) {
   return 10;
 }
 
+function leasedUntil(state, b, owner, now) {
+  const l = state.leases && state.leases[b.id];
+  if (l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) {
+    return l.acquiredMs + LEASE_TTL_MS;
+  }
+  const e = accEntry(state, b.id);
+  return e && (e.inUseUntilMs ?? 0) > now && e.owner !== owner ? e.inUseUntilMs : 0;
+}
+
 // A port whose browser-group marker is flagged `reaping` is off-limits for
 // new leases while the mark is fresh — the teardown owner frees it shortly.
 function reapingBusyUntil(stateDir, port, now) {
@@ -407,15 +419,7 @@ function reapingBusyUntil(stateDir, port, now) {
 }
 
 export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null, backends = BACKENDS, stateDir = STATE_DIR) {
-  const isLeased = (b) => {
-    const l = state.leases && state.leases[b.id];
-    if (l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) {
-      return l.acquiredMs + LEASE_TTL_MS;
-    }
-    const e = accEntry(state, b.id);
-    const accBusy = e && (e.inUseUntilMs ?? 0) > now && e.owner !== owner ? e.inUseUntilMs : 0;
-    return Math.max(accBusy, reapingBusyUntil(stateDir, b.cdp, now));
-  };
+  const isLeased = (b) => Math.max(leasedUntil(state, b, owner, now), reapingBusyUntil(stateDir, b.cdp, now));
 
   const req = requestedModel ? (resolveModelId(requestedModel) || requestedModel.toLowerCase()) : null;
   const candidates = backends.filter((b) => {
@@ -774,12 +778,12 @@ export function classifyFailure(err, authHint = null) {
     };
   }
 
-  // 2. transient (stream caps + driver/page faults, PLUG-286)
+  // 2. transient (stream caps + driver/page faults, PLUG-286, PLUG-371)
   if (
-    /generation still running after (?:540|900|\d+)s cap|stream_timeout|argon_stream_timeout|web_gemini_stream_timeout|hung page|stalled generation/i.test(
+    /generation still running after (?:540|900|\d+)s cap|stream_timeout|argon_stream_timeout|web_gemini_stream_timeout|hung page|stalled generation|generation stalled/i.test(
       message
     ) ||
-    (err && (err.code === "WEB_GEMINI_STREAM_TIMEOUT" || err.code === "ARGON_STREAM_TIMEOUT" || err.name === "TimeoutError")) ||
+    (err && (err.code === "WEB_GEMINI_STREAM_TIMEOUT" || err.code === "ARGON_STREAM_TIMEOUT" || err.code === "WEB_GEMINI_STALLED" || err.code === "ARGON_STALLED" || err.name === "TimeoutError")) ||
     DRIVER_TRANSIENT_RE.test(message)
   ) {
     return {
@@ -1297,9 +1301,10 @@ function turnError(id, outcome, reason, stage = "preflight") {
   } });
 }
 
-function createTaskTurn(sessionId) {
+export function createTaskTurn(sessionId) {
   const controller = new AbortController();
   const started = Date.now();
+  const sessionCapAt = started + SESSION_CAP_MS;
   let deadline = started + SEND_DEADLINE_MS;
   const toolCallId = "gemini-turn-" + randomUUID();
   const update = (fields) => out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { toolCallId, ...fields } } });
@@ -1316,6 +1321,7 @@ function createTaskTurn(sessionId) {
     wake({ cancelled: true });
   };
   let timer;
+  let deadlineWatch = null;
   const setDeadline = (value) => {
     deadline = value;
     clearTimeout(timer);
@@ -1325,6 +1331,7 @@ function createTaskTurn(sessionId) {
       timer = setTimeout(() => stop("deadline exceeded"), remaining);
       timer.unref();
     }
+    deadlineWatch?.(deadline);
   };
   setDeadline(deadline);
   const progress = (status, message) => {
@@ -1343,14 +1350,30 @@ function createTaskTurn(sessionId) {
   const turn = {
     get stage() { return stage; },
     get deadline() { return deadline; },
+    get started() { return started; },
+    get sessionCapAt() { return sessionCapAt; },
     setDeadline, signal: controller.signal, aborted, stop, ownedFiles: [],
     pinnedSha: null,
     packageSha256: null,
+    get onDeadlineChange() { return deadlineWatch; },
+    set onDeadlineChange(fn) { deadlineWatch = typeof fn === "function" ? fn : null; },
     ping(next, extra) {
       if (closed || controller.signal.aborted) return;
+      const prevStage = stage;
       stage = typeof next === "object" ? next.stage : next;
       const data = typeof next === "object" ? next : (extra ? { stage, ...extra } : { stage });
       slog("task:stage", { sessionId, ...data });
+      // PLUG-371: дедлайн пересчитывается только при смене стадии — heartbeat
+      // ping той же стадии не должен сдвигать фазовый лимит. На время
+      // генерации действует потолок сессии, при выходе из неё и на
+      // verify/commit возвращается окно SEND_DEADLINE_MS.
+      if (stage !== prevStage) {
+        if (stage === "generation") {
+          setDeadline(sessionCapAt);
+        } else if (prevStage === "generation" || stage === "verify" || stage === "commit") {
+          setDeadline(Math.min(Date.now() + SEND_DEADLINE_MS, sessionCapAt));
+        }
+      }
       if (turn.journal && turn.journal.turn.stage !== stage) {
         turn.journal.turn.stage = stage;
         try {
@@ -1446,7 +1469,7 @@ async function probeAuthHint(backend) {
 }
 
 /* ---------- backend binding ---------- */
-async function bindBackend(s, sessionId, profile = s) {
+async function bindBackend(s, sessionId, profile = s, { allowSameBackend = false, excludeId = null } = {}) {
   const owner = `${process.pid}:${sessionId}`;
   const reqModel = profile.model
     ? (resolveModelId(profile.model) || profile.model.toLowerCase())
@@ -1519,18 +1542,41 @@ async function bindBackend(s, sessionId, profile = s) {
       if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
       if (reaping) return { busyUntil: reapUntil, account: prev };
       if (r.none) {
+        if (allowSameBackend) {
+          const same = BACKENDS.find((b) => b.id === prev);
+          const coolUntil = accEntry(state, prev)?.cooldownUntilMs ?? 0;
+          if (same && !isLocked && coolUntil <= now && leasedUntil(state, same, owner, now) === 0) {
+            acquireInState(state, same, owner, now);
+            return { backend: same };
+          }
+        }
         return { error: reqModel === "carbon" ? "no accounts in pool with Carbon available" : "all accounts are in cooldown or busy and no sibling is free" };
       }
       return { error: `account "${prev}" is in cooldown until ${new Date(cool).toISOString()} and no sibling is free` };
     }
 
-    const r = pickBackendFromState(state, null, owner, now, reqModel);
+    const r = pickBackendFromState(state, excludeId, owner, now, reqModel);
     if (r.backend) {
       acquireInState(state, r.backend, owner, now);
       return { backend: r.backend };
     }
     if (r.busyUntil) return { busyUntil: r.busyUntil };
     if (r.none) {
+      // PLUG-371: ретрай стола — исключённый аккаунт возвращаем только когда
+      // свободных соседей в пуле совсем нет.
+      if (allowSameBackend && excludeId) {
+        const same = BACKENDS.find((b) => b.id === excludeId);
+        const e = same ? accEntry(state, same.id) : null;
+        const tier = same ? getAccountTier(same, state) : null;
+        const sameLocked = Boolean(same) && (
+          (reqModel && e?.lockedModels?.includes(reqModel)) ||
+          (reqModel === "carbon" && tier !== "ultra")
+        );
+        if (same && !sameLocked && (e?.cooldownUntilMs ?? 0) <= now && leasedUntil(state, same, owner, now) === 0) {
+          acquireInState(state, same, owner, now);
+          return { backend: same };
+        }
+      }
       return { error: reqModel === "carbon" ? "no accounts in pool with Carbon available" : "account pool is empty (no enabled backends)" };
     }
     if (r.cooledUntil) {
@@ -1687,9 +1733,13 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       }
 
       const maxAttempts = Math.min(BACKENDS.length, 3);
-      const turnDeadline = task?.deadline ?? Date.now() + SEND_DEADLINE_MS;
+      const turnStarted = task?.started ?? Date.now();
+      const turnDeadline = task?.deadline ?? (turnStarted + SEND_DEADLINE_MS);
+      const sessionCapAt = task?.sessionCapAt ?? (turnStarted + SESSION_CAP_MS);
       const waitDeadline = Math.min(Date.now() + 130_000, turnDeadline);
       let attempts = 0;
+      let stallRetries = 0;
+      let excludeBackendId = null;
       let lastErr = null;
       let streamedAny = false;
 
@@ -1845,7 +1895,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
 
       while (true) {
         if (s.cancelled || task?.signal.aborted) return { cancelled: true };
-        const bound = await bindBackend(s, sessionId, profile);
+        const bound = await bindBackend(s, sessionId, profile, { allowSameBackend: stallRetries > 0, excludeId: excludeBackendId });
         if (bound.error) {
           if (task?.resume?.convId && s.convId && !resumeFallbackDone) {
             // Прежний backend недоступен — повторная доставка в новый чат.
@@ -2000,6 +2050,10 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               try {
                 res = await sendWebPrompt(request);
               } catch (error) {
+                if (task && (error.code === "WEB_GEMINI_STALLED" || error.code === "ARGON_STALLED" || /generation stalled|stalled generation/i.test(error?.message || ""))) {
+                  budgets.contextBytes = Math.max(0, budgets.contextBytes - outboundBytes);
+                  persistJournal();
+                }
                 // §7.3: сохранённый разговор недоступен (редирект на новый
                 // чат) — одноразовая конвертация в повторную доставку
                 // сохранённого пакета с обменами хода.
@@ -2193,21 +2247,27 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         })();
         activeAttempt = attempt;
 
-        const remaining = turnDeadline - Date.now();
-        if (remaining <= 0) {
-          await releaseLease(backend.id);
-          activeBackendId = null;
-          activeAbort = null;
-          activeAttempt = null;
-          activePromptSessionId = null;
-          throw new Error(`turn exceeded ${SEND_DEADLINE_MS / 60000}min deadline`);
-        }
-
+        // PLUG-371: дедлайн попытки следует за task.deadline — при переходе в
+        // generation он растёт до потолка сессии, при выходе обратно сжимается
+        // до фазового окна (task.onDeadlineChange из createTaskTurn).
+        let attemptDeadlineIsCap = false;
+        let resolveDeadline;
+        const deadlineP = new Promise((res) => { resolveDeadline = res; });
         let deadlineTimer;
-        const deadlineP = new Promise((res) => {
-          deadlineTimer = setTimeout(() => res("deadline"), remaining);
+        const armAttemptDeadline = () => {
+          clearTimeout(deadlineTimer);
+          const limit = task ? task.deadline : turnDeadline;
+          attemptDeadlineIsCap = limit >= sessionCapAt;
+          const rem = limit - Date.now();
+          if (rem <= 0) {
+            resolveDeadline("deadline");
+            return;
+          }
+          deadlineTimer = setTimeout(() => resolveDeadline("deadline"), rem);
           deadlineTimer.unref?.();
-        });
+        };
+        if (task) task.onDeadlineChange = armAttemptDeadline;
+        armAttemptDeadline();
 
         const outcome = await Promise.race([
           attempt.then(() => "done", () => "failed"),
@@ -2217,6 +2277,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           deadlineP,
         ]);
         clearTimeout(deadlineTimer);
+        if (task) task.onDeadlineChange = null;
         s._cancelRes = null;
 
         if (outcome === "cancelled") {
@@ -2238,7 +2299,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           activeAbort = null;
           activeAttempt = null;
           activePromptSessionId = null;
-          throw new Error(`turn exceeded ${SEND_DEADLINE_MS / 60000}min deadline`);
+          throw new Error(`turn exceeded ${attemptDeadlineIsCap ? `${SESSION_CAP_MS / 3600000}h session cap` : `${SEND_DEADLINE_MS / 60000}min deadline`}`);
         }
 
         try {
@@ -2285,15 +2346,37 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           activePromptSessionId = null;
           attempts += 1;
 
+          const isStalled = Boolean(
+            err && (err.code === "WEB_GEMINI_STALLED" || err.code === "ARGON_STALLED" || /generation stalled|stalled generation/i.test(err.message || ""))
+          );
+
+          // PLUG-371: один авторетрай в рамках хода при stalled, если остаётся >25% бюджета SEND_DEADLINE.
+          // При s.convId ретрай запрещён — рестарт tool-loop ушёл бы в чужой начатый разговор.
+          const remainingPhaseBudget = (turnStarted + SEND_DEADLINE_MS) - Date.now();
+          const hasStallBudget = remainingPhaseBudget > 0.25 * SEND_DEADLINE_MS;
+          const canStallRetry = isStalled && stallRetries < 1 && hasStallBudget && !streamedAny && !s.convId && cooled !== "breaker";
+
           const canRotate =
-            profile.account === "auto" &&
-            attempts < maxAttempts &&
-            cls.rotatable &&
-            !s.convId &&
+            (canStallRetry || (
+              !isStalled &&
+              profile.account === "auto" &&
+              attempts < maxAttempts &&
+              cls.rotatable &&
+              !s.convId
+            )) &&
             !streamedAny &&
             cooled !== "breaker";
 
-          if (!canRotate) {
+          if (isStalled) {
+            if (canStallRetry) {
+              stallRetries += 1;
+              excludeBackendId = backend.id;
+              slog("task:stall-retry", { sessionId, attempt: attempts, remainingBudget: remainingPhaseBudget });
+            } else {
+              if (hint) err.authHint = hint;
+              throw err;
+            }
+          } else if (!canRotate) {
             if (hint) err.authHint = hint;
             throw err;
           }
@@ -2365,7 +2448,11 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
     if (!isExiting) {
       // PLUG-281: caller-side refusal — report verbatim, no driver framing.
       if (task) {
+        const isStalled = Boolean(
+          err && (err.code === "WEB_GEMINI_STALLED" || err.code === "ARGON_STALLED" || /generation stalled|stalled generation/i.test(err.message || ""))
+        );
         const reason = task.signal.reason === "deadline exceeded" && !err.message?.startsWith("recovery_required:") ? "deadline exceeded" :
+          isStalled ? "stalled" :
           err instanceof TaskTurnError ? err.message : "web model request failed at " + task.stage;
         if (tj && reason.startsWith("recovery_required:")) tj.turn.recoveryRequired = true;
         await task.finish("failed", reason);

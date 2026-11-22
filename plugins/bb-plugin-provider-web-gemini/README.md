@@ -68,7 +68,7 @@ ACP-провайдер «Gemini Web» (`acp-web-gemini`, обратная сов
 - `WEB_GEMINI_STATE_DIR` / `ARGON_STATE_DIR`: путь к каталогу состояния (по умолчанию `~/.bb/plugins/provider-web-gemini`, фолбэк: `~/.bb/plugins/provider-argon`).
 - `WEB_GEMINI_POOL_FILE` / `ARGON_POOL_FILE`: путь к файлу пула (по умолчанию `$STATE_DIR/pool.json`).
 - `WEB_GEMINI_BACKENDS` / `ARGON_BACKENDS`: JSON-массив описаний бэкендов в виде строки.
-- `WEB_GEMINI_SEND_DEADLINE_MS` / `ARGON_SEND_DEADLINE_MS`: таймаут генерации на ход (по умолчанию 1 200 000 мс — 20 минут).
+- `WEB_GEMINI_SEND_DEADLINE_MS` / `ARGON_SEND_DEADLINE_MS`: дедлайн негенерационных фаз хода — collect/delivery/verify/commit и фазовый бюджет авторетрая стола (по умолчанию 1 200 000 мс — 20 минут). На время стадии generation заменяется потолком `WEB_GEMINI_SESSION_CAP_MS`.
 - `WEB_GEMINI_MAX_PROMPT_BYTES` / `ARGON_MAX_PROMPT_BYTES`: потолок размера исходящего промпта в байтах UTF-8 (по умолчанию `100000` — ниже порога ~120 КБ, на котором Chrome виснет на `insertText`; `0`/отрицательное — без лимита). При превышении текст задачи переливается в файл-вложение `pkg-<sessionId>-prompt-<ts>.md` (r22, PLUG-303); при ошибке записи файла — отказ `prompt too large: … exceeds limit …` до выбора аккаунта и аренды.
 - `WEB_GEMINI_MAX_TOOL_ROUNDS` / `ARGON_MAX_TOOL_ROUNDS`: потолок раундов инструментов чтения за ход (по умолчанию 8; spec `provider-web-gemini-tools`).
 - `WEB_GEMINI_MAX_MESSAGE_BYTES` / `ARGON_MAX_MESSAGE_BYTES`: потолок первого сообщения сессии с упакованными вложениями (по умолчанию 120 000 байт).
@@ -76,7 +76,8 @@ ACP-провайдер «Gemini Web» (`acp-web-gemini`, обратная сов
 - `WEB_GEMINI_USAGE_REFRESH_MS` / `ARGON_USAGE_REFRESH_MS`: интервал троттлинга сбора лимитов использования на аккаунт (по умолчанию 300 000 мс — 5 минут).
 - `WEB_GEMINI_USAGE_TIMEOUT_MS` / `ARGON_USAGE_TIMEOUT_MS`: таймаут сбора лимитов после хода (по умолчанию 10 000 мс).
 - `WEB_GEMINI_DEBUG` / `ARGON_DEBUG`: отладочное логирование сбора лимитов и драйвера.
-- `GEMINI_MAX_WAIT_MS`: внутренний потолок ожидания стрима в драйвере (по умолчанию 900 000 мс — 15 минут).
+- `WEB_GEMINI_STALL_MS` / `ARGON_STALL_MS`: таймаут отсутствия прогресса генерации — при видимом stop-button/busy, а также когда стоп-кнопка ушла, но готового контента нет (по умолчанию 120 000 мс — 2 минуты; fail fast с исходом stalled).
+- `WEB_GEMINI_SESSION_CAP_MS` / `ARGON_SESSION_CAP_MS`: абсолютный потолок длительности хода / генерации (по умолчанию 14 400 000 мс — 4 часа; пока есть прогресс, SEND_DEADLINE 20 мин к генерации не применяется).
 - `GEMINI_PARK_IDLE`: парковка вкладки на `about:blank` в простое (`1` по умолчанию, `0` для отключения).
 - `GEMINI_PROFILE_DIR`: путь к каталогу профиля Chrome для одиночного профиля по умолчанию.
 - `GEMINI_PROFILE`: имя или каталог профиля Chrome для одиночного профиля по умолчанию (по умолчанию `~/.gemini-cli-profile`).
