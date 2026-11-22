@@ -990,8 +990,9 @@ test("connected server run-queue resolver: недоступный контекс
     projectId: "proj_valid",
     coordinatorThreadId: "thr_valid_proj",
     confirmationMode: "auto",
-    route: "fix",
+    route: "simple",
     level: "simple",
+    payload: JSON.stringify({ acceptance_text: "Valid project task criteria" }),
   });
 
   // Call run-queue with a caller cwd pointing to a fake process dir

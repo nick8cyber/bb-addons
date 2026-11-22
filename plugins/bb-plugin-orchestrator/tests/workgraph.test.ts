@@ -1986,6 +1986,7 @@ test("Round 5 Blocker 1: design_check preserves blockers count and prevents OK w
     route: "feature",
     level: "complex",
     confirmationMode: "auto",
+    payload: JSON.stringify({ spec_path: "docs/specs/dc.md", spec_sha: "dc_sha" }),
   }, now);
   store.transitionTask({
     taskKey: "DC-BLOCKERS",

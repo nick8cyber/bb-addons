@@ -24,6 +24,7 @@ import { delimiter, isAbsolute, join, relative } from "node:path";
 import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
+import { verifyReleaseDocumentsGate } from "./spec-gate.js";
 import {
   acquireCopyLock,
   restoreCopy,
@@ -2962,6 +2963,16 @@ async function runReleaseSteps(
         { taskKey, expectedSha: preSyncSha },
       );
     deps.store.addReleasePipelineShas(release.id, pipelineShas);
+
+    // §2 / §31.9: verify accepted spec documents on exact postSyncSha
+    await verifyReleaseDocumentsGate({
+      taskKey,
+      store: deps.store,
+      cmd: deps.cmd,
+      repoRoot: repo,
+      publishedSha: postSyncSha,
+      project,
+    });
     // §17.3 (ревью PLUG-214): the tip the gate vetted — the checks
     // window (up to CHECK_TIMEOUT_MS) is long enough for a revived
     // executor to land a commit on the branch; only this sha may stand

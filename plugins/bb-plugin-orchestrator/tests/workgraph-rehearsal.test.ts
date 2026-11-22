@@ -819,6 +819,7 @@ test("5в Checks failure: failing checks test loops back to code and blocks afte
     level: "simple",
     priority: 10,
     confirmationMode: "auto",
+    payload: JSON.stringify({ acceptance_text: "Checks failure loop acceptance criteria" }),
   });
 
   // start -> code

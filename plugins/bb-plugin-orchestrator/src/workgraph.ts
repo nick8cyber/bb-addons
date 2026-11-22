@@ -27,6 +27,7 @@ import {
   normalizeTaskKey,
 } from "./store.js";
 import { verdictDetailsInBody } from "./release.js";
+import { verifySpecBeforeCodeGate } from "./spec-gate.js";
 import {
   checkRouteLimits,
   type RouteLimitsCheckResult,
@@ -4002,7 +4003,9 @@ export async function runRunQueue(
             progressed = true;
             advancedCount++;
           }
-        } catch {}
+        } catch (e) {
+          if ((e as any)?.code === "spec-gate-violation") throw e;
+        }
       }
 
       // ── 1b. Request interaction for tasks waiting at owner_gate ─────────
@@ -4106,7 +4109,9 @@ export async function runRunQueue(
             progressed = true;
             advancedCount++;
           }
-        } catch {}
+        } catch (e) {
+          if ((e as any)?.code === "spec-gate-violation") throw e;
+        }
       }
 
       // ── 2. Take queued tasks ──────────────────────────────────────────
@@ -4165,7 +4170,9 @@ export async function runRunQueue(
               advancedCount++;
               availableSlots--;
             }
-          } catch {}
+          } catch (e) {
+            if ((e as any)?.code === "spec-gate-violation") throw e;
+          }
         }
       }
     }
@@ -4244,7 +4251,42 @@ export async function runRunQueue(
             shadow_eval: shadowEval,
           }),
         });
-      } catch {}
+
+        if (res.allowed && res.toNode === "code") {
+          try {
+            await verifySpecBeforeCodeGate({
+              taskKey: t.task_key,
+              store: deps.store,
+              cmd: deps.cmd,
+              repoRoot,
+              workGraphMode: deps.workGraphMode,
+              policy: deps.policy,
+              task: t,
+              payload,
+            });
+          } catch (err: any) {
+            if (err?.code === "spec-gate-violation") {
+              const blockedEval = {
+                command: "run-queue",
+                evaluated_at: Date.now(),
+                would_reject: "spec-gate-violation",
+                would_block: { reason: "spec-gate-violation" },
+                current_node: t.node,
+                current_status: t.status,
+              };
+              deps.store.updateTask(t.task_key, {
+                payload: JSON.stringify({
+                  ...payload,
+                  shadow_eval: blockedEval,
+                }),
+              });
+              throw err;
+            }
+          }
+        }
+      } catch (e) {
+        if ((e as any)?.code === "spec-gate-violation") throw e;
+      }
     }
 
     // 2. Evaluate active tasks: would advance based on completed delegations or state
@@ -4379,7 +4421,42 @@ export async function runRunQueue(
             shadow_eval: shadowEval,
           }),
         });
-      } catch {}
+
+        if (t.node === "code" || wouldTrans?.to_node === "code") {
+          try {
+            await verifySpecBeforeCodeGate({
+              taskKey: t.task_key,
+              store: deps.store,
+              cmd: deps.cmd,
+              repoRoot,
+              workGraphMode: deps.workGraphMode,
+              policy: deps.policy,
+              task: t,
+              payload,
+            });
+          } catch (err: any) {
+            if (err?.code === "spec-gate-violation") {
+              const blockedEval = {
+                command: "run-queue",
+                evaluated_at: Date.now(),
+                would_reject: "spec-gate-violation",
+                would_block: { reason: "spec-gate-violation" },
+                current_node: t.node,
+                current_status: t.status,
+              };
+              deps.store.updateTask(t.task_key, {
+                payload: JSON.stringify({
+                  ...payload,
+                  shadow_eval: blockedEval,
+                }),
+              });
+              throw err;
+            }
+          }
+        }
+      } catch (e) {
+        if ((e as any)?.code === "spec-gate-violation") throw e;
+      }
     }
   }
 
@@ -4392,6 +4469,26 @@ export async function runRunQueue(
     tasks: nonOffQueued,
     transitions,
   };
+}
+
+async function dispatchTaskNode(
+  deps: RunQueueDeps,
+  task: TaskQueueRow,
+  node: TaskNode,
+  repoRoot: string,
+): Promise<void> {
+  if (node === "code") {
+    await verifySpecBeforeCodeGate({
+      taskKey: task.task_key,
+      store: deps.store,
+      cmd: deps.cmd,
+      repoRoot,
+      workGraphMode: deps.workGraphMode,
+      policy: deps.policy,
+      task,
+    });
+  }
+  await deps.dispatchNode?.(task, node);
 }
 
 async function startQueuedTask(
@@ -4705,9 +4802,11 @@ async function startQueuedTask(
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
           if (vacuousTr.action?.dispatchNode) {
-            await deps.dispatchNode?.(
+            await dispatchTaskNode(
+              deps,
               vtr.task,
               vacuousTr.action.dispatchNode,
+              repoRoot,
             );
           }
           return true;
@@ -4758,7 +4857,7 @@ async function startQueuedTask(
     const logged = deps.store.listTransitions(task.task_key).at(-1);
     if (logged) transitions.push(logged);
     if (resolution.toStatus === "running" && resolution.action?.dispatchNode) {
-      await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+      await dispatchTaskNode(deps, tr.task, resolution.action.dispatchNode, repoRoot);
     }
     return true;
   }
@@ -5443,7 +5542,7 @@ async function advanceActiveTask(
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
           if (resolution.action?.dispatchNode) {
-            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+            await dispatchTaskNode(deps, tr.task, resolution.action.dispatchNode, repoRoot);
           }
           return true;
         }
@@ -5767,7 +5866,7 @@ async function advanceActiveTask(
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
           if (resolution.action?.dispatchNode) {
-            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+            await dispatchTaskNode(deps, tr.task, resolution.action.dispatchNode, repoRoot);
           }
           return true;
         }
@@ -5992,9 +6091,11 @@ async function advanceActiveTask(
                 const logged = deps.store.listTransitions(task.task_key).at(-1);
                 if (logged) transitions.push(logged);
                 if (vacuousTr.action?.dispatchNode) {
-                  await deps.dispatchNode?.(
+                  await dispatchTaskNode(
+                    deps,
                     vtr.task,
                     vacuousTr.action.dispatchNode,
+                    repoRoot,
                   );
                 }
                 return true;
@@ -6059,7 +6160,7 @@ async function advanceActiveTask(
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
           if (resolution.action?.dispatchNode) {
-            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+            await dispatchTaskNode(deps, tr.task, resolution.action.dispatchNode, repoRoot);
           }
           return true;
         }
@@ -6288,7 +6389,7 @@ async function advanceActiveTask(
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
           if (resolution.action?.dispatchNode) {
-            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+            await dispatchTaskNode(deps, tr.task, resolution.action.dispatchNode, repoRoot);
           }
           return true;
         }
@@ -6364,7 +6465,7 @@ async function advanceActiveTask(
         const logged = deps.store.listTransitions(task.task_key).at(-1);
         if (logged) transitions.push(logged);
         if (resolution.action?.dispatchNode) {
-          await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+          await dispatchTaskNode(deps, tr.task, resolution.action.dispatchNode, repoRoot);
         }
         return true;
       }
@@ -6569,7 +6670,7 @@ async function advanceActiveTask(
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
           if (resolution.action?.dispatchNode) {
-            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+            await dispatchTaskNode(deps, tr.task, resolution.action.dispatchNode, repoRoot);
           }
           return true;
         }
@@ -6733,7 +6834,7 @@ async function advanceActiveTask(
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
           if (resolution.action?.dispatchNode) {
-            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+            await dispatchTaskNode(deps, tr.task, resolution.action.dispatchNode, repoRoot);
           }
           return true;
         }
@@ -6862,7 +6963,7 @@ async function advanceActiveTask(
             } catch {}
           }
           if (resolution.action?.dispatchNode && tr.task) {
-            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+            await dispatchTaskNode(deps, tr.task, resolution.action.dispatchNode, repoRoot);
           }
           return true;
         }

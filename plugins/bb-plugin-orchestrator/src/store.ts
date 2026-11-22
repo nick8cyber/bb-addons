@@ -441,6 +441,23 @@ export const MIGRATIONS: readonly string[] = [
        AND finished_at IS NULL;
    ALTER TABLE coordinator_watchdog_state ADD COLUMN last_activity_at INTEGER NOT NULL DEFAULT 0;
    DELETE FROM coordinator_watchdog_state`,
+  // §31.9 / ADR-0032: table for task spec contracts
+  `CREATE TABLE IF NOT EXISTS task_spec_contracts (
+    task_key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    spec_path TEXT,
+    spec_sha TEXT,
+    spec_section TEXT,
+    adr_path TEXT,
+    is_architectural INTEGER DEFAULT 0,
+    alters_contract INTEGER DEFAULT 0,
+    mechanical_basis TEXT,
+    approval_id TEXT,
+    prepared_base_sha TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_task_spec_contracts_task ON task_spec_contracts(task_key)`,
 ];
 
 export type CommandRunStatus =
@@ -850,6 +867,22 @@ export interface TaskTransitionRow {
   reason: string;
   payload: string | null;
   created_at: number;
+}
+
+export interface TaskSpecContractRow {
+  task_key: string;
+  kind: "behavior_change" | "bugfix" | "mechanical";
+  spec_path: string | null;
+  spec_sha: string | null;
+  spec_section: string | null;
+  adr_path: string | null;
+  is_architectural: number;
+  alters_contract: number;
+  mechanical_basis: string | null;
+  approval_id: string | null;
+  prepared_base_sha: string | null;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface TransitionTaskInput {
@@ -4414,6 +4447,71 @@ export class DelegationStore {
         input.payload ?? null,
         input.createdAt ?? Date.now(),
       );
+  }
+
+  // ── §31.9 (ADR-0032): Task Spec Contracts ─────────────────────────────
+
+  saveSpecContract(
+    contract: {
+      taskKey: string;
+      kind: "behavior_change" | "bugfix" | "mechanical";
+      specPath?: string | null;
+      specSha?: string | null;
+      specSection?: string | null;
+      adrPath?: string | null;
+      isArchitectural?: boolean;
+      altersContract?: boolean;
+      mechanicalBasis?: string | null;
+      approvalId?: string | null;
+      preparedBaseSha?: string | null;
+    },
+    now: number = Date.now(),
+  ): TaskSpecContractRow {
+    const key = normalizeTaskKey(contract.taskKey);
+    this.db
+      .prepare(
+        `INSERT INTO task_spec_contracts (
+          task_key, kind, spec_path, spec_sha, spec_section, adr_path,
+          is_architectural, alters_contract, mechanical_basis, approval_id,
+          prepared_base_sha, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_key) DO UPDATE SET
+          kind = excluded.kind,
+          spec_path = excluded.spec_path,
+          spec_sha = excluded.spec_sha,
+          spec_section = excluded.spec_section,
+          adr_path = excluded.adr_path,
+          is_architectural = excluded.is_architectural,
+          alters_contract = excluded.alters_contract,
+          mechanical_basis = excluded.mechanical_basis,
+          approval_id = excluded.approval_id,
+          prepared_base_sha = excluded.prepared_base_sha,
+          updated_at = excluded.updated_at`,
+      )
+      .run(
+        key,
+        contract.kind,
+        contract.specPath ?? null,
+        contract.specSha ?? null,
+        contract.specSection ?? null,
+        contract.adrPath ?? null,
+        contract.isArchitectural ? 1 : 0,
+        contract.altersContract ? 1 : 0,
+        contract.mechanicalBasis ?? null,
+        contract.approvalId ?? null,
+        contract.preparedBaseSha ?? null,
+        now,
+        now,
+      );
+    return this.getSpecContract(key)!;
+  }
+
+  getSpecContract(taskKey: string): TaskSpecContractRow | null {
+    const key = normalizeTaskKey(taskKey);
+    const row = this.db
+      .prepare(`SELECT * FROM task_spec_contracts WHERE task_key = ?`)
+      .get(key) as TaskSpecContractRow | undefined;
+    return row ?? null;
   }
 }
 
