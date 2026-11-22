@@ -1601,6 +1601,7 @@ export async function createPlugin(
         policy: stepsDeps.policy,
         unavailableRoutes: stepsDeps.unavailableRoutes,
         log: bb.log,
+        workGraphMode: () => getWorkGraphMode(),
       });
     });
 
@@ -1705,6 +1706,7 @@ export async function createPlugin(
     t,
     now: () => Date.now(),
     unavailableRoutes: () => new Set(policyLoad.unavailableRoutes),
+    workGraphMode: () => getWorkGraphMode(),
   };
   const watchdogThreads: WatchdogThreads = {
     get: (a) => bb.sdk.threads.get(a),

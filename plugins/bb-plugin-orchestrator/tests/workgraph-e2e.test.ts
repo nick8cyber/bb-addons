@@ -112,7 +112,18 @@ function fakeCmd(
 function createTestStore(): DelegationStore {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
-  return new DelegationStore(db);
+  const store = new DelegationStore(db);
+  const origInsertTask = store.insertTask.bind(store);
+  store.insertTask = (input, now) => {
+    return origInsertTask(
+      {
+        ...input,
+        payload: input.payload ?? JSON.stringify({ acceptance_text: `${input.taskKey} acceptance criteria` }),
+      },
+      now,
+    );
+  };
+  return store;
 }
 
 // ── 1. Happy Path Full Pipeline Auto-Transitions (Simple/Fix Route) ───────
@@ -642,6 +653,7 @@ test("Review CHANGES loop: returns to code up to 3 times then transitions to blo
     route: "simple",
     level: "simple",
     confirmationMode: "auto",
+    payload: JSON.stringify({ acceptance_text: "Review loop acceptance criteria" }),
   });
 
   await runRunQueue({ store, workGraphMode: "strict", cmd });
@@ -725,6 +737,7 @@ test("Release failure loop: returns to code up to 3 times then transitions to bl
     route: "simple",
     level: "simple",
     confirmationMode: "auto",
+    payload: JSON.stringify({ acceptance_text: "Release failure loop acceptance criteria" }),
   });
 
   // Fast forward to release node
@@ -809,6 +822,7 @@ test("Delegation failure or exhaustion transitions task to stalled", async () =>
     route: "simple",
     level: "simple",
     confirmationMode: "auto",
+    payload: JSON.stringify({ acceptance_text: "Delegation stall acceptance criteria" }),
   });
 
   // Start task -> code (running)

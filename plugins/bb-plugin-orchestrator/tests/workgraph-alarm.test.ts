@@ -347,6 +347,11 @@ test("§28.2 п. 5: Resetting alarm on review verdict", async () => {
     level: "simple",
     confirmationMode: "auto",
   }, t0);
+  store.saveSpecContract({
+    taskKey: "VERDICT-1",
+    kind: "mechanical",
+    mechanicalBasis: "Alarm test acceptance criteria",
+  });
 
   store.transitionTask({
     taskKey: "VERDICT-1",

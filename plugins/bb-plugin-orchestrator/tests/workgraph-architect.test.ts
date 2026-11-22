@@ -331,6 +331,12 @@ test("§30.3: design_check verdict CHANGES target=code loops to code, target=des
     priority: 10,
     confirmationMode: "auto",
   });
+  store.saveSpecContract({
+    taskKey: "ARCH-4A",
+    kind: "behavior_change",
+    specPath: "docs/specs/arch-4a.md",
+    specSha: "arch_4a_sha",
+  });
   store.transitionTask({
     taskKey: "ARCH-4A",
     expectedNode: "start",

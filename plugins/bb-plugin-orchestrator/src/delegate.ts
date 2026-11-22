@@ -57,6 +57,8 @@ import {
 } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
 import { T_RU, type T } from "./i18n/index.js";
+import { verifySpecBeforeCodeGate, type SpecContract } from "./spec-gate.js";
+import type { WorkGraphMode } from "./workgraph.js";
 
 export interface SetupError {
   step: string;
@@ -82,6 +84,9 @@ export interface DelegateParams {
    * instructions, the files' bytes are never inlined. */
   attach?: string[];
   caller: ThreadFacts;
+  /** §31.9: Acceptance contract for spec-before-code gate */
+  specContract?: SpecContract;
+  specBeforeCode?: boolean;
 }
 
 export interface DelegateResult {
@@ -235,6 +240,8 @@ export interface DelegateDeps {
   /** §18.1: human-facing texts — the language catalog. */
   t?: T;
   log?: { warn?: (msg: string) => void; info?: (msg: string) => void };
+  workGraphMode?: WorkGraphMode | (() => WorkGraphMode);
+  repoRoot?: string;
 }
 
 /**
@@ -266,6 +273,8 @@ export interface DispatchStepsDeps {
    * step needs the same filter as `pickRoute`. */
   unavailableRoutes?: () => ReadonlySet<string>;
   t?: T;
+  workGraphMode?: WorkGraphMode | (() => WorkGraphMode);
+  repoRoot?: string;
 }
 
 export interface DispatchStepsResult {
@@ -657,6 +666,29 @@ export async function runDelegate(
     taskRow?.node === "design_check";
   const effectiveNoCode = isArchitectNode ? true : (params.noCode ?? false);
 
+  // §31.9 (ADR-0032): spec-before-code gate before creating delegation row
+  if (role === "executor" && !effectiveNoCode) {
+    const mode =
+      typeof deps.workGraphMode === "function"
+        ? deps.workGraphMode()
+        : deps.workGraphMode;
+    await verifySpecBeforeCodeGate({
+      taskKey,
+      role,
+      noCode: effectiveNoCode,
+      level,
+      contract: params.specContract,
+      store,
+      cmd: deps.cmd,
+      policy,
+      preparedBaseSha: params.from,
+      workGraphMode: mode,
+      specBeforeCode: params.specBeforeCode,
+      repoRoot: deps.repoRoot,
+      task: taskRow,
+    });
+  }
+
   // Step 2 — the unique index makes this atomic across processes.
   let row;
   try {
@@ -725,6 +757,8 @@ export async function runDelegate(
         // §17.2 (PLUG-211 С4): a manual delegate owns the refusal comment.
         commentOnRefusal: true,
         from: params.from,
+        specContract: params.specContract,
+        specBeforeCode: params.specBeforeCode,
       },
       {
         ...deps,
@@ -825,6 +859,9 @@ interface DispatchOpts {
   busyGate?: () => Promise<"queued" | "busy-expired" | null>;
   /** §20.1 п.5: routes already skipped in this dispatch. */
   _skipped?: { route: string; reason: string }[];
+  /** §31.9: Acceptance contract for spec-before-code gate */
+  specContract?: SpecContract;
+  specBeforeCode?: boolean;
 }
 
 /**
@@ -878,6 +915,28 @@ export async function dispatchToRoute(
   const policyRoute = row.route.startsWith("preset:")
     ? undefined
     : findRoute(policy, row.route);
+
+  // §31.9 (ADR-0032): Unified check before code launch across all routes / reissues / fallbacks
+  if (role === "executor" && !row.no_code) {
+    const mode =
+      typeof deps.workGraphMode === "function"
+        ? deps.workGraphMode()
+        : deps.workGraphMode;
+    await verifySpecBeforeCodeGate({
+      taskKey: row.task_key,
+      role,
+      noCode: Boolean(row.no_code),
+      level: row.level,
+      contract: opts.specContract,
+      store,
+      cmd: deps.cmd,
+      policy,
+      preparedBaseSha: opts.from,
+      workGraphMode: mode,
+      specBeforeCode: opts.specBeforeCode,
+      repoRoot: deps.repoRoot,
+    });
+  }
 
   /**
    * §20.1 п.5: hand this `dispatching` row to the next usable chain
