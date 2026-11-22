@@ -27,6 +27,7 @@ import {
   collectUploadFiles,
   pruneDir,
   settleBackend,
+  createTaskTurn,
   reapOrphanBrowserGroups,
   cleanupOwnBrowserGroups,
 } from "../acp-server.mjs";
@@ -137,11 +138,11 @@ function trackTmpDir(dir) {
   tmpDirs.push(dir);
   return dir;
 }
-function spawnServer(env) {
+function spawnServer(env, script = "acp-server.mjs", scriptArgs = []) {
   // Наследованный BB_THREAD_ID (запуск тестов из bb-треда) не должен
   // превращать голый запуск в привязанный к чужому треду.
   const { BB_THREAD_ID: _inheritedThread, ...cleanEnv } = env;
-  const proc = spawn("node", ["acp-server.mjs"], {
+  const proc = spawn("node", [script, ...scriptArgs], {
     cwd: PLUGIN_ROOT,
     env: cleanEnv,
     stdio: ["pipe", "pipe", "pipe"],
@@ -4059,6 +4060,453 @@ test("20. PLUG-304: turn completion predicate and thinking/pause guards", async 
   }
 });
 
+test("33. PLUG-371: generation stall detection (no-progress), auto-retry, and session cap", async () => {
+  // --- 1. classifyFailure: stalled generation classified as transient ---
+  const errStalled = new Error("generation stalled — no progress for 120s");
+  errStalled.code = "WEB_GEMINI_STALLED";
+  const cStalled = classifyFailure(errStalled);
+  assert.equal(cStalled.category, "transient", "WEB_GEMINI_STALLED must be classified as transient");
+  assert.equal(cStalled.rotatable, true, "stalled failure must be rotatable");
+  assert.equal(cStalled.cooldownMs, 0, "stalled failure must not cool down account");
+  assert.equal(cStalled.parkedReason, null, "stalled failure must not park account");
+
+  const errArgonStalled = new Error("stalled generation");
+  errArgonStalled.code = "ARGON_STALLED";
+  const cArgonStalled = classifyFailure(errArgonStalled);
+  assert.equal(cArgonStalled.category, "transient");
+  assert.equal(cArgonStalled.rotatable, true);
+
+  const cMsgStalled = classifyFailure(new Error("web driver: stalled generation — aborting"));
+  assert.equal(cMsgStalled.category, "transient");
+
+  // --- 2. createTaskTurn: generation phase decouples deadline to sessionCapAt ---
+  const turn = createTaskTurn("sess-plug371-turn");
+  assert.ok(turn.started > 0);
+  assert.equal(turn.sessionCapAt, turn.started + 4 * 3600_000, "sessionCapAt must be 4h (14400s) safety ceiling");
+  assert.equal(turn.deadline, turn.started + 20 * 60_000, "Initial stage deadline must be SEND_DEADLINE_MS (20m)");
+
+  // Ping generation stage: deadline expands to sessionCapAt
+  turn.ping("generation");
+  assert.equal(turn.deadline, turn.sessionCapAt, "Generation stage must decouple deadline to sessionCapAt (4h)");
+
+  // Heartbeat ping of the SAME stage must not slide the deadline
+  const genDeadline = turn.deadline;
+  await new Promise((r) => setTimeout(r, 30));
+  turn.ping("generation");
+  assert.equal(turn.deadline, genDeadline, "Repeated ping of same stage must not move the deadline");
+
+  // onDeadlineChange fires only when the deadline is re-armed
+  let watchCalls = 0;
+  turn.onDeadlineChange = () => { watchCalls += 1; };
+  turn.ping("request_more");
+  assert.ok(turn.deadline <= Date.now() + 20 * 60_000, "Leaving generation must restore the SEND_DEADLINE_MS window");
+  assert.ok(turn.deadline < genDeadline, "Post-generation window must be below the session cap");
+  assert.equal(watchCalls, 1, "Deadline change must notify the watcher exactly once");
+  turn.ping("delivery");
+  assert.equal(watchCalls, 1, "Transition between non-generation stages keeps the armed deadline");
+  turn.onDeadlineChange = null;
+
+  // Ping verify stage: deadline returns to bounded phase budget
+  turn.ping("verify");
+  assert.ok(turn.deadline <= Date.now() + 20 * 60_000, "Non-generation stage must be bounded by SEND_DEADLINE_MS");
+  const verifyDeadline = turn.deadline;
+  await new Promise((r) => setTimeout(r, 30));
+  turn.ping("verify");
+  assert.equal(turn.deadline, verifyDeadline, "Heartbeat ping on verify must not slide the deadline");
+
+  // Task turn outcome recording for stalled
+  await turn.finish("failed", "stalled");
+
+  // --- 3. Driver boundary Scenario A: no text growth + stop button -> stalled ---
+  let stopClicked = false;
+  let fakeNowA = 1_000_000;
+  let stallFirstPollAt = null;
+  const realDateNow = Date.now;
+  Date.now = () => fakeNowA;
+
+  const stallPage = {
+    url: () => "https://gemini.google.com/app",
+    goto: async () => {},
+    waitForSelector: async () => ({ click: async () => {} }),
+    waitForTimeout: async (ms = 200) => {
+      fakeNowA += ms;
+    },
+    keyboard: { press: async () => {}, insertText: async () => {} },
+    $: async (sel) => {
+      if (sel && /stop/i.test(sel)) {
+        return {
+          click: async () => {
+            stopClicked = true;
+          },
+          isDisabled: async () => false,
+        };
+      }
+      return null;
+    },
+    $$: async () => [],
+    evaluate: async (fn, arg) => {
+      if (typeof fn === "function" && fn.toString().includes("maxLength")) return null;
+      if (arg && arg.sel) return true;
+      if (arg && arg.fnSrc && !arg.checkSrc) return true;
+      if (arg && arg.checkSrc) {
+        stallFirstPollAt ??= fakeNowA;
+        return {
+          targetFound: true,
+          hasStopButton: true,
+          isBusyOrThinking: false,
+          hasFinishedContent: false,
+          hasActionButtons: false,
+          childCount: 1,
+          currentText: { src: "mc", text: "Frozen partial response" },
+        };
+      }
+      return null;
+    },
+  };
+
+  _setDriverHooks({
+    ensureChrome: async () => {},
+    connectOverCDP: async () => ({ close: async () => {} }),
+    getGeminiPage: async () => stallPage,
+  });
+
+  try {
+    await assert.rejects(
+      sendPrompt({
+        prompt: "Stall test prompt",
+        isNewChat: false,
+        stallMs: 600,
+      }),
+      (err) => {
+        assert.equal(err.code, "WEB_GEMINI_STALLED", "Error code must be WEB_GEMINI_STALLED");
+        assert.match(
+          err.message,
+          /generation stalled — no progress for/i,
+          "Message must state generation stalled"
+        );
+        return true;
+      }
+    );
+    assert.equal(stopClicked, true, "stopGeneration must be invoked to stop the hung generation");
+    const stalledAfterMs = fakeNowA - stallFirstPollAt;
+    assert.ok(
+      stalledAfterMs >= 600 - 200 && stalledAfterMs <= 600 + 3 * 200,
+      `stalled must fire at ~stallMs (600ms) from stream start, got ${stalledAfterMs}ms after first status poll`
+    );
+  } finally {
+    _setDriverHooks(null);
+    Date.now = realDateNow;
+  }
+
+  // --- 3b. Driver boundary Scenario D: stop button gone + no finished content -> stalled ---
+  // Post-generation limbo must not hang up to the session cap.
+  let fakeNowD = 1_000_000;
+  let limboFirstPollAt = null;
+  Date.now = () => fakeNowD;
+
+  const limboPage = {
+    url: () => "https://gemini.google.com/app",
+    goto: async () => {},
+    waitForSelector: async () => ({ click: async () => {} }),
+    waitForTimeout: async (ms = 200) => {
+      fakeNowD += ms;
+    },
+    keyboard: { press: async () => {}, insertText: async () => {} },
+    $: async () => null,
+    $$: async () => [],
+    evaluate: async (fn, arg) => {
+      if (typeof fn === "function" && fn.toString().includes("maxLength")) return null;
+      if (arg && arg.sel) return true;
+      if (arg && arg.fnSrc && !arg.checkSrc) return true;
+      if (arg && arg.checkSrc) {
+        limboFirstPollAt ??= fakeNowD;
+        return {
+          targetFound: true,
+          hasStopButton: false,
+          isBusyOrThinking: false,
+          hasFinishedContent: false,
+          hasActionButtons: false,
+          childCount: 1,
+          targetTextLength: 0,
+          currentText: { src: "raw", text: "" },
+        };
+      }
+      return null;
+    },
+  };
+
+  _setDriverHooks({
+    ensureChrome: async () => {},
+    connectOverCDP: async () => ({ close: async () => {} }),
+    getGeminiPage: async () => limboPage,
+  });
+
+  try {
+    await assert.rejects(
+      sendPrompt({
+        prompt: "Post-generation limbo prompt",
+        isNewChat: false,
+        stallMs: 600,
+      }),
+      (err) => {
+        assert.equal(err.code, "WEB_GEMINI_STALLED", "Limbo without content must fail fast as WEB_GEMINI_STALLED");
+        return true;
+      }
+    );
+    const limboMs = fakeNowD - limboFirstPollAt;
+    assert.ok(
+      limboMs >= 600 - 200 && limboMs <= 600 + 3 * 200,
+      `limbo must fail fast at ~stallMs (600ms), got ${limboMs}ms after first status poll`
+    );
+  } finally {
+    _setDriverHooks(null);
+    Date.now = realDateNow;
+  }
+
+  // --- 4. Driver boundary Scenario B: slow text growth -> NOT stalled ---
+  let fakeNowB = 1_000_000;
+  Date.now = () => fakeNowB;
+  let slowPoll = 0;
+
+  const slowPage = {
+    url: () => "https://gemini.google.com/app",
+    goto: async () => {},
+    waitForSelector: async () => ({ click: async () => {} }),
+    waitForTimeout: async (ms = 200) => {
+      fakeNowB += ms;
+    },
+    keyboard: { press: async () => {}, insertText: async () => {} },
+    $: async (sel) => {
+      if (sel && /stop/i.test(sel) && slowPoll < 5) {
+        return { click: async () => {}, isDisabled: async () => false };
+      }
+      return null;
+    },
+    $$: async () => [],
+    evaluate: async (fn, arg) => {
+      if (typeof fn === "function" && fn.toString().includes("maxLength")) return null;
+      if (arg && arg.sel) return true;
+      if (arg && arg.fnSrc && !arg.checkSrc) return true;
+      if (arg && arg.checkSrc) {
+        const p = Math.min(slowPoll++, 5);
+        const text = "Incremental output chunk " + p;
+        const isDone = p >= 5;
+        return {
+          targetFound: true,
+          hasStopButton: !isDone,
+          isBusyOrThinking: false,
+          hasFinishedContent: true,
+          hasActionButtons: isDone,
+          childCount: p + 1,
+          currentText: { src: "mc", text },
+        };
+      }
+      return null;
+    },
+  };
+
+  _setDriverHooks({
+    ensureChrome: async () => {},
+    connectOverCDP: async () => ({ close: async () => {} }),
+    getGeminiPage: async () => slowPage,
+  });
+
+  try {
+    const resSlow = await sendPrompt({
+      prompt: "Slow progress prompt",
+      isNewChat: false,
+      stallMs: 500,
+    });
+    assert.equal(
+      String(resSlow),
+      "Incremental output chunk 5",
+      "Turn must complete successfully when text grows slowly without hitting stallMs"
+    );
+  } finally {
+    _setDriverHooks(null);
+    Date.now = realDateNow;
+  }
+
+  // --- 5. Driver boundary Scenario C: continuous generation past 20 minutes (25 min simulated) ---
+  let fakeNowC = 1_000_000;
+  Date.now = () => fakeNowC;
+  let longPoll = 0;
+
+  const longPage = {
+    url: () => "https://gemini.google.com/app",
+    goto: async () => {},
+    waitForSelector: async () => ({ click: async () => {} }),
+    waitForTimeout: async (ms = 200) => {
+      // Advance by 30 seconds of simulated time per poll while generating (total 50 polls = 1500s = 25m)
+      fakeNowC += (longPoll <= 50 ? 30_000 : ms);
+    },
+    keyboard: { press: async () => {}, insertText: async () => {} },
+    $: async (sel) => {
+      if (sel && /stop/i.test(sel) && longPoll < 50) {
+        return { click: async () => {}, isDisabled: async () => false };
+      }
+      return null;
+    },
+    $$: async () => [],
+    evaluate: async (fn, arg) => {
+      if (typeof fn === "function" && fn.toString().includes("maxLength")) return null;
+      if (arg && arg.sel) return true;
+      if (arg && arg.fnSrc && !arg.checkSrc) return true;
+      if (arg && arg.checkSrc) {
+        const p = Math.min(longPoll++, 50);
+        const isDone = p >= 50;
+        return {
+          targetFound: true,
+          hasStopButton: !isDone,
+          isBusyOrThinking: false,
+          hasFinishedContent: true,
+          hasActionButtons: isDone,
+          childCount: p + 1,
+          currentText: { src: "mc", text: "Long active generation token ".repeat(p + 1).trim() },
+        };
+      }
+      return null;
+    },
+  };
+
+  _setDriverHooks({
+    ensureChrome: async () => {},
+    connectOverCDP: async () => ({ close: async () => {} }),
+    getGeminiPage: async () => longPage,
+  });
+
+  try {
+    const resLong = await sendPrompt({
+      prompt: "25-minute continuous generation prompt",
+      isNewChat: false,
+      stallMs: 60_000,
+    });
+    assert.ok(
+      fakeNowC - 1_000_000 >= 1_500_000,
+      "Simulated elapsed time must exceed 20-minute (1200s) former deadline (25 minutes reached)"
+    );
+    assert.ok(
+      String(resLong).startsWith("Long active generation token"),
+      "Continuous generation past 20 minutes must succeed without stall or deadline exceeded"
+    );
+  } finally {
+    _setDriverHooks(null);
+    Date.now = realDateNow;
+  }
+});
+
+test("34. PLUG-371 e2e: real runPrompt stall-retry, budget cutoff, rotation, and generation past SEND_DEADLINE", async (t) => {
+  const fixtureScript = path.join("tests", "fixtures", "stall-server.mjs");
+  const fakeBb = path.join(PLUGIN_ROOT, "tests", "fixtures", "fake-bb.sh");
+  const threadId = "t" + "hr_fixture371";
+  const projectId = "p" + "roj_fixture371";
+  const envId = "e" + "nv_fixture371";
+  const backendsEnv = JSON.stringify([
+    { id: "acc-1", cdp: "9301" },
+    { id: "acc-2", cdp: "9302" },
+  ]);
+
+  async function runFixture({ scenario, delayMs, sendDeadlineMs = 20000, sessionCapMs = 120000 }) {
+    const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "wg-stall-state-")));
+    const cwdDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "wg-stall-cwd-")));
+    const logFile = path.join(stateDir, "driver-calls.jsonl");
+    const threadDto = {
+      thread: { id: threadId, projectId, environmentId: envId, originPluginId: "orchestrator" },
+      environment: { id: envId, path: fs.realpathSync(cwdDir), projectId },
+    };
+    const serverProc = spawnServer({
+      ...process.env,
+      WEB_GEMINI_STATE_DIR: stateDir,
+      WEB_GEMINI_BACKENDS: backendsEnv,
+      WEB_GEMINI_SEND_DEADLINE_MS: String(sendDeadlineMs),
+      WEB_GEMINI_SESSION_CAP_MS: String(sessionCapMs),
+      WG_FAKE_SCENARIO: scenario,
+      WG_FAKE_DELAY_MS: String(delayMs ?? 0),
+      WG_FAKE_LOG: logFile,
+      BB_CLI: fakeBb,
+      FAKE_BB_THREAD_JSON: JSON.stringify(threadDto),
+    }, fixtureScript, [`--bb-thread-id=${threadId}`]);
+
+    const lines = [];
+    let stderrBuf = "";
+    serverProc.stdout.on("data", (data) => {
+      for (const line of data.toString().split("\n")) {
+        if (line.trim()) {
+          try {
+            lines.push(JSON.parse(line.trim()));
+          } catch {}
+        }
+      }
+    });
+    serverProc.stderr.on("data", (d) => { stderrBuf += d.toString(); });
+    const sendReq = (req) => serverProc.stdin.write(JSON.stringify(req) + "\n");
+    const waitForResponse = async (id, timeoutMs = 30000) => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const idx = lines.findIndex((l) => l.id === id);
+        if (idx >= 0) return lines.splice(idx, 1)[0];
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      throw new Error(`Timeout waiting for response id=${id}\nstderr: ${stderrBuf.slice(-2000)}`);
+    };
+
+    sendReq({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
+    await waitForResponse(1);
+    sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: cwdDir } });
+    const r2 = await waitForResponse(2, 15000);
+    assert.ok(r2.result?.sessionId, `session/new must return a session: ${JSON.stringify(r2)} stderr: ${stderrBuf.slice(-2000)}`);
+    const sessionId = r2.result.sessionId;
+    sendReq({
+      jsonrpc: "2.0", id: 3, method: "session/prompt",
+      params: { sessionId, prompt: [{ type: "text", text: "run the stall scenario" }] },
+    });
+    const r3 = await waitForResponse(3, 90000);
+    serverProc.kill("SIGTERM");
+    const calls = fs.existsSync(logFile)
+      ? fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l))
+      : [];
+    const serverLog = fs.existsSync(path.join(stateDir, "acp-server.log"))
+      ? fs.readFileSync(path.join(stateDir, "acp-server.log"), "utf8")
+      : "";
+    return { response: r3, calls, serverLog, stderr: stderrBuf };
+  }
+
+  await t.test("stall with >25% phase budget retries once on a sibling account and passes", async () => {
+    const { response, calls, serverLog } = await runFixture({ scenario: "stall-then-ok", sendDeadlineMs: 20000 });
+    assert.equal(response.result?.stopReason, "end_turn", `turn must pass after stall retry: ${JSON.stringify(response)}`);
+    assert.equal(calls.length, 2, "driver must be called exactly twice (initial attempt + stall retry)");
+    assert.ok(calls[0].accountId && calls[1].accountId, "driver log must record the bound account per attempt");
+    assert.notEqual(calls[0].accountId, calls[1].accountId, "stall retry must rotate to a different pool account");
+    assert.match(serverLog, /task:stall-retry/, "stall retry must be logged");
+    assert.match(serverLog, /task:outcome.*"outcome":"passed"/, "task outcome must be passed");
+  });
+
+  await t.test("stall with <=25% phase budget fails with reason stalled and no retry", async () => {
+    const { response, calls, serverLog } = await runFixture({ scenario: "stall-late", delayMs: 9500, sendDeadlineMs: 12000 });
+    assert.equal(response.error?.code, -32000, `turn must fail: ${JSON.stringify(response)}`);
+    assert.equal(response.error?.data?.reason, "stalled", `failure reason must be stalled: ${JSON.stringify(response)}`);
+    assert.equal(calls.length, 1, "no retry once the phase budget is exhausted");
+    assert.match(serverLog, /task:outcome.*"reason":"stalled"/, "task:outcome must record reason stalled");
+    assert.doesNotMatch(serverLog, /task:stall-retry/);
+  });
+
+  await t.test("generation running past SEND_DEADLINE succeeds under the session cap", async () => {
+    const startedAt = Date.now();
+    const { response, calls } = await runFixture({ scenario: "ok", delayMs: 6000, sendDeadlineMs: 3000, sessionCapMs: 60000 });
+    const elapsed = Date.now() - startedAt;
+    assert.equal(response.result?.stopReason, "end_turn", `generation past SEND_DEADLINE must pass: ${JSON.stringify(response)}`);
+    assert.ok(elapsed >= 6000, `turn must not be cut at the ${3000}ms phase deadline (elapsed ${elapsed}ms)`);
+    assert.equal(calls.length, 1);
+  });
+
+  await t.test("stall on a follow-up round with established convId never retries", async () => {
+    const { response, calls, serverLog } = await runFixture({ scenario: "tool-then-stall", sendDeadlineMs: 20000 });
+    assert.equal(response.error?.code, -32000, `turn must fail: ${JSON.stringify(response)}`);
+    assert.equal(response.error?.data?.reason, "stalled", `failure reason must be stalled: ${JSON.stringify(response)}`);
+    assert.equal(calls.length, 2, "no stall retry once the conversation is bound to a backend (convId set)");
+    assert.doesNotMatch(serverLog, /task:stall-retry/);
+  });
+});
 test("21. PLUG-376: collectGeneratedFiles channels — fetch->blob, new tab, force-click, Drive gate", async () => {
   const dlDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "plug376-dl-")));
   const scanOf = (candidates, meta = {}) => ({ candidates, meta });

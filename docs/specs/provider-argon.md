@@ -2,8 +2,8 @@
 title: provider-web-gemini (ранее provider-argon) — ACP-провайдер веб-интерфейса Gemini
 status: approved
 owner: coordinator
-date: 2026-11-21
-revision: 28 (r28 — r27: управляемые группы браузера Chrome/Xvfb, маркеры и .lock, реапер сирот, fail-closed flock, PLUG-374; r28: §4.5 каналы сбора генерируемых файлов, отсев телеметрии/RPC, magic-bytes и canvas-fallback, PLUG-376)
+date: 2026-11-22
+revision: 29 (r29 — r27: управляемые группы браузера Chrome/Xvfb, маркеры и .lock, реапер сирот, fail-closed flock, PLUG-374; r28: §4.5 каналы сбора генерируемых файлов, отсев телеметрии/RPC, magic-bytes и canvas-fallback, PLUG-376; r29: детект стола генерации no-progress вместо wall-clock дедлайна — фазовый SEND_DEADLINE, SESSION_CAP, STALL_MS и авторетрай стола с ротацией, PLUG-371)
 tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 ---
 
@@ -108,8 +108,11 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 
 Все переменные окружения `ARGON_*` после переименования провайдера (PLUG-298) принимаются под целевыми именами `WEB_GEMINI_*`; прежние `ARGON_*` продолжают работать как фолбэк обратной совместимости (новое имя имеет приоритет).
 
-- Внешний дедлайн хода в `acp-server.mjs`: `SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000` (20 минут, предотвращает обрыв длинных глубоких ревью на `neon` high).
-- Внутренний потолок ожидания генерации в `src/gemini-driver.js`: `MAX_WAIT_MS = Number(process.env.GEMINI_MAX_WAIT_MS) || 900_000` (15 минут).
+- Фазовый дедлайн хода в `acp-server.mjs` (PLUG-371): `SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000` (20 минут) применяется к **негенерационным** стадиям хода (collect/delivery/verify/commit) и одновременно служит фазовым бюджетом авторетрая стола. При входе задачи в стадию `generation` дедлайн поднимается до `sessionCapAt`; при выходе из генерации и входе в `verify`/`commit` окно возвращается к `min(now + SEND_DEADLINE_MS, sessionCapAt)`. Перевзвод дедлайна выполняется **только при смене стадии** — повторный heartbeat той же стадии окно не сдвигает (`armAttemptDeadline` подписан на `task.onDeadlineChange` и перевзводит `deadlineTimer`, снимая подписку после `Promise.race`).
+- Абсолютный потолок длительности хода и цикла генерации: `SESSION_CAP_MS = Number(process.env.WEB_GEMINI_SESSION_CAP_MS || process.env.ARGON_SESSION_CAP_MS)` при `> 0`, иначе `4 * 3600_000` (4 часа). Пока у генерации есть прогресс, `SEND_DEADLINE_MS` к ней не применяется — медленные модели (`carbon`) могут рассуждать часами; цикл драйвера ограничен `while (Date.now() - streamStartTime < SESSION_CAP_MS)`.
+- Детект стола генерации в `src/gemini-driver.js` (PLUG-371): `STALL_MS = stallMs ?? Number(process.env.WEB_GEMINI_STALL_MS || process.env.ARGON_STALL_MS)` при `> 0`, иначе `120_000` (2 минуты). При `isGenerating` (видимый stop-button/busy) или потере target без контента (`lostWithoutContent`), а также при `awaitingContent` (стоп-кнопка ушла, но готового контента нет) отсутствие прогресса дольше `STALL_MS` бросает `generation stalled — no progress for <n>s` с кодом `WEB_GEMINI_STALLED` — классификация `transient`, `rotatable` (§3.4).
+- Авторетрай стола в рамках хода (PLUG-371): при `stalled` `runPrompt` делает **один** повтор, если остаётся `> 25%` фазового бюджета `SEND_DEADLINE_MS`; перед повтором `excludeBackendId = backend.id` — `pickBackendFromState` выбирает свободного соседа по пулу, при отсутствии соседа (`r.none`) допускается возврат на тот же аккаунт (`allowSameBackend`). При установленном `s.convId` (2+ раунд tool-loop) ретрай не запускается; без бюджета исход хода — `failed` с `reason: "stalled"`.
+- Прежний внутренний потолок ожидания генерации `MAX_WAIT_MS`/`GEMINI_MAX_WAIT_MS` из `src/gemini-driver.js` удалён (PLUG-371): его роль выполняют `STALL_MS` (отсутствие прогресса) и `SESSION_CAP_MS` (абсолютный потолок).
 - `WEB_GEMINI_MAX_TOOL_ROUNDS` / `ARGON_MAX_TOOL_ROUNDS`: максимальное количество раундов вызова инструментов за один ход (по умолчанию `8`).
 - `WEB_GEMINI_MAX_MESSAGE_BYTES` / `ARGON_MAX_MESSAGE_BYTES`: максимальный размер первого упакованного сообщения (по умолчанию `120_000` байт).
 - `WEB_GEMINI_TOOL_TIMEOUT_MS` / `ARGON_TOOL_TIMEOUT_MS`: таймаут выполнения каждого локального инструмента чтения (по умолчанию `15_000` мс / 15 с).
@@ -168,7 +171,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 ### 3.2 Аренда (`leases`) и защита от зависших замков
 
 - Один процесс Chrome (`cdpPort`) в один момент времени обслуживает не более одного активного хода (`leases[backendId] = { pid, acquiredMs, cdp }`). Поле `cdp` фиксирует строковый номер CDP-порта группы браузера (`String(b.cdp)`), что позволяет не-ACP читателям (включая конвейер `teardownGroup` и `stopChrome` в драйвере через `leaseBusyOnPort`) проверять занятость порта активной арендой без отдельной загрузки конфигурации пула backends. При захвате аренды в `acquireInState` вызывается `browserGroups.adoptGroup(STATE_DIR, b.cdp)`, чтобы перезаписать `ownerPid` и `ownerStartTime` маркера группы на текущий активный процесс ACP, благодаря чему реапер видит живого проверяемого владельца.
-- Пока идёт ход, аренда удерживаемого бэкенда периодически продлевается каждые 60 секунд (периодический таймер обновляет `acquiredMs: Date.now()`), что предотвращает истечение аренды во время длинных ходов (вплоть до `SEND_DEADLINE_MS = 20` минут).
+- Пока идёт ход, аренда удерживаемого бэкенда периодически продлевается каждые 60 секунд (периодический таймер обновляет `acquiredMs: Date.now()`), что предотвращает истечение аренды во время длинных ходов (вплоть до `SESSION_CAP_MS = 4` часов).
 - При чтении состояния просроченные аренды (`now - acquiredMs >= LEASE_TTL_MS`, где `LEASE_TTL_MS = 10 * 60_000`) и аренды мёртвых процессов (`!isPidAlive(pid)`) автоматически очищаются. Таймаут `LEASE_TTL_MS = 10` минут срабатывает только для зависших или аварийно завершившихся процессов.
 - При закрытии `stdin` (`rl.on("close")`), а также по сигналам `SIGTERM` и `SIGINT`, `acp-server.mjs` прерывает активный ход (`activePrompt?.abort.abort()`), дожидается `releaseLease(activeBackendId)` и только затем завершает процесс. Это гарантирует отсутствие осиротевших аренд при перезапуске моста или отмене треда демоном BB.
 
@@ -211,7 +214,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
   | Текст квоты/лимита (`rate limit`, `quota`, `Limit resets …`, `лимит`) | DOM-текст меню | `rate-limit` | нет; кулдаун до reset (≤ 7 сут) | да |
   | Пункт отсутствует в меню выбора, уровень отключён/залочен, апсейл-диалог | DOM | `model-unavailable` | `model-unavailable`, 6 ч | да |
   | Таймаут селектора/навигации, `TimeoutError`, крэш страницы, CDP/network-сбой | сбой драйвера | `transient` | нет | да |
-  | Таймаут ожидания генерации (stream cap, `hung page`) | сбой драйвера | `transient` | нет | да |
+  | Таймаут ожидания генерации (stream cap, `hung page`); стол генерации `WEB_GEMINI_STALLED` (нет прогресса `STALL_MS`) | сбой драйвера | `transient` | нет | да |
   | Любая прочая ошибка | — | `transient` (default) | нет | нет — сразу вызывающему |
 
   Правило PLUG-286: ни один таймаут или сбой страницы не даёт `model-unavailable` без DOM-признака; `model-unavailable` ставится только по DOM-доказательству.
@@ -400,6 +403,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
       - 30 (`browser-groups: marker lock serializes writers — a concurrent fresh marker survives`): блокировка маркера сериализует параллельные операции записи и удаления; свежий маркер параллельного запуска не затирается отработавшим сносом.
       - 31 (`browser-groups: kernel marker lock + unified stopChrome teardown`): использование блокировки ядра `flock(2)` на открытом файловом дескрипторе `<port>.lock`; отсутствие stale-steal; единый конвейер `teardownGroup` для реапера и `stopChrome` в драйвере.
       - 32 (`browser-groups: no flock on linux fails closed — no in-process degrade`): при отсутствии утилиты `flock` на Linux или ошибке запуска операции завершаются с ошибкой `BG_LOCK_UNAVAILABLE`; тихий откат к внутрипроцессной блокировке запрещён.
+  21. Детект стола генерации и фазовые дедлайны (PLUG-371, тесты 33–34): `classifyFailure` относит `WEB_GEMINI_STALLED` к `transient`/`rotatable`; перевзвод дедлайна `createTaskTurn` строго при смене стадии (вход в `generation` поднимает окно до `sessionCapAt`, выход в `verify`/`commit` возвращает `min(now + SEND_DEADLINE_MS, sessionCapAt)`, повторный heartbeat окно не сдвигает); e2e через настоящий `acp-server.mjs` с подменённым драйвером и `bb` (`tests/fixtures/stall-server.mjs`, `fake-bb.sh`) — stall при `> 25%` фазового бюджета даёт один авторетрай с ротацией на соседний аккаунт и исходом `passed`, stall при `≤ 25%` — `failed` с `reason: "stalled"` без ретрая, генерация дольше `SEND_DEADLINE_MS` под `SESSION_CAP_MS` проходит, stall на раунде с `convId` ретрая не даёт.
 - Набор `tests/provider-web-gemini-tools.test.mjs` (47 тестов, офлайн) покрывает инструменты чтения веб-Gemini по спеке `provider-web-gemini-tools.md`: разбор текстового протокола вызовов инструментов, sandbox `cwd` (запрет `..`, абсолютных путей и симлинков наружу, чёрный список чувствительных файлов), белый список `git`-команд, маскировку секретов `[скрыто: <тип>]`, раунды tool-loop и лимит `WEB_GEMINI_MAX_TOOL_ROUNDS` / `ARGON_MAX_TOOL_ROUNDS`, упаковку первого сообщения (вложения файлов/тредов/задач, потолок `WEB_GEMINI_MAX_MESSAGE_BYTES` / `ARGON_MAX_MESSAGE_BYTES`).
 
 ---
