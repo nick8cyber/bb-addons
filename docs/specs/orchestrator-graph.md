@@ -403,17 +403,15 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 ### 31.9 Единая проверка спецификации до запуска кода
 
 Этот договор применяется к проектам, где действует порядок «спека до кода». Управление гейтом осуществляется через конфигурационный флаг `specBeforeCode`:
-- **На уровне общей политики:** поле `specBeforeCode: boolean` (в `policy.json` / `Policy.specBeforeCode`).
-- **На уровне проекта (per-project):** поле `specBeforeCode: boolean` в настройках проекта (`release.projects.<projectId>.specBeforeCode` или `project.orchestrator.specBeforeCode`).
+- **На уровне общей политики:** поле `specBeforeCode: boolean` в настройке плагина `policy` (§2, `Policy.specBeforeCode`).
+- **На уровне проекта (per-project и defaults):** поле `specBeforeCode: boolean` в настройках выкладки `release.projects.<projectId>.specBeforeCode` и `release.defaults.specBeforeCode` ([orchestrator-release §6](orchestrator-release.md#6-настройка-release)).
 
 **Приоритет разрешения флага (`isSpecBeforeCodeEnforced`):**
-1. Явный параметр вызова/раздачи `specBeforeCode`.
-2. Настройка политики `policy.specBeforeCode`.
-3. Настройка проекта `project.specBeforeCode` (включая `project.orchestrator.specBeforeCode`).
-4. Поведение по умолчанию при отсутствии явных настроек:
+1. **Явный запрет (`false`):** если на любом уровне (параметр вызова/раздачи `specBeforeCode: false`, настройка политики `policy.specBeforeCode: false`, либо настройка проекта `release.projects.<projectId>.specBeforeCode: false` / `release.defaults.specBeforeCode: false`) задано явное `false` — проверка отключается (`return false`).
+2. **Явное включение (`true`):** иначе, если на любом уровне (`specBeforeCode: true` в вызове, `policy.specBeforeCode: true`, либо в настройках проекта / defaults) задано явное `true` — проверка обязательна (`return true`).
+3. **Поведение по умолчанию (если нигде не задано):**
    - В режимах графа задач `shadow` и `strict` гейт по умолчанию **включён (`true`)** для всех проектов стенда.
-   - В режиме `off` гейт по умолчанию **выключен (`false`)**, если только он не включён явно через `specBeforeCode: true` в политике или per-project настройках.
-   - Отключение гейта для конкретного проекта (например, инфраструктурного, вспомогательного или легаси) задаётся явным `specBeforeCode: false` на уровне проекта или политики.
+   - В режиме `off` гейт по умолчанию **выключен (`false`)**.
 
 Плагин вызывает одну и ту же проверку перед созданием или переводом треда в исполнителя кода. Она обязательна для `delegate` (CLI и RPC), `run-queue`, повторного запуска и перевыпуска через резервный маршрут. Режим `workGraph` управляет переходами графа. В том числе в `shadow` он не отключает проверку документации.
 

@@ -1081,4 +1081,8 @@ export const EN: Record<string, string> = {
   "cli.helpApproveS": "Approve owner_gate transition in manual mode",
   "cli.helpReleaseNoteS": "Provide release note when waiting_release_note",
   "cli.helpRunQueueS": "Single evaluation tick of the task work graph queue",
+  "cli.helpConfigS": "Inspect or change orchestrator settings (owner-only)",
+  "cli.helpModeS": "Set orchestrator approval mode (owner-only)",
+  "cli.helpSetS": "Set orchestrator setting (owner-only)",
+  "cli.helpWorkgraphS": "Set orchestrator workGraph mode (owner-only)",
 };

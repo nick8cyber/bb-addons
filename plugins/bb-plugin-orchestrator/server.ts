@@ -3417,22 +3417,22 @@ export async function createPlugin(
       },
       {
         name: "config",
-        summary: "Inspect or change orchestrator settings (owner-only)",
+        summary: t("cli.helpConfigS"),
         usage: "bb orchestrator config set <key> <value> [--json]",
       },
       {
         name: "mode",
-        summary: "Set orchestrator approval mode (owner-only)",
+        summary: t("cli.helpModeS"),
         usage: "bb orchestrator mode <auto|manual> [--json]",
       },
       {
         name: "set",
-        summary: "Set orchestrator setting (owner-only)",
+        summary: t("cli.helpSetS"),
         usage: "bb orchestrator set <key> <value> [--json]",
       },
       {
         name: "workgraph",
-        summary: "Set orchestrator workGraph mode (owner-only)",
+        summary: t("cli.helpWorkgraphS"),
         usage: "bb orchestrator workgraph <off|shadow|strict> [--json]",
       },
     ],

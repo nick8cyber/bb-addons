@@ -1093,4 +1093,8 @@ export const RU: Record<string, string> = {
   "cli.helpApproveS": "Одобрение перехода owner_gate в режиме manual",
   "cli.helpReleaseNoteS": "Передать заметку релиза при статусе waiting_release_note",
   "cli.helpRunQueueS": "Один такт конвейера графа задач",
+  "cli.helpConfigS": "Изменение настроек оркестратора (только владелец)",
+  "cli.helpModeS": "Установка режима подтверждения approvalMode (только владелец)",
+  "cli.helpSetS": "Установка настройки оркестратора (только владелец)",
+  "cli.helpWorkgraphS": "Переключение режима графа workGraph (только владелец)",
 };
