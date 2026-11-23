@@ -4647,6 +4647,15 @@ export class DelegationStore {
     }
     return null;
   }
+
+  healTaskProject(taskKey: string, projectId: string): void {
+    const key = normalizeTaskKey(taskKey);
+    this.db
+      .prepare(
+        `UPDATE delegations SET project_id = ? WHERE task_key = ? AND (status = 'done' OR status = 'failed' OR status = 'cancelled')`,
+      )
+      .run(projectId, key);
+  }
 }
 
 

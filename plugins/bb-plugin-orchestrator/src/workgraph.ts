@@ -332,6 +332,8 @@ export type TaskTrackerOrOptions =
       tracker?: TaskTrackerLike | null;
       bbCli?: BbCli | null;
       cmd?: CmdRunner | null;
+      onConflict?: "recover" | "refuse";
+      log?: { warn?: (msg: string) => void };
     }
   | null;
 
@@ -374,20 +376,23 @@ export async function resolveTaskProjectId(
     }
   }
 
-  // 2) delegations: project_id column from active or latest completed delegation
+  // 2) delegations: active delegation in-flight strictly wins
   const active = store.activeByTaskKey?.(key);
   if (active?.project_id && active.project_id.trim()) {
     return active.project_id.trim();
   }
+
+  // Check for historical completed delegation
   const done = store.latestDoneResultByTask?.(key);
-  if (done?.project_id && done.project_id.trim()) {
-    return done.project_id.trim();
-  }
-  const all = store.delegationsByTask?.(key);
-  if (all && all.length > 0) {
-    for (const d of all) {
-      if (d.status === "done" && d.project_id && d.project_id.trim()) {
-        return d.project_id.trim();
+  let donePid = done?.project_id?.trim();
+  if (!donePid) {
+    const all = store.delegationsByTask?.(key);
+    if (all && all.length > 0) {
+      for (const d of all) {
+        if (d.status === "done" && d.project_id && d.project_id.trim()) {
+          donePid = d.project_id.trim();
+          break;
+        }
       }
     }
   }
@@ -396,6 +401,8 @@ export async function resolveTaskProjectId(
   let tracker: TaskTrackerLike | undefined | null;
   let bbCli: BbCli | undefined | null;
   let cmd: CmdRunner | undefined | null;
+  let onConflict: "recover" | "refuse" | undefined;
+  let log: { warn?: (msg: string) => void } | undefined;
   if (options) {
     if ("getTask" in options && typeof (options as any).getTask === "function") {
       tracker = options as TaskTrackerLike;
@@ -404,26 +411,29 @@ export async function resolveTaskProjectId(
         tracker?: TaskTrackerLike | null;
         bbCli?: BbCli | null;
         cmd?: CmdRunner | null;
+        onConflict?: "recover" | "refuse";
+        log?: { warn?: (msg: string) => void };
       };
       tracker = opts.tracker;
       bbCli = opts.bbCli;
       cmd = opts.cmd;
+      onConflict = opts.onConflict;
+      log = opts.log;
     }
   }
 
+  let trackerPid: string | null = null;
   if (tracker) {
     try {
       const res = await tracker.getTask(key);
-      const pid = extractProjectIdFromRecord(res);
-      if (pid) return pid;
+      trackerPid = extractProjectIdFromRecord(res);
     } catch {}
   } else if (bbCli) {
     try {
       const res = await bbCli.run(["tasks", "show", key, "--json"], { timeoutMs: 5000 });
       if (res.exitCode === 0 && res.stdout) {
         const parsed = JSON.parse(res.stdout);
-        const pid = extractProjectIdFromRecord(parsed);
-        if (pid) return pid;
+        trackerPid = extractProjectIdFromRecord(parsed);
       }
     } catch {}
   } else if (cmd) {
@@ -431,8 +441,7 @@ export async function resolveTaskProjectId(
       const res = await cmd.run("bb", ["tasks", "show", key, "--json"], { timeoutMs: 5000 });
       if (res.exitCode === 0 && res.stdout) {
         const parsed = JSON.parse(res.stdout);
-        const pid = extractProjectIdFromRecord(parsed);
-        if (pid) return pid;
+        trackerPid = extractProjectIdFromRecord(parsed);
       }
     } catch {}
   } else if (typeof process !== "undefined" && process.env?.PATH) {
@@ -441,10 +450,34 @@ export async function resolveTaskProjectId(
       const res = await defaultCli.run(["tasks", "show", key, "--json"], { timeoutMs: 5000 });
       if (res.exitCode === 0 && res.stdout) {
         const parsed = JSON.parse(res.stdout);
-        const pid = extractProjectIdFromRecord(parsed);
-        if (pid) return pid;
+        trackerPid = extractProjectIdFromRecord(parsed);
       }
     } catch {}
+  }
+
+  // Conflict handling: historical done delegation vs tracker
+  if (trackerPid) {
+    if (donePid && donePid !== trackerPid) {
+      if (onConflict === "refuse") {
+        throw new OrchestratorError(
+          "task-project-conflict",
+          `task-project-conflict: задача ${key} имеет проект ${donePid} в истории завершённых делегирований, но трекер задач указывает проект ${trackerPid}`,
+          `Укажите проект задачи явно или поставьте задачу в очередь через bb orchestrator enqueue`,
+        );
+      }
+      // Standard recovery: tracker is the authoritative system of record
+      log?.warn?.(
+        `orchestrator: task ${key} project conflict: historical delegation has ${donePid}, tracker has ${trackerPid}; recovering to tracker project ${trackerPid}`,
+      );
+      try {
+        store.healTaskProject?.(key, trackerPid);
+      } catch {}
+    }
+    return trackerPid;
+  }
+
+  if (donePid) {
+    return donePid;
   }
 
   return null;

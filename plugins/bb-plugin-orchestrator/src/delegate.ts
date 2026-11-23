@@ -506,17 +506,7 @@ export async function runDelegate(
   const role = roleForLevel(level, policy);
   const taskRow = store.getTask?.(taskKey);
 
-  let taskProjectId = params.projectId ?? taskRow?.project_id;
-  if (!taskProjectId && deps.bbCli) {
-    try {
-      const shown = await runJson<{ task?: { projectId?: string }; project?: { linkedBbProjectId?: string } }>(
-        deps.bbCli,
-        ["tasks", "show", taskKey, "--json"],
-      );
-      taskProjectId = shown?.task?.projectId ?? shown?.project?.linkedBbProjectId;
-    } catch {}
-  }
-  taskProjectId = taskProjectId ?? params.caller.projectId;
+  const taskProjectId = params.projectId ?? taskRow?.project_id ?? params.caller.projectId;
   let routeName: string;
   let route: PolicyRoute;
   let reviewerWarning: string | undefined;
