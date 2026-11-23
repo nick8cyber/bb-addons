@@ -17,18 +17,23 @@ test("resolveTaskProjectId: handles confirmed conflict between historical done-d
   for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
 
-  // An old done delegation exists with proj_old (e.g. before PLUG-395)
-  const del = store.insert({
-    taskKey: "CONFLICT-1",
-    projectId: "proj_old",
-    coordinatorThreadId: "thr_coord",
-    level: "simple",
-    route: "simple",
-    preset: "preset_1",
-    provider: "provider_1",
-    round: 1,
-  });
-  store.setStatus(del.id, "done");
+  // Historical delegations exist across all 6 non-active statuses with proj_old
+  const statuses = ["done", "failed", "cancelled", "reissued", "stalled", "quota"] as const;
+  const delIds: number[] = [];
+  for (const st of statuses) {
+    const d = store.insert({
+      taskKey: "CONFLICT-1",
+      projectId: "proj_old",
+      coordinatorThreadId: "thr_coord",
+      level: "simple",
+      route: "simple",
+      preset: "preset_1",
+      provider: "provider_1",
+      round: 1,
+    });
+    store.setStatus(d.id, st);
+    delIds.push(d.id);
+  }
 
   const trackerMock = {
     getTask: async (k: string) => ({
@@ -62,17 +67,21 @@ test("resolveTaskProjectId: handles confirmed conflict between historical done-d
   assert.equal(resolvedReadOnly, "proj_tracker");
   assert.equal(warnings.length, 1);
   assert.match(warnings[0]!, /recovering to tracker project proj_tracker/);
-  // Verify DB was NOT mutated on read-only call
-  assert.equal(store.get(del.id)!.project_id, "proj_old");
+  // Verify DB was NOT mutated on read-only call across all rows
+  for (const id of delIds) {
+    assert.equal(store.get(id)!.project_id, "proj_old");
+  }
 
-  // 3. Mutating recovery path (heal: true): heals historical delegations in DB
+  // 3. Mutating recovery path (heal: true): heals historical delegations across ALL statuses in DB
   const resolvedHeal = await resolveTaskProjectId(store, "CONFLICT-1", {
     tracker: trackerMock,
     heal: true,
   });
   assert.equal(resolvedHeal, "proj_tracker");
-  const healed = store.get(del.id)!;
-  assert.equal(healed.project_id, "proj_tracker");
+  for (const id of delIds) {
+    const healed = store.get(id)!;
+    assert.equal(healed.project_id, "proj_tracker", `row #${id} status ${healed.status} should be healed`);
+  }
 });
 
 test("connected cross-project scenario: coordinator in proj_coord, task in proj_task, transient failure → watchdog reissue", async () => {

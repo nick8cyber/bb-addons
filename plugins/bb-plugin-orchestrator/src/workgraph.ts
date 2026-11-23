@@ -526,6 +526,7 @@ export async function assertGraphAllowsDirectAction(
     tracker: action?.tracker,
     bbCli: action?.bbCli,
     cmd: action?.cmd,
+    log: action?.log,
   });
 
   let effectiveMode: WorkGraphMode;
@@ -1465,6 +1466,8 @@ export async function runEnqueue(
       bbCli: deps.bbCli,
       cmd: deps.cmd,
       tracker: deps.tracker,
+      heal: true,
+      log: deps.log,
     })) ||
     (deps.ctx.projectId && deps.ctx.projectId.trim()) ||
     "";

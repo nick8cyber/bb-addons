@@ -166,12 +166,12 @@ async function exemptShasInRepo(
   const tips = new Set<string>();
   for (const r of [
     ...deps.store.delegationsByTask(args.taskKey),
-    // Rows live under the task's project (PLUG-395), falling back to
-    // coordinator's project for legacy records.
-    ...deps.store.mergedDelegationsInto(
-      from,
-      args.projectId ?? args.callerProjectId ?? null,
-    ),
+    // Rows live under the task's project (PLUG-395), with coordinator's
+    // project included for legacy records.
+    ...deps.store.mergedDelegationsInto(from, args.projectId ?? null),
+    ...(args.callerProjectId && args.callerProjectId !== args.projectId
+      ? deps.store.mergedDelegationsInto(from, args.callerProjectId)
+      : []),
   ]) {
     if (r.result_sha && shaRe.test(r.result_sha)) {
       tips.add(r.result_sha);
