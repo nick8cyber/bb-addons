@@ -65,7 +65,7 @@ import {
 import { DEFAULT_HANDOFF_PATH } from "./roles.js";
 import { isPluginUiFile, pluginNameForPaths } from "./staged.js";
 import { T_RU, type T } from "./i18n/index.js";
-import { resolveTaskSpecContract } from "./spec-gate.js";
+import { isSpecBeforeCodeEnforced, resolveTaskSpecContract } from "./spec-gate.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
 export const BUILTIN_QUOTA_PATTERNS = [
@@ -439,6 +439,8 @@ export interface WatchdogDeps {
   /** §5.6 (r34): the work-graph mode — when not `off`, task_queue owns
    * its tasks and the watchdog only wakes on its intervention states. */
   workGraphMode?(): string;
+  resolveProject?: (projectId: string) => any;
+  project?: any;
   enqueue<T>(fn: () => Promise<T>): Promise<T>;
   /** §18.6: the handoff path for the §16.5 compaction reminder —
    * read lazily so a settings change applies without a reload. */
@@ -988,7 +990,15 @@ export function createWatchdog(deps: WatchdogDeps) {
         const mode = typeof (deps as any).workGraphMode === "function"
           ? (deps as any).workGraphMode(row.project_id)
           : (deps as any).workGraphMode;
-        if (mode === "strict" || mode === "shadow") {
+        const proj = row.project_id && deps.resolveProject
+          ? await Promise.resolve(deps.resolveProject(row.project_id)).catch(() => null)
+          : (deps.project ?? null);
+        const enforced = isSpecBeforeCodeEnforced({
+          workGraphMode: mode,
+          policy: info.policy,
+          project: proj,
+        });
+        if (enforced) {
           const taskRow = store.getTask(row.task_key);
           const contract = resolveTaskSpecContract(row.task_key, store, null, {
             workGraphMode: mode,

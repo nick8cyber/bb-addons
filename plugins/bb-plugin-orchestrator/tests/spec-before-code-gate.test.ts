@@ -2547,3 +2547,216 @@ test("§31.9 Opus Audit Round 8 Blocker 1: CHANGES review verdict followed by pr
   db.prepare("DELETE FROM events WHERE kind = 'review.verdict'").run();
   assert.equal(store.getLatestAcceptedReview("REV-CH-1", SHA), null, "after pruning events, review without OK verdict must NOT be accepted");
 });
+
+test("§31.9 Opus Audit Round 9 Blocker 1: spec in coordinator HEAD but missing on origin/main is rejected without --from", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-coord-head-");
+  const { run, cmd } = initGitRepo(repoDir);
+
+  // Set up origin/main branch pointing to initial commit
+  run(["branch", "origin/main"]);
+
+  // Now create a coordinator commit in HEAD with a spec (not pushed to origin/main)
+  mkdirSync(join(repoDir, "docs/specs"), { recursive: true });
+  writeFileSync(join(repoDir, "docs/specs/unpushed.md"), "# Unpushed Spec\n");
+  run(["add", "."]);
+  run(["commit", "-m", "docs: local spec in coordinator branch"]);
+  const localSpecSha = run(["rev-parse", "HEAD"]).trim();
+
+  store.saveSpecContract({
+    taskKey: "COORD-HEAD-1",
+    projectId: "p1",
+    kind: "behavior_change",
+    specPath: "docs/specs/unpushed.md",
+    specSha: localSpecSha,
+    approvalId: `appr:p1:COORD-HEAD-1:${localSpecSha.slice(0, 12)}:1`,
+  });
+
+  // Without --from (preparedBaseSha = undefined), gate checks origin/main where spec does not exist -> REJECTS!
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "COORD-HEAD-1",
+        role: "executor",
+        level: "complex",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        workGraphMode: "shadow",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /отсутствует в базовом коммите|не найден в истории базовой ветки/);
+      return true;
+    },
+  );
+
+  // With explicit --from HEAD (or localSpecSha), executor starts from that base -> PASSES!
+  await verifySpecBeforeCodeGate({
+    taskKey: "COORD-HEAD-1",
+    role: "executor",
+    level: "complex",
+    store,
+    cmd,
+    repoRoot: repoDir,
+    preparedBaseSha: "HEAD",
+    workGraphMode: "shadow",
+  });
+});
+
+test("§31.9 Opus Audit Round 9 Blocker 2: watchdog respects specBeforeCode: false in policy or project in shadow mode", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const { createWatchdog } = await import("../src/watchdog.js");
+  const { parsePolicy } = await import("../src/policy.js");
+
+  const policyLoad = parsePolicy(JSON.stringify({
+    version: 1,
+    limits: { maxActive: 5 },
+    levels: {
+      complex: { chain: ["c1", "c2"], autoFallback: true },
+    },
+    routes: {
+      c1: { preset: "p1", provider: "pv1" },
+      c2: { preset: "p2", provider: "pv2" },
+    },
+    specBeforeCode: false,
+  }));
+
+  store.insertTask({
+    taskKey: "NO-SBC-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "manual",
+  } as any);
+
+  const row = store.insert({
+    taskKey: "NO-SBC-1",
+    projectId: "p1",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "c1",
+    preset: "p1",
+    provider: "pv1",
+  });
+  store.setStatus(row.id, "running");
+  db.prepare("UPDATE delegations SET thread_id = ? WHERE id = ?").run("thr_fake", row.id);
+
+  let dispatched = false;
+  const wd = createWatchdog({
+    store,
+    loadPolicy: async () => policyLoad,
+    dispatch: async () => { dispatched = true; return { threadId: "thr_new", status: "running", setupErrors: [] } as any; },
+    threads: { get: async () => ({ id: "thr_fake", status: "idle" }), output: async () => ({ output: "" }), stop: async () => {} } as any,
+    workGraphMode: () => "shadow",
+    enqueue: (fn: any) => fn(),
+  } as any);
+
+  // Task has NO contract, but specBeforeCode is false -> watchdog must NOT refuse reissue!
+  await wd.onTurnFailed({ threadId: "thr_fake", errorInfo: { category: "rate-limit" } });
+
+  const updated = store.get(row.id)!;
+  assert.equal(updated.status, "reissued");
+  const delegations = store.delegationsByTask("NO-SBC-1");
+  assert.equal(delegations.length, 2, "new delegation row should be created");
+  assert.equal(dispatched, true, "dispatch should be launched");
+  const setupErrors = updated.setup_errors ? JSON.parse(updated.setup_errors) : [];
+  assert.equal(setupErrors.some((e: any) => e.step === "spec-before-code-gate"), false, "must not record spec-before-code-gate error when disabled");
+});
+
+test("§31.9 Opus Audit Round 9 Blocker 3: verifyReleaseDocumentsGate rejects missing specSha, 'base' specSha, and weird kind", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const repoDir = makeTempDir("orch-spec-release-blockers-");
+  const { run, cmd } = initGitRepo(repoDir);
+
+  mkdirSync(join(repoDir, "docs/specs"), { recursive: true });
+  writeFileSync(join(repoDir, "docs/specs/test.md"), "# Spec\n");
+  run(["add", "."]);
+  run(["commit", "-m", "docs: add spec"]);
+  const pubSha = run(["rev-parse", "HEAD"]).trim();
+
+  // 3a. specSha points to a non-existent commit in repo -> rejects
+  await assert.rejects(
+    async () => {
+      await verifyReleaseDocumentsGate({
+        taskKey: "REL-NONEXISTENT-1",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        publishedSha: pubSha,
+        contract: {
+          kind: "behavior_change",
+          specPath: "docs/specs/test.md",
+          specSha: "deadbeef".repeat(5),
+          approvalId: "appr:p1:REL-NONEXISTENT-1:spec:1",
+        },
+        workGraphMode: "strict",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /не найден в репозитории/);
+      return true;
+    },
+  );
+
+  // 3b. specSha = "base" -> rejects
+  await assert.rejects(
+    async () => {
+      await verifyReleaseDocumentsGate({
+        taskKey: "REL-BASE-1",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        publishedSha: pubSha,
+        contract: {
+          kind: "behavior_change",
+          specPath: "docs/specs/test.md",
+          specSha: "base",
+          approvalId: "appr:p1:REL-BASE-1:base:1",
+        },
+        workGraphMode: "strict",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /отсутствует или недействителен коммит спецификации/);
+      return true;
+    },
+  );
+
+  // 3c. kind = "weird" -> rejects
+  await assert.rejects(
+    async () => {
+      await verifyReleaseDocumentsGate({
+        taskKey: "REL-WEIRD-1",
+        store,
+        cmd,
+        repoRoot: repoDir,
+        publishedSha: pubSha,
+        contract: {
+          kind: "weird" as any,
+          specPath: "docs/specs/test.md",
+          specSha: pubSha,
+          approvalId: "appr:p1:REL-WEIRD-1:spec:1",
+        },
+        workGraphMode: "strict",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /неизвестный тип задачи "weird"/);
+      return true;
+    },
+  );
+});

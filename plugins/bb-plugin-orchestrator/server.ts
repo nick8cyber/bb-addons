@@ -2264,6 +2264,7 @@ export async function createPlugin(
       },
     },
     workGraphMode: getWorkGraphMode,
+    resolveProject: (pid: string) => releaseConfig.config ? resolveProject(releaseConfig.config, pid) : null,
     enqueue,
     handoffPath,
     log: bb.log,

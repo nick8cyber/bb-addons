@@ -62,7 +62,12 @@ import {
 } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
 import { T_RU, type T } from "./i18n/index.js";
-import { verifySpecBeforeCodeGate, resolveTaskSpecContract, type SpecContract } from "./spec-gate.js";
+import {
+  verifySpecBeforeCodeGate,
+  resolveExecutorBaseSha,
+  resolveTaskSpecContract,
+  type SpecContract,
+} from "./spec-gate.js";
 import type { WorkGraphMode } from "./workgraph.js";
 
 export interface SetupError {
@@ -701,6 +706,17 @@ export async function runDelegate(
     const proj = effectiveProj && deps.resolveProject
       ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
       : (deps.project ?? null);
+    let executorBaseSha: string | undefined;
+    if (deps.cmd && deps.repoRoot) {
+      try {
+        executorBaseSha = await resolveExecutorBaseSha({
+          cmd: deps.cmd,
+          repoRoot: deps.repoRoot,
+          from: params.from,
+          baseBranch: (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
+        });
+      } catch {}
+    }
     await verifySpecBeforeCodeGate({
       taskKey,
       role,
@@ -710,6 +726,7 @@ export async function runDelegate(
       cmd: deps.cmd,
       policy,
       project: proj,
+      baseSha: executorBaseSha,
       preparedBaseSha: params.from,
       workGraphMode: mode,
       specBeforeCode: params.specBeforeCode,
@@ -966,6 +983,17 @@ export async function dispatchToRoute(
           }
         } catch {}
       }
+      let executorBaseSha: string | undefined;
+      if (deps.cmd && taskRepoRoot) {
+        try {
+          executorBaseSha = await resolveExecutorBaseSha({
+            cmd: deps.cmd,
+            repoRoot: taskRepoRoot,
+            from: opts.from,
+            baseBranch: (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
+          });
+        } catch {}
+      }
       await verifySpecBeforeCodeGate({
         taskKey: row.task_key,
         role,
@@ -975,6 +1003,7 @@ export async function dispatchToRoute(
         cmd: deps.cmd,
         policy,
         project: proj,
+        baseSha: executorBaseSha,
         preparedBaseSha: resolvedBaseSha,
         workGraphMode: mode,
         specBeforeCode: opts.specBeforeCode,

@@ -27,7 +27,13 @@ import {
   normalizeTaskKey,
 } from "./store.js";
 import { verdictDetailsInBody } from "./release.js";
-import { verifySpecBeforeCodeGate, resolveTaskSpecContract, parseContractFromText, type SpecContract } from "./spec-gate.js";
+import {
+  verifySpecBeforeCodeGate,
+  resolveExecutorBaseSha,
+  resolveTaskSpecContract,
+  parseContractFromText,
+  type SpecContract,
+} from "./spec-gate.js";
 import {
   checkRouteLimits,
   type RouteLimitsCheckResult,
@@ -2244,14 +2250,33 @@ export async function runApprove(
   }
 
   if (approvedContract) {
-    const specSha: string = String(
-      res.task!.spec_sha ||
+    let specSha: string | undefined =
+      (res.task!.spec_sha ||
       task.spec_sha ||
       approvedContract.specSha ||
       (payloadObj?.spec_sha ?? payloadObj?.specSha) ||
-      task.acceptance_sha ||
-      "base"
-    );
+      task.acceptance_sha) as string | undefined;
+    if (!specSha || specSha === "base") {
+      const proj = task.project_id && (deps as any).resolveProject
+        ? await Promise.resolve((deps as any).resolveProject(task.project_id)).catch(() => null)
+        : (deps as any).project ?? null;
+      const repoRoot = deps.ctx?.cwd ?? proj?.repoPath ?? proj?.repoRoot ?? process.cwd();
+      const cmdRunner = (deps as any).cmd ?? (deps.ctx as any)?.cmd;
+      if (cmdRunner && repoRoot) {
+        try {
+          const r = await cmdRunner.run("git", ["rev-parse", "HEAD"], { cwd: repoRoot });
+          if (r.exitCode === 0 && r.stdout.trim().length === 40) {
+            specSha = r.stdout.trim();
+          }
+        } catch {}
+      }
+    }
+    if (!specSha || specSha === "base") {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: не удалось определить коммит спецификации (spec_sha) для задачи ${key}`,
+      );
+    }
     const approvalId = `appr:${task.project_id ?? "proj"}:${key}:${specSha}:${now}`;
     deps.store.saveSpecContract(
       {
@@ -4357,11 +4382,23 @@ export async function runRunQueue(
           try {
             const tRepo = deps.resolveTaskRepoContext ? await Promise.resolve(deps.resolveTaskRepoContext(t)).catch(() => null) : null;
             const proj = t.project_id && deps.resolveProject ? await Promise.resolve(deps.resolveProject(t.project_id)).catch(() => null) : (deps.project ?? null);
+            const effectiveRepo = tRepo?.repoRoot ?? repoRoot;
+            let executorBaseSha: string | undefined;
+            if (deps.cmd && effectiveRepo) {
+              try {
+                executorBaseSha = await resolveExecutorBaseSha({
+                  cmd: deps.cmd,
+                  repoRoot: effectiveRepo,
+                  baseBranch: (proj as any)?.baseBranch ?? (deps.policy as any)?.baseBranch,
+                });
+              } catch {}
+            }
             await verifySpecBeforeCodeGate({
               taskKey: t.task_key,
               store: deps.store,
               cmd: deps.cmd,
-              repoRoot: tRepo?.repoRoot ?? repoRoot,
+              repoRoot: effectiveRepo,
+              baseSha: executorBaseSha,
               workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               project: proj,
@@ -4531,11 +4568,23 @@ export async function runRunQueue(
           try {
             const tRepo = deps.resolveTaskRepoContext ? await Promise.resolve(deps.resolveTaskRepoContext(t)).catch(() => null) : null;
             const proj = t.project_id && deps.resolveProject ? await Promise.resolve(deps.resolveProject(t.project_id)).catch(() => null) : (deps.project ?? null);
+            const effectiveRepo = tRepo?.repoRoot ?? repoRoot;
+            let executorBaseSha: string | undefined;
+            if (deps.cmd && effectiveRepo) {
+              try {
+                executorBaseSha = await resolveExecutorBaseSha({
+                  cmd: deps.cmd,
+                  repoRoot: effectiveRepo,
+                  baseBranch: (proj as any)?.baseBranch ?? (deps.policy as any)?.baseBranch,
+                });
+              } catch {}
+            }
             await verifySpecBeforeCodeGate({
               taskKey: t.task_key,
               store: deps.store,
               cmd: deps.cmd,
-              repoRoot: tRepo?.repoRoot ?? repoRoot,
+              repoRoot: effectiveRepo,
+              baseSha: executorBaseSha,
               workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               project: proj,
@@ -4591,11 +4640,22 @@ async function dispatchTaskNode(
     const proj = task.project_id && deps.resolveProject
       ? await Promise.resolve(deps.resolveProject(task.project_id)).catch(() => null)
       : (deps.project ?? null);
+    let executorBaseSha: string | undefined;
+    if (deps.cmd && repoRoot) {
+      try {
+        executorBaseSha = await resolveExecutorBaseSha({
+          cmd: deps.cmd,
+          repoRoot,
+          baseBranch: (proj as any)?.baseBranch ?? (deps.policy as any)?.baseBranch,
+        });
+      } catch {}
+    }
     await verifySpecBeforeCodeGate({
       taskKey: task.task_key,
       store: deps.store,
       cmd: deps.cmd,
       repoRoot,
+      baseSha: executorBaseSha,
       workGraphMode: taskMode,
       policy: deps.policy,
       project: proj,
@@ -4966,19 +5026,21 @@ async function startQueuedTask(
         const isBugfixValid = parsed.kind === "bugfix" && Boolean(parsed.specPath || parsed.specSection);
         const isBehaviorValid = parsed.kind === "behavior_change" && Boolean(parsed.specPath);
         if (isMechanicalValid || isBugfixValid || isBehaviorValid) {
-          const specSha = parsed.specSha || acceptanceSha || "base";
-          const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
-          deps.store.saveSpecContract(
-            {
-              ...parsed,
-              taskKey: task.task_key,
-              projectId: task.project_id ?? undefined,
-              specSha: parsed.specSha || acceptanceSha || undefined,
-              approvalId,
-            },
-            now,
-          );
-          cleanedPayload.approval_id = approvalId;
+          const specSha = parsed.specSha || acceptanceSha;
+          if (specSha && specSha !== "base") {
+            const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
+            deps.store.saveSpecContract(
+              {
+                ...parsed,
+                taskKey: task.task_key,
+                projectId: task.project_id ?? undefined,
+                specSha,
+                approvalId,
+              },
+              now,
+            );
+            cleanedPayload.approval_id = approvalId;
+          }
         }
       }
     }
@@ -4996,12 +5058,23 @@ async function startQueuedTask(
     const proj = task.project_id && deps.resolveProject
       ? await Promise.resolve(deps.resolveProject(task.project_id)).catch(() => null)
       : (deps.project ?? null);
+    let executorBaseSha: string | undefined;
+    if (deps.cmd && repoRoot) {
+      try {
+        executorBaseSha = await resolveExecutorBaseSha({
+          cmd: deps.cmd,
+          repoRoot,
+          baseBranch: (proj as any)?.baseBranch ?? (deps.policy as any)?.baseBranch,
+        });
+      } catch {}
+    }
     try {
       await verifySpecBeforeCodeGate({
         taskKey: task.task_key,
         store: deps.store,
         cmd: deps.cmd,
         repoRoot,
+        baseSha: executorBaseSha,
         workGraphMode: taskMode,
         policy: deps.policy,
         project: proj,
@@ -5023,9 +5096,7 @@ async function startQueuedTask(
           deps.store.updateTask(task.task_key, {
             payload: JSON.stringify(cleanedPayload),
           });
-          if (deps.autoAdvance) {
-            return false;
-          }
+          return false;
         } else {
           deps.log?.warn?.(`orchestrator: task ${task.task_key} refused by spec gate: ${gateErr.message}`);
           return false;
@@ -6405,25 +6476,25 @@ async function advanceActiveTask(
             if (task.confirmation_mode === "auto") {
               const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
               if (approvedContract) {
-                const specSha: string = String(
+                const specSha =
                   tr.task?.spec_sha ||
                   task.spec_sha ||
                   approvedContract.specSha ||
                   ((payload as any)?.spec_sha ?? (payload as any)?.specSha) ||
-                  task.acceptance_sha ||
-                  "base"
-                );
-                const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
-                deps.store.saveSpecContract(
-                  {
-                    ...approvedContract,
-                    taskKey: task.task_key,
-                    projectId: task.project_id ?? undefined,
-                    specSha,
-                    approvalId,
-                  },
-                  now,
-                );
+                  task.acceptance_sha;
+                if (specSha && specSha !== "base") {
+                  const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
+                  deps.store.saveSpecContract(
+                    {
+                      ...approvedContract,
+                      taskKey: task.task_key,
+                      projectId: task.project_id ?? undefined,
+                      specSha,
+                      approvalId,
+                    },
+                    now,
+                  );
+                }
               }
             }
           } else if (verdict === "CHANGES") {
@@ -7109,25 +7180,25 @@ async function advanceActiveTask(
             if (task.confirmation_mode === "auto") {
               const approvedContract = resolveTaskSpecContract(task.task_key, deps.store, payload, { task: tr.task });
               if (approvedContract) {
-                const specSha: string = String(
+                const specSha =
                   tr.task?.spec_sha ||
                   task.spec_sha ||
                   approvedContract.specSha ||
                   ((payload as any)?.spec_sha ?? (payload as any)?.specSha) ||
-                  task.acceptance_sha ||
-                  "base"
-                );
-                const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
-                deps.store.saveSpecContract(
-                  {
-                    ...approvedContract,
-                    taskKey: task.task_key,
-                    projectId: task.project_id ?? undefined,
-                    specSha,
-                    approvalId,
-                  },
-                  now,
-                );
+                  task.acceptance_sha;
+                if (specSha && specSha !== "base") {
+                  const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
+                  deps.store.saveSpecContract(
+                    {
+                      ...approvedContract,
+                      taskKey: task.task_key,
+                      projectId: task.project_id ?? undefined,
+                      specSha,
+                      approvalId,
+                    },
+                    now,
+                  );
+                }
               }
             }
           } else if (verdict === "CHANGES") {
