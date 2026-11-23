@@ -2405,6 +2405,35 @@ test("§22.2 (ревью): merge-коммит `bb orchestrator merge` на main 
   assert.equal(res.status, "running");
 });
 
+test("§22.2: cross-project delegate with task projectId matching linkedBbProjectId exempts legacy merge under coordinator's project", async () => {
+  const { repo } = makeClone();
+  gitR(repo, ["checkout", "-b", "task-w"]);
+  const taskTip = commitLocal(repo, "task.txt");
+  gitR(repo, ["checkout", "main"]);
+  const originTip = gitR(repo, ["rev-parse", "origin/main"]);
+  gitR(repo, ["merge", "--no-ff", "task-w", "-m", "merge PLUG-2 r1"]);
+  const mergeSha = gitR(repo, ["rev-parse", "HEAD"]);
+  const { deps, store } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  // Older delegation of another task merged under coordinator's project proj_main
+  recordMergedTask(store, "main", originTip, taskTip, mergeSha);
+  // Coordinator is in proj_main, task projectId is explicitly proj_bb (matching linkedBbProjectId)
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      projectId: "proj_bb",
+      level: "simple",
+      from: "main",
+      caller: COORDINATOR, // projectId: "proj_main"
+    },
+    deps,
+  );
+  assert.equal(res.status, "running");
+});
+
 test("§22.2 (ревью): merge-коммит без записанного merged_sha — exempt по родителю-вершине задачи", async () => {
   const { repo } = makeClone();
   gitR(repo, ["checkout", "-b", "task-w"]);

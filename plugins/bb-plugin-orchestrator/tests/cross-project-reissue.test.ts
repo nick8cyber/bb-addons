@@ -218,6 +218,35 @@ test("connected cross-project scenario: coordinator in proj_coord, task in proj_
     projectId: "proj_coord", // Coordinator belongs to proj_coord
   };
 
+  // Simulate historical state before PLUG-395: stale row with proj_coord
+  const staleRow = store.insert({
+    taskKey: "CROSS-1",
+    projectId: "proj_coord",
+    coordinatorThreadId: "thr_coord",
+    level: "medium",
+    route: "route-primary",
+    preset: "preset_1",
+    provider: "provider_1",
+    round: 1,
+  });
+  store.setStatus(staleRow.id, "failed");
+
+  // Server-level resolution: resolveTaskProjectId with tracker and heal: true heals DB and returns authoritative task projectId
+  const resolvedPid = await resolveTaskProjectId(store, "CROSS-1", {
+    tracker: {
+      getTask: async () => ({
+        id: "t-cross-1",
+        key: "CROSS-1",
+        title: "cross task",
+        status: "todo",
+        projectId: "proj_task",
+      }),
+    },
+    heal: true,
+  });
+  assert.equal(resolvedPid, "proj_task");
+  assert.equal(store.get(staleRow.id)!.project_id, "proj_task");
+
   // 1. Initial delegation of CROSS-1 (task belongs to proj_task)
   const initialRes = await runDelegate(
     {
@@ -226,7 +255,7 @@ test("connected cross-project scenario: coordinator in proj_coord, task in proj_
       route: "route-primary",
       from: ACCEPTED_SHA,
       caller: COORDINATOR,
-      projectId: "proj_task",
+      projectId: resolvedPid!,
     },
     delegateDeps,
   );

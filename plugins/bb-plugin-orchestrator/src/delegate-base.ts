@@ -55,9 +55,9 @@ export interface DelegateBaseArgs {
   /** §22.2 case 3: an explicit `--from` ref, if the caller gave one. */
   from?: string;
   taskKey: string;
-  /** The COORDINATOR's bb project — delegation rows (and the
-   * `merged_into` records `bb orchestrator merge` leaves) are stored
-   * under it, not under the task's linked project. */
+  /** The COORDINATOR's bb project — legacy delegation rows (and the
+   * `merged_into` records `bb orchestrator merge` leaves) may be stored
+   * under it before PLUG-395, in addition to the task's linked project. */
   callerProjectId?: string | null;
 }
 
@@ -166,8 +166,9 @@ async function exemptShasInRepo(
   const tips = new Set<string>();
   for (const r of [
     ...deps.store.delegationsByTask(args.taskKey),
-    // Rows live under the task's project (PLUG-395), with coordinator's
-    // project included for legacy records.
+    // Rows live under the task's project (PLUG-395). When the coordinator's
+    // project differs, query it too so legacy records merged under the
+    // coordinator's project (before PLUG-395) are recognized as exempt.
     ...deps.store.mergedDelegationsInto(from, args.projectId ?? null),
     ...(args.callerProjectId && args.callerProjectId !== args.projectId
       ? deps.store.mergedDelegationsInto(from, args.callerProjectId)

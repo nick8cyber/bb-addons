@@ -387,14 +387,22 @@ export async function resolveTaskProjectId(
     return active.project_id.trim();
   }
 
-  // Check for historical completed delegation
+  // Check for historical non-active delegation across all terminal statuses
+  const TERMINAL_STATUSES = new Set([
+    "done",
+    "failed",
+    "cancelled",
+    "reissued",
+    "stalled",
+    "quota",
+  ]);
   const done = store.latestDoneResultByTask?.(key);
   let donePid = done?.project_id?.trim();
   if (!donePid) {
     const all = store.delegationsByTask?.(key);
     if (all && all.length > 0) {
       for (const d of all) {
-        if (d.status === "done" && d.project_id && d.project_id.trim()) {
+        if (TERMINAL_STATUSES.has(d.status) && d.project_id && d.project_id.trim()) {
           donePid = d.project_id.trim();
           break;
         }

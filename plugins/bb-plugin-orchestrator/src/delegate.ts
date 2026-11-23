@@ -210,6 +210,9 @@ export interface DelegateThreads {
   getPluginMetadata?(args: {
     threadId: string;
   }): Promise<Record<string, unknown> | null | undefined>;
+  get?(args: {
+    threadId: string;
+  }): Promise<{ id?: string; projectId?: string | null } | null | undefined>;
   update(args: {
     threadId: string;
     parentThreadId?: string | null;
@@ -936,6 +939,7 @@ export async function runDelegate(
         from: params.from,
         specBeforeCode: params.specBeforeCode,
         immutableBaseSha: executorBaseSha,
+        coordinatorProjectId: params.caller.projectId ?? null,
       },
       {
         ...deps,
@@ -1038,6 +1042,8 @@ interface DispatchOpts {
   _skipped?: { route: string; reason: string }[];
   specBeforeCode?: boolean;
   immutableBaseSha?: string;
+  /** Coordinator's bb project ID — passed to delegateBase for legacy merge exemption. */
+  coordinatorProjectId?: string | null;
 }
 
 /**
@@ -1815,13 +1821,19 @@ async function dispatchViaSpawn(
     // `base-unavailable`. The check skips where git is unreachable
     // (another host, no local_path source, no runner) — the response
     // then names the reason («база не проверена: <причина>»).
+    const coordinatorProjectId =
+      opts.coordinatorProjectId ??
+      (row.coordinator_thread_id && deps.threads?.get
+        ? (await deps.threads.get({ threadId: row.coordinator_thread_id }).catch(() => null))?.projectId ?? null
+        : null);
+
     const base = await delegateBase(deps, {
       projectId: linkedBbProjectId!,
       hostId,
       baseBranchName: p!.baseBranch ?? null,
       from: opts.from,
       taskKey: row.task_key,
-      callerProjectId: row.project_id ?? null,
+      callerProjectId: coordinatorProjectId ?? null,
     });
     if ("refuse" in base) {
       await refuse(base.refuse);

@@ -1686,7 +1686,7 @@ export class DelegationStore {
    */
   reissue(
     id: number,
-    next: { route: string; preset: string; provider: string },
+    next: { route: string; preset: string; provider: string; projectId?: string | null },
   ): DelegationRow | undefined {
     const next_ = this.db.transaction(() => {
       const row = this.get(id);
@@ -1715,7 +1715,7 @@ export class DelegationStore {
         .run(
           row.task_key,
           row.task_id,
-          row.project_id,
+          next.projectId ?? row.project_id,
           row.coordinator_thread_id,
           row.level,
           next.route,

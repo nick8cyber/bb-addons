@@ -392,7 +392,10 @@ export interface WatchdogDeps {
    */
   dispatch(
     row: DelegationRow,
-    opts?: { onDispatchFailure?: "remove" | "fail" },
+    opts?: {
+      onDispatchFailure?: "remove" | "fail";
+      coordinatorProjectId?: string | null;
+    },
   ): Promise<DispatchStepsResult>;
   /** §4 steps 4–6 on a `dispatching` row that already has `thread_id`. */
   finalize(
@@ -986,12 +989,14 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
     if (nextName && nextRoute) {
       const role = levelRole(info.policy, row.level);
+      const taskRow = store.getTask(row.task_key);
+      const effectivePid = taskRow?.project_id || row.project_id;
       if (role === "executor" && !row.no_code) {
         const mode = typeof (deps as any).workGraphMode === "function"
-          ? (deps as any).workGraphMode(row.project_id)
+          ? (deps as any).workGraphMode(effectivePid)
           : (deps as any).workGraphMode;
-        const proj = row.project_id && deps.resolveProject
-          ? await Promise.resolve(deps.resolveProject(row.project_id)).catch(() => null)
+        const proj = effectivePid && deps.resolveProject
+          ? await Promise.resolve(deps.resolveProject(effectivePid)).catch(() => null)
           : (deps.project ?? null);
         const enforced = isSpecBeforeCodeEnforced({
           workGraphMode: mode,
@@ -999,7 +1004,6 @@ export function createWatchdog(deps: WatchdogDeps) {
           project: proj,
         });
         if (enforced) {
-          const taskRow = store.getTask(row.task_key);
           const contract = resolveTaskSpecContract(row.task_key, store, null, {
             workGraphMode: mode,
             task: taskRow,
@@ -1031,6 +1035,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           route: nextName,
           preset: nextRoute.preset,
           provider: nextRoute.provider,
+          projectId: effectivePid || row.project_id,
         });
       } catch (e) {
         const current = store.get(row.id) ?? row;
@@ -1049,8 +1054,10 @@ export function createWatchdog(deps: WatchdogDeps) {
       }
       if (fresh) {
         try {
+          const coord = await getThread(fresh.coordinator_thread_id).catch(() => null);
           const res = await deps.dispatch(fresh, {
             onDispatchFailure: "fail",
+            coordinatorProjectId: coord?.projectId ?? null,
           });
           await report(
             row,
@@ -3988,8 +3995,10 @@ export function createWatchdog(deps: WatchdogDeps) {
     // grace — the queue is a live wait, not a lost dispatch.
     if (row.queued_at != null && !row.thread_id) {
       try {
+        const coord = await getThread(row.coordinator_thread_id).catch(() => null);
         const res = await deps.dispatch(store.get(row.id) ?? row, {
           onDispatchFailure: "fail",
+          coordinatorProjectId: coord?.projectId ?? null,
         });
         if (res.status === "running") {
           s.relinked++;
@@ -4028,8 +4037,10 @@ export function createWatchdog(deps: WatchdogDeps) {
           // silently removed. The thread search came up empty, so the
           // dispatch runs here; a refusal marks the row `failed`.
           try {
+            const coord = await getThread(row.coordinator_thread_id).catch(() => null);
             const res = await deps.dispatch(store.get(row.id) ?? row, {
               onDispatchFailure: "fail",
+              coordinatorProjectId: coord?.projectId ?? null,
             });
             store.resetRetry(row.id); // resolved — the streak is over
             if (res.status === "running") {
