@@ -1027,7 +1027,7 @@ export async function verifySpecBeforeCodeGate(
   const targetSha = currentBaseSha ?? input.preparedBaseSha ?? input.baseSha;
 
   // §31.9 NET-46: in auto mode, positive spec review on exact SHA automatically resolves & persists contract
-  if ((!contract || !contract.approvalId) && isAutoMode) {
+  if (isAutoMode) {
     const specRev = await findAcceptedSpecReview({
       taskKey: input.taskKey,
       store: input.store,
@@ -1041,61 +1041,73 @@ export async function verifySpecBeforeCodeGate(
       targetSha,
     });
     if (specRev) {
-      const now = Date.now();
-      let plObj: any = {};
-      if (taskRow?.payload) {
-        try {
-          plObj = JSON.parse(taskRow.payload);
-        } catch {}
-      }
-      const isArch =
-        contract?.isArchitectural ??
-        Boolean(
-          plObj.is_architectural ||
-            plObj.isArchitectural ||
-            specRev.specPath.includes("/adr/"),
-        );
-      const adr =
-        contract?.adrPath ??
-        plObj.adr_path ??
-        plObj.adrPath ??
-        (specRev.specPath.includes("/adr/") ? specRev.specPath : undefined);
-      const alters =
-        contract?.altersContract ??
-        Boolean(plObj.alters_contract || plObj.altersContract);
-      const section =
-        contract?.specSection ??
-        plObj.spec_section ??
-        plObj.specSection;
+      const shouldSynthesize =
+        !contract ||
+        !contract.approvalId ||
+        (Boolean(contract.specSha) && contract.specSha !== specRev.reviewedSha);
+      if (shouldSynthesize) {
+        let plObj: any = {};
+        if (taskRow?.payload) {
+          try {
+            plObj = JSON.parse(taskRow.payload);
+          } catch {}
+        }
+        const isArch =
+          contract?.isArchitectural ??
+          Boolean(
+            plObj.is_architectural ||
+              plObj.isArchitectural ||
+              specRev.specPath.includes("/adr/"),
+          );
+        const adr =
+          contract?.adrPath ??
+          plObj.adr_path ??
+          plObj.adrPath ??
+          (specRev.specPath.includes("/adr/") ? specRev.specPath : undefined);
+        const alters =
+          contract?.altersContract ??
+          Boolean(plObj.alters_contract || plObj.altersContract);
+        const section =
+          contract?.specSection ??
+          plObj.spec_section ??
+          plObj.specSection;
 
-      const synthesizedContract: SpecContract = {
-        kind:
-          contract?.kind ??
-          ((taskRow as any)?.route === "fix"
-            ? "bugfix"
-            : "behavior_change"),
-        projectId:
-          (taskRow as any)?.project_id ?? (input.project as any)?.id,
-        specPath: contract?.specPath ?? specRev.specPath,
-        specSha: specRev.reviewedSha,
-        specSection: section,
-        adrPath: adr,
-        approvalId: specRev.approvalId,
-        altersContract: alters,
-        isArchitectural: isArch,
-        preparedBaseSha: targetSha,
-      };
-      pendingContractToSave = synthesizedContract;
-      contract = synthesizedContract;
+        const synthesizedContract: SpecContract = {
+          kind:
+            contract?.kind ??
+            ((taskRow as any)?.route === "fix"
+              ? "bugfix"
+              : "behavior_change"),
+          projectId:
+            (taskRow as any)?.project_id ?? (input.project as any)?.id,
+          specPath: contract?.specPath ?? specRev.specPath,
+          specSha: specRev.reviewedSha,
+          specSection: section,
+          adrPath: adr,
+          approvalId: specRev.approvalId,
+          altersContract: alters,
+          isArchitectural: isArch,
+          preparedBaseSha: targetSha,
+        };
+        pendingContractToSave = synthesizedContract;
+        contract = synthesizedContract;
+      }
     }
   }
 
   if (!contract) {
     if (!isAutoMode) {
+      if (effectiveApprovalMode === "manual") {
+        throw new OrchestratorError(
+          "spec-gate-violation",
+          `spec-gate-violation: задача ${input.taskKey} ожидает одобрения спецификации владельцем (approvalMode: manual); договор приёмки не подтверждён владельцем`,
+          "Одобри спецификацию через команду approve до запуска кода",
+        );
+      }
       throw new OrchestratorError(
         "spec-gate-violation",
-        `spec-gate-violation: задача ${input.taskKey} ожидает одобрения спецификации владельцем (approvalMode: ${effectiveApprovalMode || "manual"}); договор приёмки не подтверждён владельцем`,
-        "Одобри спецификацию через команду approve до запуска кода",
+        `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация или договор приёмки отсутствует (§31.9; approvalMode: не задан)`,
+        "Добавь задачу в очередь конвейера или назначь ревью спецификации через bb orchestrator delegate <KEY> --level review --kind spec_review",
       );
     }
 
