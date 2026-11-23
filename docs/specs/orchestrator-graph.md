@@ -2,7 +2,7 @@
 title: Orchestrator — граф задачи и очередь кодом (Work Graphs)
 status: approved
 updated: 2026-11-23
-revision: 34.7 (r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
+revision: 34.8 (r34.8 / PLUG-398 — наблюдатель-сверка shadow §32.5, ADR-0041; r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
 ---
 
 # Граф задачи и очередь кодом (Work Graphs)
@@ -579,50 +579,75 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 
 #### 32.5.1 Приём задачи в очередь при ручной раздаче (только `shadow`)
 
-1. В проекте с эффективным режимом `shadow` первый ручной `delegate` по задаче, которой нет в `task_queue`, **создаёт** запись очереди (приём, `adopt`). Исключения: `orchestrator_helper` (§19.1) и раздачи уровней `research`/`release-audit` без ключа задачи трекера.
-2. Поля принятой записи: `project_id` — по порядку §32.2 п. 2; `coordinator_thread_id` — тред, выполнивший `delegate`; `route` — из `payload.route` трекера; если его нет — по первой принятой раздаче: уровни `complex`/`medium`/`spec`/`architect` → `feature`, уровень `simple` → `simple`; раздача уровня ревью с видом `spec_review` → `feature`, если все пути её диапазона в `docs/` или `*.md` и задача не ссылается на код (`payload.no_code`) → `docs`; ревью кода → по уровню, найденному обратным поиском `reviewByLevel` (`complex`/`medium` → `feature`, `simple` → `simple`), без совпадения → `feature`; `level` — уровень раздачи; если первая принятая раздача — ревью, `level` берётся обратным поиском по `reviewByLevel` политики (`review` → `complex`, `review-medium` → `medium`, `review-simple` → `simple`), при отсутствии совпадения — `complex`; `confirmation_mode` — по §29.3; `branch` — фактическая ветка раздачи; `priority = 100`; `payload.origin = "shadow-adopt"`, `payload.adopted_delegation_id`.
+1. В проекте с эффективным режимом `shadow` первый ручной `delegate` по задаче трекера, которой нет в `task_queue`, **создаёт** запись очереди (приём, `adopt`). Никогда не принимаются и не зеркалируются:
+   - `orchestrator_helper` (§19.1);
+   - раздачи уровня `release-audit`: это служебный шаг конвейера выкладки, его исход учитывается строкой `release <KEY>` таблицы §32.5.2;
+   - любые раздачи без ключа задачи трекера.
+2. Поля принятой записи:
+   - `project_id` — по порядку §32.2 п. 2; `coordinator_thread_id` — тред, выполнивший `delegate`; `priority = 100`; `payload.origin = "shadow-adopt"`, `payload.adopted_delegation_id`;
+   - `route` — из `payload.route` трекера; если его нет — по первой принятой раздаче: уровень `research` → `research`; уровни `complex`/`medium`/`spec`/`architect` → `feature`; уровень `simple` → `simple`; раздача уровня ревью с видом `spec_review` → `docs`, если все пути её диапазона в `docs/` или `*.md` и задача помечена `no_code`, иначе `feature`; ревью кода → по уровню, найденному обратным поиском `reviewByLevel` (`complex`/`medium` → `feature`, `simple` → `simple`), без совпадения → `feature`;
+   - `level` — уровень раздачи; если первая принятая раздача — ревью, `level` берётся обратным поиском по `reviewByLevel` политики (`review` → `complex`, `review-medium` → `medium`, `review-simple` → `simple`), при отсутствии совпадения — `complex`. Значение всегда входит в CHECK §27.1; для `route = feature` допустимы любые уровни из CHECK, включая `spec` и `architect` (уровень описывает первую раздачу, а не весь маршрут);
+   - `confirmation_mode` — по §29.3; `branch` — фактическая ветка раздачи, для `route = research` — `NULL` (§27.1).
 3. Узел и статус записи сразу выставляются по таблице §32.5.2 для этой раздачи (а не `start/queued`). Принятая задача **никогда не берётся** `run-queue` в `shadow`: конвейер в `shadow` только вычисляет `shadow_eval` (§32.1).
-4. Запись `task_transitions`: `actor = "shadow:adopt"`, `from_node = "none"`, `from_status = "none"`, `to_node`/`to_status` — по п. 3, `reason = "shadow-adopt:<command>"`.
+4. Запись `task_transitions`: `actor = "shadow:adopt"`, `from_node = "none"`, `from_status = "none"`, `to_node`/`to_status` — по п. 3, `reason = "shadow-adopt:<command>"`. Класс вердикта (§32.5.3) приём не получает.
 5. В `strict` приёма нет: отказ `graph-required` по §32.1 сохраняется. В `off` — правило абсолютного молчания §32.2 п. 3.
-6. Служебная запись `task-not-enqueued` (§32.1) остаётся только для случаев, когда приём невозможен (нет ключа задачи трекера, проект не определён). Её доля — отдельная метрика отчёта §32.5.5.
+6. Служебная запись `task-not-enqueued` (§32.1) после выкладки §32.5 пишется только для ручных `merge`/`release` по задаче вне очереди и для раздач без ключа задачи трекера или с неопределённым проектом. Записи до момента выкладки §32.5 — история, в метрики отчёта §32.5.5 не входят.
 
 #### 32.5.2 Продвижение зеркала вслед за фактом
 
-Каждое ручное действие по задаче в очереди (`shadow`) обрабатывается в два шага в одной транзакции:
+Каждое ручное действие по задаче в очереди (`shadow`) обрабатывается в одной транзакции в два шага:
 
-1. **Оценка** — как сейчас: `shadow_eval` против **текущего** узла записи. Результат классифицируется (§32.5.3) и пишется в `task_transitions.payload.verdict`.
-2. **Следование** — запись переводится в фактический узел (CAS по §27.1 п. 2, `actor = "shadow:follow"`, `reason = "shadow-follow:<command>"`). Счётчики кругов (`spec_review_rounds`, `code_review_rounds`, `code_attempts`) инкрементируются по тем же правилам, что в §28.1, чтобы потолок 3 кругов тоже сверялся.
+1. **Оценка** — класс §32.5.3 против **текущего** состояния записи, результат пишется в `task_transitions.payload.verdict`.
+2. **Следование** — запись переводится в фактический узел и статус (CAS по §27.1 п. 2, `actor = "shadow:follow"`, `reason = "shadow-follow:<command>"`). Счётчики кругов (`spec_review_rounds`, `code_review_rounds`, `design_check_rounds`, `code_attempts`) инкрементируются по правилам §28.1, чтобы сверялся и потолок 3 кругов.
+
+У записи хранится признак `payload.mirror.dispatched` — была ли уже раздача в текущем узле с момента входа в него. Вход в узел через действие без раздачи (`approve`, `merge`) сбрасывает признак в `false`. Любая раздача ставит его в `true`.
 
 Сопоставление «ручное действие → фактический узел/статус»:
 
-| Ручное действие | Фактический узел | Статус |
-|---|---|---|
-| `delegate` уровня `spec` / `architect` | `spec` / `design` | `running` |
-| `delegate` уровня ревью, вид ревью `spec_review` (§31.9) | `spec_review` | `running` |
-| `approve <KEY>` владельцем, текущий узел `start`/`design`/`spec`/`spec_review`/`owner_gate` (одобрение до кода, `gate_stage = pre_code`) | `code` | `running` |
-| `approve <KEY>` владельцем, текущий узел `code`/`checks`/`review`/`design_check` (одобрение до выкладки, `gate_stage = pre_release`) | `release` | `running` |
-| `delegate` уровня кода (`complex`/`medium`/`simple`) | `code` | `running` |
-| `delegate` уровня ревью, вид ревью кода | `review` | `running` |
-| итог ревью `CHANGES` (событие, не действие координатора) | без перехода и без класса вердикта; только инкремент счётчика круга. Следующая раздача кода из `review` в `code` — `match` по §28.1 | — |
-| `merge <KEY>` | `release` | `running` |
-| `release <KEY>` с исходом `published` | `release` | `done` |
-| перевыпуск сторожем (`reissue_of`) (событие машины) | без перехода и без класса вердикта | — |
+| Ручное действие | Условие | Фактический узел | Статус |
+|---|---|---|---|
+| `delegate` уровня `architect` | — | `design` | `running` |
+| `delegate` уровня `spec` | — | `spec` | `running` |
+| `delegate` уровня `research` | — | `research` | `running` |
+| `delegate` уровня ревью, вид `spec_review` (§31.9) | — | `spec_review` | `running` |
+| `delegate` уровня кода (`complex`/`medium`/`simple`) | — | `code` | `running` |
+| `delegate` уровня ревью, вид ревью кода | — | `review` | `running` |
+| `approve <KEY>` (одобрение до кода) | `route` ∈ {`feature`, `fix`, `simple`} и текущий узел ∈ {`start`, `design`, `spec`, `spec_review`} | `code` | `running` |
+| `approve <KEY>` (одобрение до выкладки) | `route = docs` и текущий узел ∈ {`spec`, `spec_review`}; либо `route` ∈ {`feature`, `fix`, `simple`} и текущий узел ∈ {`code`, `checks`, `review`, `design_check`} | `release` | `running` |
+| `merge <KEY>` | — | `release` | `running` |
+| `release <KEY>`, исход `published` | — | `release` | `done` |
 
-`approve` получает класс `match`, если перед ним последний вердикт ревью текущего этапа — `OK, blockers: 0` и `confirmation_mode = manual`; иначе `skip` с деталью `approve-without-accepted-review`. Ни одно ручное действие не переводит зеркало в узел `owner_gate`: в ручном потоке это ожидание, а не шаг. Раздача кода после принятого ревью спеки без `approve` при `confirmation_mode = manual` — `skip` с ожидаемым `owner_gate`; при `auto` — `match`.
+Зеркало никогда не входит в узел `owner_gate`: в ручном потоке ожидание одобрения — не шаг, а пауза между действиями. Поэтому `payload.gate_stage` у принятых задач не ведётся, а вид одобрения определяется строками `approve` выше. `approve` в `shadow` сохраняет своё штатное действие (запись одобрения для гейта §31.9 и договора приёмки); узел двигает только следование зеркала, отдельного перехода `run-queue` нет.
 
-Узел `checks` выполняет только машина. Если ручной поток перешёл `code → review`, а `checks` не запускался, это расхождение класса `graph-only` (§32.5.3), а не ошибка координатора.
+События без действия координатора — итог ревью (`OK`/`CHANGES`), перевыпуск сторожем (`reissue_of`), сдача исполнителя — узел не двигают и класса не получают. Они обновляют `payload.mirror.last_verdict` (вердикт последнего ревью текущего этапа) и счётчики кругов.
 
 #### 32.5.3 Классы вердикта сверки
 
-| Класс | Условие | Смысл для решения о `strict` |
-|---|---|---|
-| `match` | в матрице §28.1 есть переход из текущего узла в фактический для этого маршрута и режима | граф сделал бы то же |
-| `repeat` | действие координатора, у которого фактический узел равен текущему (повторная раздача того же узла, ручной повтор ревью в пределах потолка). События без действия координатора (`CHANGES`, `reissue_of`) класса не получают | допустимо |
-| `skip` | координатор пропустил обязательный узел (например, `code` без принятого `spec_review` в `feature`, `release` без `review` OK) | граф **остановил бы** — ошибка процесса координатора |
-| `graph-only` | пропущен узел, который в ручном потоке некому выполнить (`checks`, `design_check`) | не ошибка; включается в `strict` автоматически |
-| `unmapped` | действие не сопоставляется таблице §32.5.2 | дефект сверки, блокирует вердикт |
+Класс считается **по событию графа**, а не по равенству узлов. Правила проверяются по порядку, первое совпавшее даёт класс:
 
-Каждое `skip` и `unmapped` хранит `payload.verdict_detail` с ожидаемым и фактическим узлом и id делегирования.
+| № | Класс | Условие |
+|---|---|---|
+| 1 | `unmapped` | действие не сопоставлено ни одной строке таблицы §32.5.2 |
+| 2 | `skip` | нарушено одно из правил пропуска ниже |
+| 3 | `match` | в матрице §28.1 для `route` и `confirmation_mode` задачи есть переход из текущего узла в фактический **с учётом машинных узлов**: узлы `checks` и `design_check` между ними считаются пройденными и дают отдельный класс `graph-only` (п. 5); узел `owner_gate` между ними допускается только для действия `approve` (оно и есть прохождение шлюза) |
+| 4 | `match` | раздача в текущий узел при `payload.mirror.dispatched = false`: это та раздача, которую граф сам делает при входе в узел (например, раздача кода после `approve`) |
+| 4а | `match` | `merge <KEY>` при `node = release`, `status = running`, `payload.mirror.dispatched = false`: первый шаг выкладки после входа в узел (признак ставится в `true`) |
+| 4б | `match` | `release <KEY> published` при `node = release`, `status = running`: завершение узла выкладки |
+| 5 | `graph-only` | дополнительная строка с тем же `transition_id` для каждого машинного узла (`checks`, `design_check`), который граф прошёл бы между текущим и фактическим узлом; в ручном потоке их некому выполнить, это не ошибка координатора |
+| 6 | `repeat` | раздача в текущий узел (или повторный `merge` в узле `release`) при `payload.mirror.dispatched = true`: повторный заход или ручной повтор ревью; допустимо, пока счётчик круга не превысил потолок 3 (иначе `skip` с деталью `round-cap-exceeded`) |
+
+Правила пропуска (`skip`), только при `confirmation_mode = manual`, кроме последнего:
+
+1. раздача кода в `feature`, когда `payload.mirror.last_verdict` этапа `spec_review` не равен `OK, blockers: 0` → ожидался `spec_review`;
+2. раздача кода в `feature`/`fix`/`simple` без предшествующего `approve` до кода → ожидался `owner_gate` (`pre_code`); при `auto` то же действие — `match`;
+3. `merge` в `feature`/`fix`/`simple`, когда последний вердикт ревью кода не `OK, blockers: 0` → ожидался `review`;
+4. `merge` или `release` без предшествующего `approve` до выкладки → ожидался `owner_gate` (`pre_release`); при `auto` — `match`;
+5. `approve`, когда последний вердикт ревью текущего этапа не `OK, blockers: 0` → деталь `approve-without-accepted-review`;
+6. при любом `confirmation_mode`: превышен потолок 3 кругов (`round-cap-exceeded`).
+
+Каждое `skip` и `unmapped` хранит `payload.verdict_detail` с ожидаемым узлом, фактическим узлом и id делегирования.
+
+Пример (`feature`, `manual`): раздача `spec` (`match` 4) → ревью спеки OK (событие) → `approve` (`match` 3: `spec_review → owner_gate → code`) → раздача кода (`match` 4, узел уже `code`, `dispatched = false`) → раздача ревью кода (`match` 3 и `graph-only` для `checks`) → ревью OK (событие) → `approve` до выкладки (`match` 3: `review → design_check → owner_gate → release` и `graph-only` для `design_check`) → `merge` (`match` 4а) → `release published` (`match` 4б). Тот же поток в `auto` без обоих `approve`: раздача кода после ревью спеки OK — `match` 3 (`spec_review → code`), `merge` после ревью кода OK — `match` 3 (`review → design_check → release`) и `graph-only` для `design_check`.
 
 #### 32.5.4 Синхронизация конечных статусов
 
@@ -635,7 +660,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 
 #### 32.5.5 Отчёт сверки и критерий готовности к `strict`
 
-1. Команда только на чтение `bb orchestrator shadow-report [--project <id>] [--since <iso>] [--json]`: по каждому проекту — число задач, полных циклов (`spec_review` → `release done` либо `code` → `release done`), количество и доля каждого класса §32.5.3, доля служебных `task-not-enqueued`, список всех `skip` и `unmapped` с деталями.
+1. Команда `bb orchestrator shadow-report [--project <id>] [--since <iso>] [--json]`: по каждому проекту — число задач, полных циклов (`spec_review` → `release done` либо `code` → `release done`), количество и доля каждого класса §32.5.3, доля служебных `task-not-enqueued`, список всех `skip` и `unmapped` с деталями. Первым шагом команда выполняет синхронизацию §32.5.4 (пишет только строки `shadow:sync`); больше ничего не меняет. В отчёт входят и все действующие переопределения `workGraphProjects`: строковые (бессрочные) помечаются `permanent`, объектные — с `until` и `reason`.
 2. **Проект готов к `strict`**, когда в окне не короче 48 часов одновременно:
    - не меньше 3 полных циклов;
    - `unmapped = 0`;
@@ -658,7 +683,12 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 #### 32.5.8 Обязательные тесты (через настоящие входы, §19.7)
 
 1. **Приём:** `shadow`, задача вне очереди, `delegate` уровня `medium` → одна запись очереди с `node = 'code'`, `status = 'running'`, `payload.origin = 'shadow-adopt'`; одна строка `shadow:adopt`; `run-queue --once` не делает ни одной раздачи.
-2. **Следование и `match`:** `feature` в `manual`: `spec` → ревью спеки OK → `approve` → код → ревью кода OK → `merge` → `release published`. Каждое действие даёт `match` или `graph-only` (`checks`), в конце `node = 'release'`, `status = 'done'`.
+2. **Следование и `match` (`manual`):** `feature`: `spec` → ревью спеки OK → `approve` → код → ревью кода OK → `approve` до выкладки → `merge` → `release published`. Классы строго как в примере §32.5.3: только `match` и две строки `graph-only` (`checks`, `design_check`); в конце `node = 'release'`, `status = 'done'`.
+2а. **Следование (`auto`):** тот же поток без обоих `approve` → только `match` и `graph-only` (`checks`, `design_check`).
+2б. **`docs` (`manual`):** `spec` → ревью спеки OK → `approve` → `release published` → `approve` ведёт в `release` (не в `code`), все шаги `match`.
+2в. **Пропуск одобрения до выкладки:** `feature` в `manual`, `merge` после ревью кода OK без второго `approve` → `skip` с ожидаемым `owner_gate` (`pre_release`).
+2г. **`repeat` и потолок:** вторая раздача кода в узле `code` после `CHANGES` → `repeat`; четвёртый круг ревью кода → `skip` `round-cap-exceeded`.
+2д. **`research` и `release-audit`:** `delegate` уровня `research` с ключом задачи → приём с `route = research`, `branch = NULL`, `node = research`; `delegate` уровня `release-audit` → 0 записей очереди и 0 строк `shadow:*`.
 3. **`skip`:** `feature`, код раздан без принятого ревью спеки → вердикт `skip` с ожидаемым `spec_review`; запись всё равно следует в `code`.
 4. **Синхронизация:** задача `done` в трекере при записи `start/queued` → после такта `status = 'done'`, строка `shadow:sync`, `shadow_eval` без `would_transition`.
 5. **Срок переопределения:** `{ "mode": "off", "until": now+1s }` → до срока `off`, после — наследуемый режим, ключ удалён, событие `setting-override-expired`, сообщение координатору; `until` = now+48h обрезается до 24h.
