@@ -4529,6 +4529,19 @@ export function createJanitor(deps: JanitorDeps) {
       const envThreads = threadsAll.filter(
         (x) => x.environmentId === envId && liveThread(x),
       );
+      // §16.9 п.1: a live coordinator-role thread protects its env and
+      // branch even before a binding is registered (an executor
+      // promoted to coordinator keeps its env until a dedicated
+      // Worktree is created — §13.5 п.2).
+      if (
+        envThreads.some(
+          (x) => deps.store.threadRole(x.id)?.role === "orchestrator",
+        )
+      ) {
+        keepEnv(envId, "coordinator-live");
+        if (envBranch) keepBranch(envBranch, "coordinator-live");
+        continue;
+      }
       const activeDelegation = delegations.some(
         (d) =>
           (d.status === "dispatching" || d.status === "running") &&

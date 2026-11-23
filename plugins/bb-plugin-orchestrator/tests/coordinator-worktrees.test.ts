@@ -76,6 +76,10 @@ function makeWorld(opts: {
   envThreads?: Map<string, CoordinatorThreadDto[] | null>;
   roles?: Record<string, string>;
   hasProcessIn?: (p: string) => Promise<boolean | null>;
+  /** §13.5 п.2: env ids that are delegation result envs. */
+  delegationEnvs?: Set<string>;
+  /** §7: env ids whose `environment show` transiently fails (throws). */
+  envError?: Set<string>;
 } = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -89,7 +93,11 @@ function makeWorld(opts: {
     store,
     threadRole: (id) => roles.threadRole(id),
     cmd: realCmd,
-    showEnvironment: async (id) => opts.envs?.get(id) ?? null,
+    showEnvironment: async (id) => {
+      if (opts.envError?.has(id)) throw new Error("bb unavailable");
+      return opts.envs?.get(id) ?? null;
+    },
+    isDelegationEnv: (id) => opts.delegationEnvs?.has(id) ?? false,
     listEnvThreads: async (envId) => opts.envThreads?.get(envId) ?? null,
     hasProcessIn: opts.hasProcessIn ?? (async () => false),
     now: () => clock.t,
@@ -492,4 +500,320 @@ test("unarchive cancels the admission: active + new generation, stale verdict di
     false,
   );
   assert.equal(w.store.byId(row.id)!.state, "active");
+});
+
+// ── r6 audit fixes (PLUG-392) ──────────────────────────────────────
+
+test("ensureBinding: a delegation result env is refused — coordinator-worktree-required", async () => {
+  const { repo, base } = makeRepo("coord-ensure-deleg-");
+  const env = addEnv(repo, base, "w");
+  const w = makeWorld({
+    envs: new Map([[env.id, env]]),
+    roles: { thr_c: "orchestrator" },
+    delegationEnvs: new Set([env.id!]),
+  });
+  assert.equal(
+    await w.wt.ensureBinding({
+      id: "thr_c",
+      environmentId: env.id,
+      projectId: "proj_1",
+    }),
+    null,
+  );
+  assert.equal(w.store.byThread("thr_c"), undefined);
+});
+
+test("ensureBinding: an unpublished base is refused — base-unpublished (§13.5 п.2)", async () => {
+  const { repo, base } = makeRepo("coord-ensure-base-");
+  // The env is created from a commit origin has never seen.
+  commitIn(repo, "local.txt", "feat: local-only base");
+  const env = addEnv(repo, base, "w2");
+  const w = makeWorld({
+    envs: new Map([[env.id, env]]),
+    roles: { thr_c: "orchestrator" },
+  });
+  assert.equal(
+    await w.wt.ensureBinding({
+      id: "thr_c",
+      environmentId: env.id,
+      projectId: "proj_1",
+    }),
+    null,
+  );
+  assert.equal(w.store.byThread("thr_c"), undefined);
+  // …while a copy created from the published tip registers (the
+  // «Created from» reflog base passes `log origin/main..<base>`).
+  const { repo: repo2, base: base2 } = makeRepo("coord-ensure-pub-");
+  const env2 = addEnv(repo2, base2, "w");
+  const w3 = makeWorld({
+    envs: new Map([[env2.id, env2]]),
+    roles: { thr_c: "orchestrator" },
+  });
+  assert.ok(
+    await w3.wt.ensureBinding({
+      id: "thr_c",
+      environmentId: env2.id,
+      projectId: "proj_1",
+    }),
+  );
+});
+
+test("ensureBinding: a transient environment show failure → null, no binding (§7)", async () => {
+  const { repo, base } = makeRepo("coord-ensure-err-");
+  const env = addEnv(repo, base, "w");
+  const w = makeWorld({
+    envs: new Map([[env.id, env]]),
+    roles: { thr_c: "orchestrator" },
+    envError: new Set([env.id!]),
+  });
+  assert.equal(
+    await w.wt.ensureBinding({
+      id: "thr_c",
+      environmentId: env.id,
+      projectId: "proj_1",
+    }),
+    null,
+  );
+  assert.equal(w.store.byThread("thr_c"), undefined);
+});
+
+test("archive: a reset-orphaned commit (reflog-only) → held unpushed-commits", async () => {
+  const { repo, base } = makeRepo("coord-arch-reset-");
+  const env = addEnv(repo, base, "w");
+  commitIn(env.path!, "wip.txt", "feat: orphaned by reset");
+  // The commit survives only in the reflogs — the tree is clean and
+  // the tip sits back on origin.
+  git(env.path!, ["reset", "--hard", "origin/main"]);
+  const w = makeWorld({
+    envs: new Map([[env.id!, env]]),
+    envThreads: new Map([[env.id!, [archived("thr_c", env.id!)]]]),
+    roles: { thr_c: "orchestrator" },
+  });
+  const row = w.store.register(
+    {
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_c",
+      envId: env.id!,
+      worktreePath: env.path,
+      branch: env.branchName,
+    },
+    w.clock.t,
+  );
+  await w.wt.onThreadArchived(archived("thr_c", env.id!));
+  const after = w.store.byId(row.id)!;
+  assert.equal(after.state, "held");
+  assert.equal(after.reason, "unpushed-commits");
+});
+
+test("archive: a detached-HEAD commit → held unpushed-commits", async () => {
+  const { repo, base } = makeRepo("coord-arch-detach-");
+  const env = addEnv(repo, base, "w");
+  git(env.path!, ["checkout", "--detach", "HEAD"]);
+  commitIn(env.path!, "det.txt", "feat: detached work");
+  const w = makeWorld({
+    envs: new Map([[env.id!, env]]),
+    envThreads: new Map([[env.id!, [archived("thr_c", env.id!)]]]),
+    roles: { thr_c: "orchestrator" },
+  });
+  const row = w.store.register(
+    {
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_c",
+      envId: env.id!,
+      worktreePath: env.path,
+      branch: env.branchName,
+    },
+    w.clock.t,
+  );
+  await w.wt.onThreadArchived(archived("thr_c", env.id!));
+  const after = w.store.byId(row.id)!;
+  assert.equal(after.state, "held");
+  assert.equal(after.reason, "unpushed-commits");
+});
+
+test("archive: a nested node_modules is expendable → remove_pending", async () => {
+  const { repo, base } = makeRepo("coord-arch-nm-");
+  const env = addEnv(repo, base, "w");
+  // Repo-local ignore rules — .git/info/exclude never dirties status.
+  const commonDir = git(env.path!, ["rev-parse", "--git-common-dir"]);
+  writeFileSync(join(commonDir, "info", "exclude"), "node_modules/\n");
+  mkdirSync(join(env.path!, "plugins", "x", "node_modules"), {
+    recursive: true,
+  });
+  writeFileSync(
+    join(env.path!, "plugins", "x", "node_modules", "pkg.js"),
+    "x\n",
+  );
+  const w = makeWorld({
+    envs: new Map([[env.id!, env]]),
+    envThreads: new Map([[env.id!, [archived("thr_c", env.id!)]]]),
+    roles: { thr_c: "orchestrator" },
+  });
+  const row = w.store.register(
+    {
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_c",
+      envId: env.id!,
+      worktreePath: env.path,
+      branch: env.branchName,
+    },
+    w.clock.t,
+  );
+  await w.wt.onThreadArchived(archived("thr_c", env.id!));
+  const after = w.store.byId(row.id)!;
+  assert.equal(after.state, "remove_pending");
+});
+
+test("archive: a non-expendable ignored path → held untracked-ignored", async () => {
+  const { repo, base } = makeRepo("coord-arch-ign-");
+  const env = addEnv(repo, base, "w");
+  const commonDir = git(env.path!, ["rev-parse", "--git-common-dir"]);
+  writeFileSync(join(commonDir, "info", "exclude"), "secret/\n");
+  mkdirSync(join(env.path!, "secret"));
+  writeFileSync(join(env.path!, "secret", "key.txt"), "k\n");
+  const w = makeWorld({
+    envs: new Map([[env.id!, env]]),
+    envThreads: new Map([[env.id!, [archived("thr_c", env.id!)]]]),
+    roles: { thr_c: "orchestrator" },
+  });
+  const row = w.store.register(
+    {
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_c",
+      envId: env.id!,
+      worktreePath: env.path,
+      branch: env.branchName,
+    },
+    w.clock.t,
+  );
+  await w.wt.onThreadArchived(archived("thr_c", env.id!));
+  const after = w.store.byId(row.id)!;
+  assert.equal(after.state, "held");
+  assert.equal(after.reason, "untracked-ignored");
+});
+
+test("unarchive: env-removed is not revived — a new copy is required (§16.9 п.3)", async () => {
+  const w = makeWorld({
+    envs: new Map(),
+    envThreads: new Map([["env_gone", [archived("thr_c", "env_gone")]]]),
+    roles: { thr_c: "orchestrator" },
+  });
+  const row = w.store.register(
+    {
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_c",
+      envId: "env_gone",
+      worktreePath: "/definitely/missing",
+      branch: "bb/gone",
+    },
+    w.clock.t,
+  );
+  await w.wt.onThreadArchived(archived("thr_c", "env_gone"));
+  assert.equal(w.store.byId(row.id)!.state, "env-removed");
+  await w.wt.onThreadUnarchived({
+    id: "thr_c",
+    environmentId: "env_gone",
+    archivedAt: null,
+  });
+  assert.equal(w.store.byId(row.id)!.state, "env-removed");
+});
+
+test("unarchive of remove_pending re-checks the env: gone → env-removed, live → active, error → held", async () => {
+  const { repo, base } = makeRepo("coord-unarch-rp-");
+  const env = addEnv(repo, base, "w");
+  const w = makeWorld({
+    envs: new Map([[env.id!, env]]),
+    envThreads: new Map([[env.id!, [archived("thr_c", env.id!)]]]),
+    roles: { thr_c: "orchestrator" },
+  });
+  const row = w.store.register(
+    {
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_c",
+      envId: env.id!,
+      worktreePath: env.path,
+      branch: env.branchName,
+    },
+    w.clock.t,
+  );
+  await w.wt.onThreadArchived(archived("thr_c", env.id!));
+  assert.equal(w.store.byId(row.id)!.state, "remove_pending");
+  // The env is still there → the admission is cancelled.
+  await w.wt.onThreadUnarchived({
+    id: "thr_c",
+    environmentId: env.id,
+    archivedAt: null,
+  });
+  assert.equal(w.store.byId(row.id)!.state, "active");
+  // Back to remove_pending, then BB retires the env → env-removed.
+  await w.wt.onThreadArchived(archived("thr_c", env.id!));
+  assert.equal(w.store.byId(row.id)!.state, "remove_pending");
+  const w2 = makeWorld({
+    envs: new Map(),
+    roles: { thr_c: "orchestrator" },
+  });
+  const row2 = w2.store.register(
+    {
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_c",
+      envId: "env_retired",
+      worktreePath: "/definitely/missing",
+      branch: "bb/gone",
+    },
+    w2.clock.t,
+  );
+  w2.store.setState(row2.id, "remove_pending", null, w2.clock.t);
+  await w2.wt.onThreadUnarchived({
+    id: "thr_c",
+    environmentId: "env_retired",
+    archivedAt: null,
+  });
+  assert.equal(w2.store.byId(row2.id)!.state, "env-removed");
+  // A transient lookup failure keeps the property — never env-removed.
+  const w3 = makeWorld({
+    envs: new Map([[env.id!, env]]),
+    roles: { thr_c: "orchestrator" },
+    envError: new Set([env.id!]),
+  });
+  const row3 = w3.store.register(
+    {
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_c",
+      envId: env.id!,
+      worktreePath: env.path,
+      branch: env.branchName,
+    },
+    w3.clock.t,
+  );
+  w3.store.setState(row3.id, "remove_pending", null, w3.clock.t);
+  await w3.wt.onThreadUnarchived({
+    id: "thr_c",
+    environmentId: env.id,
+    archivedAt: null,
+  });
+  assert.equal(w3.store.byId(row3.id)!.state, "held");
+  assert.equal(w3.store.byId(row3.id)!.reason, "remote-unavailable");
+});
+
+test("archive: a transient environment show failure → archive_pending, never env-removed (§7)", async () => {
+  const { repo, base } = makeRepo("coord-arch-err-");
+  const env = addEnv(repo, base, "w");
+  const w = makeWorld({
+    envs: new Map([[env.id!, env]]),
+    envThreads: new Map([[env.id!, [archived("thr_c", env.id!)]]]),
+    roles: { thr_c: "orchestrator" },
+    envError: new Set([env.id!]),
+  });
+  const row = w.store.register(
+    {
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_c",
+      envId: env.id!,
+      worktreePath: env.path,
+      branch: env.branchName,
+    },
+    w.clock.t,
+  );
+  await w.wt.onThreadArchived(archived("thr_c", env.id!));
+  assert.equal(w.store.byId(row.id)!.state, "archive_pending");
 });

@@ -15,6 +15,7 @@
  * «разархивация отменяет уборку» true after a restart too.
  */
 import { existsSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import type { CmdRunner } from "./cmd.js";
 import { OrchestratorError } from "./errors.js";
 import type { JanitorLog } from "./janitor.js";
@@ -51,7 +52,19 @@ export interface CoordinatorWorktreesDeps {
    * coordinator-role thread even before a binding exists. */
   threadRole(threadId: string): { role: string } | undefined;
   cmd: CmdRunner;
+  /**
+   * `bb environment show <id>` — `null` only when the env is
+   * definitively gone; a transient lookup failure THROWS so callers
+   * can keep the property instead of writing `env-removed` (§7:
+   * «при ошибке разрешения среды имущество сохраняется»).
+   */
   showEnvironment(envId: string): Promise<CoordinatorEnvDto | null>;
+  /**
+   * §13.5 п.2: an env that is the `result_env_id` of a delegation (or
+   * otherwise an executor-round env) can never register as a
+   * coordinator integration copy — `coordinator-worktree-required`.
+   */
+  isDelegationEnv?(envId: string): boolean;
   /**
    * `bb thread show` — resolves the env of a thread when the event
    * payload did not carry one (`message.dispatched` ships only ids).
@@ -64,14 +77,24 @@ export interface CoordinatorWorktreesDeps {
   log?: JanitorLog;
 }
 
-/** §16.9 п.2: expendable build artifacts, anything else ignored is
- * `untracked-ignored`. */
-const EXPENDABLE_IGNORED = /^(?:dist|node_modules|coverage|\.cache)(?:\/|$)/;
+/** §16.9 п.2: expendable build artifacts — matched in ANY path
+ * segment (`plugins/x/node_modules/` is expendable too); anything
+ * else ignored is `untracked-ignored`. */
+const EXPENDABLE_IGNORED =
+  /(?:^|\/)(?:dist|node_modules|coverage|\.cache)(?:\/|$)/;
 const UNFINISHED_OPS = [
   "MERGE_HEAD",
   "REBASE_HEAD",
   "CHERRY_PICK_HEAD",
   "REVERT_HEAD",
+];
+/** §16.3/§16.9 п.2: in-flight operations whose state lives as files
+ * in the worktree's git dir, not as refs (`--verify` cannot see a
+ * mid-`git bisect` or `rebase -i` run). */
+const UNFINISHED_OP_PATHS = [
+  "rebase-merge",
+  "rebase-apply",
+  "BISECT_LOG",
 ];
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -167,11 +190,39 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
   };
 
   /**
+   * §13.5 п.2: the env's actual base — the position of the branch's
+   * «branch: Created from <sha>» reflog entry (newest → oldest, the
+   * latest (re)creation point), like `countOwnCommits` in janitor.
+   * `null` when the reflog holds no creation entry.
+   */
+  const createdFromBase = async (
+    worktreePath: string,
+    branch: string,
+  ): Promise<string | null> => {
+    const reflog = await gitOut(worktreePath, [
+      "log",
+      "-g",
+      "--format=%H%x00%gs",
+      `refs/heads/${branch}`,
+    ]);
+    if (reflog === null) return null;
+    for (const line of reflog.split("\n")) {
+      const sep = line.indexOf("\0");
+      if (sep < 0) continue;
+      if (/^branch: Created from\b/.test(line.slice(sep + 1))) {
+        return line.slice(0, sep);
+      }
+    }
+    return null;
+  };
+
+  /**
    * §13.5 п.1: lazy registration for a chat-created coordinator thread.
    * Only `thread_roles.role = 'orchestrator'` qualifies; the env must be
-   * a provisioned managed worktree (path + branch resolved). Async —
-   * never inside the synchronous `message.dispatch` pass. Returns the
-   * row when a binding exists/was created, else `null`.
+   * a provisioned managed worktree (path + branch resolved) that is NOT
+   * an executor-round env. Async — never inside the synchronous
+   * `message.dispatch` pass. Returns the row when a binding exists/was
+   * created, else `null` (retried on the next event).
    */
   const ensureBinding = async (thread: {
     id: string;
@@ -189,7 +240,28 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
       projectId = projectId ?? t?.projectId;
     }
     if (!environmentId) return null;
-    const env = await deps.showEnvironment(environmentId);
+    // §13.5 п.2: an env already serving a delegation is an executor
+    // round — a promoted coordinator needs a dedicated Worktree, so
+    // registration refuses it (coordinator-worktree-required).
+    if (deps.isDelegationEnv?.(environmentId)) {
+      log.warn?.(
+        `orchestrator worktrees: thread ${thread.id} — ` +
+          `coordinator-worktree-required: env ${environmentId} is a ` +
+          `delegation result env; create a dedicated Worktree`,
+      );
+      return null;
+    }
+    let env: CoordinatorEnvDto | null;
+    try {
+      env = await deps.showEnvironment(environmentId);
+    } catch (e) {
+      // Transient resolution failure — property stays, retry later.
+      log.warn?.(
+        `orchestrator worktrees: showEnvironment ${environmentId}: ` +
+          message(e),
+      );
+      return null;
+    }
     if (!env || envGone(env)) return null;
     if (
       env.managed !== true ||
@@ -206,15 +278,26 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
       await gitOut(env.path, ["rev-parse", "--git-common-dir"])
     )?.trim();
     if (!repoRoot) return null;
-    const baseSha = env.mergeBaseBranch
-      ? (await gitOut(env.path, [
-          "merge-base",
-          "HEAD",
-          env.mergeBaseBranch.startsWith("origin/")
-            ? env.mergeBaseBranch
-            : `origin/${env.mergeBaseBranch}`,
-        ]))?.trim()
-      : undefined;
+    // §13.5 п.2: the base is what the env was actually created from —
+    // the reflog «Created from» entry, else BB's mergeBaseBranch, else
+    // the merge-base (always on origin by construction — the publish
+    // check then proves nothing but stays harmless).
+    const createdFrom = await createdFromBase(env.path, env.branchName);
+    const targetBranch = env.mergeBaseBranch?.replace(/^origin\//, "");
+    const baseSha =
+      createdFrom ??
+      (env.mergeBaseBranch
+        ? (await gitOut(env.path, [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            env.mergeBaseBranch.startsWith("origin/")
+              ? env.mergeBaseBranch
+              : `origin/${env.mergeBaseBranch}`,
+          ]))?.trim()
+        : undefined) ??
+      (await gitOut(env.path, ["merge-base", "HEAD", "origin/HEAD"]))
+        ?.trim();
     const tipSha = (
       await gitOut(env.path, ["rev-parse", "--verify", "HEAD"])
     )?.trim();
@@ -231,10 +314,7 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
           baseSha: baseSha ?? null,
           tipSha: tipSha ?? null,
         },
-        // The merge-base of HEAD vs origin/<target> is on origin by
-        // construction — the publish check is meaningful only for a
-        // base the caller pins explicitly (§13.5 п.2).
-        { skipBaseCheck: true },
+        { targetBranch },
       );
       log.info?.(
         `orchestrator worktrees: bound thread ${thread.id} ` +
@@ -257,15 +337,25 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
   /**
    * §16.9 п.2: the pre-removal admission. Order mirrors the spec —
    * live threads, processes, clean tree/index, §16.3 commit safety.
-   * The commit check here is ancestry-only (`rev-list --not
-   * --remotes=origin`): patch-id equivalence is a later stage, so a
-   * squash/rebase-merged copy conservatively stays `unpushed-commits`
-   * — the «kept (squash)» outcome §16.9 п.2 prescribes anyway.
+   * The commit check covers EVERY position §16.3 lists — the whole
+   * reflog of HEAD (a detached-HEAD or `reset`-orphaned commit lives
+   * only there) and of the bound branch, their current tips, and the
+   * copy-scoped `refs/worktree/*` / `refs/bisect/*` — `rev-list
+   * <positions> --not --remotes=origin`. Ancestry-only for now:
+   * patch-id equivalence is a later stage, so a squash/rebase-merged
+   * copy conservatively stays `unpushed-commits` — the «kept (squash)»
+   * outcome §16.9 п.2 prescribes anyway.
    */
   const evaluate = async (
     binding: CoordinatorWorktreeRow,
   ): Promise<Admission> => {
-    const env = await deps.showEnvironment(binding.env_id);
+    let env: CoordinatorEnvDto | null;
+    try {
+      env = await deps.showEnvironment(binding.env_id);
+    } catch {
+      // «не найдено» is `null` — anything else proves nothing (§7).
+      return { verdict: "pending" };
+    }
     if (envGone(env)) {
       return { verdict: "held", reason: "env-removed" };
     }
@@ -293,6 +383,15 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
       if (
         await gitOk(path, ["rev-parse", "--verify", "--quiet", ref])
       ) {
+        return { verdict: "held", reason: "dirty-worktree" };
+      }
+    }
+    for (const name of UNFINISHED_OP_PATHS) {
+      const p = (
+        await gitOut(path, ["rev-parse", "--git-path", name])
+      )?.trim();
+      if (!p) return { verdict: "pending" };
+      if (existsSync(isAbsolute(p) ? p : join(path, p))) {
         return { verdict: "held", reason: "dirty-worktree" };
       }
     }
@@ -332,10 +431,64 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
     if (!(await gitOk(path, ["fetch", "origin"]))) {
       return { verdict: "held", reason: "remote-unavailable", tipSha };
     }
+    // §16.3 «ничего не теряется»: positions = whole reflog of HEAD and
+    // of the bound branch plus their tips and the copy-scoped refs —
+    // a commit surviving only in a reflog (reset --hard, amend,
+    // detached HEAD) must hold the copy exactly like a tip commit.
+    const refs = ["HEAD"];
+    if (binding.branch) {
+      const ref = `refs/heads/${binding.branch}`;
+      if (
+        await gitOk(path, ["rev-parse", "--verify", "--quiet", ref])
+      ) {
+        refs.push(ref);
+      }
+      // A bound branch already deleted has no positions left to
+      // protect — its recorded tip_sha still gates §16.9 п.4.
+    }
+    const extra = await gitOut(path, [
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/worktree/",
+      "refs/bisect/",
+    ]);
+    if (extra === null) return { verdict: "pending" };
+    for (const r of extra
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)) {
+      if (!refs.includes(r)) refs.push(r);
+    }
+    const positions = new Set<string>();
+    for (const ref of refs) {
+      const log = await gitOut(path, [
+        "log",
+        "-g",
+        "--format=%H",
+        ref,
+      ]);
+      if (log === null) return { verdict: "pending" };
+      for (const l of log.split("\n")) {
+        const s = l.trim();
+        if (s) positions.add(s);
+      }
+      // The tip is a position of its own (PLUG-198): its reflog entry
+      // may be expired or never recorded.
+      const tip = (
+        await gitOut(path, [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          ref,
+        ])
+      )?.trim();
+      if (!tip) return { verdict: "pending" };
+      positions.add(tip);
+    }
     const unconfirmed = await gitOut(path, [
       "rev-list",
       "--count",
-      tipSha ?? "HEAD",
+      ...positions,
       "--not",
       "--remotes=origin",
     ]);
@@ -417,12 +570,32 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
     onThreadGone(thread, "deleted");
 
   /** §16.9 п.3: unarchive before removal cancels the admission —
-   * the binding goes back to `active` under a new generation. */
+   * the binding goes back to `active` under a new generation. A copy
+   * already gone stays `env-removed`: reviving it would return a dead
+   * binding from `ensureBinding` («возврат после уже завершённой
+   * уборки требует новой копии»). */
   const onThreadUnarchived = async (
     thread: CoordinatorThreadDto,
   ): Promise<void> => {
     const b = deps.store.byThread(thread.id);
-    if (!b || b.state === "removed") return;
+    if (!b || b.state === "removed" || b.state === "env-removed") return;
+    if (b.state === "remove_pending") {
+      // BB may have already retired the env — prove it lives before
+      // reviving the binding.
+      let env: CoordinatorEnvDto | null;
+      try {
+        env = await deps.showEnvironment(b.env_id);
+      } catch {
+        // Resolution failed — keep the property, retry on the next
+        // event (§7).
+        deps.store.setState(b.id, "held", "remote-unavailable", now());
+        return;
+      }
+      if (envGone(env)) {
+        deps.store.setState(b.id, "env-removed", null, now());
+        return;
+      }
+    }
     deps.store.beginDecision(b.id, "active", now());
     deps.store.setState(b.id, "active", "coordinator-live", now());
   };

@@ -37,7 +37,10 @@ import {
   type TaskCleanupArgs,
   type TaskCleanupSummary,
 } from "./src/janitor.js";
-import { createCoordinatorWorktrees } from "./src/coordinator-worktrees.js";
+import {
+  createCoordinatorWorktrees,
+  type CoordinatorEnvDto,
+} from "./src/coordinator-worktrees.js";
 import {
   createBbCli,
   runChecked,
@@ -2255,16 +2258,25 @@ export async function createPlugin(
     threadRole: (id) => store.threadRole(id),
     cmd,
     showEnvironment: async (envId) => {
-      try {
-        return await runJson(bbCli, [
-          "environment",
-          "show",
-          envId,
-          "--json",
-        ]);
-      } catch {
+      // §7/§16.9: «not found» is a verdict (null); any other failure
+      // throws so a transient bb hiccup never reads as «env removed».
+      const res = await bbCli.run([
+        "environment",
+        "show",
+        envId,
+        "--json",
+      ]);
+      if (res.exitCode === 0) {
+        return JSON.parse(res.stdout) as CoordinatorEnvDto;
+      }
+      if (/environment_not_found|not found/i.test(res.stderr + res.stdout)) {
         return null;
       }
+      throw new OrchestratorError(
+        "bb-cli-failed",
+        `bb environment show ${envId} failed (exit ${res.exitCode}): ` +
+          `${res.stderr.trim() || res.stdout.trim() || "no output"}`,
+      );
     },
     showThread: async (threadId) => {
       try {
@@ -2288,6 +2300,10 @@ export async function createPlugin(
         return null;
       }
     },
+    // §13.5 п.2: a delegation's result env is an executor round — it
+    // must never register as a coordinator integration copy.
+    isDelegationEnv: (envId) =>
+      store.delegationTaskIndex().some((d) => d.envId === envId),
     hasProcessIn: async (p) => defaultHasProcessIn(p),
     log: bb.log,
   });

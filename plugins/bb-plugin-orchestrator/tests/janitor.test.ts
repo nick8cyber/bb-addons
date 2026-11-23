@@ -6612,3 +6612,47 @@ test("§16.9: taskCleanup keeps a bound coordinator env and branch (§22 п.5)",
     git(repo, ["rev-parse", "--verify", coord.branchName]),
   );
 });
+
+test("§16.9 п.1: taskCleanup keeps an env with a live coordinator thread — no binding yet", async () => {
+  const { repo, base } = makeRepo("jan-coord-promoted-");
+  // An executor promoted to coordinator: the env is still the task's
+  // result env (§13.5 п.2), the thread now holds the orchestrator role
+  // and the binding is not registered yet.
+  const coord = addEnv(repo, base, "plug-392-promoted");
+  commitIn(coord.path, "c.txt", "feat: promoted coordinator copy");
+  const coordTip = git(coord.path, ["rev-parse", "HEAD"]);
+  commitIn(repo, "final.txt", "feat: final version");
+  git(repo, ["push", "origin", "main"]);
+  const published = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [coord],
+    roles: { [`thr_${coord.id}`]: "orchestrator" },
+    threads: { [coord.id]: [idle({ t: Date.now() }, coord.id)] },
+  });
+  bindDelegation(w, "PLUG-392", coord, coordTip);
+  publishTask(w, "PLUG-392", repo, published);
+  const res = await w.jan.taskCleanup({
+    taskKey: "PLUG-392",
+    repoPath: coord.path,
+    publishedSha: published,
+    targetBranch: "main",
+  });
+  assert.equal(res.envsRemoved, 0);
+  assert.ok(
+    res.kept.some((k) => k.id === coord.id && k.reason === "coordinator-live"),
+  );
+  assert.ok(
+    res.kept.some(
+      (k) =>
+        k.kind === "branch" &&
+        k.id === coord.branchName &&
+        k.reason === "coordinator-live",
+    ),
+  );
+  assert.deepEqual(w.cleanedUp, []);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.ok(existsSync(coord.path));
+  assert.doesNotThrow(() =>
+    git(repo, ["rev-parse", "--verify", coord.branchName]),
+  );
+});
