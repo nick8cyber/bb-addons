@@ -37,18 +37,10 @@ export function isShaMatch(a?: string | null, b?: string | null): boolean {
 export function resolveEffectiveApprovalMode(params: {
   taskConfirmationMode?: string | null;
   approvalMode?: "auto" | "manual" | (() => "auto" | "manual" | null) | null;
-  projectApprovalMode?: string | null;
-  policyApprovalMode?: string | null;
   route?: string | null;
 }): "auto" | "manual" | null {
   if (params.taskConfirmationMode === "auto" || params.taskConfirmationMode === "manual") {
     return params.taskConfirmationMode;
-  }
-  if (params.projectApprovalMode === "auto" || params.projectApprovalMode === "manual") {
-    return params.projectApprovalMode;
-  }
-  if (params.policyApprovalMode === "auto" || params.policyApprovalMode === "manual") {
-    return params.policyApprovalMode;
   }
   const resolved = typeof params.approvalMode === "function" ? params.approvalMode() : params.approvalMode;
   if (resolved === "auto" || resolved === "manual") {
@@ -157,6 +149,7 @@ export interface AcceptedSpecReview {
   delegation: any;
   reviewedSha: string;
   specPath: string;
+  adrPath?: string;
   approvalId: string;
 }
 
@@ -454,10 +447,15 @@ export async function findAcceptedSpecReview(opts: {
 
     const allFound = [...specPaths, ...rawSpecPaths];
     const uniqueSpecs = Array.from(new Set(allFound.filter((p) => p.includes("specs/") || p.endsWith(".md"))));
+    const docSpecs = uniqueSpecs.filter((p) => !p.includes("/adr/") && !p.startsWith("docs/adr/"));
+    const adrSpecs = uniqueSpecs.filter((p) => p.includes("/adr/") || p.startsWith("docs/adr/"));
     const specPath =
-      uniqueSpecs.length > 0
-        ? uniqueSpecs.join(",")
-        : (specPaths[0] ?? rawSpecPaths[0] ?? `docs/specs/${normKey}.md`);
+      docSpecs.length > 0
+        ? docSpecs.join(",")
+        : (uniqueSpecs.length > 0
+          ? uniqueSpecs.join(",")
+          : (specPaths[0] ?? rawSpecPaths[0] ?? `docs/specs/${normKey}.md`));
+    const adrDocPath = adrSpecs.length > 0 ? adrSpecs.join(",") : undefined;
 
     const projId = rev.project_id ?? opts.projectId ?? "proj";
     const approvalId = `appr:${projId}:${normKey}:${headSha}:${rev.finished_at || rev.updated_at || Date.now()}`;
@@ -466,6 +464,7 @@ export async function findAcceptedSpecReview(opts: {
       delegation: rev,
       reviewedSha: headSha,
       specPath,
+      adrPath: adrDocPath,
       approvalId,
     };
   }
@@ -1034,8 +1033,6 @@ export async function verifySpecBeforeCodeGate(
   const effectiveApprovalMode = resolveEffectiveApprovalMode({
     taskConfirmationMode: taskConfMode,
     approvalMode: input.approvalMode,
-    projectApprovalMode: (input.project as any)?.approvalMode,
-    policyApprovalMode: (input.policy as any)?.approvalMode,
     route: (taskRow as any)?.route ?? (input.task as any)?.route,
   });
   const isAutoMode = effectiveApprovalMode === "auto";
@@ -1102,34 +1099,8 @@ export async function verifySpecBeforeCodeGate(
       let isRevokedForSameRev = false;
 
       if (storedRev && (!storedRev.approval_id || !storedRev.approval_id.trim())) {
-        let lastRevokedSha: string | null = null;
-        const allDelegations = input.store.delegationsByTask(normalizeTaskKey(input.taskKey));
-        for (const d of allDelegations) {
-          const dTime = d.finished_at ?? d.updated_at ?? d.created_at;
-          if (dTime != null && dTime <= storedRev.updated_at) {
-            let isSpecRev = false;
-            let headSha = d.continue_from;
-            if (d.attach) {
-              try {
-                const att = JSON.parse(d.attach);
-                if (att && att.kind === "spec_review" && att.headSha) {
-                  isSpecRev = true;
-                  headSha = att.headSha;
-                }
-              } catch {}
-            }
-            if (isSpecRev && d.status === "done" && headSha) {
-              lastRevokedSha = headSha;
-              break;
-            }
-          }
-        }
         const reviewFinishedTime = specRev.delegation.finished_at ?? specRev.delegation.updated_at ?? specRev.delegation.created_at;
-        const reviewIsPreRevocation = reviewFinishedTime != null && reviewFinishedTime <= storedRev.updated_at;
-        if (
-          (lastRevokedSha && isShaMatch(specRev.reviewedSha, lastRevokedSha) && reviewIsPreRevocation) ||
-          (reviewIsPreRevocation && !lastRevokedSha)
-        ) {
+        if (reviewFinishedTime != null && reviewFinishedTime <= storedRev.updated_at) {
           isRevokedForSameRev = true;
         }
       }
@@ -1151,9 +1122,11 @@ export async function verifySpecBeforeCodeGate(
             Boolean(
               plObj.is_architectural ||
                 plObj.isArchitectural ||
+                specRev.adrPath ||
                 specRev.specPath.includes("/adr/"),
             );
           const adr =
+            specRev.adrPath ??
             contract?.adrPath ??
             plObj.adr_path ??
             plObj.adrPath ??
@@ -1166,24 +1139,16 @@ export async function verifySpecBeforeCodeGate(
             plObj.spec_section ??
             plObj.specSection;
 
-          const combinedSpecs = Array.from(
-            new Set([
-              ...splitDocPaths(contract?.specPath),
-              ...splitDocPaths(specRev.specPath),
-            ]),
-          );
-          const effectiveSpecPath =
-            combinedSpecs.length > 0 ? combinedSpecs.join(",") : specRev.specPath;
-
           const synthesizedContract: SpecContract = {
+            ...(contract ?? {}),
             kind:
               contract?.kind ??
               ((taskRow as any)?.route === "fix"
                 ? "bugfix"
                 : "behavior_change"),
             projectId:
-              (taskRow as any)?.project_id ?? (input.project as any)?.id,
-            specPath: effectiveSpecPath,
+              (taskRow as any)?.project_id ?? (input.project as any)?.id ?? contract?.projectId,
+            specPath: specRev.specPath,
             specSha: specRev.reviewedSha,
             specSection: section,
             adrPath: adr,
@@ -1227,6 +1192,16 @@ export async function verifySpecBeforeCodeGate(
         (!targetProjId || !d.project_id || d.project_id === targetProjId),
     );
 
+    const specReviews = reviews.filter((r) => {
+      if (!r.attach) return false;
+      try {
+        const att = JSON.parse(r.attach);
+        return att?.kind === "spec_review";
+      } catch {
+        return false;
+      }
+    });
+
     if (reviews.length === 0) {
       throw new OrchestratorError(
         "spec-gate-violation",
@@ -1239,23 +1214,46 @@ export async function verifySpecBeforeCodeGate(
 
     // Check if there is a review specifically targeting targetSha
     const targetReview = targetSha
-      ? reviews.find((r) => {
-          if (r.continue_from && (r.continue_from === targetSha || targetSha.startsWith(r.continue_from) || r.continue_from.startsWith(targetSha))) {
+      ? (specReviews.find((r) => {
+          if (r.continue_from && isShaMatch(r.continue_from, targetSha)) {
             return true;
           }
           if (r.attach) {
             try {
               const att = JSON.parse(r.attach);
-              if (att?.headSha && (att.headSha === targetSha || targetSha.startsWith(att.headSha) || att.headSha.startsWith(targetSha))) {
+              if (att?.headSha && isShaMatch(att.headSha, targetSha)) {
                 return true;
               }
             } catch {}
           }
           return false;
-        })
+        }) ??
+        reviews.find((r) => {
+          if (r.continue_from && isShaMatch(r.continue_from, targetSha)) {
+            return true;
+          }
+          if (r.attach) {
+            try {
+              const att = JSON.parse(r.attach);
+              if (att?.headSha && isShaMatch(att.headSha, targetSha)) {
+                return true;
+              }
+            } catch {}
+          }
+          return false;
+        }))
       : null;
 
-    const reviewToCheck = targetReview ?? reviews[0];
+    if (targetSha && !targetReview) {
+      const shortSha = targetSha.slice(0, 7);
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: для коммита ${shortSha} отсутствует принятое ревью спецификации либо спецификация была изменена после ревью (§31.9; approvalMode: auto)`,
+        `Назначь ревью спецификации на коммит ${shortSha} через bb orchestrator delegate ${input.taskKey} --level review --kind spec_review --from ${shortSha}`,
+      );
+    }
+
+    const reviewToCheck = targetReview ?? specReviews[0] ?? reviews[0];
     const delEvent = events.slice().reverse().find((e) => {
       try {
         return JSON.parse(e.payload).delegationId === reviewToCheck.id;
