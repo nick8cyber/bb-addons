@@ -5692,3 +5692,92 @@ test("§31.9 approvalMode forwarding via dispatchToRoute and runRunQueue", async
 
   assert.ok(runQueueDispatched.includes("FWD-2"), "runRunQueue unblocks FWD-2 with approvalMode: auto");
 });
+
+test("§31.9: revocation bypass prevented when pre-revocation code review exists on different SHA", async () => {
+  const dir = makeTempDir("repro-revoke-");
+  const { run, cmd } = initGitRepo(dir);
+  const repoId = (await resolveRepoIdentity(cmd, dir))!;
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/RV-1.md"), "# base\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "base"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+  writeFileSync(join(dir, "docs/specs/RV-1.md"), "# spec v1\n");
+  run(["commit", "-qam", "spec v1"]);
+  const specSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const sr = store.insert({
+    taskKey: "RV-1",
+    projectId: "p",
+    coordinatorThreadId: "c",
+    level: "review",
+    route: "r",
+    preset: "a",
+    provider: "x",
+    round: 1,
+    continueFrom: specSha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "RV-1",
+      projectId: "p",
+      repo: repoId,
+      baseSha,
+      headSha: specSha,
+      specPaths: ["docs/specs/RV-1.md"],
+    }),
+  });
+  store.setStatus(sr.id, "running");
+  store.setStatusIf(sr.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const gate = () =>
+    verifySpecBeforeCodeGate({
+      taskKey: "RV-1",
+      role: "executor",
+      level: "complex",
+      store,
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      baseSha: specSha,
+      approvalMode: "auto",
+      project: { id: "p" } as any,
+    });
+  await gate();
+  assert.ok(store.getSpecContract("RV-1")?.approval_id, "approved after spec review");
+
+  // Code review with CHANGES on a different SHA, then task returns to spec -> revoke
+  const cr = store.insert({
+    taskKey: "RV-1",
+    projectId: "p",
+    coordinatorThreadId: "c",
+    level: "review",
+    route: "r",
+    preset: "a",
+    provider: "x",
+    round: 2,
+    continueFrom: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    explicitRoute: false,
+    noCode: true,
+  });
+  store.setStatus(cr.id, "running");
+  store.setStatusIf(cr.id, "running", "done", {
+    reviewVerdict: { verdict: "CHANGES", blockers: 2 },
+  } as any);
+  store.revokeSpecContractApproval("RV-1", Date.now() + 1000);
+  assert.equal(store.getSpecContract("RV-1")?.approval_id, null);
+
+  let rejected = false;
+  try {
+    await gate();
+  } catch (e: any) {
+    rejected = e.code === "spec-gate-violation";
+  }
+  assert.ok(rejected, "gate must reject after revocation (same spec revision, no new review)");
+});

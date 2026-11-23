@@ -1107,13 +1107,19 @@ export async function verifySpecBeforeCodeGate(
         for (const d of allDelegations) {
           const dTime = d.finished_at ?? d.updated_at ?? d.created_at;
           if (dTime != null && dTime <= storedRev.updated_at) {
-            if (
-              (d.level.includes("review") || d.level === "audit" || d.level === "spec_review") &&
-              d.level !== "release-audit" &&
-              d.status === "done" &&
-              d.continue_from
-            ) {
-              lastRevokedSha = d.continue_from;
+            let isSpecRev = false;
+            let headSha = d.continue_from;
+            if (d.attach) {
+              try {
+                const att = JSON.parse(d.attach);
+                if (att && att.kind === "spec_review" && att.headSha) {
+                  isSpecRev = true;
+                  headSha = att.headSha;
+                }
+              } catch {}
+            }
+            if (isSpecRev && d.status === "done" && headSha) {
+              lastRevokedSha = headSha;
               break;
             }
           }
