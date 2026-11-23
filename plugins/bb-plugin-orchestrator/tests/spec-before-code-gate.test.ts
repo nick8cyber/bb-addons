@@ -2765,9 +2765,11 @@ test("§31.9 Opus Audit Round 9 Blocker 3: verifyReleaseDocumentsGate rejects mi
   );
 });
 
-test("§31.9 Incident NET-46: in auto mode, positive spec review on exact SHA automatically resolves & persists contract", async () => {
+test("§31.9 Acceptance Scenario 1 (NET-46): in auto mode, positive spec review binds to recorded range, even after target branch advances", async () => {
   const d = makeTempDir("orch-net46-");
   const { run, cmd } = initGitRepo(d);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+
   mkdirSync(join(d, "docs/specs"), { recursive: true });
   writeFileSync(join(d, "docs/specs/test-spec.md"), "# Spec\n§1: requirement\n");
   run(["add", "."]);
@@ -2789,7 +2791,7 @@ test("§31.9 Incident NET-46: in auto mode, positive spec review on exact SHA au
     confirmationMode: "auto",
   } as any);
 
-  // Record spec review delegation #1756 on exact specSha
+  // Record spec review delegation #1756 on exact range baseSha..specSha
   const del = store.insert({
     taskKey: "NET-46",
     projectId: "proj_eshr98jkqq",
@@ -2799,14 +2801,29 @@ test("§31.9 Incident NET-46: in auto mode, positive spec review on exact SHA au
     preset: "opus55-review",
     provider: "claude-code",
     continueFrom: specSha,
-    attach: JSON.stringify({ paths: [], from: specSha }),
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "NET-46",
+      projectId: "proj_eshr98jkqq",
+      repo: d,
+      baseSha,
+      headSha: specSha,
+      paths: ["docs/specs/test-spec.md"],
+      from: specSha,
+    }),
   });
   store.setStatus(del.id, "running");
   store.setStatusIf(del.id, "running", "done", {
     reviewVerdict: { verdict: "OK", blockers: 0 },
   });
 
-  // Verify spec gate passes for executor in shadow mode
+  // Target branch advances!
+  run(["checkout", "main"]);
+  writeFileSync(join(d, "adv.txt"), "target branch advanced\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "feat: advance target branch"]);
+
+  // Verify spec gate passes for executor in shadow mode using fixed recorded range
   await verifySpecBeforeCodeGate({
     taskKey: "NET-46",
     role: "executor",
@@ -3231,7 +3248,8 @@ test("§31.9 Round 11: NET-46 auto-acceptance preserves altersContract and isArc
     }),
   });
 
-  // Recorded positive spec review
+  // Recorded positive spec review with explicit spec review range
+  const baseSha = run(["rev-parse", "HEAD~1"]).trim();
   const rev = store.insert({
     taskKey: "AUTO-ALT",
     projectId: "proj_1",
@@ -3242,6 +3260,15 @@ test("§31.9 Round 11: NET-46 auto-acceptance preserves altersContract and isArc
     provider: "agy",
     round: 1,
     continueFrom: specCommit,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "AUTO-ALT",
+      projectId: "proj_1",
+      repo: dir,
+      baseSha,
+      headSha: specCommit,
+      paths: ["docs/specs/auto-alt.md"],
+    }),
   });
   store.setStatus(rev.id, "running");
   store.setStatusIf(rev.id, "running", "done", {
@@ -3797,4 +3824,206 @@ test("§31.9 Round 13 Non-spec files (.sql, .json, .yml) in review are not accep
     baseBranch: "main",
   });
   assert.equal(found, null, "Review modifying SQL migration must NOT be accepted as spec review");
+});
+
+test("§31.9 Acceptance Scenario 3: missing recorded baseSha in old review requires explicit spec review and blocks executor spawn until verdict", async () => {
+  const dir = makeTempDir("r14-scen3-");
+  const { run, cmd } = initGitRepo(dir);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/scen3.md"), "# Spec\n§1: content\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "docs: scen3 spec"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.insertTask({
+    taskKey: "SCEN3-1",
+    projectId: "proj_scen3",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+  });
+
+  // Old review record without proven baseSha (attach has no baseSha or kind: "spec_review")
+  const oldRev = store.insert({
+    taskKey: "SCEN3-1",
+    projectId: "proj_scen3",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-opus",
+    preset: "opus55-review",
+    provider: "claude-code",
+    round: 1,
+    continueFrom: headSha,
+    attach: JSON.stringify({ paths: [], from: headSha }),
+  } as any);
+  store.setStatus(oldRev.id, "running");
+  store.setStatusIf(oldRev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  let spawnCount = 0;
+  const mockThreads = {
+    spawn: async () => {
+      spawnCount++;
+      return { id: "thr_mock_scen3" };
+    },
+  };
+
+  const pol = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      presets: {
+        devin: { provider: "acp-devin", baseBranch: "main" },
+        "opus55-review": { provider: "claude-code", baseBranch: "main" },
+      },
+      routes: {
+        devin: { preset: "devin", provider: "acp-devin" },
+        "review-opus": { preset: "opus55-review", provider: "claude-code" },
+      },
+      levels: {
+        complex: { chain: ["devin"] },
+        review: { chain: ["review-opus"] },
+      },
+    }),
+  );
+
+  const fakeCli: BbCli = {
+    run: async (args: string[]) => {
+      if (args[0] === "tasks" && args[1] === "preset") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            preset: {
+              providerId: "acp-devin",
+              permissionMode: "full",
+              environmentKind: "host",
+              baseBranch: "main",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "tasks" && args[1] === "show") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            task: { id: "t_scen3", key: "SCEN3-1", title: "Task" },
+            project: { id: "proj_scen3", linkedBbProjectId: "proj_scen3_bb" },
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "{}", stderr: "" };
+    },
+  };
+
+  // 1) Attempt executor delegate: must be rejected with spec-gate-violation and 0 spawns!
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "SCEN3-1",
+          level: "complex",
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_scen3",
+          },
+        },
+        {
+          store,
+          policy: () => pol.policy,
+          loadPolicy: async () => pol,
+          bbCli: fakeCli,
+          threads: mockThreads as any,
+          probes: { roleByThreadId: () => "orchestrator" },
+          primaryHostId: async () => "host_1",
+          cmd,
+          repoRoot: dir,
+          workGraphMode: "shadow",
+        } as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /Для старой записи ревью без доказанного базового коммита требуется назначить ревью спецификации с явным диапазоном SHA/);
+      return true;
+    },
+  );
+  assert.equal(spawnCount, 0, "No executor must be spawned when baseSha is unproven");
+
+  // 2) Delegate short spec review with explicit range (baseSha, headSha)
+  const specRev = await runDelegate(
+    {
+      taskKey: "SCEN3-1",
+      level: "review",
+      kind: "spec_review",
+      baseSha,
+      from: headSha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_scen3",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+    } as any,
+  );
+  assert.equal(specRev.ok, true);
+
+  // Review completes with OK/0
+  store.setStatus(specRev.delegationId, "running");
+  store.setStatusIf(specRev.delegationId, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  // 3) Now executor delegate succeeds!
+  const execRes = await runDelegate(
+    {
+      taskKey: "SCEN3-1",
+      level: "complex",
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_scen3",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+    } as any,
+  );
+  assert.equal(execRes.status, "running");
+  assert.equal(spawnCount, 2, "Executor must be spawned after positive spec review (1 reviewer + 1 executor)");
 });

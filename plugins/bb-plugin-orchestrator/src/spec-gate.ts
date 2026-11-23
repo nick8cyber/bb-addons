@@ -138,7 +138,7 @@ export async function findAcceptedSpecReview(opts: {
   const delegations = opts.store.delegationsByTask(normKey);
   const reviews = delegations.filter(
     (d) =>
-      (d.level.includes("review") || d.level === "audit") &&
+      (d.level.includes("review") || d.level === "audit" || d.level === "spec_review") &&
       d.level !== "release-audit" &&
       d.status === "done" &&
       Boolean(d.continue_from),
@@ -177,164 +177,96 @@ export async function findAcceptedSpecReview(opts: {
 
     if (!verdictOk) continue;
 
-    let specPaths: string[] = [];
-    let isCodeReview = false;
+    // §31.9: Strict spec review binding
+    // Before review launch, the orchestrator records kind: "spec_review", baseSha, headSha, paths, repo, project.
+    // A positive verdict with 0 blockers binds strictly to this record and range.
+    // If a delegation lacks proven baseSha or kind is not spec_review, do not guess base via branch merge-base or revSha^.
+    if (!rev.attach) continue;
 
-    if (rev.attach) {
-      try {
-        const att = JSON.parse(rev.attach);
-        if (Array.isArray(att.paths) && att.paths.length > 0) {
-          for (const p of att.paths) {
-            if (isDocOrSpecPath(p)) {
-              specPaths.push(p);
-            } else if (isCodePath(p)) {
-              isCodeReview = true;
-            }
-          }
-        }
-      } catch {}
+    let att: any = null;
+    try {
+      att = JSON.parse(rev.attach);
+    } catch {
+      continue;
     }
 
-    if (opts.cmd && opts.repoRoot && !isCodeReview) {
-      try {
-        let baseCommit = "";
-        const candidateBases = [
-          opts.baseBranch
-            ? (opts.baseBranch.startsWith("origin/")
-                ? opts.baseBranch
-                : `origin/${opts.baseBranch}`)
-            : undefined,
-          opts.baseBranch,
-          "origin/dev",
-          "origin/main",
-          "origin/master",
-          "dev",
-          "main",
-          "master",
-        ].filter(Boolean) as string[];
-
-        for (const cand of candidateBases) {
-          const mbRes = await opts.cmd.run(
-            "git",
-            ["merge-base", cand, revSha],
-            { cwd: opts.repoRoot },
-          );
-          if (mbRes.exitCode === 0 && mbRes.stdout.trim()) {
-            const mb = mbRes.stdout.trim();
-            if (mb !== revSha) {
-              baseCommit = mb;
-              break;
-            }
-          }
-        }
-
-        if (!baseCommit) {
-          const parRes = await opts.cmd.run(
-            "git",
-            ["rev-parse", "--verify", "--quiet", `${revSha}^`],
-            { cwd: opts.repoRoot },
-          );
-          if (parRes.exitCode === 0 && parRes.stdout.trim()) {
-            baseCommit = parRes.stdout.trim();
-          }
-        }
-
-        if (baseCommit && baseCommit !== revSha) {
-          const diffRes = await opts.cmd.run(
-            "git",
-            ["diff", "--name-only", baseCommit, revSha],
-            { cwd: opts.repoRoot },
-          );
-          if (diffRes.exitCode === 0) {
-            const changedFiles = diffRes.stdout
-              .split("\n")
-              .map((s) => s.trim())
-              .filter(Boolean);
-            if (changedFiles.length === 0) {
-              isCodeReview = true;
-            } else {
-              for (const f of changedFiles) {
-                if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
-                if (isDocOrSpecPath(f)) {
-                  if (!specPaths.includes(f)) specPaths.push(f);
-                } else {
-                  isCodeReview = true;
-                  break;
-                }
-              }
-            }
-          } else {
-            isCodeReview = true;
-          }
-        } else {
-          const dtRes = await opts.cmd.run(
-            "git",
-            ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", revSha],
-            { cwd: opts.repoRoot },
-          );
-          if (dtRes.exitCode === 0 && dtRes.stdout.trim()) {
-            const files = dtRes.stdout
-              .split("\n")
-              .map((s) => s.trim())
-              .filter(Boolean);
-            if (files.length === 0) {
-              isCodeReview = true;
-            } else {
-              for (const f of files) {
-                if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
-                if (isDocOrSpecPath(f)) {
-                  if (!specPaths.includes(f)) specPaths.push(f);
-                } else {
-                  isCodeReview = true;
-                  break;
-                }
-              }
-            }
-          } else {
-            isCodeReview = true;
-          }
-        }
-      } catch {
-        isCodeReview = true;
-      }
+    if (!att || att.kind !== "spec_review" || !att.baseSha || !att.headSha) {
+      continue;
     }
 
-    if (isCodeReview) continue;
-    specPaths = specPaths.filter((p) => isDocOrSpecPath(p));
-    if (specPaths.length === 0) continue;
+    const baseSha: string = att.baseSha;
+    const headSha: string = att.headSha;
 
-    const specPath =
-      specPaths.find((p) => p.includes("specs/") || p.endsWith(".md")) ??
-      specPaths[0] ??
-      `docs/specs/${normKey}.md`;
+    if (att.projectId && opts.projectId && att.projectId !== opts.projectId) {
+      continue;
+    }
+    if (att.taskKey && normalizeTaskKey(att.taskKey) !== normKey) {
+      continue;
+    }
 
     if (opts.cmd && opts.repoRoot) {
-      try {
-        const cat = await opts.cmd.run(
-          "git",
-          ["cat-file", "-e", `${revSha}:${specPath}`],
-          { cwd: opts.repoRoot },
-        );
-        if (cat.exitCode !== 0) {
-          const catCommit = await opts.cmd.run(
-            "git",
-            ["cat-file", "-e", `${revSha}^{commit}`],
-            { cwd: opts.repoRoot },
-          );
-          if (catCommit.exitCode !== 0) continue;
+      // 1) Verify both Git objects exist in the repository
+      const catBase = await opts.cmd.run("git", ["cat-file", "-e", `${baseSha}^{commit}`], { cwd: opts.repoRoot });
+      if (catBase.exitCode !== 0) continue;
+      const catHead = await opts.cmd.run("git", ["cat-file", "-e", `${headSha}^{commit}`], { cwd: opts.repoRoot });
+      if (catHead.exitCode !== 0) continue;
+
+      // 2) Verify composition of changes in reviewed range: baseSha..headSha
+      const diffRes = await opts.cmd.run("git", ["diff", "--name-only", baseSha, headSha], { cwd: opts.repoRoot });
+      if (diffRes.exitCode !== 0) continue;
+
+      const changedFiles = diffRes.stdout
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      if (changedFiles.length === 0) continue;
+
+      let hasNonDoc = false;
+      const specPaths: string[] = [];
+
+      for (const f of changedFiles) {
+        if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+        if (!isDocOrSpecPath(f) || isCodePath(f)) {
+          hasNonDoc = true;
+          break;
         }
-      } catch {}
+        specPaths.push(f);
+      }
+
+      if (hasNonDoc || specPaths.length === 0) continue;
+
+      const specPath =
+        specPaths.find((p) => p.includes("specs/") || p.endsWith(".md")) ??
+        specPaths[0] ??
+        `docs/specs/${normKey}.md`;
+
+      const projId = rev.project_id ?? opts.projectId ?? "proj";
+      const approvalId = `appr:${projId}:${normKey}:${headSha}:${rev.finished_at || rev.updated_at || Date.now()}`;
+
+      return {
+        delegation: rev,
+        reviewedSha: headSha,
+        specPath,
+        approvalId,
+      };
+    } else {
+      // Without cmd/repoRoot
+      const specPaths = Array.isArray(att.paths) && att.paths.length > 0 ? att.paths : [`docs/specs/${normKey}.md`];
+      const specPath =
+        specPaths.find((p: string) => p.includes("specs/") || p.endsWith(".md")) ??
+        specPaths[0];
+
+      const projId = rev.project_id ?? opts.projectId ?? "proj";
+      const approvalId = `appr:${projId}:${normKey}:${headSha}:${rev.finished_at || rev.updated_at || Date.now()}`;
+
+      return {
+        delegation: rev,
+        reviewedSha: headSha,
+        specPath,
+        approvalId,
+      };
     }
-
-    const projId = rev.project_id ?? opts.projectId ?? "proj";
-    const approvalId = `appr:${projId}:${normKey}:${revSha}:${rev.finished_at || rev.updated_at || Date.now()}`;
-
-    return {
-      delegation: rev,
-      reviewedSha: revSha,
-      specPath,
-      approvalId,
-    };
   }
 
   return null;
@@ -968,6 +900,17 @@ export async function verifySpecBeforeCodeGate(
   }
 
   if (!contract) {
+    const delegations = input.store.delegationsByTask(normalizeTaskKey(input.taskKey));
+    const unprovenRev = delegations.find(
+      (d) => (d.level.includes("review") || d.level === "audit") && d.status === "done" && d.continue_from,
+    );
+    if (unprovenRev) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация отсутствует (§31.9). Для старой записи ревью без доказанного базового коммита требуется назначить ревью спецификации с явным диапазоном SHA (baseSha и headSha) до запуска кода`,
+        "Назначь ревью спецификации с явным диапазоном SHA через bb orchestrator delegate <KEY> --level review --from <headSha> или одобри спецификацию через команду approve",
+      );
+    }
     throw new OrchestratorError(
       "spec-gate-violation",
       `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация или договор приёмки отсутствует (§31.9)`,

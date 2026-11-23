@@ -67,6 +67,8 @@ import {
   resolveExecutorBaseSha,
   resolvePresetBaseBranch,
   resolveTaskSpecContract,
+  isDocOrSpecPath,
+  isCodePath,
   type SpecContract,
 } from "./spec-gate.js";
 import type { WorkGraphMode } from "./workgraph.js";
@@ -96,6 +98,9 @@ export interface DelegateParams {
   attach?: string[];
   caller: ThreadFacts;
   specBeforeCode?: boolean;
+  kind?: string;
+  baseSha?: string;
+  headSha?: string;
 }
 
 export interface DelegateResult {
@@ -744,6 +749,134 @@ export async function runDelegate(
     });
   }
 
+  // §31.9: At review delegation time, resolve and record spec review scope if this is a spec review
+  const isReview =
+    role === "auditor" ||
+    level.includes("review") ||
+    level === "audit" ||
+    level === "spec_review";
+
+  let isSpecReview = false;
+  let specBaseSha: string | undefined;
+  let specHeadSha: string | undefined;
+  let specPaths: string[] = [];
+  let repoIdentity: string | undefined;
+
+  if (isReview) {
+    if (deps.repoRoot && deps.cmd) {
+      try {
+        const topRes = await deps.cmd.run("git", ["rev-parse", "--show-toplevel"], { cwd: deps.repoRoot });
+        repoIdentity = topRes.exitCode === 0 ? topRes.stdout.trim() : deps.repoRoot;
+      } catch {
+        repoIdentity = deps.repoRoot;
+      }
+    } else {
+      repoIdentity = deps.repoRoot;
+    }
+
+    const headCand = params.headSha ?? params.from ?? continueFrom ?? "HEAD";
+    if (deps.cmd && deps.repoRoot && headCand) {
+      try {
+        const revHead = await deps.cmd.run("git", ["rev-parse", headCand], { cwd: deps.repoRoot });
+        if (revHead.exitCode === 0 && revHead.stdout.trim().length === 40) {
+          specHeadSha = revHead.stdout.trim();
+        }
+      } catch {}
+    }
+    if (!specHeadSha && headCand && headCand.length === 40 && /^[0-9a-f]{40}$/i.test(headCand)) {
+      specHeadSha = headCand;
+    }
+
+    if (params.baseSha) {
+      if (deps.cmd && deps.repoRoot) {
+        try {
+          const revBase = await deps.cmd.run("git", ["rev-parse", params.baseSha], { cwd: deps.repoRoot });
+          if (revBase.exitCode === 0 && revBase.stdout.trim().length === 40) {
+            specBaseSha = revBase.stdout.trim();
+          }
+        } catch {}
+      }
+      if (!specBaseSha && params.baseSha.length === 40 && /^[0-9a-f]{40}$/i.test(params.baseSha)) {
+        specBaseSha = params.baseSha;
+      }
+    } else if (deps.cmd && deps.repoRoot && specHeadSha) {
+      try {
+        const presetName = params.preset ?? route.preset;
+        const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+          policy,
+          presetDetails: (policy as any)?.presetDetails,
+        });
+        const proj = (params.caller.projectId ?? taskRow?.project_id) && deps.resolveProject
+          ? await Promise.resolve(deps.resolveProject(params.caller.projectId ?? taskRow?.project_id)).catch(() => null)
+          : (deps.project ?? null);
+        const baseBranch = presetBaseBranch ?? (proj as any)?.baseBranch ?? (policy as any)?.baseBranch;
+        const candidateBases = [
+          baseBranch ? (baseBranch.startsWith("origin/") ? baseBranch : `origin/${baseBranch}`) : undefined,
+          baseBranch,
+          "origin/dev",
+          "origin/main",
+          "origin/master",
+          "dev",
+          "main",
+          "master",
+        ].filter(Boolean) as string[];
+
+        for (const cand of candidateBases) {
+          const mbRes = await deps.cmd.run("git", ["merge-base", cand, specHeadSha], { cwd: deps.repoRoot });
+          if (mbRes.exitCode === 0 && mbRes.stdout.trim()) {
+            const mb = mbRes.stdout.trim();
+            if (mb !== specHeadSha) {
+              specBaseSha = mb;
+              break;
+            }
+          }
+        }
+        if (!specBaseSha) {
+          const parRes = await deps.cmd.run("git", ["rev-parse", "--verify", "--quiet", `${specHeadSha}^`], { cwd: deps.repoRoot });
+          if (parRes.exitCode === 0 && parRes.stdout.trim()) {
+            specBaseSha = parRes.stdout.trim();
+          }
+        }
+      } catch {}
+    }
+
+    if (params.kind === "spec_review" || taskRow?.node === "spec_review") {
+      isSpecReview = true;
+    }
+
+    if (specBaseSha && specHeadSha && deps.cmd && deps.repoRoot) {
+      try {
+        const diffRes = await deps.cmd.run("git", ["diff", "--name-only", specBaseSha, specHeadSha], { cwd: deps.repoRoot });
+        if (diffRes.exitCode === 0 && diffRes.stdout.trim()) {
+          const files = diffRes.stdout.split("\n").map(s => s.trim()).filter(Boolean);
+          let allDocs = true;
+          const foundDocs: string[] = [];
+          for (const f of files) {
+            if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+            if (isDocOrSpecPath(f)) {
+              foundDocs.push(f);
+            } else {
+              allDocs = false;
+              break;
+            }
+          }
+          if (allDocs && foundDocs.length > 0) {
+            isSpecReview = true;
+            specPaths = foundDocs;
+          }
+        }
+      } catch {}
+    }
+
+    if (params.attach?.length) {
+      for (const p of params.attach) {
+        if (isDocOrSpecPath(p) && !specPaths.includes(p)) {
+          specPaths.push(p);
+        }
+      }
+    }
+  }
+
   // Step 2 — the unique index makes this atomic across processes.
   let row;
   try {
@@ -761,13 +894,26 @@ export async function runDelegate(
       noCode: effectiveNoCode,
       // §20.1 п.4: the attach spec survives onto the row — a reissue
       // lists the same `--attach` paths in the seed prompt.
+      // §31.9: Strict spec review binding persists kind, baseSha, headSha, paths, repo, and project.
       attach:
-        params.attach?.length || params.from
+        isSpecReview && specBaseSha && specHeadSha
           ? JSON.stringify({
-              paths: params.attach ?? [],
-              from: params.from ?? null,
+              kind: "spec_review",
+              taskKey,
+              projectId: params.caller.projectId ?? taskRow?.project_id ?? null,
+              repo: repoIdentity,
+              baseSha: specBaseSha,
+              headSha: specHeadSha,
+              paths: specPaths,
+              from: params.from ?? specHeadSha ?? null,
             })
-          : null,
+          : params.attach?.length || params.from
+            ? JSON.stringify({
+                kind: params.kind ?? (isReview ? "review" : undefined),
+                paths: params.attach ?? [],
+                from: params.from ?? null,
+              })
+            : null,
     });
   } catch (e) {
     if (
