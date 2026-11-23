@@ -66,6 +66,7 @@ import { DEFAULT_HANDOFF_PATH } from "./roles.js";
 import { isPluginUiFile, pluginNameForPaths } from "./staged.js";
 import { T_RU, type T } from "./i18n/index.js";
 import { isSpecBeforeCodeEnforced, resolveTaskSpecContract } from "./spec-gate.js";
+import { resolveTaskProjectId } from "./workgraph.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
 export const BUILTIN_QUOTA_PATTERNS = [
@@ -990,7 +991,18 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (nextName && nextRoute) {
       const role = levelRole(info.policy, row.level);
       const taskRow = store.getTask(row.task_key);
-      const effectivePid = taskRow?.project_id || row.project_id;
+      let effectivePid = taskRow?.project_id || null;
+      if (!effectivePid && deps.bbCli) {
+        effectivePid = await resolveTaskProjectId(store, row.task_key, {
+          bbCli: deps.bbCli,
+          cmd: (deps as any).cmd,
+          heal: true,
+          log,
+        }).catch(() => null);
+      }
+      if (!effectivePid) {
+        effectivePid = row.project_id;
+      }
       if (role === "executor" && !row.no_code) {
         const mode = typeof (deps as any).workGraphMode === "function"
           ? (deps as any).workGraphMode(effectivePid)

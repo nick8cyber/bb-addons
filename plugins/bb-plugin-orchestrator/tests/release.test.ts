@@ -2554,7 +2554,7 @@ test("§17.3 Б4: merged — every merged delegation needs an OK review on its m
     preset: "r",
     provider: "p",
   });
-  store.setThreadInfo(rev2.id, "thr_rev2");
+  store.setThreadInfo(rev2.id, "thr_rev");
   store.setStatus(rev2.id, "done");
   // PLUG-2's review is bound to an older sha — not its merged result
   bindReview("0".repeat(40), rev2.id);
@@ -2562,6 +2562,64 @@ test("§17.3 Б4: merged — every merged delegation needs an OK review on its m
     runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
     (e: unknown) => /нет ревью на влитый итог/.test((e as OrchestratorError).message),
   );
+});
+
+test("PLUG-395: reviewGate recognizes legacy merged delegations under coordinator's project", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  // a second task's result merged into the same branch
+  gitR(coord, ["checkout", "work"]);
+  writeFileSync(join(coord, "task2.txt"), "x\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "feat: task2 result"]);
+  const sha2 = gitR(coord, ["rev-parse", "HEAD"]);
+  gitR(coord, ["checkout", "work-2"]);
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+    delegationProjectId: "proj_task",
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "pr", branch: "main" } },
+    }),
+  });
+  // PLUG-1 (current task) belongs to proj_task (via delegationProjectId)
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
+
+  // PLUG-2 was merged under coordinator's project proj_coord (before PLUG-395)
+  const exec2 = store.insert({
+    taskKey: "PLUG-2",
+    projectId: "proj_coord",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "c",
+    preset: "c",
+    provider: "p",
+  });
+  store.setThreadInfo(exec2.id, "thr_exec2");
+  store.setStatus(exec2.id, "done");
+  store.setMerged(exec2.id, { into: "work", sha: sha2 });
+  const rev2 = store.insert({
+    taskKey: "PLUG-2",
+    projectId: "proj_coord",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+  });
+  store.setThreadInfo(rev2.id, "thr_rev");
+  store.setStatus(rev2.id, "running");
+  store.setStatusIf(rev2.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+  bindReview(sha2, rev2.id);
+
+  // Coordinator belongs to proj_coord
+  const coordCaller = { ...COORD, projectId: "proj_coord" };
+  // Should not throw unreviewed-commits
+  const res = await runRelease({ taskKey: "PLUG-1", caller: coordCaller }, deps);
+  assert.equal(res.status, "auditing");
 });
 
 test("§17.3 Б1: gh pr create URL is read from plain-text stdout", async () => {

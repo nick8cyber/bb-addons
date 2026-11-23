@@ -2385,6 +2385,9 @@ async function reviewGate(
     /** The released project — merged-delegation rows are scoped to it
      * (ревью PLUG-214 мелко). */
     projectId: string | null;
+    /** The COORDINATOR's bb project — legacy merged delegation rows may be
+     * stored under it before PLUG-395. */
+    callerProjectId?: string | null;
   },
 ): Promise<void> {
   const t = deps.t ?? T_RU;
@@ -2485,7 +2488,19 @@ async function reviewGate(
   // recorded `merged_sha` absent from the copy is a clear refusal, not
   // a bare `rev-list` error.
   const unpublished: DelegationRow[] = [];
-  for (const row of deps.store.mergedDelegationsInto(branch, projectId)) {
+  const seenIds = new Set<number>();
+  const mergedRows: DelegationRow[] = [];
+  for (const r of [
+    ...deps.store.mergedDelegationsInto(branch, projectId),
+    ...(ctx.callerProjectId && ctx.callerProjectId !== projectId
+      ? deps.store.mergedDelegationsInto(branch, ctx.callerProjectId)
+      : []),
+  ]) {
+    if (seenIds.has(r.id)) continue;
+    seenIds.add(r.id);
+    mergedRows.push(r);
+  }
+  for (const row of mergedRows) {
     if (!row.merged_sha) continue;
     if (!(await shaExists(deps, repo, row.merged_sha))) {
       throw new OrchestratorError(
@@ -2960,6 +2975,7 @@ async function runReleaseSteps(
     tipSha: preSyncSha,
     policy: policyLoad.policy,
     projectId: executor.project_id ?? input.caller.projectId,
+    callerProjectId: input.caller.projectId ?? null,
   });
 
   // §2 r10 п.0: target identity = the repo's MAIN worktree dir
