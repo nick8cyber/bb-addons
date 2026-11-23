@@ -490,3 +490,34 @@ test("migrations 0..54 immutable SHA-256 hash guard (anti-shift, PLUG-283)", () 
     "migration 54 must be attach",
   );
 });
+
+test("§7 coordinator_worktrees: schema + live/env uniqueness (PLUG-392)", () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const columns = (db
+    .prepare(`PRAGMA table_info(coordinator_worktrees)`)
+    .all() as { name: string }[]).map((c) => c.name);
+  assert.deepEqual(columns.sort(), [
+    "base_sha",
+    "branch",
+    "coordinator_thread_id",
+    "created_at",
+    "decision_generation",
+    "env_id",
+    "host_id",
+    "id",
+    "project_id",
+    "reason",
+    "repo_root",
+    "state",
+    "tip_sha",
+    "updated_at",
+    "worktree_path",
+  ]);
+  const indexes = (db
+    .prepare(`PRAGMA index_list(coordinator_worktrees)`)
+    .all() as { name: string }[]).map((i) => i.name);
+  assert.ok(indexes.includes("coordinator_worktrees_live_idx"));
+  assert.ok(indexes.includes("coordinator_worktrees_env_idx"));
+  assert.ok(indexes.includes("coordinator_worktrees_branch_idx"));
+});

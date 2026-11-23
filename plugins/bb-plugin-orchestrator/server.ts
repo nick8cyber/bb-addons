@@ -19,6 +19,7 @@ import {
 import { OrchestratorError, errorJson, toErrorBody } from "./src/errors.js";
 import { parsePolicy, getNodeTimeoutSeconds, type PolicyLoad } from "./src/policy.js";
 import {
+  CoordinatorWorktreeStore,
   DelegationStore,
   JanitorStore,
   MIGRATIONS,
@@ -32,9 +33,11 @@ import {
 } from "./src/janitor-config.js";
 import {
   createJanitor,
+  defaultHasProcessIn,
   type TaskCleanupArgs,
   type TaskCleanupSummary,
 } from "./src/janitor.js";
+import { createCoordinatorWorktrees } from "./src/coordinator-worktrees.js";
 import {
   createBbCli,
   runChecked,
@@ -523,6 +526,18 @@ export async function createPlugin(
       experimental_multiline: true,
       default: "",
     },
+    coordinatorWorktrees: {
+      type: "string",
+      label: "Coordinator worktrees",
+      description:
+        "§13.5 (PLUG-392, ADR-0024): `off` (default) — coordinators " +
+        "share the checkout and binding checks never refuse an " +
+        "operation; `on` — owner-only switch after BB env-retention " +
+        "is confirmed: coordinator operations require a registered " +
+        "integration copy. Binding registration and the §16.9 " +
+        "archive-admission ledger run in both modes.",
+      default: "off",
+    },
     gitInstructions: {
       type: "string",
       label: "Working with git",
@@ -727,6 +742,7 @@ export async function createPlugin(
     }
   }).catch(() => {});
   const janitorStore = new JanitorStore(db);
+  const worktreeStore = new CoordinatorWorktreeStore(db);
   const enqueue = createDelegateQueue();
   const positiveInt = (v: string | undefined, dflt: number): number => {
     const n = Number(v);
@@ -2227,8 +2243,53 @@ export async function createPlugin(
     },
     loadConfig: janitorConfig,
     localHostId,
+    worktrees: worktreeStore,
     log: bb.log,
     t,
+  });
+  // §13.5/§16.9 (r34.8, PLUG-392): coordinator worktree bindings —
+  // lazy registration on thread events and the archive-admission
+  // ledger that decides `held`/`remove_pending`/`env-removed`.
+  const coordWorktrees = createCoordinatorWorktrees({
+    store: worktreeStore,
+    threadRole: (id) => store.threadRole(id),
+    cmd,
+    showEnvironment: async (envId) => {
+      try {
+        return await runJson(bbCli, [
+          "environment",
+          "show",
+          envId,
+          "--json",
+        ]);
+      } catch {
+        return null;
+      }
+    },
+    showThread: async (threadId) => {
+      try {
+        return await runJson(bbCli, ["thread", "show", threadId, "--json"]);
+      } catch {
+        return null;
+      }
+    },
+    listEnvThreads: async (envId) => {
+      try {
+        return await runJson(bbCli, [
+          "thread",
+          "list",
+          "--environment",
+          envId,
+          "--include-archived",
+          "--include-hidden",
+          "--json",
+        ]);
+      } catch {
+        return null;
+      }
+    },
+    hasProcessIn: async (p) => defaultHasProcessIn(p),
+    log: bb.log,
   });
   let janitorBusy = false;
   let lastJanitorRunAt = 0;
@@ -2280,6 +2341,38 @@ export async function createPlugin(
             : Promise.resolve(undefined)
           ).catch((e) =>
             bb.log.warn(`orchestrator janitor: ${describeError(e)}`),
+          ),
+        );
+        // §13.5/§16.9 (PLUG-392): coordinator worktree lifecycle —
+        // lazy binding on activity (`message.dispatched` ships only
+        // `entry.threadId`, the env is resolved inside), archive
+        // admission, and unarchive cancellation. All async — never
+        // the synchronous `message.dispatch` pass.
+        bb.events.on("thread.active", ({ thread }) =>
+          void coordWorktrees.onThreadActive(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+          ),
+        );
+        bb.events.on("message.dispatched", ({ entry }) =>
+          void coordWorktrees
+            .onThreadActive({ id: entry.threadId })
+            .catch((e) =>
+              bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+            ),
+        );
+        bb.events.on("thread.archived", ({ thread }) =>
+          void coordWorktrees.onThreadArchived(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+          ),
+        );
+        bb.events.on("thread.unarchived", ({ thread }) =>
+          void coordWorktrees.onThreadUnarchived(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+          ),
+        );
+        bb.events.on("thread.deleted", ({ thread }) =>
+          void coordWorktrees.onThreadDeleted(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
           ),
         );
       }

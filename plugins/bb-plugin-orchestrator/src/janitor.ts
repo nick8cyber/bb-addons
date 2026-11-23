@@ -105,6 +105,7 @@ import { T_RU, type T } from "./i18n/index.js";
 import type { CmdRunner } from "./cmd.js";
 import type { JanitorConfig, JanitorConfigLoad } from "./janitor-config.js";
 import type {
+  CoordinatorWorktreeStore,
   DelegationStore,
   JanitorItemState,
   JanitorRescueRow,
@@ -187,6 +188,13 @@ export interface JanitorDeps {
    * e.g. macOS) — the copy is then kept with `process-unknown`.
    */
   hasProcessIn?: (path: string) => Promise<boolean | null>;
+  /**
+   * §16.9 (r34.8, PLUG-392): coordinator worktree bindings — an env
+   * with a binding in state ≠ `removed`/`env-removed` is never
+   * archived or cleaned, and a branch bound anywhere but `removed` is
+   * unconditionally excluded from the branch sweep (§7).
+   */
+  worktrees?: CoordinatorWorktreeStore;
   /**
    * §15 «что смотрит»: id of the host this bb runs on. Envs advertising a
    * different `hostId` are skipped entirely — their copies are
@@ -1785,6 +1793,32 @@ export function createJanitor(deps: JanitorDeps) {
     );
     const envById = new Map(envs.map((e) => [e.id, e]));
 
+    // §16.9/§7 (r34.8, PLUG-392): coordinator bindings. An env BB no
+    // longer reports closes its binding `env-removed`; the branch
+    // record stays protected until the binding reaches `removed`.
+    if (deps.worktrees) {
+      for (const b of deps.worktrees.envBindings()) {
+        if (!ctx.allEnvIds.has(b.env_id)) {
+          deps.worktrees.setState(b.id, "env-removed", null, at);
+        }
+      }
+    }
+    // §16.9 п.1: bound coordinator envs and envs housing a live
+    // coordinator-role thread are never archived or removed — the
+    // janitor reports «coordinator-live» (or the held binding's own
+    // reason) and moves on.
+    const coordBoundEnvs = new Map<string, string>();
+    if (deps.worktrees) {
+      for (const b of deps.worktrees.envBindings()) {
+        coordBoundEnvs.set(
+          b.env_id,
+          b.state === "held" && b.reason ? b.reason : "coordinator-live",
+        );
+      }
+    }
+    const coordBranches =
+      deps.worktrees?.protectedBranches() ?? new Set<string>();
+
     const activeDelegations = (): Set<string> =>
       new Set(
         deps.store
@@ -1888,6 +1922,38 @@ export function createJanitor(deps: JanitorDeps) {
      * thread outside the archived cascade still holds the copy).
      */
     let latestGraph = graph;
+
+    // §16.9 п.1 (r34.8): a cascade holding a live coordinator-role
+    // thread or a bound env is never archived — the coordinator copy
+    // is the integration point its delegates publish into.
+    const coordCascadeBlock = (
+      memberList: ThreadDto[],
+      envs: Map<string, EnvDto>,
+    ): { env: string | null; reason: string } | null => {
+      for (const t of memberList) {
+        if (deps.store.threadRole(t.id)?.role === "orchestrator") {
+          return {
+            env: t.environmentId ?? null,
+            reason: "coordinator-live",
+          };
+        }
+      }
+      for (const eid of envs.keys()) {
+        const held = coordBoundEnvs.get(eid);
+        if (held) return { env: eid, reason: held };
+      }
+      return null;
+    };
+    const coordHeldEnvReason = (envId: string): string | null =>
+      coordBoundEnvs.get(envId) ??
+      ((latestGraph.byEnv.get(envId) ?? []).some(
+        (t) =>
+          !t.archivedAt &&
+          !t.deletedAt &&
+          deps.store.threadRole(t.id)?.role === "orchestrator",
+      )
+        ? "coordinator-live"
+        : null);
     const liveThreadsOf = (
       envId: string,
       g?: ThreadGraph,
@@ -2603,6 +2669,11 @@ export function createJanitor(deps: JanitorDeps) {
         note("cascade-env-external", null);
         return;
       }
+      const coordBlock = coordCascadeBlock(members, memberEnvs);
+      if (coordBlock) {
+        note(coordBlock.reason, coordBlock.env);
+        return;
+      }
       const blocked = await checkCond4(
         cond4Threads(members, memberEnvs, graph),
         delegatedThreads,
@@ -2650,6 +2721,11 @@ export function createJanitor(deps: JanitorDeps) {
       }
       if (externalFresh) {
         note("cascade-env-external", null);
+        return;
+      }
+      const coordBlockFresh = coordCascadeBlock(freshMembers, freshEnvs);
+      if (coordBlockFresh) {
+        note(coordBlockFresh.reason, coordBlockFresh.env);
         return;
       }
       const blockedFresh = await checkCond4(
@@ -2894,6 +2970,12 @@ export function createJanitor(deps: JanitorDeps) {
       }
     };
     for (const env of envs) {
+      const coordReason = coordHeldEnvReason(env.id);
+      if (coordReason) {
+        writeKept(env, coordReason);
+        settle(env, coordReason);
+        continue;
+      }
       const facts = await envFacts(env);
       if (!facts.ready) {
         if (facts.reason === "fetch-failed") {
@@ -3144,6 +3226,9 @@ export function createJanitor(deps: JanitorDeps) {
         }
       }
       for (const branch of localBranches) {
+        // §7/§16.9: a coordinator-bound branch is never a candidate,
+        // regardless of its prefix.
+        if (coordBranches.has(branch)) continue;
         if (!branch.startsWith(BRANCH_PREFIX)) continue;
         if (cfg.protectedBranches.includes(branch)) continue;
         if (excludedBranches.has(branch)) continue;
@@ -4428,6 +4513,13 @@ export function createJanitor(deps: JanitorDeps) {
       const env = await showEnvironment(envId);
       const path = env?.path ?? null;
       if (!path || !existsSync(path)) continue; // копии уже нет
+      // §16.9 (r34.8): the coordinator integration copy is never a
+      // task-cleanup candidate — post-release cleanup keeps it.
+      const coordEnv = deps.worktrees?.byEnv(envId);
+      if (coordEnv && coordEnv.state !== "removed") {
+        keepEnv(envId, "coordinator-live");
+        continue;
+      }
       const envBranch = env?.branchName?.trim() || null;
       if (envBranch) branchSet.add(envBranch);
       if (threadsAll === null) {
@@ -4682,7 +4774,14 @@ export function createJanitor(deps: JanitorDeps) {
               .map((w) => w.branch)
               .filter((b): b is string => !!b),
           );
+    // §7/§16.9: coordinator-bound branches are unconditionally kept.
+    const coordBranches =
+      deps.worktrees?.protectedBranches() ?? new Set<string>();
     for (const branch of branchSet) {
+      if (coordBranches.has(branch)) {
+        keepBranch(branch, "coordinator-live");
+        continue;
+      }
       if (!branch.startsWith(BRANCH_PREFIX)) continue;
       if (branch === args.targetBranch) continue;
       if (openBranches === null) {
