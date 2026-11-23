@@ -5,7 +5,8 @@
  * reissues, route fallbacks) and before publishing releases.
  */
 
-import { basename } from "node:path";
+import { basename, resolve, isAbsolute } from "node:path";
+import { realpathSync } from "node:fs";
 import { OrchestratorError } from "./errors.js";
 import type { CmdRunner } from "./cmd.js";
 import type { BbCli } from "./bb-cli.js";
@@ -123,6 +124,39 @@ export interface AcceptedSpecReview {
 }
 
 /**
+ * §31.9: Resolve canonical repository identity.
+ * For git repositories (including linked worktrees), uses the canonical absolute
+ * path of `--git-common-dir` so all worktrees of the same repository share identity,
+ * while distinct repositories (even with identical folder names) have distinct identities.
+ */
+export async function resolveRepoIdentity(cmd?: CmdRunner, repoRoot?: string): Promise<string | undefined> {
+  if (!repoRoot) return undefined;
+  if (cmd) {
+    try {
+      const gitDirRes = await cmd.run("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repoRoot });
+      let dirOut = gitDirRes.exitCode === 0 ? gitDirRes.stdout.trim() : "";
+      if (!dirOut) {
+        const fallbackRes = await cmd.run("git", ["rev-parse", "--git-common-dir"], { cwd: repoRoot });
+        if (fallbackRes.exitCode === 0) dirOut = fallbackRes.stdout.trim();
+      }
+      if (dirOut) {
+        const abs = isAbsolute(dirOut) ? dirOut : resolve(repoRoot, dirOut);
+        try {
+          return realpathSync(abs);
+        } catch {
+          return abs;
+        }
+      }
+    } catch {}
+  }
+  try {
+    return realpathSync(repoRoot);
+  } catch {
+    return repoRoot;
+  }
+}
+
+/**
  * §31.9: Find accepted spec review for a task.
  * Enforces project matching, exact commit SHA, and ensures only reviews of specs/docs
  * qualify (ordinary code reviews never approve a spec).
@@ -149,7 +183,6 @@ export async function findAcceptedSpecReview(opts: {
   const events = opts.store.listEvents("review.verdict");
 
   for (const rev of reviews.slice().reverse()) {
-    const revSha = rev.continue_from!;
     if (opts.projectId && rev.project_id && opts.projectId !== rev.project_id) {
       continue;
     }
@@ -198,6 +231,22 @@ export async function findAcceptedSpecReview(opts: {
     const baseSha: string = att.baseSha;
     const headSha: string = att.headSha;
 
+    // Canonical head consistency: continue_from on delegation row MUST match att.headSha
+    if (!rev.continue_from || rev.continue_from !== headSha) {
+      if (opts.cmd && opts.repoRoot && rev.continue_from) {
+        try {
+          const revRes = await opts.cmd.run("git", ["rev-parse", "--verify", `${rev.continue_from}^{commit}`], { cwd: opts.repoRoot });
+          if (revRes.exitCode !== 0 || revRes.stdout.trim() !== headSha) {
+            continue;
+          }
+        } catch {
+          continue;
+        }
+      } else {
+        continue;
+      }
+    }
+
     if (att.projectId && opts.projectId && att.projectId !== opts.projectId) {
       continue;
     }
@@ -205,87 +254,87 @@ export async function findAcceptedSpecReview(opts: {
       continue;
     }
     if (att.repo && opts.repoRoot) {
-      try {
-        const normAttRepo = att.repo.replace(/\/+$/, "");
-        const normOptsRepo = opts.repoRoot.replace(/\/+$/, "");
-        if (normAttRepo !== normOptsRepo && basename(normAttRepo) !== basename(normOptsRepo)) {
-          continue;
+      const currentRepoIdentity = await resolveRepoIdentity(opts.cmd, opts.repoRoot);
+      let match = false;
+      if (currentRepoIdentity && att.repo === currentRepoIdentity) {
+        match = true;
+      } else {
+        let attIdentity = att.repo;
+        try {
+          attIdentity = realpathSync(att.repo);
+        } catch {}
+        if (currentRepoIdentity && attIdentity === currentRepoIdentity) {
+          match = true;
+        } else if (opts.cmd) {
+          try {
+            const attCommon = await resolveRepoIdentity(opts.cmd, att.repo);
+            if (attCommon && attCommon === currentRepoIdentity) {
+              match = true;
+            }
+          } catch {}
         }
-      } catch {}
-    }
-
-    if (opts.cmd && opts.repoRoot) {
-      // 1) Verify both Git objects exist in the repository
-      const catBase = await opts.cmd.run("git", ["cat-file", "-e", `${baseSha}^{commit}`], { cwd: opts.repoRoot });
-      if (catBase.exitCode !== 0) continue;
-      const catHead = await opts.cmd.run("git", ["cat-file", "-e", `${headSha}^{commit}`], { cwd: opts.repoRoot });
-      if (catHead.exitCode !== 0) continue;
-
-      // 2) Verify composition of changes in reviewed range: baseSha..headSha
-      const diffRes = await opts.cmd.run("git", ["diff", "--name-only", baseSha, headSha], { cwd: opts.repoRoot });
-      if (diffRes.exitCode !== 0) continue;
-
-      const changedFiles = diffRes.stdout
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean);
-
-      if (changedFiles.length === 0) continue;
-
-      let hasNonDoc = false;
-      const specPaths: string[] = [];
-
-      for (const f of changedFiles) {
-        if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
-        if (!isDocOrSpecPath(f) || isCodePath(f)) {
-          hasNonDoc = true;
-          break;
-        }
-        specPaths.push(f);
       }
-
-      if (hasNonDoc || specPaths.length === 0) continue;
-
-      const rawSpecPaths = Array.isArray(att.specPaths) && att.specPaths.length > 0
-        ? att.specPaths
-        : (Array.isArray(att.paths) && att.paths.length > 0 ? att.paths : []);
-
-      const specPath =
-        specPaths.find((p) => p.includes("specs/") || p.endsWith(".md")) ??
-        rawSpecPaths.find((p: string) => p.includes("specs/") || p.endsWith(".md")) ??
-        specPaths[0] ??
-        rawSpecPaths[0] ??
-        `docs/specs/${normKey}.md`;
-
-      const projId = rev.project_id ?? opts.projectId ?? "proj";
-      const approvalId = `appr:${projId}:${normKey}:${headSha}:${rev.finished_at || rev.updated_at || Date.now()}`;
-
-      return {
-        delegation: rev,
-        reviewedSha: headSha,
-        specPath,
-        approvalId,
-      };
-    } else {
-      // Without cmd/repoRoot
-      const rawSpecPaths = Array.isArray(att.specPaths) && att.specPaths.length > 0
-        ? att.specPaths
-        : (Array.isArray(att.paths) && att.paths.length > 0 ? att.paths : []);
-      const specPaths = rawSpecPaths.length > 0 ? rawSpecPaths : [`docs/specs/${normKey}.md`];
-      const specPath =
-        specPaths.find((p: string) => p.includes("specs/") || p.endsWith(".md")) ??
-        specPaths[0];
-
-      const projId = rev.project_id ?? opts.projectId ?? "proj";
-      const approvalId = `appr:${projId}:${normKey}:${headSha}:${rev.finished_at || rev.updated_at || Date.now()}`;
-
-      return {
-        delegation: rev,
-        reviewedSha: headSha,
-        specPath,
-        approvalId,
-      };
+      if (!match) {
+        continue;
+      }
     }
+
+    if (!opts.cmd || !opts.repoRoot) {
+      // Without cmd/repoRoot cannot verify git objects and reviewed range
+      continue;
+    }
+
+    // 1) Verify both Git objects exist in the repository
+    const catBase = await opts.cmd.run("git", ["cat-file", "-e", `${baseSha}^{commit}`], { cwd: opts.repoRoot });
+    if (catBase.exitCode !== 0) continue;
+    const catHead = await opts.cmd.run("git", ["cat-file", "-e", `${headSha}^{commit}`], { cwd: opts.repoRoot });
+    if (catHead.exitCode !== 0) continue;
+
+    // 2) Verify composition of changes in reviewed range: baseSha..headSha
+    const diffRes = await opts.cmd.run("git", ["diff", "--name-only", baseSha, headSha], { cwd: opts.repoRoot });
+    if (diffRes.exitCode !== 0) continue;
+
+    const changedFiles = diffRes.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (changedFiles.length === 0) continue;
+
+    let hasNonDoc = false;
+    const specPaths: string[] = [];
+
+    for (const f of changedFiles) {
+      if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+      if (!isDocOrSpecPath(f) || isCodePath(f)) {
+        hasNonDoc = true;
+        break;
+      }
+      specPaths.push(f);
+    }
+
+    if (hasNonDoc || specPaths.length === 0) continue;
+
+    const rawSpecPaths = Array.isArray(att.specPaths) && att.specPaths.length > 0
+      ? att.specPaths
+      : (Array.isArray(att.paths) && att.paths.length > 0 ? att.paths : []);
+
+    const specPath =
+      specPaths.find((p) => p.includes("specs/") || p.endsWith(".md")) ??
+      rawSpecPaths.find((p: string) => p.includes("specs/") || p.endsWith(".md")) ??
+      specPaths[0] ??
+      rawSpecPaths[0] ??
+      `docs/specs/${normKey}.md`;
+
+    const projId = rev.project_id ?? opts.projectId ?? "proj";
+    const approvalId = `appr:${projId}:${normKey}:${headSha}:${rev.finished_at || rev.updated_at || Date.now()}`;
+
+    return {
+      delegation: rev,
+      reviewedSha: headSha,
+      specPath,
+      approvalId,
+    };
   }
 
   return null;

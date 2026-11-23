@@ -4324,3 +4324,354 @@ test("§31.9 spec review dispatch without confirmed baseSha does not record spec
   });
   assert.equal(found, null);
 });
+
+// ── 33. Round 15 & Architect Feedback: Canonical Head & Common-Dir Repo Verification ──
+
+test("§31.9 Scenario A: divergent headSha and from rejects before delegation insert", async () => {
+  const dir = makeTempDir("orch-scen-a-");
+  const { run, cmd } = initGitRepo(dir);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/scen-a.md"), "# Spec A\n§1 Intro\n");
+  run(["add", "."]); run(["commit", "-qm", "docs: add spec"]);
+  const docSha = run(["rev-parse", "HEAD"]).trim();
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/code.ts"), "export const x = 1;\n");
+  run(["add", "."]); run(["commit", "-qm", "feat: code change"]);
+  const codeSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const pol = parsePolicy(POLICY_TEXT);
+
+  let spawned = false;
+  const deps = {
+    store,
+    policy: () => pol.policy,
+    loadPolicy: async () => pol,
+    bbCli: fakeCli().cli,
+    threads: { spawn: async () => { spawned = true; return { id: "thr_sub" }; } } as any,
+    probes: { roleByThreadId: () => "orchestrator" },
+    primaryHostId: async () => "host1",
+    cmd,
+    repoRoot: dir,
+    workGraphMode: "shadow",
+  } as any;
+
+  // Passing docSha as headSha and codeSha as from (divergent commits) MUST throw spec-head-mismatch
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "SCENA-1",
+          level: "review",
+          kind: "spec_review",
+          baseSha,
+          headSha: docSha,
+          from: codeSha,
+          caller: { threadId: "thr_coord", parentThreadId: null, title: "coord", originPluginId: null, projectId: "proj_bb" },
+        } as any,
+        deps,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-head-mismatch");
+      return true;
+    },
+  );
+  assert.equal(spawned, false);
+  assert.equal(store.delegationsByTask("SCENA-1").length, 0);
+});
+
+test("§31.9 Scenario B: spec review with head-sha but without from records canonical head and enables executor", async () => {
+  const dir = makeTempDir("orch-scen-b-");
+  const { run, cmd } = initGitRepo(dir);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/scen-b.md"), "# Spec B\n§1 Spec details\n");
+  run(["add", "."]); run(["commit", "-qm", "docs: add spec"]);
+  const docSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  store.insertTask({
+    taskKey: "SCENB-1",
+    projectId: "proj_bb",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+  });
+  const pol = parsePolicy(POLICY_TEXT);
+
+  let spawns = 0;
+  const deps = {
+    store,
+    policy: () => pol.policy,
+    loadPolicy: async () => pol,
+    bbCli: fakeCli().cli,
+    threads: { spawn: async () => { spawns++; return { id: `thr_sub_${spawns}` }; } } as any,
+    probes: { roleByThreadId: () => "orchestrator" },
+    primaryHostId: async () => "host1",
+    cmd,
+    repoRoot: dir,
+    workGraphMode: "shadow",
+  } as any;
+
+  // Dispatch spec_review with headSha but WITHOUT from on a fresh task
+  const delRes = await runDelegate(
+    {
+      taskKey: "SCENB-1",
+      level: "review",
+      kind: "spec_review",
+      baseSha,
+      headSha: docSha,
+      caller: { threadId: "thr_coord", parentThreadId: null, title: "coord", originPluginId: null, projectId: "proj_bb" },
+    } as any,
+    deps,
+  );
+  assert.equal(delRes.ok, true);
+
+  const row = store.get(delRes.delegationId)!;
+  // All three locations MUST match docSha
+  assert.equal(row.continue_from, docSha, "row.continue_from must equal docSha");
+  const att = JSON.parse(row.attach!);
+  assert.equal(att.headSha, docSha, "attach.headSha must equal docSha");
+  assert.equal(att.from, docSha, "attach.from must equal docSha");
+
+  // Mark review done with OK/0
+  store.setStatus(row.id, "running");
+  store.setStatusIf(row.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  // findAcceptedSpecReview MUST find the review
+  const found = await findAcceptedSpecReview({
+    taskKey: "SCENB-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    projectId: "proj_bb",
+  });
+  assert.ok(found, "Approval must be found");
+  assert.equal(found.reviewedSha, docSha);
+
+  // Executor delegation must succeed without spec-gate-violation
+  const execDel = await runDelegate(
+    {
+      taskKey: "SCENB-1",
+      level: "complex",
+      caller: { threadId: "thr_coord", parentThreadId: null, title: "coord", originPluginId: null, projectId: "proj_bb" },
+    } as any,
+    deps,
+  );
+  assert.equal(execDel.ok, true);
+});
+
+test("§31.9 Scenario C: canonical git-common-dir allows linked worktrees of same repo and rejects foreign repo with same folder name", async () => {
+  // Main repository
+  const mainDir = makeTempDir("same-basename-main-");
+  const repoA = join(mainDir, "bb-addons");
+  mkdirSync(repoA, { recursive: true });
+  const { run: runA, cmd: cmdA } = initGitRepo(repoA);
+  const baseSha = runA(["rev-parse", "HEAD"]).trim();
+  mkdirSync(join(repoA, "docs/specs"), { recursive: true });
+  writeFileSync(join(repoA, "docs/specs/c.md"), "# Spec C\n");
+  runA(["add", "."]); runA(["commit", "-qm", "docs: add spec"]);
+  const headSha = runA(["rev-parse", "HEAD"]).trim();
+
+  // Linked worktree of repoA with different folder name
+  const worktreeA = join(mainDir, "bb-addons-worktree-other-name");
+  runA(["worktree", "add", worktreeA, "HEAD"]);
+  const { cmd: cmdWorktreeA } = initGitRepo(worktreeA);
+
+  // Foreign repo with identical folder name "bb-addons"
+  const foreignDir = makeTempDir("same-basename-foreign-");
+  const repoForeign = join(foreignDir, "bb-addons");
+  mkdirSync(repoForeign, { recursive: true });
+  const { cmd: cmdForeign } = initGitRepo(repoForeign);
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const pol = parsePolicy(POLICY_TEXT);
+
+  const depsA = {
+    store,
+    policy: () => pol.policy,
+    loadPolicy: async () => pol,
+    bbCli: fakeCli().cli,
+    threads: { spawn: async () => ({ id: "thr_sub" }) } as any,
+    probes: { roleByThreadId: () => "orchestrator" },
+    primaryHostId: async () => "host1",
+    cmd: cmdA,
+    repoRoot: repoA,
+    workGraphMode: "shadow",
+  } as any;
+
+  // Review created in repoA
+  const rev = await runDelegate(
+    {
+      taskKey: "SCENC-1",
+      level: "review",
+      kind: "spec_review",
+      baseSha,
+      headSha,
+      caller: { threadId: "thr_coord", parentThreadId: null, title: "coord", originPluginId: null, projectId: "proj_bb" },
+    } as any,
+    depsA,
+  );
+  store.setStatus(rev.delegationId, "running");
+  store.setStatusIf(rev.delegationId, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  // 1. Verifying from linked worktree of same repository (different folder name) MUST SUCCEED
+  const foundInWorktree = await findAcceptedSpecReview({
+    taskKey: "SCENC-1",
+    store,
+    cmd: cmdWorktreeA,
+    repoRoot: worktreeA,
+    projectId: "proj_bb",
+  });
+  assert.ok(foundInWorktree, "Linked worktree of the same repo must be accepted");
+
+  // 2. Verifying from foreign repo with identical folder name MUST REJECT
+  const foundInForeign = await findAcceptedSpecReview({
+    taskKey: "SCENC-1",
+    store,
+    cmd: cmdForeign,
+    repoRoot: repoForeign,
+    projectId: "proj_bb",
+  });
+  assert.equal(foundInForeign, null, "Foreign repo with same folder name must be rejected");
+});
+
+test("§31.9 Finding 3: reviewer instructions include spec range and filter out code files from docs list", async () => {
+  const dir = makeTempDir("orch-find3-");
+  const { run, cmd } = initGitRepo(dir);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/f3.md"), "# Spec F3\n");
+  run(["add", "."]); run(["commit", "-qm", "docs: add spec"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const pol = parsePolicy(POLICY_TEXT);
+
+  // Delegate spec review with attach containing BOTH a doc path and a code path
+  let capturedPrompt: string | undefined;
+  const del = await runDelegate(
+    {
+      taskKey: "FIND3-1",
+      level: "review",
+      kind: "spec_review",
+      baseSha,
+      headSha,
+      attach: ["docs/specs/f3.md", "src/secret-code.ts"],
+      caller: { threadId: "thr_coord", parentThreadId: null, title: "coord", originPluginId: null, projectId: "proj_bb" },
+    } as any,
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli().cli,
+      threads: {
+        spawn: async (args: any) => {
+          capturedPrompt = args.prompt;
+          return { id: "thr_auditor" };
+        },
+      } as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+    } as any,
+  );
+
+  const row = store.get(del.delegationId)!;
+  const att = JSON.parse(row.attach!);
+
+  // attach.paths preserves code path, while attach.specPaths contains only docs
+  assert.ok(att.paths.includes("src/secret-code.ts"), "attach.paths preserves code path");
+  assert.ok(att.paths.includes("docs/specs/f3.md"));
+  assert.ok(!att.specPaths.includes("src/secret-code.ts"), "attach.specPaths must not include code");
+  assert.ok(att.specPaths.includes("docs/specs/f3.md"));
+
+  assert.ok(capturedPrompt, "Prompt must be provided");
+  const specRangeLine = capturedPrompt
+    .split("\n")
+    .find((l) => l.includes("Диапазон проверки спецификации:"));
+  assert.ok(specRangeLine, "Spec range line must be present");
+  assert.ok(
+    specRangeLine.includes(`Диапазон проверки спецификации: ${baseSha}..${headSha}`),
+    "Instructions in prompt must contain exact spec range",
+  );
+  assert.ok(
+    specRangeLine.includes("docs/specs/f3.md"),
+    "Spec range line must contain spec path",
+  );
+  assert.ok(
+    !specRangeLine.includes("src/secret-code.ts"),
+    "Spec range line must NOT list code files under docs",
+  );
+  // Meanwhile attach line preserves all original paths (§20.1 п.4)
+  assert.ok(capturedPrompt.includes("src/secret-code.ts"), "Prompt preserves original attach paths");
+});
+
+test("§31.9 Mismatched continue_from vs att.headSha is rejected by findAcceptedSpecReview", async () => {
+  const dir = makeTempDir("orch-mismatch-head-");
+  const { run, cmd } = initGitRepo(dir);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/m.md"), "# Spec\n");
+  run(["add", "."]); run(["commit", "-qm", "docs"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const row = store.insert({
+    taskKey: "MISMATCH-1",
+    projectId: "proj_bb",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-route",
+    preset: "auditor",
+    provider: "acp-devin",
+    round: 1,
+    continueFrom: "0000000000000000000000000000000000000000", // corrupted/mismatched continue_from
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "MISMATCH-1",
+      projectId: "proj_bb",
+      repo: dir,
+      baseSha,
+      headSha, // different from continueFrom
+      specPaths: ["docs/specs/m.md"],
+      paths: [],
+      from: headSha,
+    }),
+  });
+  store.setStatus(row.id, "running");
+  store.setStatusIf(row.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const found = await findAcceptedSpecReview({
+    taskKey: "MISMATCH-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    projectId: "proj_bb",
+  });
+  assert.equal(found, null, "Mismatched continue_from and att.headSha must be rejected");
+});

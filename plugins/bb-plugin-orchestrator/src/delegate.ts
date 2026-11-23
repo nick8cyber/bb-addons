@@ -67,6 +67,7 @@ import {
   resolveExecutorBaseSha,
   resolvePresetBaseBranch,
   resolveTaskSpecContract,
+  resolveRepoIdentity,
   isDocOrSpecPath,
   isCodePath,
   type SpecContract,
@@ -763,15 +764,27 @@ export async function runDelegate(
   let repoIdentity: string | undefined;
 
   if (isReview) {
-    if (deps.repoRoot && deps.cmd) {
-      try {
-        const topRes = await deps.cmd.run("git", ["rev-parse", "--show-toplevel"], { cwd: deps.repoRoot });
-        repoIdentity = topRes.exitCode === 0 ? topRes.stdout.trim() : deps.repoRoot;
-      } catch {
-        repoIdentity = deps.repoRoot;
+    repoIdentity = await resolveRepoIdentity(deps.cmd, deps.repoRoot);
+
+    if (params.headSha && params.from) {
+      let resolvedHead = params.headSha;
+      let resolvedFrom = params.from;
+      if (deps.cmd && deps.repoRoot) {
+        try {
+          const rH = await deps.cmd.run("git", ["rev-parse", "--verify", `${params.headSha}^{commit}`], { cwd: deps.repoRoot });
+          if (rH.exitCode === 0 && rH.stdout.trim().length === 40) resolvedHead = rH.stdout.trim();
+        } catch {}
+        try {
+          const rF = await deps.cmd.run("git", ["rev-parse", "--verify", `${params.from}^{commit}`], { cwd: deps.repoRoot });
+          if (rF.exitCode === 0 && rF.stdout.trim().length === 40) resolvedFrom = rF.stdout.trim();
+        } catch {}
       }
-    } else {
-      repoIdentity = deps.repoRoot;
+      if (resolvedHead !== resolvedFrom) {
+        throw new OrchestratorError(
+          "spec-head-mismatch",
+          `Конфликт параметров диапазона: headSha (${params.headSha}) не совпадает с from (${params.from}). Для ревью спеки должен быть передан один непротиворечивый конец диапазона.`,
+        );
+      }
     }
 
     const headCand = params.headSha ?? params.from ?? continueFrom;
@@ -830,6 +843,10 @@ export async function runDelegate(
 
   // Step 2 — the unique index makes this atomic across processes.
   let row;
+  const effectiveContinueFrom =
+    isSpecReview && specBaseSha && specHeadSha
+      ? specHeadSha
+      : continueFrom;
   try {
     row = store.insert({
       taskKey,
@@ -840,7 +857,7 @@ export async function runDelegate(
       preset: route.preset,
       provider: route.provider,
       round,
-      continueFrom: continueFrom,
+      continueFrom: effectiveContinueFrom,
       explicitRoute: params.route !== undefined || params.preset !== undefined,
       noCode: effectiveNoCode,
       // §20.1 п.4: the attach spec survives onto the row — a reissue
@@ -857,7 +874,7 @@ export async function runDelegate(
               headSha: specHeadSha,
               specPaths: specPaths,
               paths: params.attach ?? [],
-              from: params.from ?? specHeadSha ?? null,
+              from: specHeadSha,
             })
           : params.attach?.length || params.from
             ? JSON.stringify({
@@ -1303,9 +1320,7 @@ export async function dispatchToRoute(
         const docsList =
           att.specPaths && att.specPaths.length > 0
             ? att.specPaths.join(", ")
-            : att.paths && att.paths.length > 0
-              ? att.paths.join(", ")
-              : "спецификации задачи";
+            : "спецификации задачи";
         specReviewPrompt = `Диапазон проверки спецификации: ${att.baseSha}..${att.headSha}, документы: ${docsList}.\nУбедись, что проверяются исключительно изменения спецификации/документации в указанном диапазоне и нет изменений кода.`;
       }
     } catch {}
