@@ -147,4 +147,60 @@ describe("enforce: expanded queue shows exactly min(N,3) items", () => {
     // 2 реальных сообщения — 1-е и 3-е li; высота до низа 3-го = 180 + pads 20
     expect(scroll.style.maxHeight).toBe("200px");
   });
+  it("removes all queue and section grants while an inline editor is mounted", () => {
+    const { card, scroll, frame, lis } = buildDom({ rows: 2 });
+    const section = document.createElement("section");
+    card.removeChild(frame);
+    section.appendChild(frame);
+    card.insertBefore(section, card.firstChild);
+    box(scroll, 0, 103);
+    box(frame, 0, 103);
+    box(section, 0, 103);
+
+    enforce(card, win);
+    expect(scroll.style.maxHeight).toBe("140px");
+    expect(frame.style.maxHeight).toBe("140px");
+    expect(section.style.minHeight).toBe("140px");
+
+    lis[0].setAttribute("data-queued-message-inline-editor", "");
+    enforce(card, win);
+    expect(scroll.style.maxHeight).toBe("");
+    expect(frame.style.maxHeight).toBe("");
+    expect(section.style.minHeight).toBe("");
+
+    lis[0].removeAttribute("data-queued-message-inline-editor");
+    enforce(card, win);
+    expect(scroll.style.maxHeight).toBe("140px");
+    expect(frame.style.maxHeight).toBe("140px");
+    expect(section.style.minHeight).toBe("140px");
+  });
+  it("reconciles grown section grant down to want after large row/editor closes (delta ~ 0)", () => {
+    const { card, scroll, frame, lis } = buildDom({ rows: 2 });
+    const section = document.createElement("section");
+    card.removeChild(frame);
+    section.appendChild(frame);
+    card.insertBefore(section, card.firstChild);
+
+    // Initial state: row 0 was large (300px), requiring a large grant (380px)
+    box(lis[0], 0, 300);
+    box(lis[1], 300, 60);
+    box(scroll, 0, 103);
+    box(frame, 0, 103);
+    box(section, 0, 103);
+    enforce(card, win);
+    expect(section.style.minHeight).toBe("380px");
+
+    // Editor closes / row shrinks back to 60px.
+    // scroll reports 140px (roomBefore = 140, queueMax = 140 -> delta = 0).
+    // Section still holds 380px from previous grant.
+    box(lis[0], 0, 60);
+    box(lis[1], 60, 60);
+    box(scroll, 0, 140);
+    box(frame, 0, 140);
+    box(section, 0, 380);
+
+    enforce(card, win);
+    // Overinflated grant must be reconciled down to actual want (140px)
+    expect(section.style.minHeight).toBe("140px");
+  });
 });

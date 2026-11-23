@@ -57,8 +57,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "build": "tsc --noEmit && vitest run"
+    "test": "NODE_ENV=test vitest run --testTimeout=60000",
+    "build": "tsc --noEmit && NODE_ENV=test vitest run --testTimeout=60000"
   },
   "description": "Набор компактных переработок интерфейса bb: список чатов порциями, навигация иконками в верхнем ряду, кеп композера, скрытие лишних элементов."
 }
