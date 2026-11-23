@@ -5052,9 +5052,14 @@ test("§31.9 GH-684 Acceptance: global auto+shadow, NO task_queue, two OK review
   run(["commit", "-qam", "docs: spec revision 2"]);
   const rev2Sha = run(["rev-parse", "HEAD"]).trim();
 
+  // Rev 3 (subsequent update in next round)
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 3 in round 2\n");
+  run(["commit", "-qam", "docs: spec revision 3"]);
+  const rev3Sha = run(["rev-parse", "HEAD"]).trim();
+
   // Foreign / Unreviewed SHA
-  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 3 unreviewed\n");
-  run(["commit", "-qam", "docs: spec revision 3 unreviewed"]);
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 4 unreviewed\n");
+  run(["commit", "-qam", "docs: spec revision 4 unreviewed"]);
   const foreignSha = run(["rev-parse", "HEAD"]).trim();
 
   const db = new Database(":memory:");
@@ -5117,6 +5122,34 @@ test("§31.9 GH-684 Acceptance: global auto+shadow, NO task_queue, two OK review
   });
   store.setStatus(del2.id, "running");
   store.setStatusIf(del2.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  // Review 3 on rev3Sha (OK, 0 blockers)
+  const del3 = store.insert({
+    taskKey: "GH-684",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-neon",
+    preset: "auditor",
+    provider: "neon",
+    round: 3,
+    continueFrom: rev3Sha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "GH-684",
+      projectId: "proj_gh",
+      repo: repoId,
+      baseSha,
+      headSha: rev3Sha,
+      specPaths: ["docs/specs/GH-684.md"],
+    }),
+  });
+  store.setStatus(del3.id, "running");
+  store.setStatusIf(del3.id, "running", "done", {
     reviewVerdict: { verdict: "OK", blockers: 0 },
   } as any);
 
@@ -5273,4 +5306,43 @@ test("§31.9 GH-684 Acceptance: global auto+shadow, NO task_queue, two OK review
   const savedContract = store.getSpecContract("GH-684");
   assert.ok(savedContract, "Contract must be saved in task_spec_contracts");
   assert.equal(savedContract?.spec_sha, rev2Sha, "Contract must be bound to rev2Sha");
+
+  // Mark round 1 executor done so task is no longer active
+  store.setStatus(res.delegationId, "running");
+  store.setStatusIf(res.delegationId, "running", "done");
+
+  // 4. Stale stored contract in DB (rev2Sha) must NOT block rev3Sha in auto mode: contract rebuilt and updated
+  assert.equal(store.getSpecContract("GH-684")?.spec_sha, rev2Sha);
+  const res3 = await runDelegate(
+    {
+      taskKey: "GH-684",
+      level: "complex",
+      from: rev3Sha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_gh",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: () => "auto",
+    } as any,
+  );
+
+  assert.equal(spawnCount, 2, "Spawns 2nd time on rev3Sha updating stale contract in auto mode");
+  const updatedContract = store.getSpecContract("GH-684");
+  assert.ok(updatedContract, "Contract must still exist");
+  assert.equal(updatedContract?.spec_sha, rev3Sha, "Contract must be updated to rev3Sha");
 });

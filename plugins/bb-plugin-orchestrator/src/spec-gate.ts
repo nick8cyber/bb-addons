@@ -1080,7 +1080,7 @@ export async function verifySpecBeforeCodeGate(
               : "behavior_change"),
           projectId:
             (taskRow as any)?.project_id ?? (input.project as any)?.id,
-          specPath: contract?.specPath ?? specRev.specPath,
+          specPath: specRev.specPath,
           specSha: specRev.reviewedSha,
           specSection: section,
           adrPath: adr,
@@ -1249,7 +1249,7 @@ export async function verifySpecBeforeCodeGate(
     (taskConfMode === "auto" || taskConfMode === "manual")
       ? taskConfMode
       : effectiveApprovalMode;
-  if (effectiveConfMode === "manual" || storedContract) {
+  if (effectiveConfMode === "manual" || (storedContract && !pendingContractToSave)) {
     if (!storedContract || !storedContract.approval_id) {
       throw new OrchestratorError(
         "spec-gate-violation",
