@@ -580,7 +580,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 #### 32.5.1 Приём задачи в очередь при ручной раздаче (только `shadow`)
 
 1. В проекте с эффективным режимом `shadow` первый ручной `delegate` по задаче, которой нет в `task_queue`, **создаёт** запись очереди (приём, `adopt`). Исключения: `orchestrator_helper` (§19.1) и раздачи уровней `research`/`release-audit` без ключа задачи трекера.
-2. Поля принятой записи: `project_id` — по порядку §32.2 п. 2; `coordinator_thread_id` — тред, выполнивший `delegate`; `route` — из `payload.route` трекера, иначе `feature` для уровней `complex`/`medium`/`spec`/`architect`, `simple` для уровня `simple`; `level` — уровень раздачи; если первая принятая раздача — ревью, `level` берётся обратным поиском по `reviewByLevel` политики (`review` → `complex`, `review-medium` → `medium`, `review-simple` → `simple`), при отсутствии совпадения — `complex`; `confirmation_mode` — по §29.3; `branch` — фактическая ветка раздачи; `priority = 100`; `payload.origin = "shadow-adopt"`, `payload.adopted_delegation_id`.
+2. Поля принятой записи: `project_id` — по порядку §32.2 п. 2; `coordinator_thread_id` — тред, выполнивший `delegate`; `route` — из `payload.route` трекера; если его нет — по первой принятой раздаче: уровни `complex`/`medium`/`spec`/`architect` → `feature`, уровень `simple` → `simple`; раздача уровня ревью с видом `spec_review` → `feature`, если все пути её диапазона в `docs/` или `*.md` и задача не ссылается на код (`payload.no_code`) → `docs`; ревью кода → по уровню, найденному обратным поиском `reviewByLevel` (`complex`/`medium` → `feature`, `simple` → `simple`), без совпадения → `feature`; `level` — уровень раздачи; если первая принятая раздача — ревью, `level` берётся обратным поиском по `reviewByLevel` политики (`review` → `complex`, `review-medium` → `medium`, `review-simple` → `simple`), при отсутствии совпадения — `complex`; `confirmation_mode` — по §29.3; `branch` — фактическая ветка раздачи; `priority = 100`; `payload.origin = "shadow-adopt"`, `payload.adopted_delegation_id`.
 3. Узел и статус записи сразу выставляются по таблице §32.5.2 для этой раздачи (а не `start/queued`). Принятая задача **никогда не берётся** `run-queue` в `shadow`: конвейер в `shadow` только вычисляет `shadow_eval` (§32.1).
 4. Запись `task_transitions`: `actor = "shadow:adopt"`, `from_node = "none"`, `from_status = "none"`, `to_node`/`to_status` — по п. 3, `reason = "shadow-adopt:<command>"`.
 5. В `strict` приёма нет: отказ `graph-required` по §32.1 сохраняется. В `off` — правило абсолютного молчания §32.2 п. 3.
@@ -599,13 +599,16 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 |---|---|---|
 | `delegate` уровня `spec` / `architect` | `spec` / `design` | `running` |
 | `delegate` уровня ревью, вид ревью `spec_review` (§31.9) | `spec_review` | `running` |
-| `approve <KEY>` владельцем | узел после `owner_gate` по §28.1 | `running` |
+| `approve <KEY>` владельцем, текущий узел `start`/`design`/`spec`/`spec_review`/`owner_gate` (одобрение до кода, `gate_stage = pre_code`) | `code` | `running` |
+| `approve <KEY>` владельцем, текущий узел `code`/`checks`/`review`/`design_check` (одобрение до выкладки, `gate_stage = pre_release`) | `release` | `running` |
 | `delegate` уровня кода (`complex`/`medium`/`simple`) | `code` | `running` |
 | `delegate` уровня ревью, вид ревью кода | `review` | `running` |
-| итог ревью `CHANGES` | без перехода; инкремент счётчика круга | — |
+| итог ревью `CHANGES` (событие, не действие координатора) | без перехода и без класса вердикта; только инкремент счётчика круга. Следующая раздача кода из `review` в `code` — `match` по §28.1 | — |
 | `merge <KEY>` | `release` | `running` |
 | `release <KEY>` с исходом `published` | `release` | `done` |
-| перевыпуск сторожем (`reissue_of`) | без перехода | — |
+| перевыпуск сторожем (`reissue_of`) (событие машины) | без перехода и без класса вердикта | — |
+
+`approve` получает класс `match`, если перед ним последний вердикт ревью текущего этапа — `OK, blockers: 0` и `confirmation_mode = manual`; иначе `skip` с деталью `approve-without-accepted-review`. Ни одно ручное действие не переводит зеркало в узел `owner_gate`: в ручном потоке это ожидание, а не шаг. Раздача кода после принятого ревью спеки без `approve` при `confirmation_mode = manual` — `skip` с ожидаемым `owner_gate`; при `auto` — `match`.
 
 Узел `checks` выполняет только машина. Если ручной поток перешёл `code → review`, а `checks` не запускался, это расхождение класса `graph-only` (§32.5.3), а не ошибка координатора.
 
@@ -614,7 +617,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | Класс | Условие | Смысл для решения о `strict` |
 |---|---|---|
 | `match` | в матрице §28.1 есть переход из текущего узла в фактический для этого маршрута и режима | граф сделал бы то же |
-| `repeat` | фактический узел равен текущему (повтор захода, перевыпуск, новый круг ревью в пределах потолка) | допустимо |
+| `repeat` | действие координатора, у которого фактический узел равен текущему (повторная раздача того же узла, ручной повтор ревью в пределах потолка). События без действия координатора (`CHANGES`, `reissue_of`) класса не получают | допустимо |
 | `skip` | координатор пропустил обязательный узел (например, `code` без принятого `spec_review` в `feature`, `release` без `review` OK) | граф **остановил бы** — ошибка процесса координатора |
 | `graph-only` | пропущен узел, который в ручном потоке некому выполнить (`checks`, `design_check`) | не ошибка; включается в `strict` автоматически |
 | `unmapped` | действие не сопоставляется таблице §32.5.2 | дефект сверки, блокирует вердикт |
