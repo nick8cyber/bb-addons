@@ -1445,7 +1445,7 @@ test("§31.9 Architect Incident (PLUG-371): live no-row path without task_queue 
   run(["commit", "-m", "feat: legacy code"]);
   const codeSha = run(["rev-parse", "HEAD"]).trim();
 
-  // Exactly matching live PLUG-371 DB state:
+  // Synthetic test state matching unconstrained DB state:
   // count(task_queue) = 0 and count(task_spec_contracts) = 0
   assert.equal(store.listAllTasks().length, 0);
   assert.equal(store.getSpecContract("PLUG-371"), null);
@@ -1453,8 +1453,8 @@ test("§31.9 Architect Incident (PLUG-371): live no-row path without task_queue 
   // Delegation #1745: executor round produced codeSha
   const exec = store.insert({
     taskKey: "PLUG-371",
-    projectId: "proj_z6bxvt43zb",
-    coordinatorThreadId: "thr_ctphpsrvcg",
+    projectId: "proj_test_main",
+    coordinatorThreadId: "thr_coord_test",
     level: "simple",
     route: "oc-nemotron-lightning",
     preset: "oc-nemotron",
@@ -1472,8 +1472,8 @@ test("§31.9 Architect Incident (PLUG-371): live no-row path without task_queue 
   // Delegation #1744: review round for codeSha with OK verdict
   const rev = store.insert({
     taskKey: "PLUG-371",
-    projectId: "proj_z6bxvt43zb",
-    coordinatorThreadId: "thr_ctphpsrvcg",
+    projectId: "proj_test_main",
+    coordinatorThreadId: "thr_coord_test",
     level: "review",
     route: "gemini",
     preset: "gemini-38-wt",
@@ -2784,8 +2784,8 @@ test("§31.9 Acceptance Scenario 1 (NET-46): in auto mode, positive spec review 
 
   store.insertTask({
     taskKey: "NET-46",
-    projectId: "proj_eshr98jkqq",
-    coordinatorThreadId: "thr_aitmf7kjfx",
+    projectId: "proj_test_infra",
+    coordinatorThreadId: "thr_coord_infra",
     route: "feature",
     level: "complex",
     node: "start",
@@ -2796,8 +2796,8 @@ test("§31.9 Acceptance Scenario 1 (NET-46): in auto mode, positive spec review 
   // Record spec review delegation #1756 on exact range baseSha..specSha
   const del = store.insert({
     taskKey: "NET-46",
-    projectId: "proj_eshr98jkqq",
-    coordinatorThreadId: "thr_aitmf7kjfx",
+    projectId: "proj_test_infra",
+    coordinatorThreadId: "thr_coord_infra",
     level: "review",
     route: "review-opus",
     preset: "opus55-review",
@@ -2806,7 +2806,7 @@ test("§31.9 Acceptance Scenario 1 (NET-46): in auto mode, positive spec review 
     attach: JSON.stringify({
       kind: "spec_review",
       taskKey: "NET-46",
-      projectId: "proj_eshr98jkqq",
+      projectId: "proj_test_infra",
       repo: d,
       baseSha,
       headSha: specSha,
@@ -2841,8 +2841,8 @@ test("§31.9 Acceptance Scenario 1 (NET-46): in auto mode, positive spec review 
   const stored = store.getSpecContract("NET-46");
   assert.ok(stored, "stored contract must exist in task_spec_contracts");
   assert.equal(stored?.spec_sha, specSha);
-  assert.equal(stored?.project_id, "proj_eshr98jkqq");
-  assert.ok(stored?.approval_id?.startsWith("appr:proj_eshr98jkqq:NET-46:"));
+  assert.equal(stored?.project_id, "proj_test_infra");
+  assert.ok(stored?.approval_id?.startsWith("appr:proj_test_infra:NET-46:"));
 
   // Task payload was also updated
   const updatedTask = store.getTask("NET-46");
@@ -2866,8 +2866,8 @@ test("§31.9 Incident NET-46: ordinary code review does NOT approve a spec", asy
 
   store.insertTask({
     taskKey: "NET-47",
-    projectId: "proj_eshr98jkqq",
-    coordinatorThreadId: "thr_aitmf7kjfx",
+    projectId: "proj_test_infra",
+    coordinatorThreadId: "thr_coord_infra",
     route: "feature",
     level: "complex",
     node: "start",
@@ -2878,8 +2878,8 @@ test("§31.9 Incident NET-46: ordinary code review does NOT approve a spec", asy
   // Review of code change
   const del = store.insert({
     taskKey: "NET-47",
-    projectId: "proj_eshr98jkqq",
-    coordinatorThreadId: "thr_aitmf7kjfx",
+    projectId: "proj_test_infra",
+    coordinatorThreadId: "thr_coord_infra",
     level: "review",
     route: "review-opus",
     preset: "opus55-review",
@@ -2924,8 +2924,8 @@ test("§31.9 Incident NET-46: manual confirmation mode requires explicit owner a
 
   store.insertTask({
     taskKey: "NET-48",
-    projectId: "proj_eshr98jkqq",
-    coordinatorThreadId: "thr_aitmf7kjfx",
+    projectId: "proj_test_infra",
+    coordinatorThreadId: "thr_coord_infra",
     route: "feature",
     level: "complex",
     node: "start",
@@ -2935,8 +2935,8 @@ test("§31.9 Incident NET-46: manual confirmation mode requires explicit owner a
 
   const del = store.insert({
     taskKey: "NET-48",
-    projectId: "proj_eshr98jkqq",
-    coordinatorThreadId: "thr_aitmf7kjfx",
+    projectId: "proj_test_infra",
+    coordinatorThreadId: "thr_coord_infra",
     level: "review",
     route: "review-opus",
     preset: "opus55-review",

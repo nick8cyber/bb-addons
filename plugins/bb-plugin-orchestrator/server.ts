@@ -3425,6 +3425,16 @@ export async function createPlugin(
         summary: "Set orchestrator approval mode (owner-only)",
         usage: "bb orchestrator mode <auto|manual> [--json]",
       },
+      {
+        name: "set",
+        summary: "Set orchestrator setting (owner-only)",
+        usage: "bb orchestrator set <key> <value> [--json]",
+      },
+      {
+        name: "workgraph",
+        summary: "Set orchestrator workGraph mode (owner-only)",
+        usage: "bb orchestrator workgraph <off|shadow|strict> [--json]",
+      },
     ],
     async run(argv, ctx: PluginCliContext) {
       const json = argv.includes("--json");
