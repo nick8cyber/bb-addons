@@ -387,8 +387,8 @@ test("§31.9 Fallback route chain: neither primary nor fallback routes spawn on 
   // Verify 0 spawns
   assert.equal(spawnedThreads.length, 0, "No primary or fallback thread should be spawned");
   // Verify row route did not advance to reserve-1 or reserve-2
-  const updatedRow = store.get(row.id)!;
-  assert.equal(updatedRow.route, "complex", "Route must not advance to fallbacks");
+  const updatedRow = store.get(row.id);
+  assert.ok(!updatedRow || updatedRow.route === "complex", "Route must not advance to fallbacks");
 });
 
 // ── 4. Foreign / unreachable SHA ──────────────────────────────────────────────
@@ -530,11 +530,13 @@ test("§31.9 Positive execution: bugfix referencing existing spec and section pa
   );
   run(["add", "."]);
   run(["commit", "-m", "docs: graph spec"]);
+  const specSha = run(["rev-parse", "HEAD"]).trim();
 
   const contract: SpecContract = {
     kind: "bugfix",
     specPath: "docs/specs/graph.md",
     specSection: "§31.9",
+    specSha,
     altersContract: false,
     approvalId: "appr:proj_1:FIX-1:base:1",
   };
@@ -3383,6 +3385,244 @@ test("§31.9 Round 11: release gate rejects bugfix when spec was modified during
     },
     (err: any) => {
       assert.match(err.message, /была изменена при сведении ветки релиза/);
+      return true;
+    },
+  );
+});
+
+test("§31.9 Round 12: project specBeforeCode with workGraph off leaves 0 delegations and does not block second call", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const dir = makeTempDir("r12-proj-spec-");
+  const { cmd } = initGitRepo(dir);
+
+  const pol = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      presets: {
+        simple: { provider: "p" },
+      },
+      routes: {
+        simple: { preset: "simple", provider: "p" },
+      },
+      levels: {
+        simple: { chain: ["simple"] },
+      },
+    }),
+  );
+
+  const deps = {
+    store,
+    policy: () => pol.policy,
+    loadPolicy: async () => pol,
+    workGraphMode: "off",
+    resolveProject: () => ({ excluded: false, specBeforeCode: true }),
+    repoRoot: dir,
+    cmd,
+    threads: {
+      spawn: async () => ({ id: "thr_exec" }),
+      update: async () => ({}),
+    },
+    probes: { roleByThreadId: () => "orchestrator" },
+    bbCli: {
+      run: async (args: string[]) => {
+        if (args[0] === "tasks" && args[1] === "show") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              task: { id: "t_1", key: "P-SPEC-1", title: "Task" },
+              project: { id: "proj_1", linkedBbProjectId: "proj_1_bb" },
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "{}", stderr: "" };
+      },
+    },
+  };
+
+  // First call: must reject with spec-gate-violation
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "P-SPEC-1",
+          level: "simple",
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_1",
+          },
+        },
+        deps as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+
+  // Store must have 0 rows
+  assert.equal(store.delegationsByTask("P-SPEC-1").length, 0);
+
+  // Second call: must STILL reject with spec-gate-violation (NOT task-already-delegated)
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "P-SPEC-1",
+          level: "simple",
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_1",
+          },
+        },
+        deps as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+  assert.equal(store.delegationsByTask("P-SPEC-1").length, 0);
+});
+
+test("§31.9 Round 12: shadow mode without repoRoot leaves 0 delegations and does not block second call", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const pol = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      presets: {
+        simple: { provider: "p" },
+      },
+      routes: {
+        simple: { preset: "simple", provider: "p" },
+      },
+      levels: {
+        simple: { chain: ["simple"] },
+      },
+    }),
+  );
+
+  const deps = {
+    store,
+    policy: () => pol.policy,
+    loadPolicy: async () => pol,
+    workGraphMode: "shadow",
+    repoRoot: undefined,
+    cmd: undefined,
+    threads: {
+      spawn: async () => ({ id: "thr_exec" }),
+      update: async () => ({}),
+    },
+    probes: { roleByThreadId: () => "orchestrator" },
+    bbCli: {
+      run: async (args: string[]) => {
+        if (args[0] === "tasks" && args[1] === "show") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              task: { id: "t_1", key: "NO-REPO-1", title: "Task" },
+              project: { id: "proj_1", linkedBbProjectId: "proj_1_bb" },
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "{}", stderr: "" };
+      },
+    },
+  };
+
+  // First call rejects with spec-gate-violation
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "NO-REPO-1",
+          level: "simple",
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_1",
+          },
+        },
+        deps as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+
+  assert.equal(store.delegationsByTask("NO-REPO-1").length, 0);
+
+  // Second call STILL rejects with spec-gate-violation (not task-already-delegated)
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "NO-REPO-1",
+          level: "simple",
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_1",
+          },
+        },
+        deps as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+  assert.equal(store.delegationsByTask("NO-REPO-1").length, 0);
+});
+
+test("§31.9 Round 12: bugfix contract without specSha and without baseSha rejects pre-code gate", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const dir = makeTempDir("r12-fix-no-sha-");
+  const { cmd } = initGitRepo(dir);
+
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "FIX-NO-SHA",
+        role: "executor",
+        level: "simple",
+        store,
+        cmd,
+        repoRoot: dir,
+        workGraphMode: "shadow",
+        contract: {
+          kind: "bugfix",
+          specPath: "docs/specs/test.md",
+          specSection: "§1",
+          approvalId: "appr:p1:FIX-NO-SHA:sha:1",
+        },
+      });
+    },
+    (err: any) => {
+      assert.match(err.message, /отсутствует или недействителен коммит спецификации/);
       return true;
     },
   );

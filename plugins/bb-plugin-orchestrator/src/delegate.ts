@@ -705,48 +705,43 @@ export async function runDelegate(
       typeof deps.workGraphMode === "function"
         ? (deps.workGraphMode as any)(params.caller.projectId)
         : deps.workGraphMode;
-    const isGateActive =
-      (mode === "strict" || mode === "shadow" || Boolean(policy.specBeforeCode)) &&
-      Boolean(deps.cmd && deps.repoRoot);
-    if (isGateActive) {
-      const effectiveProj = params.caller.projectId ?? taskRow?.project_id;
-      const proj = effectiveProj && deps.resolveProject
-        ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
-        : (deps.project ?? null);
-      const presetName = params.preset ?? route.preset;
-      const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
-        policy,
-        presetDetails: (policy as any)?.presetDetails,
-      });
-      if (deps.cmd && deps.repoRoot) {
-        try {
-          executorBaseSha = await resolveExecutorBaseSha({
-            cmd: deps.cmd,
-            repoRoot: deps.repoRoot,
-            from: params.from,
-            baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
-          });
-        } catch {}
-      }
-      await verifySpecBeforeCodeGate({
-        taskKey,
-        role,
-        noCode: effectiveNoCode,
-        level,
-        store,
-        cmd: deps.cmd,
-        policy,
-        project: proj,
-        baseSha: executorBaseSha,
-        preparedBaseSha: params.from,
-        baseBranchName: presetBaseBranch,
-        presetName,
-        workGraphMode: mode,
-        specBeforeCode: policy.specBeforeCode,
-        repoRoot: deps.repoRoot,
-        task: taskRow ?? undefined,
-      });
+    const effectiveProj = params.caller.projectId ?? taskRow?.project_id;
+    const proj = effectiveProj && deps.resolveProject
+      ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
+      : (deps.project ?? null);
+    const presetName = params.preset ?? route.preset;
+    const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+      policy,
+      presetDetails: (policy as any)?.presetDetails,
+    });
+    if (deps.cmd && deps.repoRoot) {
+      try {
+        executorBaseSha = await resolveExecutorBaseSha({
+          cmd: deps.cmd,
+          repoRoot: deps.repoRoot,
+          from: params.from,
+          baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
+        });
+      } catch {}
     }
+    await verifySpecBeforeCodeGate({
+      taskKey,
+      role,
+      noCode: effectiveNoCode,
+      level,
+      store,
+      cmd: deps.cmd,
+      policy,
+      project: proj,
+      baseSha: executorBaseSha,
+      preparedBaseSha: params.from,
+      baseBranchName: presetBaseBranch,
+      presetName,
+      workGraphMode: mode,
+      specBeforeCode: policy.specBeforeCode,
+      repoRoot: deps.repoRoot,
+      task: taskRow ?? undefined,
+    });
   }
 
   // Step 2 — the unique index makes this atomic across processes.
@@ -1041,6 +1036,8 @@ export async function dispatchToRoute(
       if (err?.code === "spec-gate-violation") {
         if (opts.onDispatchFailure === "fail") {
           store.setStatus(row.id, "failed");
+        } else {
+          store.remove(row.id);
         }
       }
       throw err;

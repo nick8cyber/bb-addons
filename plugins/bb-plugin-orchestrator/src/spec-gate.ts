@@ -196,24 +196,39 @@ export async function findAcceptedSpecReview(opts: {
 
     if (opts.cmd && opts.repoRoot && !isCodeReview) {
       try {
-        let baseCommit = "HEAD";
-        const mbRes = await opts.cmd.run(
+        let baseCommit = "";
+        const parRes = await opts.cmd.run(
           "git",
-          ["merge-base", "origin/main", revSha],
+          ["rev-parse", "--verify", "--quiet", `${revSha}^`],
           { cwd: opts.repoRoot },
         );
-        if (mbRes.exitCode === 0 && mbRes.stdout.trim()) {
-          baseCommit = mbRes.stdout.trim();
+        if (parRes.exitCode === 0 && parRes.stdout.trim()) {
+          baseCommit = parRes.stdout.trim();
         } else {
-          const parRes = await opts.cmd.run(
-            "git",
-            ["rev-parse", `${revSha}^`],
-            { cwd: opts.repoRoot },
-          );
-          if (parRes.exitCode === 0 && parRes.stdout.trim()) {
-            baseCommit = parRes.stdout.trim();
+          const candidateBases = [
+            (opts as any).baseBranch ? `origin/${(opts as any).baseBranch}` : undefined,
+            (opts as any).baseBranch,
+            "origin/dev",
+            "dev",
+            "origin/main",
+            "main",
+            "origin/master",
+            "master",
+          ].filter(Boolean) as string[];
+
+          for (const cand of candidateBases) {
+            const mbRes = await opts.cmd.run(
+              "git",
+              ["merge-base", cand, revSha],
+              { cwd: opts.repoRoot },
+            );
+            if (mbRes.exitCode === 0 && mbRes.stdout.trim()) {
+              baseCommit = mbRes.stdout.trim();
+              break;
+            }
           }
         }
+        if (!baseCommit) baseCommit = "HEAD";
         const diffRes = await opts.cmd.run(
           "git",
           ["diff", "--name-only", baseCommit, revSha],
@@ -511,9 +526,11 @@ export function resolveTaskSpecContract(
 
     // Fix route with spec section or fix route
     if (typeof pl.spec_section === "string" || typeof pl.specSection === "string" || taskRow?.route === "fix") {
+      const sha = (taskRow?.spec_sha ?? pl.spec_sha ?? pl.specSha) as string | undefined;
       return {
         kind: "bugfix",
         specPath: (pl.spec_path ?? pl.specPath) as string | undefined,
+        specSha: sha,
         specSection: ((pl.spec_section ?? pl.specSection) || "§31.9") as string,
         altersContract: Boolean(pl.alters_contract ?? pl.altersContract),
         approvalId: pl.approval_id ?? pl.approvalId,
@@ -1236,6 +1253,14 @@ export async function verifySpecBeforeCodeGate(
         "spec-gate-violation",
         `spec-gate-violation: исправление ошибки в задаче ${input.taskKey} требует изменения договора (altersContract = true); задача возвращается на этап описания спецификации`,
         "Создай спецификацию на изменение поведения вместо исправления",
+      );
+    }
+
+    if (!contract.specSha || contract.specSha === "base" || !contract.specSha.trim()) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: для исправления в задаче ${input.taskKey} отсутствует или недействителен коммит спецификации (${contract.specSha || "пусто"})`,
+        "Укажи specSha принятой спецификации, поведение которой восстанавливается",
       );
     }
 
