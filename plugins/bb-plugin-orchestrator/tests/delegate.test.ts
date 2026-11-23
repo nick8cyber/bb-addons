@@ -2651,3 +2651,45 @@ test("§34.6 (ADR-0037): design_check appends design_check_packet and applies is
   assert.ok(prompt?.includes("### PACKET CONTENT ###"));
   assert.ok(prompt?.includes("Original instructions"));
 });
+
+test("cross-project delegation preserves task projectId in delegation row, attach and spawn (PLUG-395)", async () => {
+  const { deps, store, spawnArgs } = makeDeps({
+    cli: (args) => {
+      if (args.join(" ").startsWith("tasks show")) {
+        return ok(
+          JSON.stringify({
+            task: { id: "task-smk-99", key: "SMK-99", title: "smoke", description: "body", status: "todo" },
+            project: { name: "isolated", linkedBbProjectId: "proj_isolated" },
+            subtasks: [],
+            attachments: [],
+            comments: [],
+          }),
+        );
+      }
+      return defaultCli(args);
+    },
+  });
+  store.insertTask({
+    taskKey: "SMK-99",
+    projectId: "proj_isolated",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "simple",
+  });
+
+  const res = await runDelegate(
+    {
+      taskKey: "SMK-99",
+      level: "simple",
+      caller: COORDINATOR, // COORDINATOR.projectId is "proj_main"
+      projectId: "proj_isolated",
+    },
+    deps,
+  );
+  assert.equal(res.ok, true);
+  const row = store.get(res.delegationId)!;
+  // Delegation row must carry task's project ID, NOT coordinator's project ID
+  assert.equal(row.project_id, "proj_isolated");
+  // Threads spawn must also carry task's project ID
+  assert.equal(spawnArgs[0]?.projectId, "proj_isolated");
+});

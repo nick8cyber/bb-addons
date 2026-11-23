@@ -1593,7 +1593,7 @@ export async function createPlugin(
       }
       const taskPid = (await resolveTaskProjectId(store, input.taskKey, { bbCli })) ?? caller.projectId;
       const wtCtx = await resolveWorktreeContext(input.threadId, taskPid, undefined).catch(() => null);
-      return runDelegate({ ...input, caller }, {
+      return runDelegate({ ...input, caller, projectId: taskPid }, {
         store,
         bbCli,
         threads: bb.sdk.threads as unknown as DelegateThreads,

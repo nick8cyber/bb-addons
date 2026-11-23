@@ -103,6 +103,7 @@ export interface DelegateParams {
   kind?: string;
   baseSha?: string;
   headSha?: string;
+  projectId?: string;
 }
 
 export interface DelegateResult {
@@ -504,6 +505,18 @@ export async function runDelegate(
   const held = store.heldGroups(Date.now());
   const role = roleForLevel(level, policy);
   const taskRow = store.getTask?.(taskKey);
+
+  let taskProjectId = params.projectId ?? taskRow?.project_id;
+  if (!taskProjectId && deps.bbCli) {
+    try {
+      const shown = await runJson<{ task?: { projectId?: string }; project?: { linkedBbProjectId?: string } }>(
+        deps.bbCli,
+        ["tasks", "show", taskKey, "--json"],
+      );
+      taskProjectId = shown?.task?.projectId ?? shown?.project?.linkedBbProjectId;
+    } catch {}
+  }
+  taskProjectId = taskProjectId ?? params.caller.projectId;
   let routeName: string;
   let route: PolicyRoute;
   let reviewerWarning: string | undefined;
@@ -710,9 +723,9 @@ export async function runDelegate(
   if (role === "executor" && !effectiveNoCode) {
     const mode =
       typeof deps.workGraphMode === "function"
-        ? (deps.workGraphMode as any)(params.caller.projectId)
+        ? (deps.workGraphMode as any)(taskProjectId)
         : deps.workGraphMode;
-    const effectiveProj = params.caller.projectId ?? taskRow?.project_id;
+    const effectiveProj = taskProjectId;
     const proj = effectiveProj && deps.resolveProject
       ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
       : (deps.project ?? null);
@@ -854,7 +867,7 @@ export async function runDelegate(
   try {
     row = store.insert({
       taskKey,
-      projectId: params.caller.projectId,
+      projectId: taskProjectId,
       coordinatorThreadId: params.caller.threadId,
       level,
       route: routeName,
@@ -872,7 +885,7 @@ export async function runDelegate(
           ? JSON.stringify({
               kind: "spec_review",
               taskKey,
-              projectId: params.caller.projectId ?? taskRow?.project_id ?? null,
+              projectId: taskProjectId,
               repo: repoIdentity,
               baseSha: specBaseSha,
               headSha: specHeadSha,
