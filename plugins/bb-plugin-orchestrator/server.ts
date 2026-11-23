@@ -1591,7 +1591,7 @@ export async function createPlugin(
           `calling thread ${input.threadId} is not readable: ${describeError(e)}`,
         );
       }
-      const taskPid = (await resolveTaskProjectId(store, input.taskKey, { bbCli })) ?? caller.projectId;
+      const taskPid = (await resolveTaskProjectId(store, input.taskKey, { bbCli, heal: true, log: bb.log })) ?? caller.projectId;
       const wtCtx = await resolveWorktreeContext(input.threadId, taskPid, undefined).catch(() => null);
       return runDelegate({ ...input, caller, projectId: taskPid }, {
         store,
@@ -2600,7 +2600,7 @@ export async function createPlugin(
         };
       }
       const mode = store.getTaskConfirmationMode(key);
-      const taskPid = await resolveTaskProjectId(store, key, { bbCli });
+      const taskPid = await resolveTaskProjectId(store, key, { bbCli, log: bb.log });
       const finalPid = taskPid ?? threadPid;
       return {
         taskKey: key,
@@ -2654,7 +2654,7 @@ export async function createPlugin(
       return { ok: true as const };
     },
     async ownerApprove(input) {
-      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli, log: bb.log });
       const res = await runApprove(input.taskKey, input.comment, {
         store,
         ctx: {},
@@ -2675,7 +2675,7 @@ export async function createPlugin(
       };
     },
     async ownerReject(input) {
-      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli, log: bb.log });
       const res = await runReject(input.taskKey, input.target, input.reason, {
         store,
         ctx: {},
@@ -2696,7 +2696,7 @@ export async function createPlugin(
       };
     },
     async ownerDefer(input) {
-      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli, log: bb.log });
       const res = await runDefer(input.taskKey, input.reason, {
         store,
         ctx: {},
@@ -2716,7 +2716,7 @@ export async function createPlugin(
       };
     },
     async ownerResume(input) {
-      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli, log: bb.log });
       const res = await runResume(input.taskKey, input.target, {
         store,
         ctx: {},
@@ -2737,7 +2737,7 @@ export async function createPlugin(
       };
     },
     async ownerDequeue(input) {
-      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli });
+      const taskPid = await resolveTaskProjectId(store, input.taskKey, { bbCli, log: bb.log });
       const res = await runDequeue(input.taskKey, input.reason, {
         store,
         cmd: cmdRunner,
@@ -4457,7 +4457,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator enqueue <KEY> ...",
             );
           }
-          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli, heal: true, log: bb.log })) ?? ctx.projectId;
           if (getWorkGraphMode(taskProjId) === "off") {
             throw new OrchestratorError(
               "graph-disabled",
@@ -4553,7 +4553,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator dequeue <KEY> ...",
             );
           }
-          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli, log: bb.log })) ?? ctx.projectId;
           if (getWorkGraphMode(taskProjId) === "off") {
             throw new OrchestratorError(
               "graph-disabled",
@@ -4593,7 +4593,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator defer <KEY> --reason <причина>",
             );
           }
-          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli, log: bb.log })) ?? ctx.projectId;
           const res = await runDefer(taskKey, flag("--reason"), {
             store,
             ctx,
@@ -4616,7 +4616,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator reject <KEY> [--target <t>] --reason <причина>",
             );
           }
-          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli, log: bb.log })) ?? ctx.projectId;
           const res = await runReject(taskKey, flag("--target"), flag("--reason"), {
             store,
             ctx,
@@ -4644,7 +4644,7 @@ abandoned: ${res.reported
             ctx.projectId,
             ctx.cwd,
           ).catch(() => null);
-          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli, log: bb.log })) ?? ctx.projectId;
           const res = await runResume(taskKey, flag("--target"), {
             store,
             ctx,
@@ -4670,7 +4670,7 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator approve <KEY> [--comment <text>]",
             );
           }
-          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli, log: bb.log })) ?? ctx.projectId;
           const res = await runApprove(taskKey, flag("--comment"), {
             store,
             ctx,
@@ -4694,7 +4694,7 @@ abandoned: ${res.reported
               'укажи ключ и заметку: bb orchestrator release-note <KEY> "<заметка>"',
             );
           }
-          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli })) ?? ctx.projectId;
+          const taskProjId = (await resolveTaskProjectId(store, taskKey, { bbCli, log: bb.log })) ?? ctx.projectId;
           const res = await runReleaseNote(taskKey, note, {
             store,
             ctx,

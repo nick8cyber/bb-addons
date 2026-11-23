@@ -52,18 +52,25 @@ test("resolveTaskProjectId: handles confirmed conflict between historical done-d
     },
   );
 
-  // 2. Standard recovery path (default): tracker is authoritative, heals delegations
+  // 2. Standard recovery path (read-only): tracker is authoritative, does not mutate DB without heal: true
   const warnings: string[] = [];
-  const resolved = await resolveTaskProjectId(store, "CONFLICT-1", {
+  const resolvedReadOnly = await resolveTaskProjectId(store, "CONFLICT-1", {
     tracker: trackerMock,
     log: { warn: (msg) => warnings.push(msg) },
   });
 
-  assert.equal(resolved, "proj_tracker");
+  assert.equal(resolvedReadOnly, "proj_tracker");
   assert.equal(warnings.length, 1);
   assert.match(warnings[0]!, /recovering to tracker project proj_tracker/);
+  // Verify DB was NOT mutated on read-only call
+  assert.equal(store.get(del.id)!.project_id, "proj_old");
 
-  // Verify historical delegation was healed in DB
+  // 3. Mutating recovery path (heal: true): heals historical delegations in DB
+  const resolvedHeal = await resolveTaskProjectId(store, "CONFLICT-1", {
+    tracker: trackerMock,
+    heal: true,
+  });
+  assert.equal(resolvedHeal, "proj_tracker");
   const healed = store.get(del.id)!;
   assert.equal(healed.project_id, "proj_tracker");
 });

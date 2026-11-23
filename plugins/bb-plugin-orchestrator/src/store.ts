@@ -4652,7 +4652,7 @@ export class DelegationStore {
     const key = normalizeTaskKey(taskKey);
     this.db
       .prepare(
-        `UPDATE delegations SET project_id = ? WHERE task_key = ? AND (status = 'done' OR status = 'failed' OR status = 'cancelled')`,
+        `UPDATE delegations SET project_id = ? WHERE task_key = ? AND status IN ('done', 'failed', 'cancelled', 'reissued', 'stalled', 'quota')`,
       )
       .run(projectId, key);
   }

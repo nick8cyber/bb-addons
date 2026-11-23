@@ -333,6 +333,7 @@ export type TaskTrackerOrOptions =
       bbCli?: BbCli | null;
       cmd?: CmdRunner | null;
       onConflict?: "recover" | "refuse";
+      heal?: boolean;
       log?: { warn?: (msg: string) => void };
     }
   | null;
@@ -352,10 +353,14 @@ function extractProjectIdFromRecord(res: any): string | null {
 }
 
 /**
- * §32.2 п.2 (PLUG-361): Task Project Resolution strictly in order:
+ * §32.2 п.2 (PLUG-395): Task Project Resolution:
  * 1) task_queue: project_id column (or payload.project_id);
- * 2) delegations: project_id column from active or latest completed delegation;
- * 3) tracker: metadata query via tracker API bb tasks / tracker.getTask(taskKey) -> task.projectId.
+ * 2) delegations: project_id column from active delegation in-flight;
+ * 3) tracker: metadata query via tracker API bb tasks / tracker.getTask(taskKey) -> task.projectId;
+ * 4) conflict resolution: if trackerPid !== donePid:
+ *    - onConflict === "refuse" throws task-project-conflict;
+ *    - onConflict === "recover" (default) logs warning; if heal === true, heals historical rows in delegations;
+ * 5) delegations: historical completed delegation fallback if tracker unavailable.
  */
 export async function resolveTaskProjectId(
   store: DelegationStore,
@@ -402,6 +407,7 @@ export async function resolveTaskProjectId(
   let bbCli: BbCli | undefined | null;
   let cmd: CmdRunner | undefined | null;
   let onConflict: "recover" | "refuse" | undefined;
+  let heal: boolean | undefined;
   let log: { warn?: (msg: string) => void } | undefined;
   if (options) {
     if ("getTask" in options && typeof (options as any).getTask === "function") {
@@ -412,12 +418,14 @@ export async function resolveTaskProjectId(
         bbCli?: BbCli | null;
         cmd?: CmdRunner | null;
         onConflict?: "recover" | "refuse";
+        heal?: boolean;
         log?: { warn?: (msg: string) => void };
       };
       tracker = opts.tracker;
       bbCli = opts.bbCli;
       cmd = opts.cmd;
       onConflict = opts.onConflict;
+      heal = opts.heal;
       log = opts.log;
     }
   }
@@ -469,9 +477,11 @@ export async function resolveTaskProjectId(
       log?.warn?.(
         `orchestrator: task ${key} project conflict: historical delegation has ${donePid}, tracker has ${trackerPid}; recovering to tracker project ${trackerPid}`,
       );
-      try {
-        store.healTaskProject?.(key, trackerPid);
-      } catch {}
+      if (heal) {
+        try {
+          store.healTaskProject?.(key, trackerPid);
+        } catch {}
+      }
     }
     return trackerPid;
   }
