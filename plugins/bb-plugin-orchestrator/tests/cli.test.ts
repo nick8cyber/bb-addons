@@ -1118,3 +1118,65 @@ test("§18.6: the 2500 limit applies to the REAL handoffPath", async () => {
   assert.ok(!text.includes("yyyy"), "addition dropped");
   assert.match(text, /ни sudo/, "mandatory tail intact");
 });
+
+test("§31.9: CLI delegate forwards --kind, --base-sha, and --head-sha", async () => {
+  const { cli } = fakeCli();
+  const host = await hostWith(
+    {
+      policy: JSON.stringify({
+        version: 1,
+        limits: { maxActive: 5 },
+        levels: {
+          simple: { chain: ["simple"] },
+          review: { chain: ["simple"] },
+        },
+        routes: { simple: { preset: "simple", provider: "acp-opencode" } },
+      }),
+    },
+    cli,
+    {
+      threads: {
+        get: async () => ({
+          id: "thr_coord",
+          parentThreadId: null,
+          title: "coordinator",
+          titleFallback: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        }),
+        spawn: async () => ({ id: "thr_rev" }),
+        list: async () => [],
+        update: async () => ({}),
+      },
+    },
+  );
+  const res = await host.harness.runCli(
+    [
+      "delegate",
+      "PLUG-1",
+      "--level",
+      "review",
+      "--kind",
+      "spec_review",
+      "--base-sha",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "--head-sha",
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "--json",
+    ],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(res.exitCode, 0);
+  const body = JSON.parse(res.stdout);
+  assert.equal(body.ok, true);
+  const shown = await host.harness.runCli(
+    ["show", String(body.delegationId), "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(shown.exitCode, 0);
+  const delegation = (JSON.parse(shown.stdout) as { delegation: any }).delegation;
+  const attach = JSON.parse(delegation.attach);
+  assert.equal(attach.kind, "spec_review");
+  assert.equal(attach.baseSha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  assert.equal(attach.headSha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+});

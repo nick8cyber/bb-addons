@@ -774,10 +774,10 @@ export async function runDelegate(
       repoIdentity = deps.repoRoot;
     }
 
-    const headCand = params.headSha ?? params.from ?? continueFrom ?? "HEAD";
+    const headCand = params.headSha ?? params.from ?? continueFrom;
     if (deps.cmd && deps.repoRoot && headCand) {
       try {
-        const revHead = await deps.cmd.run("git", ["rev-parse", headCand], { cwd: deps.repoRoot });
+        const revHead = await deps.cmd.run("git", ["rev-parse", "--verify", `${headCand}^{commit}`], { cwd: deps.repoRoot });
         if (revHead.exitCode === 0 && revHead.stdout.trim().length === 40) {
           specHeadSha = revHead.stdout.trim();
         }
@@ -790,79 +790,30 @@ export async function runDelegate(
     if (params.baseSha) {
       if (deps.cmd && deps.repoRoot) {
         try {
-          const revBase = await deps.cmd.run("git", ["rev-parse", params.baseSha], { cwd: deps.repoRoot });
+          const revBase = await deps.cmd.run("git", ["rev-parse", "--verify", `${params.baseSha}^{commit}`], { cwd: deps.repoRoot });
           if (revBase.exitCode === 0 && revBase.stdout.trim().length === 40) {
             specBaseSha = revBase.stdout.trim();
           }
         } catch {}
-      }
-      if (!specBaseSha && params.baseSha.length === 40 && /^[0-9a-f]{40}$/i.test(params.baseSha)) {
+      } else if (params.baseSha.length === 40 && /^[0-9a-f]{40}$/i.test(params.baseSha)) {
         specBaseSha = params.baseSha;
       }
-    } else if (deps.cmd && deps.repoRoot && specHeadSha) {
-      try {
-        const presetName = params.preset ?? route.preset;
-        const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
-          policy,
-          presetDetails: (policy as any)?.presetDetails,
-        });
-        const proj = (params.caller.projectId ?? taskRow?.project_id) && deps.resolveProject
-          ? await Promise.resolve(deps.resolveProject(params.caller.projectId ?? taskRow?.project_id)).catch(() => null)
-          : (deps.project ?? null);
-        const baseBranch = presetBaseBranch ?? (proj as any)?.baseBranch ?? (policy as any)?.baseBranch;
-        const candidateBases = [
-          baseBranch ? (baseBranch.startsWith("origin/") ? baseBranch : `origin/${baseBranch}`) : undefined,
-          baseBranch,
-          "origin/dev",
-          "origin/main",
-          "origin/master",
-          "dev",
-          "main",
-          "master",
-        ].filter(Boolean) as string[];
-
-        for (const cand of candidateBases) {
-          const mbRes = await deps.cmd.run("git", ["merge-base", cand, specHeadSha], { cwd: deps.repoRoot });
-          if (mbRes.exitCode === 0 && mbRes.stdout.trim()) {
-            const mb = mbRes.stdout.trim();
-            if (mb !== specHeadSha) {
-              specBaseSha = mb;
-              break;
-            }
-          }
-        }
-        if (!specBaseSha) {
-          const parRes = await deps.cmd.run("git", ["rev-parse", "--verify", "--quiet", `${specHeadSha}^`], { cwd: deps.repoRoot });
-          if (parRes.exitCode === 0 && parRes.stdout.trim()) {
-            specBaseSha = parRes.stdout.trim();
-          }
-        }
-      } catch {}
     }
 
-    if (params.kind === "spec_review" || taskRow?.node === "spec_review") {
+    if (params.kind === "spec_review" || taskRow?.node === "spec_review" || level === "spec_review") {
       isSpecReview = true;
     }
 
-    if (specBaseSha && specHeadSha && deps.cmd && deps.repoRoot) {
+    if (isSpecReview && specBaseSha && specHeadSha && deps.cmd && deps.repoRoot) {
       try {
         const diffRes = await deps.cmd.run("git", ["diff", "--name-only", specBaseSha, specHeadSha], { cwd: deps.repoRoot });
         if (diffRes.exitCode === 0 && diffRes.stdout.trim()) {
           const files = diffRes.stdout.split("\n").map(s => s.trim()).filter(Boolean);
-          let allDocs = true;
-          const foundDocs: string[] = [];
           for (const f of files) {
             if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
-            if (isDocOrSpecPath(f)) {
-              foundDocs.push(f);
-            } else {
-              allDocs = false;
-              break;
+            if (isDocOrSpecPath(f) && !specPaths.includes(f)) {
+              specPaths.push(f);
             }
-          }
-          if (allDocs && foundDocs.length > 0) {
-            isSpecReview = true;
-            specPaths = foundDocs;
           }
         }
       } catch {}
@@ -894,7 +845,7 @@ export async function runDelegate(
       noCode: effectiveNoCode,
       // §20.1 п.4: the attach spec survives onto the row — a reissue
       // lists the same `--attach` paths in the seed prompt.
-      // §31.9: Strict spec review binding persists kind, baseSha, headSha, paths, repo, and project.
+      // §31.9: Strict spec review binding persists kind, baseSha, headSha, specPaths, paths, repo, and project.
       attach:
         isSpecReview && specBaseSha && specHeadSha
           ? JSON.stringify({
@@ -904,12 +855,13 @@ export async function runDelegate(
               repo: repoIdentity,
               baseSha: specBaseSha,
               headSha: specHeadSha,
-              paths: specPaths,
+              specPaths: specPaths,
+              paths: params.attach ?? [],
               from: params.from ?? specHeadSha ?? null,
             })
           : params.attach?.length || params.from
             ? JSON.stringify({
-                kind: params.kind ?? (isReview ? "review" : undefined),
+                kind: isReview ? "review" : params.kind,
                 paths: params.attach ?? [],
                 from: params.from ?? null,
               })
@@ -1343,6 +1295,21 @@ export async function dispatchToRoute(
     ? t("instr.attachList", { list: spec.paths.join(", ") })
     : undefined;
   const contractForTask = resolveTaskSpecContract(row.task_key, store, null);
+  let specReviewPrompt: string | undefined;
+  if (role === "auditor" && row.attach) {
+    try {
+      const att = JSON.parse(row.attach);
+      if (att && att.kind === "spec_review" && att.baseSha && att.headSha) {
+        const docsList =
+          att.specPaths && att.specPaths.length > 0
+            ? att.specPaths.join(", ")
+            : att.paths && att.paths.length > 0
+              ? att.paths.join(", ")
+              : "спецификации задачи";
+        specReviewPrompt = `Диапазон проверки спецификации: ${att.baseSha}..${att.headSha}, документы: ${docsList}.\nУбедись, что проверяются исключительно изменения спецификации/документации в указанном диапазоне и нет изменений кода.`;
+      }
+    } catch {}
+  }
   const mechanicalPrompt =
     role === "auditor" &&
     contractForTask?.kind === "mechanical" &&
@@ -1350,7 +1317,12 @@ export async function dispatchToRoute(
       ? `Внимание: задача заявлена как механическая работа без изменения поведения (§31.9).\nЗаявленное основание: "${contractForTask.mechanicalBasis}".\nПроверь по фактическому диффу, что изменения действительно носят исключительно механический характер и не изменяют поведение системы.`
       : undefined;
   const extra =
-    [opts.instructions?.trim(), attachLine?.trim(), mechanicalPrompt?.trim()]
+    [
+      opts.instructions?.trim(),
+      attachLine?.trim(),
+      specReviewPrompt?.trim(),
+      mechanicalPrompt?.trim(),
+    ]
       .filter(Boolean)
       .join("\n\n") || undefined;
   const instructions = mergeDispatchInstructions(

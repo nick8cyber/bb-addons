@@ -5,6 +5,7 @@
  * reissues, route fallbacks) and before publishing releases.
  */
 
+import { basename } from "node:path";
 import { OrchestratorError } from "./errors.js";
 import type { CmdRunner } from "./cmd.js";
 import type { BbCli } from "./bb-cli.js";
@@ -203,6 +204,15 @@ export async function findAcceptedSpecReview(opts: {
     if (att.taskKey && normalizeTaskKey(att.taskKey) !== normKey) {
       continue;
     }
+    if (att.repo && opts.repoRoot) {
+      try {
+        const normAttRepo = att.repo.replace(/\/+$/, "");
+        const normOptsRepo = opts.repoRoot.replace(/\/+$/, "");
+        if (normAttRepo !== normOptsRepo && basename(normAttRepo) !== basename(normOptsRepo)) {
+          continue;
+        }
+      } catch {}
+    }
 
     if (opts.cmd && opts.repoRoot) {
       // 1) Verify both Git objects exist in the repository
@@ -236,9 +246,15 @@ export async function findAcceptedSpecReview(opts: {
 
       if (hasNonDoc || specPaths.length === 0) continue;
 
+      const rawSpecPaths = Array.isArray(att.specPaths) && att.specPaths.length > 0
+        ? att.specPaths
+        : (Array.isArray(att.paths) && att.paths.length > 0 ? att.paths : []);
+
       const specPath =
         specPaths.find((p) => p.includes("specs/") || p.endsWith(".md")) ??
+        rawSpecPaths.find((p: string) => p.includes("specs/") || p.endsWith(".md")) ??
         specPaths[0] ??
+        rawSpecPaths[0] ??
         `docs/specs/${normKey}.md`;
 
       const projId = rev.project_id ?? opts.projectId ?? "proj";
@@ -252,7 +268,10 @@ export async function findAcceptedSpecReview(opts: {
       };
     } else {
       // Without cmd/repoRoot
-      const specPaths = Array.isArray(att.paths) && att.paths.length > 0 ? att.paths : [`docs/specs/${normKey}.md`];
+      const rawSpecPaths = Array.isArray(att.specPaths) && att.specPaths.length > 0
+        ? att.specPaths
+        : (Array.isArray(att.paths) && att.paths.length > 0 ? att.paths : []);
+      const specPaths = rawSpecPaths.length > 0 ? rawSpecPaths : [`docs/specs/${normKey}.md`];
       const specPath =
         specPaths.find((p: string) => p.includes("specs/") || p.endsWith(".md")) ??
         specPaths[0];
@@ -908,7 +927,7 @@ export async function verifySpecBeforeCodeGate(
       throw new OrchestratorError(
         "spec-gate-violation",
         `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация отсутствует (§31.9). Для старой записи ревью без доказанного базового коммита требуется назначить ревью спецификации с явным диапазоном SHA (baseSha и headSha) до запуска кода`,
-        "Назначь ревью спецификации с явным диапазоном SHA через bb orchestrator delegate <KEY> --level review --from <headSha> или одобри спецификацию через команду approve",
+        "Назначь ревью спецификации с явным диапазоном SHA через bb orchestrator delegate <KEY> --level review --kind spec_review --base-sha <baseSha> --from <headSha> или одобри спецификацию через команду approve",
       );
     }
     throw new OrchestratorError(

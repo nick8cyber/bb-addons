@@ -4027,3 +4027,300 @@ test("§31.9 Acceptance Scenario 3: missing recorded baseSha in old review requi
   assert.equal(execRes.status, "running");
   assert.equal(spawnCount, 2, "Executor must be spawned after positive spec review (1 reviewer + 1 executor)");
 });
+
+test("§31.9 Acceptance Scenario 2: ordinary review of multi-commit branch with code in commit 1 and doc in commit 2 does NOT approve spec", async () => {
+  const dir = makeTempDir("r14-scen2-");
+  const { run, cmd } = initGitRepo(dir);
+
+  // Commit 1: add code file
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/feature.ts"), "export const feat = 42;\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "feat: add feature code"]);
+  const codeSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Commit 2: add spec doc (docs-only commit at the tip)
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/scen2.md"), "# Spec\n§1: requirement\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "docs: add scen2 spec"]);
+  const tipSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.insertTask({
+    taskKey: "SCEN2-1",
+    projectId: "proj_scen2",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+  });
+
+  let spawnCount = 0;
+  const mockThreads = {
+    spawn: async () => {
+      spawnCount++;
+      return { id: "thr_mock_scen2" };
+    },
+  };
+
+  const pol = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      presets: {
+        devin: { provider: "acp-devin", baseBranch: "main" },
+        "opus55-review": { provider: "claude-code", baseBranch: "main" },
+      },
+      routes: {
+        devin: { preset: "devin", provider: "acp-devin" },
+        "review-opus": { preset: "opus55-review", provider: "claude-code" },
+      },
+      levels: {
+        complex: { chain: ["devin"] },
+        review: { chain: ["review-opus"] },
+      },
+    }),
+  );
+
+  const fakeCli: BbCli = {
+    run: async (args: string[]) => {
+      if (args[0] === "tasks" && args[1] === "preset") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            preset: {
+              providerId: "acp-devin",
+              permissionMode: "full",
+              environmentKind: "host",
+              baseBranch: "main",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "tasks" && args[1] === "show") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            task: { id: "t_scen2", key: "SCEN2-1", title: "Task" },
+            project: { id: "proj_scen2", linkedBbProjectId: "proj_scen2_bb" },
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "{}", stderr: "" };
+    },
+  };
+
+  // Dispatch ordinary review (NOT spec_review, no baseSha passed)
+  const revDel = await runDelegate(
+    {
+      taskKey: "SCEN2-1",
+      level: "review",
+      from: tipSha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_scen2",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+    } as any,
+  );
+  assert.equal(revDel.ok, true);
+
+  const revRow = store.get(revDel.delegationId)!;
+  const parsedAttach = revRow.attach ? JSON.parse(revRow.attach) : null;
+  assert.notEqual(parsedAttach?.kind, "spec_review", "Ordinary review must NOT be marked as spec_review");
+
+  // Review completes OK with 0 blockers
+  store.setStatus(revDel.delegationId, "running");
+  store.setStatusIf(revDel.delegationId, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  // findAcceptedSpecReview must return null
+  const found = await findAcceptedSpecReview({
+    taskKey: "SCEN2-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    projectId: "proj_scen2",
+  });
+  assert.equal(found, null, "Ordinary review with code in branch must NOT be accepted as spec review");
+
+  // Attempt to delegate executor: must be rejected with spec-gate-violation and 0 executor spawns!
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "SCEN2-1",
+          level: "complex",
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_scen2",
+          },
+        },
+        {
+          store,
+          policy: () => pol.policy,
+          loadPolicy: async () => pol,
+          bbCli: fakeCli,
+          threads: mockThreads as any,
+          probes: { roleByThreadId: () => "orchestrator" },
+          primaryHostId: async () => "host_1",
+          cmd,
+          repoRoot: dir,
+          workGraphMode: "shadow",
+        } as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+  assert.equal(spawnCount, 1, "Only 1 spawn (the review thread), executor was blocked");
+});
+
+test("§31.9 spec review dispatch without confirmed baseSha does not record spec_review approval", async () => {
+  const dir = makeTempDir("r14-nobase-");
+  const { run, cmd } = initGitRepo(dir);
+
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/nobase.md"), "# Spec\n§1: content\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "docs: nobase spec"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.insertTask({
+    taskKey: "NOBASE-1",
+    projectId: "proj_nobase",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+  });
+
+  const pol = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      presets: {
+        devin: { provider: "acp-devin", baseBranch: "main" },
+        "opus55-review": { provider: "claude-code", baseBranch: "main" },
+      },
+      routes: {
+        devin: { preset: "devin", provider: "acp-devin" },
+        "review-opus": { preset: "opus55-review", provider: "claude-code" },
+      },
+      levels: {
+        complex: { chain: ["devin"] },
+        review: { chain: ["review-opus"] },
+      },
+    }),
+  );
+
+  const fakeCli: BbCli = {
+    run: async (args: string[]) => {
+      if (args[0] === "tasks" && args[1] === "preset") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            preset: {
+              providerId: "claude-code",
+              permissionMode: "full",
+              environmentKind: "host",
+              baseBranch: "main",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "tasks" && args[1] === "show") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            task: { id: "t_nobase", key: "NOBASE-1", title: "Task" },
+            project: { id: "proj_nobase", linkedBbProjectId: "proj_nobase_bb" },
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "{}", stderr: "" };
+    },
+  };
+
+  // Dispatch spec_review with missing / unconfirmed baseSha
+  const revDel = await runDelegate(
+    {
+      taskKey: "NOBASE-1",
+      level: "review",
+      kind: "spec_review",
+      // baseSha omitted!
+      from: headSha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_nobase",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: { spawn: async () => ({ id: "thr_mock_nobase" }) } as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+    } as any,
+  );
+  assert.equal(revDel.ok, true);
+
+  const revRow = store.get(revDel.delegationId)!;
+  const parsedAttach = revRow.attach ? JSON.parse(revRow.attach) : null;
+  assert.notEqual(parsedAttach?.kind, "spec_review", "Spec review without confirmed base must NOT record kind: spec_review");
+  assert.equal(parsedAttach?.baseSha, undefined);
+
+  // Complete review OK/0
+  store.setStatus(revDel.delegationId, "running");
+  store.setStatusIf(revDel.delegationId, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  // findAcceptedSpecReview must return null
+  const found = await findAcceptedSpecReview({
+    taskKey: "NOBASE-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    projectId: "proj_nobase",
+  });
+  assert.equal(found, null);
+});

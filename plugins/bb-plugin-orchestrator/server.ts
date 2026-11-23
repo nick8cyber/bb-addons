@@ -1570,6 +1570,9 @@ export async function createPlugin(
     noCode?: boolean;
     attach?: string[];
     threadId?: string;
+    kind?: string;
+    baseSha?: string;
+    headSha?: string;
   }) =>
     enqueue(async () => {
       if (!input.threadId) {
@@ -2795,6 +2798,18 @@ export async function createPlugin(
         .array(z.string().min(1))
         .optional()
         .describe(t("tool.delAttach")),
+      kind: z
+        .string()
+        .optional()
+        .describe(t("tool.delKind")),
+      baseSha: z
+        .string()
+        .optional()
+        .describe(t("tool.delBaseSha")),
+      headSha: z
+        .string()
+        .optional()
+        .describe(t("tool.delHeadSha")),
     }),
     async execute(params, ctx) {
       // §5.6 (r33.11): a productive call resets the idle nudge schedule.
@@ -3815,6 +3830,9 @@ export async function createPlugin(
             fresh: argv.includes("--fresh"),
             noCode: argv.includes("--no-code") ? true : undefined,
             ...(attach.length ? { attach } : {}),
+            kind: flag("--kind"),
+            baseSha: flag("--base-sha"),
+            headSha: flag("--head-sha"),
             threadId: ctx.threadId,
           });
           return json

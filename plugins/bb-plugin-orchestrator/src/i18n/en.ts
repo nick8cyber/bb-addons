@@ -734,6 +734,9 @@ export const EN: Record<string, string> = {
     "(§6 --fresh)",
   "tool.delAttach":
     "Repo file paths to list in the task instructions (§20.1 п.4)",
+  "tool.delKind": "Delegation kind, e.g. 'spec_review' (§31.9)",
+  "tool.delBaseSha": "Explicit base SHA for spec review range (§31.9)",
+  "tool.delHeadSha": "Explicit head SHA for spec review range (§31.9)",
   "tool.status":
     "List this coordinator's delegations and counters (active vs " +
     "policy limits).",
