@@ -4769,6 +4769,10 @@ async function startQueuedTask(
   const normKey = normalizeTaskKey(task.task_key);
   const payload = parsePayload(task.payload);
   const now = deps.now ? deps.now() : Date.now();
+  const effectiveMode =
+    task.confirmation_mode ??
+    deps.approvalMode ??
+    (task.route === "feature" ? "manual" : "auto");
 
   let branch = task.branch;
   if (task.route !== "research") {
@@ -4821,7 +4825,7 @@ async function startQueuedTask(
               node: "start",
               status: "queued",
               event: { type: "queue_take", branchExistsWithCommits: true, branch },
-              mode: task.confirmation_mode,
+              mode: effectiveMode,
               counters: extractCounters(task),
             });
             const tr = deps.store.transitionTask({
@@ -4860,7 +4864,7 @@ async function startQueuedTask(
             node: "start",
             status: "queued",
             event: { type: "git_failure", reason, gitError: reason },
-            mode: task.confirmation_mode,
+            mode: effectiveMode,
             counters: extractCounters(task),
           });
           if (!failTr.allowed) {
@@ -4889,7 +4893,7 @@ async function startQueuedTask(
     node: "start",
     status: "queued",
     event: { type: "queue_take" },
-    mode: task.confirmation_mode,
+    mode: effectiveMode,
     counters: extractCounters(task),
   });
 
@@ -4908,7 +4912,7 @@ async function startQueuedTask(
           node: "start",
           status: "queued",
           event: { type: "git_failure", reason },
-          mode: task.confirmation_mode,
+          mode: effectiveMode,
           counters: extractCounters(task),
         });
         if (!failTr.allowed) {
@@ -5110,7 +5114,7 @@ async function startQueuedTask(
   // ONLY if explicit and valid acceptance contract text was provided
   if (
     (task.route === "fix" || task.route === "simple") &&
-    task.confirmation_mode === "auto"
+    effectiveMode === "auto"
   ) {
     const existingContract = deps.store.getSpecContract(task.task_key);
     if (!existingContract?.approval_id && payload.acceptance_text) {

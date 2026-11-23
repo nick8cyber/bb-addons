@@ -998,10 +998,25 @@ export async function verifySpecBeforeCodeGate(
   const effectiveApprovalMode =
     (taskConfMode === "auto" || taskConfMode === "manual")
       ? taskConfMode
-      : (resolvedInputApprovalMode ?? (input.project as any)?.approvalMode ?? (input.policy as any)?.approvalMode ?? null);
+      : ((input.project as any)?.approvalMode ?? (input.policy as any)?.approvalMode ?? resolvedInputApprovalMode ?? null);
   const isAutoMode = effectiveApprovalMode === "auto";
 
   let pendingContractToSave: SpecContract | null = null;
+
+  if (!input.repoRoot || !input.repoRoot.trim()) {
+    throw new OrchestratorError(
+      "spec-gate-violation",
+      `spec-gate-violation: репозиторий задачи ${input.taskKey} не определён или недоступен для проверки спецификации`,
+      "Убедись, что репозиторий проекта доступен на текущем хосте",
+    );
+  }
+
+  if (!input.cmd) {
+    throw new OrchestratorError(
+      "spec-gate-violation",
+      `spec-gate-violation: git-команды недоступны для проверки спецификации задачи ${input.taskKey}`,
+    );
+  }
 
   // Resolve base commit SHA if possible before review matching (§31.9: exact executor base)
   const cmd = input.cmd;
@@ -1041,56 +1056,67 @@ export async function verifySpecBeforeCodeGate(
       targetSha,
     });
     if (specRev) {
-      const shouldSynthesize =
-        !contract ||
-        !contract.approvalId ||
-        (Boolean(contract.specSha) && contract.specSha !== specRev.reviewedSha);
-      if (shouldSynthesize) {
-        let plObj: any = {};
-        if (taskRow?.payload) {
-          try {
-            plObj = JSON.parse(taskRow.payload);
-          } catch {}
-        }
-        const isArch =
-          contract?.isArchitectural ??
-          Boolean(
-            plObj.is_architectural ||
-              plObj.isArchitectural ||
-              specRev.specPath.includes("/adr/"),
-          );
-        const adr =
-          contract?.adrPath ??
-          plObj.adr_path ??
-          plObj.adrPath ??
-          (specRev.specPath.includes("/adr/") ? specRev.specPath : undefined);
-        const alters =
-          contract?.altersContract ??
-          Boolean(plObj.alters_contract || plObj.altersContract);
-        const section =
-          contract?.specSection ??
-          plObj.spec_section ??
-          plObj.specSection;
+      const storedRev = input.store.getSpecContract(input.taskKey);
+      const isRevokedForSameRev = Boolean(
+        storedRev &&
+        (!storedRev.approval_id || !storedRev.approval_id.trim()) &&
+        storedRev.spec_sha &&
+        specRev.reviewedSha &&
+        storedRev.spec_sha.toLowerCase() === specRev.reviewedSha.toLowerCase(),
+      );
 
-        const synthesizedContract: SpecContract = {
-          kind:
-            contract?.kind ??
-            ((taskRow as any)?.route === "fix"
-              ? "bugfix"
-              : "behavior_change"),
-          projectId:
-            (taskRow as any)?.project_id ?? (input.project as any)?.id,
-          specPath: specRev.specPath,
-          specSha: specRev.reviewedSha,
-          specSection: section,
-          adrPath: adr,
-          approvalId: specRev.approvalId,
-          altersContract: alters,
-          isArchitectural: isArch,
-          preparedBaseSha: targetSha,
-        };
-        pendingContractToSave = synthesizedContract;
-        contract = synthesizedContract;
+      if (!isRevokedForSameRev) {
+        const shouldSynthesize =
+          !contract ||
+          !contract.approvalId ||
+          (Boolean(contract.specSha) && contract.specSha !== specRev.reviewedSha);
+        if (shouldSynthesize) {
+          let plObj: any = {};
+          if (taskRow?.payload) {
+            try {
+              plObj = JSON.parse(taskRow.payload);
+            } catch {}
+          }
+          const isArch =
+            contract?.isArchitectural ??
+            Boolean(
+              plObj.is_architectural ||
+                plObj.isArchitectural ||
+                specRev.specPath.includes("/adr/"),
+            );
+          const adr =
+            contract?.adrPath ??
+            plObj.adr_path ??
+            plObj.adrPath ??
+            (specRev.specPath.includes("/adr/") ? specRev.specPath : undefined);
+          const alters =
+            contract?.altersContract ??
+            Boolean(plObj.alters_contract || plObj.altersContract);
+          const section =
+            contract?.specSection ??
+            plObj.spec_section ??
+            plObj.specSection;
+
+          const synthesizedContract: SpecContract = {
+            kind:
+              contract?.kind ??
+              ((taskRow as any)?.route === "fix"
+                ? "bugfix"
+                : "behavior_change"),
+            projectId:
+              (taskRow as any)?.project_id ?? (input.project as any)?.id,
+            specPath: specRev.specPath,
+            specSha: specRev.reviewedSha,
+            specSection: section,
+            adrPath: adr,
+            approvalId: specRev.approvalId,
+            altersContract: alters,
+            isArchitectural: isArch,
+            preparedBaseSha: targetSha,
+          };
+          pendingContractToSave = synthesizedContract;
+          contract = synthesizedContract;
+        }
       }
     }
   }
@@ -1113,12 +1139,14 @@ export async function verifySpecBeforeCodeGate(
 
     const normKey = normalizeTaskKey(input.taskKey);
     const delegations = input.store.delegationsByTask(normKey);
+    const targetProjId = (taskRow as any)?.project_id ?? (input.project as any)?.id;
     const reviews = delegations.filter(
       (d) =>
         (d.level.includes("review") || d.level === "audit" || d.level === "spec_review") &&
         d.level !== "release-audit" &&
         d.status === "done" &&
-        Boolean(d.continue_from),
+        Boolean(d.continue_from) &&
+        (!targetProjId || !d.project_id || d.project_id === targetProjId),
     );
 
     if (reviews.length === 0) {
@@ -1130,24 +1158,43 @@ export async function verifySpecBeforeCodeGate(
     }
 
     const events = input.store.listEvents("review.verdict");
-    const hasAnyOk = reviews.some((rev) => {
-      const delEvent = events.slice().reverse().find((e) => {
-        try {
-          return JSON.parse(e.payload).delegationId === rev.id;
-        } catch {
+
+    // Check if there is a review specifically targeting targetSha
+    const targetReview = targetSha
+      ? reviews.find((r) => {
+          if (r.continue_from && (r.continue_from === targetSha || targetSha.startsWith(r.continue_from) || r.continue_from.startsWith(targetSha))) {
+            return true;
+          }
+          if (r.attach) {
+            try {
+              const att = JSON.parse(r.attach);
+              if (att?.headSha && (att.headSha === targetSha || targetSha.startsWith(att.headSha) || att.headSha.startsWith(targetSha))) {
+                return true;
+              }
+            } catch {}
+          }
           return false;
-        }
-      });
-      if (!delEvent) return false;
+        })
+      : null;
+
+    const reviewToCheck = targetReview ?? reviews[0];
+    const delEvent = events.slice().reverse().find((e) => {
       try {
-        const p = JSON.parse(delEvent.payload);
-        return p.verdict === "OK" && (p.blockers === 0 || p.blockers == null);
+        return JSON.parse(e.payload).delegationId === reviewToCheck.id;
       } catch {
         return false;
       }
     });
 
-    if (!hasAnyOk) {
+    let reviewToCheckVerdictOk = false;
+    if (delEvent) {
+      try {
+        const p = JSON.parse(delEvent.payload);
+        reviewToCheckVerdictOk = p.verdict === "OK" && (p.blockers === 0 || p.blockers == null);
+      } catch {}
+    }
+
+    if (!reviewToCheckVerdictOk) {
       throw new OrchestratorError(
         "spec-gate-violation",
         `spec-gate-violation: спецификация для задачи ${input.taskKey} не принята ревью (последний вердикт: CHANGES или наличие блокеров; approvalMode: auto)`,
@@ -1155,17 +1202,15 @@ export async function verifySpecBeforeCodeGate(
       );
     }
 
-    const hasProvenSpecReview = reviews.some((d) => {
-      if (!d.attach) return false;
+    let reviewToCheckProven = false;
+    if (reviewToCheck.attach) {
       try {
-        const att = JSON.parse(d.attach);
-        return att && att.kind === "spec_review" && att.baseSha && att.headSha;
-      } catch {
-        return false;
-      }
-    });
+        const att = JSON.parse(reviewToCheck.attach);
+        reviewToCheckProven = Boolean(att && att.kind === "spec_review" && att.baseSha && att.headSha && att.repo);
+      } catch {}
+    }
 
-    if (!hasProvenSpecReview) {
+    if (!reviewToCheckProven) {
       throw new OrchestratorError(
         "spec-gate-violation",
         `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация отсутствует (§31.9). Для старой записи ревью без доказанного базового коммита требуется назначить ревью спецификации с явным диапазоном SHA (baseSha и headSha) до запуска кода`,
@@ -1249,7 +1294,8 @@ export async function verifySpecBeforeCodeGate(
     (taskConfMode === "auto" || taskConfMode === "manual")
       ? taskConfMode
       : effectiveApprovalMode;
-  if (effectiveConfMode === "manual" || (storedContract && !pendingContractToSave)) {
+
+  if (effectiveConfMode === "manual") {
     if (!storedContract || !storedContract.approval_id) {
       throw new OrchestratorError(
         "spec-gate-violation",
@@ -1266,21 +1312,32 @@ export async function verifySpecBeforeCodeGate(
         `spec-gate-violation: принятие ${contract.approvalId} не совпадает с сохранённым в базе (${storedContract.approval_id})`,
       );
     }
-  }
+  } else if (storedContract) {
+    if (!storedContract.approval_id || !storedContract.approval_id.trim()) {
+      const isNewRevision =
+        Boolean(pendingContractToSave) &&
+        storedContract.spec_sha != null &&
+        contract.specSha != null &&
+        storedContract.spec_sha.toLowerCase() !== contract.specSha.toLowerCase();
 
-  if (!input.repoRoot || !input.repoRoot.trim()) {
-    throw new OrchestratorError(
-      "spec-gate-violation",
-      `spec-gate-violation: репозиторий задачи ${input.taskKey} не определён или недоступен для проверки спецификации`,
-      "Убедись, что репозиторий проекта доступен на текущем хосте",
-    );
-  }
-
-  if (!cmd) {
-    throw new OrchestratorError(
-      "spec-gate-violation",
-      `spec-gate-violation: git-команды недоступны для проверки спецификации задачи ${input.taskKey}`,
-    );
+      if (!isNewRevision) {
+        throw new OrchestratorError(
+          "spec-gate-violation",
+          `spec-gate-violation: задача ${input.taskKey} требует одобрения владельца в task_spec_contracts, но запись отсутствует или была отозвана`,
+          "Одобри спецификацию через команду approve до запуска кода",
+        );
+      }
+    } else if (!pendingContractToSave) {
+      if (
+        storedContract.approval_id !== contract.approvalId &&
+        !contract.approvalId.startsWith("appr:transition:")
+      ) {
+        throw new OrchestratorError(
+          "spec-gate-violation",
+          `spec-gate-violation: принятие ${contract.approvalId} не совпадает с сохранённым в базе (${storedContract.approval_id})`,
+        );
+      }
+    }
   }
 
   // 5. Validate according to work kind (mechanical tasks require no spec, but require valid basis and accessible git repo)
