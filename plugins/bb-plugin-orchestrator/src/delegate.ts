@@ -1113,7 +1113,17 @@ export async function dispatchToRoute(
       ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
       : (deps.project ?? null);
     try {
-      let resolvedBaseSha = opts.from;
+      let parsedAttachFrom: string | undefined;
+      if (row.attach) {
+        try {
+          const parsed = JSON.parse(row.attach);
+          if (typeof parsed?.from === "string" && parsed.from.trim()) {
+            parsedAttachFrom = parsed.from.trim();
+          }
+        } catch {}
+      }
+      const effectiveFrom = opts.from ?? row.continue_from ?? parsedAttachFrom;
+      let resolvedBaseSha = effectiveFrom;
       if (resolvedBaseSha && deps.cmd && taskRepoRoot && !/^[0-9a-fA-F]{40}$/.test(resolvedBaseSha)) {
         try {
           const rev = await deps.cmd.run("git", ["rev-parse", resolvedBaseSha], { cwd: taskRepoRoot });
@@ -1134,7 +1144,7 @@ export async function dispatchToRoute(
           executorBaseSha = await resolveExecutorBaseSha({
             cmd: deps.cmd,
             repoRoot: taskRepoRoot,
-            from: opts.from,
+            from: effectiveFrom,
             baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
           });
         } catch {}
@@ -1831,7 +1841,7 @@ async function dispatchViaSpawn(
       projectId: linkedBbProjectId!,
       hostId,
       baseBranchName: p!.baseBranch ?? null,
-      from: opts.from,
+      from: opts.from ?? row.continue_from ?? undefined,
       taskKey: row.task_key,
       callerProjectId: coordinatorProjectId ?? null,
     });

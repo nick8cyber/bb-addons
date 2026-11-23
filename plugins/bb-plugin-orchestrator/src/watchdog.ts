@@ -396,6 +396,7 @@ export interface WatchdogDeps {
     opts?: {
       onDispatchFailure?: "remove" | "fail";
       coordinatorProjectId?: string | null;
+      from?: string;
     },
   ): Promise<DispatchStepsResult>;
   /** §4 steps 4–6 on a `dispatching` row that already has `thread_id`. */
@@ -1070,6 +1071,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           const res = await deps.dispatch(fresh, {
             onDispatchFailure: "fail",
             coordinatorProjectId: coord?.projectId ?? null,
+            from: fresh.continue_from ?? undefined,
           });
           await report(
             row,
@@ -4011,6 +4013,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         const res = await deps.dispatch(store.get(row.id) ?? row, {
           onDispatchFailure: "fail",
           coordinatorProjectId: coord?.projectId ?? null,
+          from: row.continue_from ?? undefined,
         });
         if (res.status === "running") {
           s.relinked++;
@@ -4053,6 +4056,7 @@ export function createWatchdog(deps: WatchdogDeps) {
             const res = await deps.dispatch(store.get(row.id) ?? row, {
               onDispatchFailure: "fail",
               coordinatorProjectId: coord?.projectId ?? null,
+              from: row.continue_from ?? undefined,
             });
             store.resetRetry(row.id); // resolved — the streak is over
             if (res.status === "running") {
