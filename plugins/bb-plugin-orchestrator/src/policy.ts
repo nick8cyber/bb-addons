@@ -86,6 +86,9 @@ export interface Policy {
   routeLimits?: RouteLimitsConfig;
   /** §31.9 (ADR-0032): spec-before-code gate enforcement flag */
   specBeforeCode?: boolean;
+  /** Presets facts and base branches */
+  presets?: Record<string, { baseBranch?: string | null; environmentKind?: string | null }>;
+  presetDetails?: ReadonlyMap<string, { environmentKind?: string | null; baseBranch?: string | null }>;
 }
 
 /** §31.7: Route boundaries configuration for fix and simple routes. */
@@ -174,8 +177,8 @@ const isPositiveInt = (x: unknown): x is number =>
 export function parsePolicy(
   text: string | undefined,
   knownPresets?: ReadonlySet<string>,
-  /** §16.8: preset name/id → facts; used for the executor-worktree warning. */
-  presetDetails?: ReadonlyMap<string, { environmentKind?: string | null }>,
+  /** §16.8: preset name/id → facts; used for the executor-worktree warning and base branch. */
+  presetDetails?: ReadonlyMap<string, { environmentKind?: string | null; baseBranch?: string | null }>,
   /** §18.1 (PLUG-247a): parse messages come from the language catalog. */
   t: T = T_RU,
 ): PolicyLoad {
@@ -810,6 +813,7 @@ export function parsePolicy(
       ...(checks && Object.keys(checks).length > 0 ? { checks } : {}),
       ...(routeLimits && Object.keys(routeLimits).length > 0 ? { routeLimits } : {}),
       ...(typeof raw.specBeforeCode === "boolean" ? { specBeforeCode: raw.specBeforeCode } : {}),
+      ...(presetDetails ? { presetDetails } : {}),
       levels,
       routes,
     },

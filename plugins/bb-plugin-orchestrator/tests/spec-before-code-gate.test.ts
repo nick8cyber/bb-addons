@@ -2760,3 +2760,333 @@ test("§31.9 Opus Audit Round 9 Blocker 3: verifyReleaseDocumentsGate rejects mi
     },
   );
 });
+
+test("§31.9 Incident NET-46: in auto mode, positive spec review on exact SHA automatically resolves & persists contract", async () => {
+  const d = makeTempDir("orch-net46-");
+  const { run, cmd } = initGitRepo(d);
+  mkdirSync(join(d, "docs/specs"), { recursive: true });
+  writeFileSync(join(d, "docs/specs/test-spec.md"), "# Spec\n§1: requirement\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "docs: test spec"]);
+  const specSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.insertTask({
+    taskKey: "NET-46",
+    projectId: "proj_eshr98jkqq",
+    coordinatorThreadId: "thr_aitmf7kjfx",
+    route: "feature",
+    level: "complex",
+    node: "start",
+    status: "queued",
+    confirmationMode: "auto",
+  } as any);
+
+  // Record spec review delegation #1756 on exact specSha
+  const del = store.insert({
+    taskKey: "NET-46",
+    projectId: "proj_eshr98jkqq",
+    coordinatorThreadId: "thr_aitmf7kjfx",
+    level: "review",
+    route: "review-opus",
+    preset: "opus55-review",
+    provider: "claude-code",
+    continueFrom: specSha,
+    attach: JSON.stringify({ paths: [], from: specSha }),
+  });
+  store.setStatus(del.id, "running");
+  store.setStatusIf(del.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+
+  // Verify spec gate passes for executor in shadow mode
+  await verifySpecBeforeCodeGate({
+    taskKey: "NET-46",
+    role: "executor",
+    store,
+    cmd,
+    repoRoot: d,
+    workGraphMode: "shadow",
+    baseSha: specSha,
+    preparedBaseSha: specSha,
+  });
+
+  // Contract was persisted to task_spec_contracts
+  const stored = store.getSpecContract("NET-46");
+  assert.ok(stored, "stored contract must exist in task_spec_contracts");
+  assert.equal(stored?.spec_sha, specSha);
+  assert.equal(stored?.project_id, "proj_eshr98jkqq");
+  assert.ok(stored?.approval_id?.startsWith("appr:proj_eshr98jkqq:NET-46:"));
+
+  // Task payload was also updated
+  const updatedTask = store.getTask("NET-46");
+  assert.equal(updatedTask?.spec_sha, specSha);
+  const pl = JSON.parse(updatedTask?.payload || "{}");
+  assert.equal(pl.approval_id, stored?.approval_id);
+});
+
+test("§31.9 Incident NET-46: ordinary code review does NOT approve a spec", async () => {
+  const d = makeTempDir("orch-net46-code-");
+  const { run, cmd } = initGitRepo(d);
+  mkdirSync(join(d, "src"), { recursive: true });
+  writeFileSync(join(d, "src/server.ts"), "export const a = 1;\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "feat: code change"]);
+  const codeSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.insertTask({
+    taskKey: "NET-47",
+    projectId: "proj_eshr98jkqq",
+    coordinatorThreadId: "thr_aitmf7kjfx",
+    route: "feature",
+    level: "complex",
+    node: "start",
+    status: "queued",
+    confirmationMode: "auto",
+  } as any);
+
+  // Review of code change
+  const del = store.insert({
+    taskKey: "NET-47",
+    projectId: "proj_eshr98jkqq",
+    coordinatorThreadId: "thr_aitmf7kjfx",
+    level: "review",
+    route: "review-opus",
+    preset: "opus55-review",
+    provider: "claude-code",
+    continueFrom: codeSha,
+    attach: JSON.stringify({ paths: ["src/server.ts"], from: codeSha }),
+  });
+  store.setStatus(del.id, "running");
+  store.setStatusIf(del.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+
+  await assert.rejects(
+    verifySpecBeforeCodeGate({
+      taskKey: "NET-47",
+      role: "executor",
+      store,
+      cmd,
+      repoRoot: d,
+      workGraphMode: "shadow",
+      baseSha: codeSha,
+      preparedBaseSha: codeSha,
+    }),
+    /spec-gate-violation/,
+    "code review must NOT approve spec",
+  );
+  assert.equal(store.getSpecContract("NET-47"), null);
+});
+
+test("§31.9 Incident NET-46: manual confirmation mode requires explicit owner approve", async () => {
+  const d = makeTempDir("orch-net46-man-");
+  const { run, cmd } = initGitRepo(d);
+  mkdirSync(join(d, "docs/specs"), { recursive: true });
+  writeFileSync(join(d, "docs/specs/test-spec.md"), "# Spec\n§1: requirement\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "docs: test spec"]);
+  const specSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.insertTask({
+    taskKey: "NET-48",
+    projectId: "proj_eshr98jkqq",
+    coordinatorThreadId: "thr_aitmf7kjfx",
+    route: "feature",
+    level: "complex",
+    node: "start",
+    status: "queued",
+    confirmationMode: "manual",
+  } as any);
+
+  const del = store.insert({
+    taskKey: "NET-48",
+    projectId: "proj_eshr98jkqq",
+    coordinatorThreadId: "thr_aitmf7kjfx",
+    level: "review",
+    route: "review-opus",
+    preset: "opus55-review",
+    provider: "claude-code",
+    continueFrom: specSha,
+    attach: JSON.stringify({ paths: [], from: specSha }),
+  });
+  store.setStatus(del.id, "running");
+  store.setStatusIf(del.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+
+  await assert.rejects(
+    verifySpecBeforeCodeGate({
+      taskKey: "NET-48",
+      role: "executor",
+      store,
+      cmd,
+      repoRoot: d,
+      workGraphMode: "shadow",
+      baseSha: specSha,
+      preparedBaseSha: specSha,
+    }),
+    /spec-gate-violation/,
+    "manual mode must reject without owner approve",
+  );
+});
+
+test("§31.9 Alignment: gate and spawn share exact immutable SHA when origin/HEAD and preset.baseBranch diverge", async () => {
+  const remoteDir = makeTempDir("orch-remote-diverge-");
+  const localDir = makeTempDir("orch-local-diverge-");
+
+  // Init bare/origin repo
+  const runRemote = (args: string[]) => execFileSync("git", args, { cwd: remoteDir, encoding: "utf8" });
+  runRemote(["init", "-b", "main"]);
+  runRemote(["config", "user.name", "Tester"]);
+  runRemote(["config", "user.email", "test@test.local"]);
+  writeFileSync(join(remoteDir, "README.md"), "# Main\n");
+  runRemote(["add", "."]);
+  runRemote(["commit", "-qm", "initial main"]);
+  const mainSha = runRemote(["rev-parse", "HEAD"]).trim();
+
+  // Create dev branch with spec in remote
+  runRemote(["checkout", "-b", "dev"]);
+  mkdirSync(join(remoteDir, "docs/specs"), { recursive: true });
+  writeFileSync(join(remoteDir, "docs/specs/DIV-1.md"), "# Spec DIV-1\n§1: requirement\n");
+  runRemote(["add", "."]);
+  runRemote(["commit", "-qm", "docs: dev branch spec"]);
+  const devSha = runRemote(["rev-parse", "HEAD"]).trim();
+  runRemote(["checkout", "main"]);
+
+  // Local clone pointing to remote
+  const runLocal = (args: string[]) => execFileSync("git", args, { cwd: localDir, encoding: "utf8" });
+  runLocal(["init", "-b", "main"]);
+  runLocal(["remote", "add", "origin", remoteDir]);
+  runLocal(["fetch", "origin"]);
+  runLocal(["reset", "--hard", "origin/main"]);
+  runLocal(["config", "user.name", "Tester"]);
+  runLocal(["config", "user.email", "test@test.local"]);
+
+  const cmdLocal: CmdRunner = {
+    run: async (file, args, opts) => {
+      try {
+        const out = execFileSync(file, args, { cwd: opts?.cwd ?? localDir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+        return { exitCode: 0, stdout: out, stderr: "" };
+      } catch (e: any) {
+        return { exitCode: e.status ?? 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+      }
+    },
+  };
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.saveSpecContract({
+    taskKey: "DIV-1",
+    projectId: "proj_div",
+    kind: "behavior_change",
+    specPath: "docs/specs/DIV-1.md",
+    specSha: devSha,
+    approvalId: "appr:proj_div:DIV-1:spec:1",
+  });
+
+  let capturedSpawnArgs: any = null;
+  const mockThreads = {
+    spawn: async (args: any) => {
+      capturedSpawnArgs = args;
+      return { id: "thr_exec_div" };
+    },
+  };
+
+  const policy = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      specBeforeCode: true,
+      routes: {
+        "dev-route": { preset: "dev-preset", provider: "mock" },
+      },
+      levels: {
+        complex: { chain: ["dev-route"] },
+      },
+      presets: {
+        "dev-preset": { baseBranch: "dev" },
+      },
+    }),
+  );
+
+  const fakeCli: BbCli = {
+    run: async (args: string[]) => {
+      if (args[0] === "tasks" && args[1] === "show") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            task: { id: "task_div_1", key: "DIV-1", title: "Task DIV-1", description: "desc", status: "in_progress" },
+            project: { id: "proj_div", linkedBbProjectId: "proj_div_bb" },
+            comments: [],
+            subtasks: [],
+            attachments: [],
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "tasks" && args[1] === "preset" && args[2] === "show") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            preset: {
+              providerId: "mock-prov",
+              permissionMode: "full",
+              environmentKind: "host",
+              baseBranch: "dev",
+              machineId: "host_1",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "{}", stderr: "" };
+    },
+  };
+
+  const res = await runDelegate(
+    {
+      taskKey: "DIV-1",
+      level: "complex",
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_div",
+      },
+    },
+    {
+      store,
+      policy: () => policy.policy,
+      loadPolicy: async () => policy,
+      bbCli: fakeCli,
+      cmd: cmdLocal,
+      repoRoot: localDir,
+      workGraphMode: "shadow",
+      threads: mockThreads as any,
+      primaryHostId: async () => "host_1",
+      probes: { roleByThreadId: () => "orchestrator" },
+    } as any,
+  );
+
+  assert.equal(res.status, "running");
+  assert.ok(capturedSpawnArgs, "threads.spawn must be called");
+  // Both gate and spawn must see exact devSha, NOT mainSha
+  assert.equal(capturedSpawnArgs.environment?.workspace?.baseBranch?.name, devSha);
+  assert.notEqual(devSha, mainSha);
+  const del = store.get(res.delegationId)!;
+  assert.equal(del.continue_from, devSha);
+});

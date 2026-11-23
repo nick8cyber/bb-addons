@@ -1160,6 +1160,14 @@ export class DelegationStore {
       .run(at, Date.now(), id);
   }
 
+  setContinueFrom(id: number, sha: string | null): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET continue_from = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(sha, Date.now(), id);
+  }
+
   /**
    * §20.1 п.5 (r34.4): a skipped or timed-out route hands the SAME
    * dispatching row to the next chain route — only while the row is

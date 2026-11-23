@@ -30,6 +30,7 @@ import { verdictDetailsInBody } from "./release.js";
 import {
   verifySpecBeforeCodeGate,
   resolveExecutorBaseSha,
+  resolvePresetBaseBranch,
   resolveTaskSpecContract,
   parseContractFromText,
   type SpecContract,
@@ -2250,55 +2251,78 @@ export async function runApprove(
   }
 
   if (approvedContract) {
-    let specSha: string | undefined =
-      (res.task!.spec_sha ||
-      task.spec_sha ||
-      approvedContract.specSha ||
-      (payloadObj?.spec_sha ?? payloadObj?.specSha) ||
-      task.acceptance_sha) as string | undefined;
-    if (!specSha || specSha === "base") {
-      const proj = task.project_id && (deps as any).resolveProject
-        ? await Promise.resolve((deps as any).resolveProject(task.project_id)).catch(() => null)
-        : (deps as any).project ?? null;
-      const repoRoot = deps.ctx?.cwd ?? proj?.repoPath ?? proj?.repoRoot ?? process.cwd();
-      const cmdRunner = (deps as any).cmd ?? (deps.ctx as any)?.cmd;
-      if (cmdRunner && repoRoot) {
-        try {
-          const r = await cmdRunner.run("git", ["rev-parse", "HEAD"], { cwd: repoRoot });
-          if (r.exitCode === 0 && r.stdout.trim().length === 40) {
-            specSha = r.stdout.trim();
-          }
-        } catch {}
-      }
-    }
-    if (!specSha || specSha === "base") {
-      throw new OrchestratorError(
-        "spec-gate-violation",
-        `spec-gate-violation: не удалось определить коммит спецификации (spec_sha) для задачи ${key}`,
+    if (approvedContract.kind === "mechanical") {
+      const approvalId = `appr:${task.project_id ?? "proj"}:${key}:mech:${now}`;
+      deps.store.saveSpecContract(
+        {
+          ...approvedContract,
+          taskKey: key,
+          projectId: task.project_id ?? undefined,
+          approvalId,
+        },
+        now,
       );
+      payloadObj.approval_id = approvalId;
+      deps.store.updateTask(key, { payload: JSON.stringify(payloadObj) });
+    } else {
+      let specSha: string | undefined =
+        (res.task!.spec_sha ||
+        task.spec_sha ||
+        approvedContract.specSha ||
+        (payloadObj?.spec_sha ?? payloadObj?.specSha) ||
+        task.acceptance_sha) as string | undefined;
+      if (!specSha || specSha === "base") {
+        const tRepo = (deps as any).resolveTaskRepoContext
+          ? await Promise.resolve((deps as any).resolveTaskRepoContext(task)).catch(() => null)
+          : null;
+        const proj = task.project_id && (deps as any).resolveProject
+          ? await Promise.resolve((deps as any).resolveProject(task.project_id)).catch(() => null)
+          : (deps as any).project ?? null;
+        const repoRoot = tRepo?.repoRoot ?? proj?.repoPath ?? proj?.repoRoot ?? deps.ctx?.cwd;
+        const cmdRunner = (deps as any).cmd ?? (deps.ctx as any)?.cmd;
+        if (cmdRunner && repoRoot) {
+          try {
+            const r = await cmdRunner.run("git", ["rev-parse", "HEAD"], { cwd: repoRoot });
+            if (r.exitCode === 0 && r.stdout.trim().length === 40) {
+              specSha = r.stdout.trim();
+            }
+          } catch {}
+        }
+      }
+      if (!specSha || specSha === "base") {
+        const cmdRunner = (deps as any).cmd ?? (deps.ctx as any)?.cmd;
+        if (!cmdRunner || deps.workGraphMode === "shadow") {
+          specSha = `sha-${key.toLowerCase()}-${now}`;
+        } else {
+          throw new OrchestratorError(
+            "spec-gate-violation",
+            `spec-gate-violation: не удалось определить коммит спецификации (spec_sha) для задачи ${key}`,
+          );
+        }
+      }
+      const approvalId = `appr:${task.project_id ?? "proj"}:${key}:${specSha}:${now}`;
+      deps.store.saveSpecContract(
+        {
+          ...approvedContract,
+          taskKey: key,
+          projectId: task.project_id ?? undefined,
+          specSha,
+          isArchitectural: approvedContract.isArchitectural,
+          approvalId,
+        },
+        now,
+      );
+      payloadObj.approval_id = approvalId;
+      payloadObj.spec_sha = specSha;
+      if (approvedContract.specPath) {
+        payloadObj.spec_path = approvedContract.specPath;
+      }
+      if (approvedContract.adrPath) {
+        payloadObj.adr_path = approvedContract.adrPath;
+      }
+      payloadObj.is_architectural = approvedContract.isArchitectural;
+      deps.store.updateTask(key, { payload: JSON.stringify(payloadObj) });
     }
-    const approvalId = `appr:${task.project_id ?? "proj"}:${key}:${specSha}:${now}`;
-    deps.store.saveSpecContract(
-      {
-        ...approvedContract,
-        taskKey: key,
-        projectId: task.project_id ?? undefined,
-        specSha,
-        isArchitectural: approvedContract.isArchitectural,
-        approvalId,
-      },
-      now,
-    );
-    payloadObj.approval_id = approvalId;
-    payloadObj.spec_sha = specSha;
-    if (approvedContract.specPath) {
-      payloadObj.spec_path = approvedContract.specPath;
-    }
-    if (approvedContract.adrPath) {
-      payloadObj.adr_path = approvedContract.adrPath;
-    }
-    payloadObj.is_architectural = approvedContract.isArchitectural;
-    deps.store.updateTask(key, { payload: JSON.stringify(payloadObj) });
   }
 
   return { ok: true, task: res.task! };
@@ -4382,16 +4406,19 @@ export async function runRunQueue(
           try {
             const tRepo = deps.resolveTaskRepoContext ? await Promise.resolve(deps.resolveTaskRepoContext(t)).catch(() => null) : null;
             const proj = t.project_id && deps.resolveProject ? await Promise.resolve(deps.resolveProject(t.project_id)).catch(() => null) : (deps.project ?? null);
+            const tPreset = deps.policy?.routes?.[t.route]?.preset;
+            const presetBaseBranch = await resolvePresetBaseBranch(tPreset, {
+              bbCli: deps.bbCli,
+              policy: deps.policy,
+            });
             const effectiveRepo = tRepo?.repoRoot ?? repoRoot;
             let executorBaseSha: string | undefined;
             if (deps.cmd && effectiveRepo) {
-              try {
-                executorBaseSha = await resolveExecutorBaseSha({
-                  cmd: deps.cmd,
-                  repoRoot: effectiveRepo,
-                  baseBranch: (proj as any)?.baseBranch ?? (deps.policy as any)?.baseBranch,
-                });
-              } catch {}
+              executorBaseSha = await resolveExecutorBaseSha({
+                cmd: deps.cmd,
+                repoRoot: effectiveRepo,
+                baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? tRepo?.mergeBaseBranch,
+              });
             }
             await verifySpecBeforeCodeGate({
               taskKey: t.task_key,
@@ -4568,16 +4595,19 @@ export async function runRunQueue(
           try {
             const tRepo = deps.resolveTaskRepoContext ? await Promise.resolve(deps.resolveTaskRepoContext(t)).catch(() => null) : null;
             const proj = t.project_id && deps.resolveProject ? await Promise.resolve(deps.resolveProject(t.project_id)).catch(() => null) : (deps.project ?? null);
+            const tPreset = deps.policy?.routes?.[t.route]?.preset;
+            const presetBaseBranch = await resolvePresetBaseBranch(tPreset, {
+              bbCli: deps.bbCli,
+              policy: deps.policy,
+            });
             const effectiveRepo = tRepo?.repoRoot ?? repoRoot;
             let executorBaseSha: string | undefined;
             if (deps.cmd && effectiveRepo) {
-              try {
-                executorBaseSha = await resolveExecutorBaseSha({
-                  cmd: deps.cmd,
-                  repoRoot: effectiveRepo,
-                  baseBranch: (proj as any)?.baseBranch ?? (deps.policy as any)?.baseBranch,
-                });
-              } catch {}
+              executorBaseSha = await resolveExecutorBaseSha({
+                cmd: deps.cmd,
+                repoRoot: effectiveRepo,
+                baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? tRepo?.mergeBaseBranch,
+              });
             }
             await verifySpecBeforeCodeGate({
               taskKey: t.task_key,
@@ -4642,11 +4672,16 @@ async function dispatchTaskNode(
       : (deps.project ?? null);
     let executorBaseSha: string | undefined;
     if (deps.cmd && repoRoot) {
+      const presetName = deps.policy?.routes?.[task.route]?.preset;
+      const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+        bbCli: deps.bbCli,
+        policy: deps.policy,
+      });
       try {
         executorBaseSha = await resolveExecutorBaseSha({
           cmd: deps.cmd,
           repoRoot,
-          baseBranch: (proj as any)?.baseBranch ?? (deps.policy as any)?.baseBranch,
+          baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch,
         });
       } catch {}
     }
@@ -5025,7 +5060,19 @@ async function startQueuedTask(
         const isMechanicalValid = parsed.kind === "mechanical" && Boolean(parsed.mechanicalBasis && parsed.mechanicalBasis.trim());
         const isBugfixValid = parsed.kind === "bugfix" && Boolean(parsed.specPath || parsed.specSection);
         const isBehaviorValid = parsed.kind === "behavior_change" && Boolean(parsed.specPath);
-        if (isMechanicalValid || isBugfixValid || isBehaviorValid) {
+        if (isMechanicalValid) {
+          const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:mech:${now}`;
+          deps.store.saveSpecContract(
+            {
+              ...parsed,
+              taskKey: task.task_key,
+              projectId: task.project_id ?? undefined,
+              approvalId,
+            },
+            now,
+          );
+          cleanedPayload.approval_id = approvalId;
+        } else if (isBugfixValid || isBehaviorValid) {
           const specSha = parsed.specSha || acceptanceSha;
           if (specSha && specSha !== "base") {
             const approvalId = `appr:${task.project_id ?? "proj"}:${normKey}:${specSha}:${now}`;
@@ -5060,11 +5107,16 @@ async function startQueuedTask(
       : (deps.project ?? null);
     let executorBaseSha: string | undefined;
     if (deps.cmd && repoRoot) {
+      const presetName = deps.policy?.routes?.[task.route]?.preset;
+      const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+        bbCli: deps.bbCli,
+        policy: deps.policy,
+      });
       try {
         executorBaseSha = await resolveExecutorBaseSha({
           cmd: deps.cmd,
           repoRoot,
-          baseBranch: (proj as any)?.baseBranch ?? (deps.policy as any)?.baseBranch,
+          baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch,
         });
       } catch {}
     }
@@ -5099,6 +5151,18 @@ async function startQueuedTask(
           return false;
         } else {
           deps.log?.warn?.(`orchestrator: task ${task.task_key} refused by spec gate: ${gateErr.message}`);
+          cleanedPayload.spec_gate_error = gateErr.message;
+          deps.store.updateTask(task.task_key, {
+            payload: JSON.stringify(cleanedPayload),
+          });
+          if (task.coordinator_thread_id && deps.bbCli) {
+            deps.bbCli.run([
+              "thread",
+              "tell",
+              task.coordinator_thread_id,
+              `[orchestrator] Задача ${task.task_key} не может быть запущена: ${gateErr.message}`,
+            ]).catch(() => {});
+          }
           return false;
         }
       } else {

@@ -65,6 +65,7 @@ import { T_RU, type T } from "./i18n/index.js";
 import {
   verifySpecBeforeCodeGate,
   resolveExecutorBaseSha,
+  resolvePresetBaseBranch,
   resolveTaskSpecContract,
   type SpecContract,
 } from "./spec-gate.js";
@@ -696,6 +697,8 @@ export async function runDelegate(
     );
   }
 
+  let executorBaseSha: string | undefined;
+
   // §31.9 (ADR-0032): spec-before-code gate before creating delegation row
   if (role === "executor" && !effectiveNoCode) {
     const mode =
@@ -706,14 +709,19 @@ export async function runDelegate(
     const proj = effectiveProj && deps.resolveProject
       ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
       : (deps.project ?? null);
-    let executorBaseSha: string | undefined;
+    const presetName = params.preset ?? route.preset;
+    const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+      bbCli: deps.bbCli,
+      policy,
+      presetDetails: (policy as any)?.presetDetails,
+    });
     if (deps.cmd && deps.repoRoot) {
       try {
         executorBaseSha = await resolveExecutorBaseSha({
           cmd: deps.cmd,
           repoRoot: deps.repoRoot,
           from: params.from,
-          baseBranch: (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
+          baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
         });
       } catch {}
     }
@@ -728,10 +736,12 @@ export async function runDelegate(
       project: proj,
       baseSha: executorBaseSha,
       preparedBaseSha: params.from,
+      baseBranchName: presetBaseBranch,
+      presetName,
       workGraphMode: mode,
-      specBeforeCode: params.specBeforeCode,
+      specBeforeCode: policy.specBeforeCode,
       repoRoot: deps.repoRoot,
-      task: taskRow,
+      task: taskRow ?? undefined,
     });
   }
 
@@ -747,7 +757,7 @@ export async function runDelegate(
       preset: route.preset,
       provider: route.provider,
       round,
-      continueFrom,
+      continueFrom: executorBaseSha ?? continueFrom,
       explicitRoute: params.route !== undefined || params.preset !== undefined,
       noCode: effectiveNoCode,
       // §20.1 п.4: the attach spec survives onto the row — a reissue
@@ -804,6 +814,7 @@ export async function runDelegate(
         commentOnRefusal: true,
         from: params.from,
         specBeforeCode: params.specBeforeCode,
+        immutableBaseSha: executorBaseSha,
       },
       {
         ...deps,
@@ -905,6 +916,7 @@ interface DispatchOpts {
   /** §20.1 п.5: routes already skipped in this dispatch. */
   _skipped?: { route: string; reason: string }[];
   specBeforeCode?: boolean;
+  immutableBaseSha?: string;
 }
 
 /**
@@ -983,16 +995,26 @@ export async function dispatchToRoute(
           }
         } catch {}
       }
-      let executorBaseSha: string | undefined;
-      if (deps.cmd && taskRepoRoot) {
+      const presetName = (opts as any)?.preset ?? row.preset;
+      const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+        bbCli: deps.bbCli,
+        policy,
+        presetDetails: (policy as any)?.presetDetails,
+      });
+      let executorBaseSha: string | undefined = opts.immutableBaseSha;
+      if (!executorBaseSha && deps.cmd && taskRepoRoot) {
         try {
           executorBaseSha = await resolveExecutorBaseSha({
             cmd: deps.cmd,
             repoRoot: taskRepoRoot,
             from: opts.from,
-            baseBranch: (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
+            baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
           });
         } catch {}
+      }
+      if (executorBaseSha) {
+        opts.immutableBaseSha = executorBaseSha;
+        store.setContinueFrom(row.id, executorBaseSha);
       }
       await verifySpecBeforeCodeGate({
         taskKey: row.task_key,
@@ -1004,7 +1026,9 @@ export async function dispatchToRoute(
         policy,
         project: proj,
         baseSha: executorBaseSha,
-        preparedBaseSha: resolvedBaseSha,
+        preparedBaseSha: resolvedBaseSha ?? executorBaseSha,
+        baseBranchName: presetBaseBranch,
+        presetName,
         workGraphMode: mode,
         specBeforeCode: opts.specBeforeCode,
         repoRoot: taskRepoRoot,
@@ -1079,7 +1103,8 @@ export async function dispatchToRoute(
         return null; // left `dispatching` meanwhile — another path owns it
       }
       (opts._skipped ??= []).push({ route: row.route, reason });
-      return dispatchToRoute(store.get(row.id) ?? row, opts, deps);
+      const nextOpts: DispatchOpts = { ...opts, immutableBaseSha: undefined };
+      return dispatchToRoute(store.get(row.id) ?? row, nextOpts, deps);
     }
     return null;
   };
@@ -1672,11 +1697,13 @@ async function dispatchViaSpawn(
         workspace: {
           type: "managed-worktree",
           baseBranch:
-            base.kind === "skip"
-              ? p!.baseBranch
-                ? { kind: "named", name: p!.baseBranch }
-                : { kind: "default" }
-              : base,
+            opts.immutableBaseSha
+              ? { kind: "named", name: opts.immutableBaseSha }
+              : base.kind === "skip"
+                ? p!.baseBranch
+                  ? { kind: "named", name: p!.baseBranch }
+                  : { kind: "default" }
+                : base,
         },
       };
     }

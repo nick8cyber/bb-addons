@@ -442,6 +442,7 @@ interface PresetListEntry {
   /** §2.3 one-off presets + §16.8 worktree check need provider/env kind. */
   providerId?: string;
   environmentKind?: string;
+  baseBranch?: string | null;
 }
 
 const describeError = (e: unknown) =>
@@ -1032,7 +1033,10 @@ export async function createPlugin(
               (key) =>
                 [
                   key,
-                  { environmentKind: p.environmentKind ?? null },
+                  {
+                    environmentKind: p.environmentKind ?? null,
+                    baseBranch: p.baseBranch ?? null,
+                  },
                 ] as const,
             ),
         ),
