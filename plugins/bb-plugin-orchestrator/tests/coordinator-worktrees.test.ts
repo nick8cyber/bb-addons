@@ -8,6 +8,7 @@ import { makeTempDir } from "./helpers/temp.js";
 import { createCmd } from "../src/cmd.js";
 import {
   createCoordinatorWorktrees,
+  environmentShowVerdict,
   type CoordinatorEnvDto,
   type CoordinatorThreadDto,
 } from "../src/coordinator-worktrees.js";
@@ -76,8 +77,6 @@ function makeWorld(opts: {
   envThreads?: Map<string, CoordinatorThreadDto[] | null>;
   roles?: Record<string, string>;
   hasProcessIn?: (p: string) => Promise<boolean | null>;
-  /** §13.5 п.2: env ids that are delegation result envs. */
-  delegationEnvs?: Set<string>;
   /** §7: env ids whose `environment show` transiently fails (throws). */
   envError?: Set<string>;
 } = {}) {
@@ -97,7 +96,7 @@ function makeWorld(opts: {
       if (opts.envError?.has(id)) throw new Error("bb unavailable");
       return opts.envs?.get(id) ?? null;
     },
-    isDelegationEnv: (id) => opts.delegationEnvs?.has(id) ?? false,
+    delegationIndex: () => roles.delegationTaskIndex(),
     listEnvThreads: async (envId) => opts.envThreads?.get(envId) ?? null,
     hasProcessIn: opts.hasProcessIn ?? (async () => false),
     now: () => clock.t,
@@ -504,13 +503,48 @@ test("unarchive cancels the admission: active + new generation, stale verdict di
 
 // ── r6 audit fixes (PLUG-392) ──────────────────────────────────────
 
+/** Insert a delegation row; `threadId`/`status`/`envId` refine it. */
+function addDelegation(
+  w: { roles: DelegationStore },
+  opts: {
+    threadId?: string;
+    status?: "dispatching" | "running" | "done" | "failed";
+    envId?: string;
+  } = {},
+) {
+  const d = w.roles.insert({
+    taskKey: "PLUG-392",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  if (opts.threadId) w.roles.setThreadInfo(d.id, opts.threadId);
+  if (opts.status) w.roles.setStatus(d.id, opts.status);
+  if (opts.envId) {
+    w.roles.setRoundResult(d.id, {
+      envId: opts.envId,
+      branch: "bb/x",
+      sha: "a".repeat(40),
+      commits: 1,
+      dirty: false,
+    });
+  }
+  return d;
+}
+
 test("ensureBinding: a delegation result env is refused — coordinator-worktree-required", async () => {
   const { repo, base } = makeRepo("coord-ensure-deleg-");
   const env = addEnv(repo, base, "w");
   const w = makeWorld({
     envs: new Map([[env.id, env]]),
     roles: { thr_c: "orchestrator" },
-    delegationEnvs: new Set([env.id!]),
+  });
+  addDelegation(w, {
+    threadId: "thr_exec",
+    status: "done",
+    envId: env.id!,
   });
   assert.equal(
     await w.wt.ensureBinding({
@@ -521,6 +555,135 @@ test("ensureBinding: a delegation result env is refused — coordinator-worktree
     null,
   );
   assert.equal(w.store.byThread("thr_c"), undefined);
+});
+
+// ── r7 audit fixes (PLUG-392) ──────────────────────────────────────
+
+test("environmentShowVerdict: only the structured BB answer is «gone» (§7, audit В2)", () => {
+  assert.equal(
+    environmentShowVerdict({ exitCode: 0, stdout: "{}", stderr: "" }),
+    "ok",
+  );
+  // The real BB answer for a removed env: exit 1 + JSON error.code.
+  assert.equal(
+    environmentShowVerdict({
+      exitCode: 1,
+      stdout: JSON.stringify({
+        ok: false,
+        error: { code: "environment_not_found" },
+      }),
+      stderr: "",
+    }),
+    "gone",
+  );
+  // «bb CLI not found» (exit 127, bb-cli.ts) must never read as
+  // «env removed» — and neither must loose «not found» text.
+  assert.equal(
+    environmentShowVerdict({
+      exitCode: 127,
+      stdout: "",
+      stderr: "bb CLI not found: bb",
+    }),
+    "failed",
+  );
+  assert.equal(
+    environmentShowVerdict({
+      exitCode: 1,
+      stdout: "environment not found",
+      stderr: "",
+    }),
+    "failed",
+  );
+  assert.equal(
+    environmentShowVerdict({
+      exitCode: 1,
+      stdout: JSON.stringify({
+        ok: false,
+        error: { code: "permission_denied" },
+      }),
+      stderr: "",
+    }),
+    "failed",
+  );
+  assert.equal(
+    environmentShowVerdict({
+      exitCode: 2,
+      stdout: JSON.stringify({
+        ok: false,
+        error: { code: "environment_not_found" },
+      }),
+      stderr: "",
+    }),
+    "failed",
+  );
+});
+
+test("ensureBinding: an executor promoted mid-round is refused — result_env_id is still NULL (§13.5 п.2, audit Б3)", async () => {
+  const { repo, base } = makeRepo("coord-live-round-");
+  const env = addEnv(repo, base, "w");
+  const w = makeWorld({
+    envs: new Map([[env.id, env]]),
+    roles: { thr_exec: "orchestrator" },
+  });
+  // The round is running: result_env_id lands only at round end, so
+  // the executor's own thread id is the marker.
+  addDelegation(w, { threadId: "thr_exec", status: "running" });
+  assert.equal(
+    await w.wt.ensureBinding({
+      id: "thr_exec",
+      environmentId: env.id,
+      projectId: "proj_1",
+    }),
+    null,
+  );
+  assert.equal(w.store.byThread("thr_exec"), undefined);
+});
+
+test("ensureBinding: an env shared with a live delegation thread is refused (§13.5 п.2, audit Б3)", async () => {
+  const { repo, base } = makeRepo("coord-live-env-");
+  const env = addEnv(repo, base, "w");
+  const w = makeWorld({
+    envs: new Map([[env.id, env]]),
+    roles: { thr_c: "orchestrator" },
+    envThreads: new Map([
+      [env.id!, [{ id: "thr_exec", environmentId: env.id }]],
+    ]),
+  });
+  // A different thread's live round occupies the env — refused too.
+  addDelegation(w, { threadId: "thr_exec", status: "running" });
+  assert.equal(
+    await w.wt.ensureBinding({
+      id: "thr_c",
+      environmentId: env.id,
+      projectId: "proj_1",
+    }),
+    null,
+  );
+  assert.equal(w.store.byThread("thr_c"), undefined);
+});
+
+test("ensureBinding: a done round does not refuse a dedicated env (§13.5 п.2)", async () => {
+  const { repo, base } = makeRepo("coord-new-env-");
+  const env = addEnv(repo, base, "w");
+  const w = makeWorld({
+    envs: new Map([[env.id, env]]),
+    roles: { thr_exec: "orchestrator" },
+    envThreads: new Map([[env.id!, []]]),
+  });
+  // The past round recorded env_old; the thread now sits in a fresh
+  // dedicated worktree — registration must go through.
+  addDelegation(w, {
+    threadId: "thr_exec",
+    status: "done",
+    envId: "env_old",
+  });
+  assert.ok(
+    await w.wt.ensureBinding({
+      id: "thr_exec",
+      environmentId: env.id,
+      projectId: "proj_1",
+    }),
+  );
 });
 
 test("ensureBinding: an unpublished base is refused — base-unpublished (§13.5 п.2)", async () => {

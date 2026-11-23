@@ -60,11 +60,18 @@ export interface CoordinatorWorktreesDeps {
    */
   showEnvironment(envId: string): Promise<CoordinatorEnvDto | null>;
   /**
-   * §13.5 п.2: an env that is the `result_env_id` of a delegation (or
-   * otherwise an executor-round env) can never register as a
-   * coordinator integration copy — `coordinator-worktree-required`.
+   * §13.5 п.2: the delegation index (`store.delegationTaskIndex`) —
+   * an env serving a delegation is an executor round and can never
+   * register as a coordinator integration copy. Needed here because
+   * `result_env_id` lands only at round end: while a round is
+   * `dispatching`/`running` the executor's own thread id and the env's
+   * live threads are the only markers (`coordinator-worktree-required`).
    */
-  isDelegationEnv?(envId: string): boolean;
+  delegationIndex?(): {
+    threadId: string | null;
+    envId: string | null;
+    status: string;
+  }[];
   /**
    * `bb thread show` — resolves the env of a thread when the event
    * payload did not carry one (`message.dispatched` ships only ids).
@@ -99,6 +106,36 @@ const UNFINISHED_OP_PATHS = [
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/**
+ * §7/§16.9: the `bb environment show <id> --json` verdict. `gone` is
+ * ONLY the structured BB answer — exit 1 with
+ * `{"ok":false,"error":{"code":"environment_not_found"}}` in stdout.
+ * Any other failure (a missing bb binary — exit 127 «bb CLI not
+ * found», another exit code, another error code, non-JSON text) is
+ * transient: it must read as «cannot prove», never «env removed» —
+ * `env-removed` has no way back.
+ */
+export function environmentShowVerdict(res: {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}): "ok" | "gone" | "failed" {
+  if (res.exitCode === 0) return "ok";
+  if (res.exitCode === 1) {
+    try {
+      const body = JSON.parse(res.stdout) as {
+        error?: { code?: string };
+      } | null;
+      if (body?.error?.code === "environment_not_found") {
+        return "gone";
+      }
+    } catch {
+      // Not the structured answer — falls through to «failed».
+    }
+  }
+  return "failed";
+}
+
 export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? {};
@@ -121,6 +158,53 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
 
   const isCoordinatorThread = (threadId: string): boolean =>
     deps.threadRole(threadId)?.role === "orchestrator";
+
+  /**
+   * §13.5 п.2: «is this env an executor-round env?» — three proofs.
+   * 1. A recorded `result_env_id` of any delegation.
+   * 2. The registering thread IS the executor of a round that is live
+   *    (`dispatching`/`running` — `result_env_id` lands only at round
+   *    end) or never had its env recorded; a promoted executor
+   *    mid-round is refused exactly like its env.
+   * 3. An env shared with a LIVE delegation thread — while the round
+   *    runs, its env appears only through the thread itself.
+   * A round already `done` with a recorded env refuses only by env
+   * match, so an executor moved to a dedicated worktree afterwards
+   * can still register. An unprovable env-thread list reads as «no
+   * hit»: refusal is for proven executor envs, not suspicion.
+   */
+  const isDelegationEnv = async (
+    envId: string,
+    threadId?: string,
+  ): Promise<boolean> => {
+    const index = deps.delegationIndex?.() ?? [];
+    const liveThreadIds = new Set<string>();
+    for (const d of index) {
+      if (d.envId != null && d.envId === envId) return true;
+      if (
+        threadId != null &&
+        d.threadId === threadId &&
+        (d.status === "dispatching" ||
+          d.status === "running" ||
+          d.envId == null)
+      ) {
+        return true;
+      }
+      if (
+        d.threadId != null &&
+        (d.status === "dispatching" || d.status === "running")
+      ) {
+        liveThreadIds.add(d.threadId);
+      }
+    }
+    if (liveThreadIds.size === 0) return false;
+    const envThreads = await deps.listEnvThreads(envId);
+    return (
+      envThreads?.some(
+        (x) => !x.archivedAt && !x.deletedAt && liveThreadIds.has(x.id),
+      ) ?? false
+    );
+  };
 
   const envGone = (env: CoordinatorEnvDto | null): boolean => {
     if (!env) return true;
@@ -243,11 +327,11 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
     // §13.5 п.2: an env already serving a delegation is an executor
     // round — a promoted coordinator needs a dedicated Worktree, so
     // registration refuses it (coordinator-worktree-required).
-    if (deps.isDelegationEnv?.(environmentId)) {
+    if (await isDelegationEnv(environmentId, thread.id)) {
       log.warn?.(
         `orchestrator worktrees: thread ${thread.id} — ` +
           `coordinator-worktree-required: env ${environmentId} is a ` +
-          `delegation result env; create a dedicated Worktree`,
+          `delegation round env; create a dedicated Worktree`,
       );
       return null;
     }
@@ -279,25 +363,20 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
     )?.trim();
     if (!repoRoot) return null;
     // §13.5 п.2: the base is what the env was actually created from —
-    // the reflog «Created from» entry, else BB's mergeBaseBranch, else
-    // the merge-base (always on origin by construction — the publish
-    // check then proves nothing but stays harmless).
+    // the reflog «Created from» entry, else the merge-base of HEAD
+    // with origin/<target> (the real fork point; the CURRENT remote
+    // tip is not proof of the creation base). Always on origin by
+    // construction, so the publish check then proves nothing but
+    // stays harmless; `null` when neither resolves.
     const createdFrom = await createdFromBase(env.path, env.branchName);
     const targetBranch = env.mergeBaseBranch?.replace(/^origin\//, "");
     const baseSha =
       createdFrom ??
-      (env.mergeBaseBranch
-        ? (await gitOut(env.path, [
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            env.mergeBaseBranch.startsWith("origin/")
-              ? env.mergeBaseBranch
-              : `origin/${env.mergeBaseBranch}`,
-          ]))?.trim()
-        : undefined) ??
-      (await gitOut(env.path, ["merge-base", "HEAD", "origin/HEAD"]))
-        ?.trim();
+      (await gitOut(env.path, [
+        "merge-base",
+        "HEAD",
+        targetBranch ? `origin/${targetBranch}` : "origin/HEAD",
+      ]))?.trim();
     const tipSha = (
       await gitOut(env.path, ["rev-parse", "--verify", "HEAD"])
     )?.trim();
