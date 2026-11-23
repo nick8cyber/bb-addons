@@ -5151,11 +5151,12 @@ async function startQueuedTask(
           return false;
         } else {
           deps.log?.warn?.(`orchestrator: task ${task.task_key} refused by spec gate: ${gateErr.message}`);
+          const prevGateErr = (cleanedPayload as any)?.spec_gate_error;
           cleanedPayload.spec_gate_error = gateErr.message;
           deps.store.updateTask(task.task_key, {
             payload: JSON.stringify(cleanedPayload),
           });
-          if (task.coordinator_thread_id && deps.bbCli) {
+          if (prevGateErr !== gateErr.message && task.coordinator_thread_id && deps.bbCli) {
             deps.bbCli.run([
               "thread",
               "tell",

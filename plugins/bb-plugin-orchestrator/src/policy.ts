@@ -813,6 +813,7 @@ export function parsePolicy(
       ...(checks && Object.keys(checks).length > 0 ? { checks } : {}),
       ...(routeLimits && Object.keys(routeLimits).length > 0 ? { routeLimits } : {}),
       ...(typeof raw.specBeforeCode === "boolean" ? { specBeforeCode: raw.specBeforeCode } : {}),
+      ...(raw.presets && typeof raw.presets === "object" ? { presets: raw.presets as any } : {}),
       ...(presetDetails ? { presetDetails } : {}),
       levels,
       routes,

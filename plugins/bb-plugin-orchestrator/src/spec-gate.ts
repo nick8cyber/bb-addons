@@ -56,15 +56,23 @@ export function isDocOrSpecPath(p: string): boolean {
   ) {
     return false;
   }
+  const baseName = clean.split("/").pop() ?? clean;
+  if (
+    baseName.startsWith("readme") ||
+    baseName.startsWith("contributing") ||
+    baseName.startsWith("license") ||
+    baseName.startsWith("changelog")
+  ) {
+    return false;
+  }
   return (
-    clean.startsWith("docs/") ||
+    clean.startsWith("docs/specs/") ||
     clean.includes("/specs/") ||
     clean.startsWith("specs/") ||
     clean.includes("/adr/") ||
     clean.startsWith("adr/") ||
-    clean.endsWith(".md") ||
-    clean.endsWith(".txt") ||
-    clean.endsWith(".rst")
+    (clean.startsWith("docs/") &&
+      (clean.endsWith(".md") || clean.endsWith(".txt") || clean.endsWith(".rst")))
   );
 }
 
@@ -188,9 +196,27 @@ export async function findAcceptedSpecReview(opts: {
 
     if (opts.cmd && opts.repoRoot && !isCodeReview) {
       try {
+        let baseCommit = "HEAD";
+        const mbRes = await opts.cmd.run(
+          "git",
+          ["merge-base", "origin/main", revSha],
+          { cwd: opts.repoRoot },
+        );
+        if (mbRes.exitCode === 0 && mbRes.stdout.trim()) {
+          baseCommit = mbRes.stdout.trim();
+        } else {
+          const parRes = await opts.cmd.run(
+            "git",
+            ["rev-parse", `${revSha}^`],
+            { cwd: opts.repoRoot },
+          );
+          if (parRes.exitCode === 0 && parRes.stdout.trim()) {
+            baseCommit = parRes.stdout.trim();
+          }
+        }
         const diffRes = await opts.cmd.run(
           "git",
-          ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", revSha],
+          ["diff", "--name-only", baseCommit, revSha],
           { cwd: opts.repoRoot },
         );
         if (diffRes.exitCode === 0 && diffRes.stdout.trim()) {
@@ -199,11 +225,33 @@ export async function findAcceptedSpecReview(opts: {
             .map((s) => s.trim())
             .filter(Boolean);
           for (const f of changedFiles) {
-            if (isDocOrSpecPath(f)) {
-              if (!specPaths.includes(f)) specPaths.push(f);
-            } else if (isCodePath(f)) {
+            if (isCodePath(f)) {
               isCodeReview = true;
               break;
+            }
+            if (isDocOrSpecPath(f)) {
+              if (!specPaths.includes(f)) specPaths.push(f);
+            }
+          }
+        } else {
+          const dtRes = await opts.cmd.run(
+            "git",
+            ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", revSha],
+            { cwd: opts.repoRoot },
+          );
+          if (dtRes.exitCode === 0 && dtRes.stdout.trim()) {
+            const files = dtRes.stdout
+              .split("\n")
+              .map((s) => s.trim())
+              .filter(Boolean);
+            for (const f of files) {
+              if (isCodePath(f)) {
+                isCodeReview = true;
+                break;
+              }
+              if (isDocOrSpecPath(f)) {
+                if (!specPaths.includes(f)) specPaths.push(f);
+              }
             }
           }
         }
@@ -211,6 +259,7 @@ export async function findAcceptedSpecReview(opts: {
     }
 
     if (isCodeReview) continue;
+    specPaths = specPaths.filter((p) => isDocOrSpecPath(p));
     if (specPaths.length === 0) continue;
 
     const specPath =
@@ -625,15 +674,6 @@ export async function resolvePresetBaseBranch(
   if (fromMap) return fromMap;
   const fromPolicy = (deps?.policy as any)?.presets?.[presetName]?.baseBranch;
   if (fromPolicy) return fromPolicy;
-  if (deps?.bbCli) {
-    try {
-      const r = await deps.bbCli.run(["tasks", "preset", "show", presetName, "--json"], { timeoutMs: 15_000 });
-      if (r.exitCode === 0) {
-        const parsed = JSON.parse(r.stdout);
-        if (parsed?.preset?.baseBranch) return parsed.preset.baseBranch;
-      }
-    } catch {}
-  }
   return null;
 }
 
@@ -820,6 +860,8 @@ export async function verifySpecBeforeCodeGate(
     taskConfMode === "auto" ||
     (!taskConfMode && ((input.project as any)?.approvalMode === "auto" || (input.policy as any)?.approvalMode === "auto"));
 
+  let pendingContractToSave: SpecContract | null = null;
+
   // §31.9 NET-46: in auto mode, positive spec review on exact SHA automatically resolves & persists contract
   if ((!contract || !contract.approvalId) && isAutoMode) {
     const specRev = await findAcceptedSpecReview({
@@ -831,39 +873,50 @@ export async function verifySpecBeforeCodeGate(
     });
     if (specRev) {
       const now = Date.now();
+      let plObj: any = {};
+      if (taskRow?.payload) {
+        try {
+          plObj = JSON.parse(taskRow.payload);
+        } catch {}
+      }
+      const isArch =
+        contract?.isArchitectural ??
+        Boolean(
+          plObj.is_architectural ||
+            plObj.isArchitectural ||
+            specRev.specPath.includes("/adr/"),
+        );
+      const adr =
+        contract?.adrPath ??
+        plObj.adr_path ??
+        plObj.adrPath ??
+        (specRev.specPath.includes("/adr/") ? specRev.specPath : undefined);
+      const alters =
+        contract?.altersContract ??
+        Boolean(plObj.alters_contract || plObj.altersContract);
+      const section =
+        contract?.specSection ??
+        plObj.spec_section ??
+        plObj.specSection;
+
       const synthesizedContract: SpecContract = {
-        kind: contract?.kind ?? "behavior_change",
-        projectId: (taskRow as any)?.project_id ?? (input.project as any)?.id,
+        kind:
+          contract?.kind ??
+          ((taskRow as any)?.route === "fix"
+            ? "bugfix"
+            : "behavior_change"),
+        projectId:
+          (taskRow as any)?.project_id ?? (input.project as any)?.id,
         specPath: contract?.specPath ?? specRev.specPath,
         specSha: specRev.reviewedSha,
-        specSection: contract?.specSection,
+        specSection: section,
+        adrPath: adr,
         approvalId: specRev.approvalId,
-        altersContract: false,
-        isArchitectural: false,
+        altersContract: alters,
+        isArchitectural: isArch,
       };
-      input.store.saveSpecContract(
-        {
-          ...synthesizedContract,
-          taskKey: input.taskKey,
-        },
-        now,
-      );
+      pendingContractToSave = synthesizedContract;
       contract = synthesizedContract;
-      if (taskRow) {
-        let plObj: any = {};
-        if (taskRow.payload) {
-          try {
-            plObj = JSON.parse(taskRow.payload);
-          } catch {}
-        }
-        plObj.approval_id = specRev.approvalId;
-        plObj.spec_sha = specRev.reviewedSha;
-        plObj.spec_path = synthesizedContract.specPath;
-        input.store.updateTask(taskRow.task_key, {
-          spec_sha: specRev.reviewedSha,
-          payload: JSON.stringify(plObj),
-        });
-      }
     }
   }
 
@@ -1255,6 +1308,32 @@ export async function verifySpecBeforeCodeGate(
       `spec-gate-violation: неизвестный тип работы "${(contract as any).kind}" в договоре приёмки задачи ${input.taskKey} (ожидается: behavior_change, bugfix или mechanical)`,
     );
   }
+
+  if (pendingContractToSave) {
+    const now = Date.now();
+    input.store.saveSpecContract(
+      {
+        ...pendingContractToSave,
+        taskKey: input.taskKey,
+      },
+      now,
+    );
+    if (taskRow) {
+      let plObj: any = {};
+      if (taskRow.payload) {
+        try {
+          plObj = JSON.parse(taskRow.payload);
+        } catch {}
+      }
+      plObj.approval_id = pendingContractToSave.approvalId;
+      plObj.spec_sha = pendingContractToSave.specSha;
+      plObj.spec_path = pendingContractToSave.specPath;
+      input.store.updateTask(taskRow.task_key, {
+        spec_sha: pendingContractToSave.specSha,
+        payload: JSON.stringify(plObj),
+      });
+    }
+  }
 }
 
 /**
@@ -1456,73 +1535,63 @@ export async function verifyReleaseDocumentsGate(
         `spec-gate-violation: для исправления в задаче ${input.taskKey} не указан путь к спецификации (specPath)`,
       );
     }
-    if (contract.specSha && contract.specSha !== "base" && contract.specSha.trim()) {
-      const catCommit = await cmd.run(
+    if (!contract.specSha || contract.specSha === "base" || !contract.specSha.trim()) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: для исправления в задаче ${input.taskKey} отсутствует или недействителен коммит спецификации (${contract.specSha || "пусто"})`,
+      );
+    }
+    const catCommit = await cmd.run(
+      "git",
+      ["cat-file", "-e", `${contract.specSha}^{commit}`],
+      { cwd },
+    );
+    if (catCommit.exitCode !== 0) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: коммит спецификации ${contract.specSha} не найден в репозитории (чужой или недоступный SHA)`,
+      );
+    }
+    const ancRes = await cmd.run(
+      "git",
+      ["merge-base", "--is-ancestor", contract.specSha, input.publishedSha],
+      { cwd },
+    );
+    if (ancRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: коммит спецификации ${contract.specSha} не входит в историю публикуемого коммита ${input.publishedSha}`,
+      );
+    }
+    for (const sp of specFiles) {
+      const catRes = await cmd.run(
         "git",
-        ["cat-file", "-e", `${contract.specSha}^{commit}`],
+        ["cat-file", "-e", `${input.publishedSha}:${sp}`],
         { cwd },
       );
-      if (catCommit.exitCode !== 0) {
+      if (catRes.exitCode !== 0) {
         throw new OrchestratorError(
           "spec-gate-violation",
-          `spec-gate-violation: коммит спецификации ${contract.specSha} не найден в репозитории (чужой или недоступный SHA)`,
+          `spec-gate-violation: спецификация ${sp} была удалена при сведении ветки релиза ${input.taskKey}`,
         );
       }
-      const ancRes = await cmd.run(
+      const diffRes = await cmd.run(
         "git",
-        ["merge-base", "--is-ancestor", contract.specSha, input.publishedSha],
+        [
+          "diff",
+          "--quiet",
+          contract.specSha,
+          input.publishedSha,
+          "--",
+          sp,
+        ],
         { cwd },
       );
-      if (ancRes.exitCode !== 0) {
+      if (diffRes.exitCode !== 0) {
         throw new OrchestratorError(
           "spec-gate-violation",
-          `spec-gate-violation: коммит спецификации ${contract.specSha} не входит в историю публикуемого коммита ${input.publishedSha}`,
+          `spec-gate-violation: спецификация ${sp} была изменена при сведении ветки релиза ${input.taskKey} без нового согласования`,
         );
-      }
-      for (const sp of specFiles) {
-        const catRes = await cmd.run(
-          "git",
-          ["cat-file", "-e", `${input.publishedSha}:${sp}`],
-          { cwd },
-        );
-        if (catRes.exitCode !== 0) {
-          throw new OrchestratorError(
-            "spec-gate-violation",
-            `spec-gate-violation: спецификация ${sp} была удалена при сведении ветки релиза ${input.taskKey}`,
-          );
-        }
-        const diffRes = await cmd.run(
-          "git",
-          [
-            "diff",
-            "--quiet",
-            contract.specSha,
-            input.publishedSha,
-            "--",
-            sp,
-          ],
-          { cwd },
-        );
-        if (diffRes.exitCode !== 0) {
-          throw new OrchestratorError(
-            "spec-gate-violation",
-            `spec-gate-violation: спецификация ${sp} была изменена при сведении ветки релиза ${input.taskKey} без нового согласования`,
-          );
-        }
-      }
-    } else {
-      for (const sp of specFiles) {
-        const catRes = await cmd.run(
-          "git",
-          ["cat-file", "-e", `${input.publishedSha}:${sp}`],
-          { cwd },
-        );
-        if (catRes.exitCode !== 0) {
-          throw new OrchestratorError(
-            "spec-gate-violation",
-            `spec-gate-violation: спецификация ${sp} отсутствует в публикуемом коммите ${input.publishedSha}`,
-          );
-        }
       }
     }
     if (contract.specSection) {

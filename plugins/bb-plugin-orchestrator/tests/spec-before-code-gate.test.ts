@@ -25,6 +25,7 @@ import {
   verifyReleaseDocumentsGate,
   resolveTaskSpecContract,
   isSpecBeforeCodeEnforced,
+  findAcceptedSpecReview,
   type SpecContract,
 } from "../src/spec-gate.js";
 import { runRunQueue, runApprove, runReject } from "../src/workgraph.js";
@@ -3088,5 +3089,301 @@ test("§31.9 Alignment: gate and spawn share exact immutable SHA when origin/HEA
   assert.equal(capturedSpawnArgs.environment?.workspace?.baseBranch?.name, devSha);
   assert.notEqual(devSha, mainSha);
   const del = store.get(res.delegationId)!;
-  assert.equal(del.continue_from, devSha);
+  assert.equal(del.continue_from, null);
+});
+
+test("§31.9 Round 11: round 2 delegation preserves continue_from from round 1", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const dir = makeTempDir("r2-preserves-");
+  const { cmd } = initGitRepo(dir);
+
+  const del1 = store.insert({
+    taskKey: "R2-1",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "provider",
+    round: 1,
+    continueFrom: "origin/main",
+  });
+  store.setStatus(del1.id, "running");
+  store.setRoundResult(del1.id, {
+    branch: "bb/r2-1",
+    sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    commits: 1,
+    dirty: false,
+  });
+  store.setStatus(del1.id, "done");
+
+  const pol = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      presets: {
+        simple: {
+          provider: "provider",
+          baseBranch: "main",
+        },
+      },
+      routes: {
+        simple: {
+          preset: "simple",
+          provider: "provider",
+        },
+      },
+      levels: {
+        simple: {
+          chain: ["simple"],
+        },
+      },
+    }),
+  );
+
+  let capturedSpawnArgs: any = null;
+  const res = await runDelegate(
+    {
+      taskKey: "R2-1",
+      level: "simple",
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_1",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: {
+        run: async (args: string[]) => {
+          if (args[0] === "tasks" && args[1] === "preset") {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({ preset: { providerId: "p", permissionMode: "read", environmentKind: "project-default" } }),
+              stderr: "",
+            };
+          }
+          if (args[0] === "tasks" && args[1] === "show") {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                task: { id: "t_1", key: "R2-1", title: "Task" },
+                project: { id: "proj_1", linkedBbProjectId: "proj_1_bb" },
+              }),
+              stderr: "",
+            };
+          }
+          return { exitCode: 0, stdout: "{}", stderr: "" };
+        },
+      },
+      threads: {
+        spawn: async (args: any) => {
+          capturedSpawnArgs = args;
+          return { id: "thr_exec_2" };
+        },
+        update: async () => {},
+      },
+      probes: { roleByThreadId: () => "orchestrator" },
+      cmd,
+      repoRoot: dir,
+    } as any,
+  );
+
+  assert.equal(res.status, "running");
+  const del2 = store.get(res.delegationId)!;
+  assert.equal(del2.round, 2);
+  assert.equal(del2.continue_from, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+});
+
+test("§31.9 Round 11: NET-46 auto-acceptance preserves altersContract and isArchitectural constraints", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const dir = makeTempDir("net46-auto-");
+  const { run, cmd } = initGitRepo(dir);
+
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/auto-alt.md"), "# Spec\n§1: content\n");
+  run(["add", "."]);
+  run(["commit", "-m", "spec commit"]);
+  const specCommit = run(["rev-parse", "HEAD"]).trim();
+
+  // Task in auto confirmation mode with altersContract = true
+  store.insertTask({
+    taskKey: "AUTO-ALT",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    route: "fix",
+    level: "complex",
+    confirmationMode: "auto",
+    payload: JSON.stringify({
+      spec_path: "docs/specs/auto-alt.md",
+      spec_section: "§1",
+      alters_contract: true,
+    }),
+  });
+
+  // Recorded positive spec review
+  const rev = store.insert({
+    taskKey: "AUTO-ALT",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-gemini",
+    preset: "gemini",
+    provider: "agy",
+    round: 1,
+    continueFrom: specCommit,
+  });
+  store.setStatus(rev.id, "running");
+  store.setStatusIf(rev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+
+  const pol = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      presets: {
+        devin: {
+          provider: "acp-devin",
+        },
+      },
+      routes: {
+        devin: {
+          preset: "devin",
+          provider: "acp-devin",
+        },
+      },
+      levels: {
+        complex: {
+          chain: ["devin"],
+        },
+      },
+    }),
+  );
+
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "AUTO-ALT",
+        role: "executor",
+        noCode: false,
+        level: "complex",
+        store,
+        cmd,
+        policy: pol.policy,
+        baseSha: specCommit,
+        repoRoot: dir,
+        workGraphMode: "shadow",
+      });
+    },
+    (err: any) => {
+      assert.match(err.message, /altersContract = true/);
+      return true;
+    },
+  );
+});
+
+test("§31.9 Round 11: review of code commit modifying README is not accepted as spec review", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const dir = makeTempDir("code-rev-readme-");
+  const { run, cmd } = initGitRepo(dir);
+
+  // Commit 1: src/foo.ts
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/foo.ts"), "export const x = 1;\n");
+  run(["add", "src/foo.ts"]);
+  run(["commit", "-m", "feat: code"]);
+
+  // Commit 2: README.md
+  writeFileSync(join(dir, "README.md"), "# Updated Readme\n");
+  run(["add", "README.md"]);
+  run(["commit", "-m", "docs: readme"]);
+  const revSha = run(["rev-parse", "HEAD"]).trim();
+
+  store.insertTask({
+    taskKey: "CODE-REV",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    route: "fix",
+    level: "complex",
+    confirmationMode: "auto",
+  });
+
+  const rev = store.insert({
+    taskKey: "CODE-REV",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-gemini",
+    preset: "gemini",
+    provider: "agy",
+    round: 1,
+    continueFrom: revSha,
+  });
+  store.setStatus(rev.id, "running");
+  store.setStatusIf(rev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  });
+
+  const found = await findAcceptedSpecReview({
+    taskKey: "CODE-REV",
+    store,
+    cmd,
+    repoRoot: dir,
+  });
+
+  assert.equal(found, null, "Code review modifying README must not be accepted as spec review");
+});
+
+test("§31.9 Round 11: release gate rejects bugfix when spec was modified during merge", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const dir = makeTempDir("fix-mod-");
+  const { run, cmd } = initGitRepo(dir);
+
+  const specPath = "docs/specs/spec.md";
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, specPath), "# Original Spec\n");
+  run(["add", specPath]);
+  run(["commit", "-m", "initial spec"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Commit on merge modifies the spec file
+  writeFileSync(join(dir, specPath), "# Rewritten Spec Without Approval\n");
+  run(["add", specPath]);
+  run(["commit", "-m", "fix: unauthorized spec rewrite"]);
+  const publishedSha = run(["rev-parse", "HEAD"]).trim();
+
+  await assert.rejects(
+    async () => {
+      await verifyReleaseDocumentsGate({
+        taskKey: "FIX-MOD",
+        store,
+        cmd,
+        repoRoot: dir,
+        publishedSha,
+        workGraphMode: "strict",
+        contract: {
+          kind: "bugfix",
+          specPath,
+          specSection: "§1",
+          specSha: baseSha,
+          approvalId: "appr:proj:FIX-MOD:sha:123",
+        },
+      });
+    },
+    (err: any) => {
+      assert.match(err.message, /была изменена при сведении ветки релиза/);
+      return true;
+    },
+  );
 });
