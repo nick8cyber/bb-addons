@@ -33,6 +33,7 @@ import {
   resolvePresetBaseBranch,
   resolveTaskSpecContract,
   parseContractFromText,
+  resolveEffectiveApprovalMode,
   type SpecContract,
 } from "./spec-gate.js";
 import {
@@ -4770,9 +4771,11 @@ async function startQueuedTask(
   const payload = parsePayload(task.payload);
   const now = deps.now ? deps.now() : Date.now();
   const effectiveMode =
-    task.confirmation_mode ??
-    deps.approvalMode ??
-    (task.route === "feature" ? "manual" : "auto");
+    resolveEffectiveApprovalMode({
+      taskConfirmationMode: task.confirmation_mode,
+      approvalMode: deps.approvalMode,
+      route: task.route,
+    }) ?? (task.route === "feature" ? "manual" : "auto");
 
   let branch = task.branch;
   if (task.route !== "research") {

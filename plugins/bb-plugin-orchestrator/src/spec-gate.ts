@@ -23,6 +23,43 @@ import type { ResolvedProject } from "./release-config.js";
 
 export type SpecWorkKind = "behavior_change" | "bugfix" | "mechanical";
 
+export function isShaMatch(a?: string | null, b?: string | null): boolean {
+  if (!a || !b) return false;
+  const ca = a.trim().toLowerCase();
+  const cb = b.trim().toLowerCase();
+  if (ca === cb) return true;
+  if (/^[0-9a-f]{4,40}$/.test(ca) && /^[0-9a-f]{4,40}$/.test(cb)) {
+    return ca.startsWith(cb) || cb.startsWith(ca);
+  }
+  return false;
+}
+
+export function resolveEffectiveApprovalMode(params: {
+  taskConfirmationMode?: string | null;
+  approvalMode?: "auto" | "manual" | (() => "auto" | "manual" | null) | null;
+  projectApprovalMode?: string | null;
+  policyApprovalMode?: string | null;
+  route?: string | null;
+}): "auto" | "manual" | null {
+  if (params.taskConfirmationMode === "auto" || params.taskConfirmationMode === "manual") {
+    return params.taskConfirmationMode;
+  }
+  if (params.projectApprovalMode === "auto" || params.projectApprovalMode === "manual") {
+    return params.projectApprovalMode;
+  }
+  if (params.policyApprovalMode === "auto" || params.policyApprovalMode === "manual") {
+    return params.policyApprovalMode;
+  }
+  const resolved = typeof params.approvalMode === "function" ? params.approvalMode() : params.approvalMode;
+  if (resolved === "auto" || resolved === "manual") {
+    return resolved;
+  }
+  if (params.route) {
+    return params.route === "feature" ? "manual" : "auto";
+  }
+  return null;
+}
+
 export function splitDocPaths(paths?: string | null): string[] {
   if (!paths) return [];
   return paths.split(/[,;\n]+/).map((s) => s.trim()).filter(Boolean);
@@ -415,12 +452,12 @@ export async function findAcceptedSpecReview(opts: {
       }
     }
 
+    const allFound = [...specPaths, ...rawSpecPaths];
+    const uniqueSpecs = Array.from(new Set(allFound.filter((p) => p.includes("specs/") || p.endsWith(".md"))));
     const specPath =
-      specPaths.find((p) => p.includes("specs/") || p.endsWith(".md")) ??
-      rawSpecPaths.find((p: string) => p.includes("specs/") || p.endsWith(".md")) ??
-      specPaths[0] ??
-      rawSpecPaths[0] ??
-      `docs/specs/${normKey}.md`;
+      uniqueSpecs.length > 0
+        ? uniqueSpecs.join(",")
+        : (specPaths[0] ?? rawSpecPaths[0] ?? `docs/specs/${normKey}.md`);
 
     const projId = rev.project_id ?? opts.projectId ?? "proj";
     const approvalId = `appr:${projId}:${normKey}:${headSha}:${rev.finished_at || rev.updated_at || Date.now()}`;
@@ -994,11 +1031,13 @@ export async function verifySpecBeforeCodeGate(
 
   const taskRow = input.task ?? input.store.getTask(input.taskKey);
   const taskConfMode = (taskRow as any)?.confirmation_mode ?? (input.task as any)?.confirmationMode;
-  const resolvedInputApprovalMode = typeof input.approvalMode === "function" ? input.approvalMode() : input.approvalMode;
-  const effectiveApprovalMode =
-    (taskConfMode === "auto" || taskConfMode === "manual")
-      ? taskConfMode
-      : ((input.project as any)?.approvalMode ?? (input.policy as any)?.approvalMode ?? resolvedInputApprovalMode ?? null);
+  const effectiveApprovalMode = resolveEffectiveApprovalMode({
+    taskConfirmationMode: taskConfMode,
+    approvalMode: input.approvalMode,
+    projectApprovalMode: (input.project as any)?.approvalMode,
+    policyApprovalMode: (input.policy as any)?.approvalMode,
+    route: (taskRow as any)?.route ?? (input.task as any)?.route,
+  });
   const isAutoMode = effectiveApprovalMode === "auto";
 
   let pendingContractToSave: SpecContract | null = null;
@@ -1022,6 +1061,7 @@ export async function verifySpecBeforeCodeGate(
   const cmd = input.cmd;
   const cwd = input.repoRoot;
   let currentBaseSha = input.baseSha;
+  let baseShaError: Error | null = null;
   if (!currentBaseSha && cwd && cmd) {
     const presetBaseBranch = await resolvePresetBaseBranch(input.presetName ?? undefined, {
       policy: input.policy,
@@ -1036,7 +1076,9 @@ export async function verifySpecBeforeCodeGate(
           input.baseBranchName ??
           (input.project as any)?.baseBranch,
       });
-    } catch {}
+    } catch (err: any) {
+      baseShaError = err;
+    }
   }
 
   const targetSha = currentBaseSha ?? input.preparedBaseSha ?? input.baseSha;
@@ -1057,19 +1099,40 @@ export async function verifySpecBeforeCodeGate(
     });
     if (specRev) {
       const storedRev = input.store.getSpecContract(input.taskKey);
-      const isRevokedForSameRev = Boolean(
-        storedRev &&
-        (!storedRev.approval_id || !storedRev.approval_id.trim()) &&
-        storedRev.spec_sha &&
-        specRev.reviewedSha &&
-        storedRev.spec_sha.toLowerCase() === specRev.reviewedSha.toLowerCase(),
-      );
+      let isRevokedForSameRev = false;
+
+      if (storedRev && (!storedRev.approval_id || !storedRev.approval_id.trim())) {
+        let lastRevokedSha: string | null = null;
+        const allDelegations = input.store.delegationsByTask(normalizeTaskKey(input.taskKey));
+        for (const d of allDelegations) {
+          const dTime = d.finished_at ?? d.updated_at ?? d.created_at;
+          if (dTime != null && dTime <= storedRev.updated_at) {
+            if (
+              (d.level.includes("review") || d.level === "audit" || d.level === "spec_review") &&
+              d.level !== "release-audit" &&
+              d.status === "done" &&
+              d.continue_from
+            ) {
+              lastRevokedSha = d.continue_from;
+              break;
+            }
+          }
+        }
+        const reviewFinishedTime = specRev.delegation.finished_at ?? specRev.delegation.updated_at ?? specRev.delegation.created_at;
+        const reviewIsPreRevocation = reviewFinishedTime != null && reviewFinishedTime <= storedRev.updated_at;
+        if (
+          (lastRevokedSha && isShaMatch(specRev.reviewedSha, lastRevokedSha) && reviewIsPreRevocation) ||
+          (reviewIsPreRevocation && !lastRevokedSha)
+        ) {
+          isRevokedForSameRev = true;
+        }
+      }
 
       if (!isRevokedForSameRev) {
         const shouldSynthesize =
           !contract ||
           !contract.approvalId ||
-          (Boolean(contract.specSha) && contract.specSha !== specRev.reviewedSha);
+          (Boolean(contract.specSha) && !isShaMatch(contract.specSha, specRev.reviewedSha));
         if (shouldSynthesize) {
           let plObj: any = {};
           if (taskRow?.payload) {
@@ -1097,6 +1160,15 @@ export async function verifySpecBeforeCodeGate(
             plObj.spec_section ??
             plObj.specSection;
 
+          const combinedSpecs = Array.from(
+            new Set([
+              ...splitDocPaths(contract?.specPath),
+              ...splitDocPaths(specRev.specPath),
+            ]),
+          );
+          const effectiveSpecPath =
+            combinedSpecs.length > 0 ? combinedSpecs.join(",") : specRev.specPath;
+
           const synthesizedContract: SpecContract = {
             kind:
               contract?.kind ??
@@ -1105,7 +1177,7 @@ export async function verifySpecBeforeCodeGate(
                 : "behavior_change"),
             projectId:
               (taskRow as any)?.project_id ?? (input.project as any)?.id,
-            specPath: specRev.specPath,
+            specPath: effectiveSpecPath,
             specSha: specRev.reviewedSha,
             specSection: section,
             adrPath: adr,
@@ -1218,6 +1290,32 @@ export async function verifySpecBeforeCodeGate(
       );
     }
 
+    if (reviewToCheck && reviewToCheck.attach) {
+      try {
+        const att = JSON.parse(reviewToCheck.attach);
+        if (att?.baseSha && att?.headSha && input.cmd && input.repoRoot) {
+          const currentRepo = await resolveRepoIdentity(input.cmd, input.repoRoot);
+          if (att.repo && currentRepo && att.repo !== currentRepo) {
+            throw new OrchestratorError(
+              "spec-gate-violation",
+              `spec-gate-violation: ревью спецификации выполнено в другом репозитории (${att.repo} !== ${currentRepo}; approvalMode: auto)`,
+              "Назначь ревью спецификации в репозитории текущего проекта",
+            );
+          }
+          const rangeCheck = await verifySpecReviewRange(input.cmd, input.repoRoot, att.baseSha, att.headSha);
+          if (!rangeCheck.ok) {
+            throw new OrchestratorError(
+              "spec-gate-violation",
+              `spec-gate-violation: диапазон ревью спецификации ${att.baseSha.slice(0, 7)}..${att.headSha.slice(0, 7)} содержит изменения исходного кода (§31.9; approvalMode: auto)`,
+              "Ревью спецификации должно охватывать только файлы спецификаций и документации",
+            );
+          }
+        }
+      } catch (err: any) {
+        if (err instanceof OrchestratorError) throw err;
+      }
+    }
+
     if (targetSha) {
       const shortSha = targetSha.slice(0, 7);
       throw new OrchestratorError(
@@ -1269,21 +1367,11 @@ export async function verifySpecBeforeCodeGate(
       apprSha !== "sha" &&
       /^[0-9a-fA-F]{4,40}$/.test(apprSha)
     ) {
-      const cleanAppr = apprSha.toLowerCase();
-      const cleanSpec = contract.specSha.toLowerCase();
-      if (cleanAppr !== cleanSpec) {
-        if (cleanAppr.length === 40 && cleanSpec.length === 40) {
-          throw new OrchestratorError(
-            "spec-gate-violation",
-            `spec-gate-violation: принятие ${contract.approvalId} привязано к другой редакции спецификации (${apprSha} !== ${contract.specSha})`,
-          );
-        }
-        if (!cleanSpec.startsWith(cleanAppr) && !cleanAppr.startsWith(cleanSpec)) {
-          throw new OrchestratorError(
-            "spec-gate-violation",
-            `spec-gate-violation: принятие ${contract.approvalId} привязано к другой редакции спецификации (${apprSha} !== ${contract.specSha})`,
-          );
-        }
+      if (!isShaMatch(apprSha, contract.specSha)) {
+        throw new OrchestratorError(
+          "spec-gate-violation",
+          `spec-gate-violation: принятие ${contract.approvalId} привязано к другой редакции спецификации (${apprSha} !== ${contract.specSha})`,
+        );
       }
     }
   }
@@ -1314,13 +1402,7 @@ export async function verifySpecBeforeCodeGate(
     }
   } else if (storedContract) {
     if (!storedContract.approval_id || !storedContract.approval_id.trim()) {
-      const isNewRevision =
-        Boolean(pendingContractToSave) &&
-        storedContract.spec_sha != null &&
-        contract.specSha != null &&
-        storedContract.spec_sha.toLowerCase() !== contract.specSha.toLowerCase();
-
-      if (!isNewRevision) {
+      if (!pendingContractToSave) {
         throw new OrchestratorError(
           "spec-gate-violation",
           `spec-gate-violation: задача ${input.taskKey} требует одобрения владельца в task_spec_contracts, но запись отсутствует или была отозвана`,
@@ -1363,6 +1445,9 @@ export async function verifySpecBeforeCodeGate(
 
   // Resolve base commit SHA if possible (§31.9: exact executor base)
   if (!currentBaseSha && cwd && cmd) {
+    if (baseShaError) {
+      throw baseShaError;
+    }
     const presetBaseBranch = await resolvePresetBaseBranch(input.presetName ?? undefined, {
       policy: input.policy,
     });

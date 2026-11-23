@@ -5352,9 +5352,9 @@ test("§31.9 GH-684 Acceptance: global auto+shadow, NO task_queue, two OK review
 
   // 5. Revoke approval for rev3Sha in task_spec_contracts
   // Running on the same rev3Sha in auto mode MUST reject (revocation must NOT be bypassed)
-  db.prepare("UPDATE task_spec_contracts SET approval_id = NULL WHERE task_key = 'GH-684'").run();
+  store.revokeSpecContractApproval("GH-684");
   assert.equal(store.getSpecContract("GH-684")?.approval_id, null);
-  assert.equal(store.getSpecContract("GH-684")?.spec_sha, rev3Sha);
+  assert.equal(store.getSpecContract("GH-684")?.spec_sha, null);
 
   await assert.rejects(
     async () => {
@@ -5528,6 +5528,72 @@ test("§31.9 GH-684 Acceptance: global auto+shadow, NO task_queue, two OK review
     } as any,
   );
   assert.equal(spawnCount, 5, "Spawns with short SHA in --from");
+
+  // 9. Multiple spec documents in spec review are preserved in specPath and verified
+  store.setStatus(resShort.delegationId, "running");
+  store.setStatusIf(resShort.delegationId, "running", "done");
+
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec v5\nMain spec.");
+  writeFileSync(join(dir, "docs/specs/GH-684-aux.md"), "# Aux Spec\nSecondary spec.");
+  run(["add", "docs/specs/GH-684-aux.md"]);
+  run(["commit", "-qam", "docs: add auxiliary spec"]);
+  const rev5Sha = run(["rev-parse", "HEAD"]).trim();
+
+  const revDel5 = store.insert({
+    taskKey: "GH-684",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-route",
+    preset: "auditor",
+    provider: "claude-code",
+    continueFrom: rev5Sha,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      baseSha: descendantSha,
+      headSha: rev5Sha,
+      specPaths: ["docs/specs/GH-684.md", "docs/specs/GH-684-aux.md"],
+      repo: repoId,
+      projectId: "proj_gh",
+      taskKey: "GH-684",
+    }),
+  });
+  store.setStatus(revDel5.id, "running");
+  store.setStatusIf(revDel5.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const res5 = await runDelegate(
+    {
+      taskKey: "GH-684",
+      level: "complex",
+      from: rev5Sha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_gh",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: () => "auto",
+    } as any,
+  );
+  assert.equal(spawnCount, 6, "Spawns for rev5Sha with multiple specs");
+  const contractMulti = store.getSpecContract("GH-684");
+  assert.ok(contractMulti?.spec_path?.includes("docs/specs/GH-684.md"), "Must contain main spec");
+  assert.ok(contractMulti?.spec_path?.includes("docs/specs/GH-684-aux.md"), "Must contain auxiliary spec");
 });
 
 test("§31.9 approvalMode forwarding via dispatchToRoute and runRunQueue", async () => {
