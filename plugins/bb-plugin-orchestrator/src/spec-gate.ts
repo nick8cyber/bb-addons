@@ -250,6 +250,7 @@ export async function findAcceptedSpecReview(opts: {
   repoRoot?: string;
   projectId?: string;
   baseBranch?: string | null;
+  targetSha?: string | null;
 }): Promise<AcceptedSpecReview | null> {
   const normKey = normalizeTaskKey(opts.taskKey);
   const delegations = opts.store.delegationsByTask(normKey);
@@ -262,9 +263,19 @@ export async function findAcceptedSpecReview(opts: {
   );
   if (reviews.length === 0) return null;
 
+  let normalizedTargetSha = opts.targetSha ? opts.targetSha.trim() : null;
+  if (normalizedTargetSha && opts.cmd && opts.repoRoot && !/^[0-9a-fA-F]{40}$/.test(normalizedTargetSha)) {
+    try {
+      const revRes = await opts.cmd.run("git", ["rev-parse", "--verify", `${normalizedTargetSha}^{commit}`], { cwd: opts.repoRoot });
+      if (revRes.exitCode === 0 && revRes.stdout.trim().length === 40) {
+        normalizedTargetSha = revRes.stdout.trim();
+      }
+    } catch {}
+  }
+
   const events = opts.store.listEvents("review.verdict");
 
-  for (const rev of reviews.slice().reverse()) {
+  for (const rev of reviews) {
     if (opts.projectId && rev.project_id && opts.projectId !== rev.project_id) {
       continue;
     }
@@ -382,6 +393,28 @@ export async function findAcceptedSpecReview(opts: {
       ? att.specPaths
       : (Array.isArray(att.paths) && att.paths.length > 0 ? att.paths : []);
 
+    // 3) If targetSha is specified, verify this review covers targetSha
+    if (normalizedTargetSha) {
+      if (headSha !== normalizedTargetSha) {
+        if (!opts.cmd || !opts.repoRoot) {
+          continue;
+        }
+        // Must be ancestor of targetSha
+        const ancRes = await opts.cmd.run("git", ["merge-base", "--is-ancestor", headSha, normalizedTargetSha], { cwd: opts.repoRoot });
+        if (ancRes.exitCode !== 0) {
+          continue;
+        }
+        // Verify spec paths did not change between headSha and targetSha
+        const checkPaths = specPaths.length > 0 ? specPaths : rawSpecPaths;
+        if (checkPaths.length > 0) {
+          const diffRes = await opts.cmd.run("git", ["diff", "--quiet", headSha, normalizedTargetSha, "--", ...checkPaths], { cwd: opts.repoRoot });
+          if (diffRes.exitCode !== 0) {
+            continue;
+          }
+        }
+      }
+    }
+
     const specPath =
       specPaths.find((p) => p.includes("specs/") || p.endsWith(".md")) ??
       rawSpecPaths.find((p: string) => p.includes("specs/") || p.endsWith(".md")) ??
@@ -436,6 +469,7 @@ export interface VerifySpecGateInput {
   task?: TaskQueueRow | null;
   payload?: any;
   specBeforeCode?: boolean;
+  approvalMode?: "auto" | "manual" | (() => "auto" | "manual" | null) | null;
 }
 
 export interface VerifyReleaseDocumentsInput {
@@ -960,11 +994,37 @@ export async function verifySpecBeforeCodeGate(
 
   const taskRow = input.task ?? input.store.getTask(input.taskKey);
   const taskConfMode = (taskRow as any)?.confirmation_mode ?? (input.task as any)?.confirmationMode;
-  const isAutoMode =
-    taskConfMode === "auto" ||
-    (!taskConfMode && ((input.project as any)?.approvalMode === "auto" || (input.policy as any)?.approvalMode === "auto"));
+  const resolvedInputApprovalMode = typeof input.approvalMode === "function" ? input.approvalMode() : input.approvalMode;
+  const effectiveApprovalMode =
+    (taskConfMode === "auto" || taskConfMode === "manual")
+      ? taskConfMode
+      : (resolvedInputApprovalMode ?? (input.project as any)?.approvalMode ?? (input.policy as any)?.approvalMode ?? null);
+  const isAutoMode = effectiveApprovalMode === "auto";
 
   let pendingContractToSave: SpecContract | null = null;
+
+  // Resolve base commit SHA if possible before review matching (§31.9: exact executor base)
+  const cmd = input.cmd;
+  const cwd = input.repoRoot;
+  let currentBaseSha = input.baseSha;
+  if (!currentBaseSha && cwd && cmd) {
+    const presetBaseBranch = await resolvePresetBaseBranch(input.presetName ?? undefined, {
+      policy: input.policy,
+    });
+    try {
+      currentBaseSha = await resolveExecutorBaseSha({
+        cmd,
+        repoRoot: cwd,
+        from: input.preparedBaseSha,
+        baseBranch:
+          presetBaseBranch ??
+          input.baseBranchName ??
+          (input.project as any)?.baseBranch,
+      });
+    } catch {}
+  }
+
+  const targetSha = currentBaseSha ?? input.preparedBaseSha ?? input.baseSha;
 
   // §31.9 NET-46: in auto mode, positive spec review on exact SHA automatically resolves & persists contract
   if ((!contract || !contract.approvalId) && isAutoMode) {
@@ -978,6 +1038,7 @@ export async function verifySpecBeforeCodeGate(
         input.baseBranchName ??
         (input.project as any)?.baseBranch ??
         (input.policy as any)?.baseBranch,
+      targetSha,
     });
     if (specRev) {
       const now = Date.now();
@@ -1022,6 +1083,7 @@ export async function verifySpecBeforeCodeGate(
         approvalId: specRev.approvalId,
         altersContract: alters,
         isArchitectural: isArch,
+        preparedBaseSha: targetSha,
       };
       pendingContractToSave = synthesizedContract;
       contract = synthesizedContract;
@@ -1029,20 +1091,88 @@ export async function verifySpecBeforeCodeGate(
   }
 
   if (!contract) {
-    const delegations = input.store.delegationsByTask(normalizeTaskKey(input.taskKey));
-    const unprovenRev = delegations.find(
-      (d) => (d.level.includes("review") || d.level === "audit") && d.status === "done" && d.continue_from,
+    if (!isAutoMode) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: задача ${input.taskKey} ожидает одобрения спецификации владельцем (approvalMode: ${effectiveApprovalMode || "manual"}); договор приёмки не подтверждён владельцем`,
+        "Одобри спецификацию через команду approve до запуска кода",
+      );
+    }
+
+    const normKey = normalizeTaskKey(input.taskKey);
+    const delegations = input.store.delegationsByTask(normKey);
+    const reviews = delegations.filter(
+      (d) =>
+        (d.level.includes("review") || d.level === "audit" || d.level === "spec_review") &&
+        d.level !== "release-audit" &&
+        d.status === "done" &&
+        Boolean(d.continue_from),
     );
-    if (unprovenRev) {
+
+    if (reviews.length === 0) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация или договор приёмки отсутствует (§31.9; approvalMode: auto)`,
+        "Назначь ревью спецификации через bb orchestrator delegate <KEY> --level review --kind spec_review --base-sha <baseSha> --from <headSha>",
+      );
+    }
+
+    const events = input.store.listEvents("review.verdict");
+    const hasAnyOk = reviews.some((rev) => {
+      const delEvent = events.slice().reverse().find((e) => {
+        try {
+          return JSON.parse(e.payload).delegationId === rev.id;
+        } catch {
+          return false;
+        }
+      });
+      if (!delEvent) return false;
+      try {
+        const p = JSON.parse(delEvent.payload);
+        return p.verdict === "OK" && (p.blockers === 0 || p.blockers == null);
+      } catch {
+        return false;
+      }
+    });
+
+    if (!hasAnyOk) {
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: спецификация для задачи ${input.taskKey} не принята ревью (последний вердикт: CHANGES или наличие блокеров; approvalMode: auto)`,
+        "Исправь замечания ревью и назначь повторное ревью спецификации",
+      );
+    }
+
+    const hasProvenSpecReview = reviews.some((d) => {
+      if (!d.attach) return false;
+      try {
+        const att = JSON.parse(d.attach);
+        return att && att.kind === "spec_review" && att.baseSha && att.headSha;
+      } catch {
+        return false;
+      }
+    });
+
+    if (!hasProvenSpecReview) {
       throw new OrchestratorError(
         "spec-gate-violation",
         `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация отсутствует (§31.9). Для старой записи ревью без доказанного базового коммита требуется назначить ревью спецификации с явным диапазоном SHA (baseSha и headSha) до запуска кода`,
         "Назначь ревью спецификации с явным диапазоном SHA через bb orchestrator delegate <KEY> --level review --kind spec_review --base-sha <baseSha> --from <headSha> или одобри спецификацию через команду approve",
       );
     }
+
+    if (targetSha) {
+      const shortSha = targetSha.slice(0, 7);
+      throw new OrchestratorError(
+        "spec-gate-violation",
+        `spec-gate-violation: для коммита ${shortSha} отсутствует принятое ревью спецификации либо спецификация была изменена после ревью (§31.9; approvalMode: auto)`,
+        `Назначь ревью спецификации на коммит ${shortSha} через bb orchestrator delegate ${input.taskKey} --level review --kind spec_review --from ${shortSha}`,
+      );
+    }
+
     throw new OrchestratorError(
       "spec-gate-violation",
-      `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация или договор приёмки отсутствует (§31.9)`,
+      `spec-gate-violation: задача ${input.taskKey} изменяет кодовую базу, но принятая спецификация или договор приёмки отсутствует (§31.9; approvalMode: auto)`,
       "Прими спецификацию (spec) или зафиксируй ссылку на существующий пункт/основание до запуска кода",
     );
   }
@@ -1103,7 +1233,10 @@ export async function verifySpecBeforeCodeGate(
 
   // If stored contract exists in DB or task is manual, ensure approvalId matches and is not revoked
   const storedContract = input.store.getSpecContract(input.taskKey);
-  const effectiveConfMode = (input.task as any)?.confirmation_mode ?? (input.task as any)?.confirmationMode ?? taskConfMode;
+  const effectiveConfMode =
+    (taskConfMode === "auto" || taskConfMode === "manual")
+      ? taskConfMode
+      : effectiveApprovalMode;
   if (effectiveConfMode === "manual" || storedContract) {
     if (!storedContract || !storedContract.approval_id) {
       throw new OrchestratorError(
@@ -1131,8 +1264,6 @@ export async function verifySpecBeforeCodeGate(
     );
   }
 
-  const cmd = input.cmd;
-  const cwd = input.repoRoot;
   if (!cmd) {
     throw new OrchestratorError(
       "spec-gate-violation",
@@ -1162,8 +1293,7 @@ export async function verifySpecBeforeCodeGate(
   }
 
   // Resolve base commit SHA if possible (§31.9: exact executor base)
-  let currentBaseSha = input.baseSha;
-  if (!currentBaseSha && cwd) {
+  if (!currentBaseSha && cwd && cmd) {
     const presetBaseBranch = await resolvePresetBaseBranch(input.presetName ?? undefined, {
       policy: input.policy,
     });

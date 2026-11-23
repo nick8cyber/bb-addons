@@ -1611,6 +1611,7 @@ export async function createPlugin(
         unavailableRoutes: stepsDeps.unavailableRoutes,
         log: bb.log,
         workGraphMode: (pid?: string) => getWorkGraphMode(pid ?? taskPid),
+        approvalMode: getApprovalMode,
         repoRoot: wtCtx?.repoRoot,
         resolveProject: (pid: string) => releaseConfig.config ? resolveProject(releaseConfig.config, pid) : null,
       });
@@ -1718,6 +1719,7 @@ export async function createPlugin(
     now: () => Date.now(),
     unavailableRoutes: () => new Set(policyLoad.unavailableRoutes),
     workGraphMode: (pid?: string) => getWorkGraphMode(pid),
+    approvalMode: getApprovalMode,
     resolveRepoRoot: async (row: DelegationRow) => {
       const wt = await resolveWorktreeContext(row.coordinator_thread_id, row.project_id ?? undefined, undefined).catch(() => null);
       return wt?.repoRoot;
@@ -2004,6 +2006,7 @@ export async function createPlugin(
       bbCli,
       resolveProject: (pid: string) => releaseConfig.config ? resolveProject(releaseConfig.config, pid) : null,
       t,
+      approvalMode: getApprovalMode() ?? undefined,
       requestOwnerGateInteraction,
       log: bb.log,
       resolveTaskRepoContext: async (task) => {
@@ -4735,6 +4738,7 @@ abandoned: ${res.reported
             bbCli,
             t,
             resolveProject: (pid: string) => releaseConfig.config ? resolveProject(releaseConfig.config, pid) : null,
+            approvalMode: getApprovalMode() ?? undefined,
             requestOwnerGateInteraction,
             log: bb.log,
             resolveTaskRepoContext: async (task) => {

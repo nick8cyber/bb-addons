@@ -5031,3 +5031,248 @@ test("§31.9: resolveRepoIdentity returns undefined on git failure", async () =>
   const res = await resolveRepoIdentity(failingCmd, nonGitDir);
   assert.equal(res, undefined, "resolveRepoIdentity must return undefined when git fails");
 });
+
+test("§31.9 GH-684 Acceptance: global auto+shadow, NO task_queue, two OK reviews on different revisions -> exact second review SHA spawns 1 and saves contract, manual and foreign SHA reject with 0 spawns", async () => {
+  const dir = makeTempDir("orch-gh684-acceptance-");
+  const { run, cmd } = initGitRepo(dir);
+  const repoId = (await resolveRepoIdentity(cmd, dir))!;
+
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 0\n");
+  run(["add", "."]); run(["commit", "-qm", "initial base"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Rev 1
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 1\n");
+  run(["commit", "-qam", "docs: spec revision 1"]);
+  const rev1Sha = run(["rev-parse", "HEAD"]).trim();
+
+  // Rev 2 (updated spec based on review comments)
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 2 with fixes\n");
+  run(["commit", "-qam", "docs: spec revision 2"]);
+  const rev2Sha = run(["rev-parse", "HEAD"]).trim();
+
+  // Foreign / Unreviewed SHA
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 3 unreviewed\n");
+  run(["commit", "-qam", "docs: spec revision 3 unreviewed"]);
+  const foreignSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  // Ensure NO row in task_queue for GH-684
+  assert.equal(store.getTask("GH-684"), null);
+  assert.equal(store.getSpecContract("GH-684"), null);
+
+  // Review 1 on rev1Sha (OK, 0 blockers)
+  const del1 = store.insert({
+    taskKey: "GH-684",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-neon",
+    preset: "auditor",
+    provider: "neon",
+    round: 1,
+    status: "dispatched",
+    continueFrom: rev1Sha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "GH-684",
+      projectId: "proj_gh",
+      repo: repoId,
+      baseSha,
+      headSha: rev1Sha,
+      specPaths: ["docs/specs/GH-684.md"],
+    }),
+  });
+  store.setStatus(del1.id, "running");
+  store.setStatusIf(del1.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  // Review 2 on rev2Sha (OK, 0 blockers)
+  const del2 = store.insert({
+    taskKey: "GH-684",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-neon",
+    preset: "auditor",
+    provider: "neon",
+    round: 2,
+    status: "dispatched",
+    continueFrom: rev2Sha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "GH-684",
+      projectId: "proj_gh",
+      repo: repoId,
+      baseSha,
+      headSha: rev2Sha,
+      specPaths: ["docs/specs/GH-684.md"],
+    }),
+  });
+  store.setStatus(del2.id, "running");
+  store.setStatusIf(del2.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const pol = parsePolicy(POLICY_TEXT);
+
+  let spawnCount = 0;
+  const mockThreads = {
+    spawn: async () => {
+      spawnCount++;
+      return { id: `thr_exec_${spawnCount}` };
+    },
+  };
+  const fakeCli: BbCli = {
+    run: async (args: string[]) => {
+      if (args[0] === "tasks" && args[1] === "preset") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            preset: {
+              providerId: "acp-devin",
+              permissionMode: "full",
+              environmentKind: "host",
+              baseBranch: "main",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "tasks" && args[1] === "show") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            task: { id: "t_gh", key: "GH-684", title: "GH-684 Task" },
+            project: { id: "proj_gh", linkedBbProjectId: "proj_gh_bb" },
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "{}", stderr: "" };
+    },
+  };
+
+  // 1. Foreign / Unreviewed SHA in auto mode -> 0 spawn, rejected with informative error
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "GH-684",
+          level: "complex",
+          from: foreignSha,
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_gh",
+          },
+        },
+        {
+          store,
+          policy: () => pol.policy,
+          loadPolicy: async () => pol,
+          bbCli: fakeCli,
+          threads: mockThreads as any,
+          probes: { roleByThreadId: () => "orchestrator" },
+          primaryHostId: async () => "host_1",
+          cmd,
+          repoRoot: dir,
+          workGraphMode: "shadow",
+          approvalMode: () => "auto",
+        } as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /отсутствует принятое ревью спецификации либо спецификация была изменена после ревью/);
+      return true;
+    },
+  );
+  assert.equal(spawnCount, 0, "No spawn on foreign SHA");
+  assert.equal(store.getSpecContract("GH-684"), null);
+
+  // 2. Manual mode on rev2Sha -> 0 spawn, rejected with owner approval required
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "GH-684",
+          level: "complex",
+          from: rev2Sha,
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_gh",
+          },
+        },
+        {
+          store,
+          policy: () => pol.policy,
+          loadPolicy: async () => pol,
+          bbCli: fakeCli,
+          threads: mockThreads as any,
+          probes: { roleByThreadId: () => "orchestrator" },
+          primaryHostId: async () => "host_1",
+          cmd,
+          repoRoot: dir,
+          workGraphMode: "shadow",
+          approvalMode: () => "manual",
+        } as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /ожидает одобрения спецификации владельцем \(approvalMode: manual\)/);
+      return true;
+    },
+  );
+  assert.equal(spawnCount, 0, "No spawn in manual mode without owner approval");
+  assert.equal(store.getSpecContract("GH-684"), null);
+
+  // 3. Exact rev2Sha in auto mode -> 1 spawn, contract persisted for rev2Sha
+  const res = await runDelegate(
+    {
+      taskKey: "GH-684",
+      level: "complex",
+      from: rev2Sha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_gh",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: () => "auto",
+    } as any,
+  );
+
+  assert.equal(spawnCount, 1, "Exactly 1 spawn on rev2Sha in auto mode");
+  assert.equal(res.taskKey, "GH-684");
+  const savedContract = store.getSpecContract("GH-684");
+  assert.ok(savedContract, "Contract must be saved in task_spec_contracts");
+  assert.equal(savedContract?.spec_sha, rev2Sha, "Contract must be bound to rev2Sha");
+});

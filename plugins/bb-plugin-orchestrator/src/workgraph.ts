@@ -3957,6 +3957,7 @@ export interface RunQueueDeps {
   resolveProject?: (
     projectId: string,
   ) => Promise<ResolvedProject | null> | ResolvedProject | null;
+  approvalMode?: "auto" | "manual" | null;
   getThread?: (threadId: string) => Promise<{ status?: string } | null>;
   stopThread?: (threadId: string) => Promise<void>;
   dispatchNode?: (
@@ -4483,6 +4484,7 @@ export async function runRunQueue(
               workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               project: proj,
+              approvalMode: deps.approvalMode,
               task: t,
               payload,
             });
@@ -4672,6 +4674,7 @@ export async function runRunQueue(
               workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               project: proj,
+              approvalMode: deps.approvalMode,
               task: t,
               payload,
             });
@@ -4749,6 +4752,7 @@ async function dispatchTaskNode(
       workGraphMode: taskMode,
       policy: deps.policy,
       project: proj,
+      approvalMode: deps.approvalMode,
       task,
     });
   }
@@ -5187,6 +5191,7 @@ async function startQueuedTask(
         workGraphMode: taskMode,
         policy: deps.policy,
         project: proj,
+        approvalMode: deps.approvalMode,
         task: { ...task, payload: JSON.stringify(cleanedPayload), acceptance_sha: acceptanceSha },
         payload: cleanedPayload,
       });
