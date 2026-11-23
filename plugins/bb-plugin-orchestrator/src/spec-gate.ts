@@ -461,12 +461,10 @@ export function isSpecBeforeCodeEnforced(params: {
   if (params.specBeforeCode === false) return false;
   if ((params.policy as any)?.specBeforeCode === false) return false;
   if ((params.project as any)?.specBeforeCode === false) return false;
-  if ((params.project as any)?.orchestrator?.specBeforeCode === false) return false;
 
   if (params.specBeforeCode === true) return true;
   if ((params.policy as any)?.specBeforeCode === true) return true;
   if ((params.project as any)?.specBeforeCode === true) return true;
-  if ((params.project as any)?.orchestrator?.specBeforeCode === true) return true;
 
   if (params.workGraphMode === "shadow" || params.workGraphMode === "strict") {
     return true;

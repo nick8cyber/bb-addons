@@ -1,8 +1,8 @@
 ---
 title: Orchestrator — граф задачи и очередь кодом (Work Graphs)
 status: approved
-updated: 2026-11-20
-revision: 34.6 (вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
+updated: 2026-11-23
+revision: 34.7 (r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
 ---
 
 # Граф задачи и очередь кодом (Work Graphs)
@@ -404,11 +404,11 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 
 Этот договор применяется к проектам, где действует порядок «спека до кода». Управление гейтом осуществляется через конфигурационный флаг `specBeforeCode`:
 - **На уровне общей политики:** поле `specBeforeCode: boolean` в настройке плагина `policy` (§2, `Policy.specBeforeCode`).
-- **На уровне проекта (per-project и defaults):** поле `specBeforeCode: boolean` в настройках выкладки `release.projects.<projectId>.specBeforeCode` и `release.defaults.specBeforeCode` ([orchestrator-release §6](orchestrator-release.md#6-настройка-release)).
+- **На уровне проекта (per-project и defaults):** поле `specBeforeCode: boolean` в настройках выкладки `release.projects.<projectId>.specBeforeCode` и `release.defaults.specBeforeCode` ([orchestrator-release §6](orchestrator-release.md#6-настройка)).
 
 **Приоритет разрешения флага (`isSpecBeforeCodeEnforced`):**
-1. **Явный запрет (`false`):** если на любом уровне (параметр вызова/раздачи `specBeforeCode: false`, настройка политики `policy.specBeforeCode: false`, либо настройка проекта `release.projects.<projectId>.specBeforeCode: false` / `release.defaults.specBeforeCode: false`) задано явное `false` — проверка отключается (`return false`).
-2. **Явное включение (`true`):** иначе, если на любом уровне (`specBeforeCode: true` в вызове, `policy.specBeforeCode: true`, либо в настройках проекта / defaults) задано явное `true` — проверка обязательна (`return true`).
+1. **Явный запрет (`false`):** если на любом уровне (внутренний параметр вызова `specBeforeCode: false`, настройка политики `policy.specBeforeCode: false`, либо эффективная настройка проекта `release.projects.<projectId>.specBeforeCode: false`, перекрывающая `release.defaults.specBeforeCode: false`) задано явное `false` — проверка отключается (`return false`).
+2. **Явное включение (`true`):** иначе, если на любом уровне (внутренний параметр `specBeforeCode: true`, `policy.specBeforeCode: true`, либо эффективная настройка проекта `release.projects.<projectId>.specBeforeCode: true` / `release.defaults.specBeforeCode: true`) задано явное `true` — проверка обязательна (`return true`).
 3. **Поведение по умолчанию (если нигде не задано):**
    - В режимах графа задач `shadow` и `strict` гейт по умолчанию **включён (`true`)** для всех проектов стенда.
    - В режиме `off` гейт по умолчанию **выключен (`false`)**.

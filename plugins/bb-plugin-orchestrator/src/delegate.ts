@@ -745,7 +745,7 @@ export async function runDelegate(
       baseBranchName: presetBaseBranch,
       presetName,
       workGraphMode: mode,
-      specBeforeCode: policy.specBeforeCode,
+      specBeforeCode: params.specBeforeCode,
       repoRoot: deps.repoRoot,
       task: taskRow ?? undefined,
     });
