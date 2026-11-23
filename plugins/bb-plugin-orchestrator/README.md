@@ -279,7 +279,7 @@ tools and skills the thread may use.
 
 ## Coordinator worktrees
 
-Managed coordinator worktrees are governed by `coordinatorWorktrees: "off" | "on"` (default: `"off"`) in `bb.settings.define` under §23 protection. Until this mode is enabled by the owner, BB removes unarchived worktrees 5 minutes after a thread is archived, and unpushed local changes are lost. When working in a shared project before the mode is enabled, keep coordinator threads unarchived, save local work, and commit changes before archiving.
+Managed coordinator worktrees are governed by `coordinatorWorktrees: "off" | "on"` (default: `"off"`) in `bb.settings.define` under §23 protection. Until this mode is enabled by the owner, BB removes a thread's worktree 5 minutes after the last thread using it is archived, and unpushed local changes are lost. When working in a shared project before the mode is enabled, keep coordinator threads unarchived, save local work, and commit changes before archiving.
 
 When enabled (`coordinatorWorktrees: "on"`), each coordinator thread runs in a separate BB Worktree environment with its own branch based on the current remote target. Fetch the target and integrate it in that worktree before publishing. Releases to the same repository and target branch use a single publication lock.
 
