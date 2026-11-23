@@ -130,29 +130,111 @@ export interface AcceptedSpecReview {
  * while distinct repositories (even with identical folder names) have distinct identities.
  */
 export async function resolveRepoIdentity(cmd?: CmdRunner, repoRoot?: string): Promise<string | undefined> {
-  if (!repoRoot) return undefined;
-  if (cmd) {
-    try {
-      const gitDirRes = await cmd.run("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repoRoot });
-      let dirOut = gitDirRes.exitCode === 0 ? gitDirRes.stdout.trim() : "";
-      if (!dirOut) {
-        const fallbackRes = await cmd.run("git", ["rev-parse", "--git-common-dir"], { cwd: repoRoot });
-        if (fallbackRes.exitCode === 0) dirOut = fallbackRes.stdout.trim();
-      }
-      if (dirOut) {
-        const abs = isAbsolute(dirOut) ? dirOut : resolve(repoRoot, dirOut);
-        try {
-          return realpathSync(abs);
-        } catch {
-          return abs;
-        }
-      }
-    } catch {}
-  }
+  if (!repoRoot || !cmd) return undefined;
   try {
-    return realpathSync(repoRoot);
+    const gitDirRes = await cmd.run("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repoRoot });
+    let dirOut = gitDirRes.exitCode === 0 ? gitDirRes.stdout.trim() : "";
+    if (!dirOut) {
+      const fallbackRes = await cmd.run("git", ["rev-parse", "--git-common-dir"], { cwd: repoRoot });
+      if (fallbackRes.exitCode === 0) dirOut = fallbackRes.stdout.trim();
+    }
+    if (dirOut) {
+      const abs = isAbsolute(dirOut) ? dirOut : resolve(repoRoot, dirOut);
+      try {
+        return realpathSync(abs);
+      } catch {
+        return abs;
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
+/**
+ * §31.9: Verify that a git range `baseSha..headSha` contains ONLY doc/spec modifications:
+ * 1. `baseSha` is an ancestor of `headSha`.
+ * 2. Non-merge commits (`git log --no-merges`) modify only docs/specs and no code.
+ * 3. Merge commits (`git diff-tree --cc`) introduce only docs/specs changes (e.g. clean merge of base with code).
+ * 4. Net diff (`git diff`) is non-empty, contains only docs/specs and no code.
+ */
+export async function verifySpecReviewRange(
+  cmd: CmdRunner,
+  repoRoot: string,
+  baseSha: string,
+  headSha: string,
+): Promise<{ ok: boolean; specPaths: string[] }> {
+  try {
+    const ancRes = await cmd.run("git", ["merge-base", "--is-ancestor", baseSha, headSha], { cwd: repoRoot });
+    if (ancRes.exitCode !== 0) return { ok: false, specPaths: [] };
+
+    // 1) Non-merge commits in range
+    const logRes = await cmd.run(
+      "git",
+      ["log", "--no-merges", "--format=", "--name-only", "--no-renames", `${baseSha}..${headSha}`],
+      { cwd: repoRoot },
+    );
+    if (logRes.exitCode !== 0) return { ok: false, specPaths: [] };
+
+    const allRangeFiles = logRes.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    // 2) Merge commits in range: check conflict resolutions / changes introduced by merge itself
+    const mergesRes = await cmd.run(
+      "git",
+      ["log", "--merges", "--format=%H", `${baseSha}..${headSha}`],
+      { cwd: repoRoot },
+    );
+    if (mergesRes.exitCode !== 0) return { ok: false, specPaths: [] };
+    const mergeShas = mergesRes.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const mSha of mergeShas) {
+      const diffTreeRes = await cmd.run(
+        "git",
+        ["diff-tree", "--cc", "--name-only", "-r", "--no-commit-id", mSha],
+        { cwd: repoRoot },
+      );
+      if (diffTreeRes.exitCode !== 0) return { ok: false, specPaths: [] };
+      const mFiles = diffTreeRes.stdout
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      allRangeFiles.push(...mFiles);
+    }
+
+    for (const f of allRangeFiles) {
+      if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+      if (!isDocOrSpecPath(f) || isCodePath(f)) {
+        return { ok: false, specPaths: [] };
+      }
+    }
+
+    // 3) Net diff between base and head
+    const diffRes = await cmd.run("git", ["diff", "--name-only", baseSha, headSha], { cwd: repoRoot });
+    if (diffRes.exitCode !== 0) return { ok: false, specPaths: [] };
+
+    const changedFiles = diffRes.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (changedFiles.length === 0) return { ok: false, specPaths: [] };
+
+    const specPaths: string[] = [];
+    for (const f of changedFiles) {
+      if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+      if (!isDocOrSpecPath(f) || isCodePath(f)) {
+        return { ok: false, specPaths: [] };
+      }
+      specPaths.push(f);
+    }
+    if (specPaths.length === 0) return { ok: false, specPaths: [] };
+
+    return { ok: true, specPaths };
   } catch {
-    return repoRoot;
+    return { ok: false, specPaths: [] };
   }
 }
 
@@ -282,61 +364,19 @@ export async function findAcceptedSpecReview(opts: {
       continue;
     }
 
-    // 1) Verify both Git objects exist in the repository and base is ancestor of head
+    // 1) Verify both Git objects exist in the repository
     const catBase = await opts.cmd.run("git", ["cat-file", "-e", `${baseSha}^{commit}`], { cwd: opts.repoRoot });
     if (catBase.exitCode !== 0) continue;
     const catHead = await opts.cmd.run("git", ["cat-file", "-e", `${headSha}^{commit}`], { cwd: opts.repoRoot });
     if (catHead.exitCode !== 0) continue;
 
-    const ancRes = await opts.cmd.run("git", ["merge-base", "--is-ancestor", baseSha, headSha], { cwd: opts.repoRoot });
-    if (ancRes.exitCode !== 0) continue;
-
     // 2) Verify composition of changes in reviewed range: baseSha..headSha
     // §31.9: Commits with code in the reviewed range exclude auto-approval,
     // even if intermediate code modifications were reverted in the net diff.
-    const logRes = await opts.cmd.run(
-      "git",
-      ["log", "--format=", "--name-only", "--no-renames", "-m", `${baseSha}..${headSha}`],
-      { cwd: opts.repoRoot },
-    );
-    if (logRes.exitCode !== 0) continue;
+    const rangeCheck = await verifySpecReviewRange(opts.cmd, opts.repoRoot, baseSha, headSha);
+    if (!rangeCheck.ok) continue;
 
-    const allRangeFiles = logRes.stdout
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    let hasNonDoc = false;
-    for (const f of allRangeFiles) {
-      if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
-      if (!isDocOrSpecPath(f) || isCodePath(f)) {
-        hasNonDoc = true;
-        break;
-      }
-    }
-    if (hasNonDoc) continue;
-
-    const diffRes = await opts.cmd.run("git", ["diff", "--name-only", baseSha, headSha], { cwd: opts.repoRoot });
-    if (diffRes.exitCode !== 0) continue;
-
-    const changedFiles = diffRes.stdout
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    if (changedFiles.length === 0) continue;
-
-    const specPaths: string[] = [];
-    for (const f of changedFiles) {
-      if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
-      if (!isDocOrSpecPath(f) || isCodePath(f)) {
-        hasNonDoc = true;
-        break;
-      }
-      specPaths.push(f);
-    }
-
-    if (hasNonDoc || specPaths.length === 0) continue;
+    const specPaths = rangeCheck.specPaths;
 
     const rawSpecPaths = Array.isArray(att.specPaths) && att.specPaths.length > 0
       ? att.specPaths

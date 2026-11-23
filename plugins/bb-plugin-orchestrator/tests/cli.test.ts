@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { makeTempDir } from "./helpers/temp.js";
@@ -305,7 +307,7 @@ test("PLUG-294: CLI delegate with --from forwards stepsDeps and succeeds", async
           title: "coordinator",
           titleFallback: null,
           originPluginId: null,
-          projectId: "proj_main",
+          projectId: "proj_bb",
           environmentId: "env_main",
         }),
         spawn: async (a: { prompt?: string }) => {
@@ -1119,8 +1121,55 @@ test("§18.6: the 2500 limit applies to the REAL handoffPath", async () => {
   assert.match(text, /ни sudo/, "mandatory tail intact");
 });
 
+function initGitRepo(dir: string): {
+  run: (args: string[]) => string;
+  cmd: CmdRunner;
+} {
+  const run = (args: string[]) =>
+    execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+  run(["init", "-b", "main"]);
+  run(["config", "user.name", "Tester"]);
+  run(["config", "user.email", "test@test.local"]);
+  run(["add", "-A"]);
+  run(["commit", "--allow-empty", "-m", "initial"]);
+
+  const cmd: CmdRunner = {
+    run: async (file, args, opts) => {
+      try {
+        const out = execFileSync(file, args, {
+          cwd: opts?.cwd ?? dir,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        return { exitCode: 0, stdout: out, stderr: "" };
+      } catch (e: any) {
+        return {
+          exitCode: e.status ?? 1,
+          stdout: e.stdout ?? "",
+          stderr: e.stderr ?? "",
+        };
+      }
+    },
+  };
+  return { run, cmd };
+}
+
 test("§31.9: CLI delegate forwards --kind, --base-sha, and --head-sha", async () => {
-  const { cli } = fakeCli();
+  const dir = makeTempDir("orch-cli-spec-");
+  const { run, cmd } = initGitRepo(dir);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/feat.md"), "# Spec\n§1 Intro\n");
+  run(["add", "."]); run(["commit", "-qm", "docs: add spec"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+
+  const { cli } = fakeCli((args) => {
+    const key = args.join(" ");
+    if (key.startsWith("environment show env_main")) {
+      return ok(JSON.stringify({ id: "env_main", path: dir, mergeBaseBranch: "main" }));
+    }
+    return undefined;
+  });
   const host = await hostWith(
     {
       policy: JSON.stringify({
@@ -1142,13 +1191,16 @@ test("§31.9: CLI delegate forwards --kind, --base-sha, and --head-sha", async (
           title: "coordinator",
           titleFallback: null,
           originPluginId: null,
-          projectId: "proj_main",
+          projectId: "proj_bb",
+          environmentId: "env_main",
         }),
         spawn: async () => ({ id: "thr_rev" }),
         list: async () => [],
         update: async () => ({}),
       },
     },
+    undefined,
+    cmd,
   );
   const res = await host.harness.runCli(
     [
@@ -1159,9 +1211,9 @@ test("§31.9: CLI delegate forwards --kind, --base-sha, and --head-sha", async (
       "--kind",
       "spec_review",
       "--base-sha",
-      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      baseSha,
       "--head-sha",
-      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      headSha,
       "--json",
     ],
     { threadId: "thr_coord" },
@@ -1177,6 +1229,8 @@ test("§31.9: CLI delegate forwards --kind, --base-sha, and --head-sha", async (
   const delegation = (JSON.parse(shown.stdout) as { delegation: any }).delegation;
   const attach = JSON.parse(delegation.attach);
   assert.equal(attach.kind, "spec_review");
-  assert.equal(attach.baseSha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-  assert.equal(attach.headSha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+  assert.equal(attach.baseSha, baseSha);
+  assert.equal(attach.headSha, headSha);
+  assert.ok(attach.repo);
+  assert.deepEqual(attach.specPaths, ["docs/specs/feat.md"]);
 });

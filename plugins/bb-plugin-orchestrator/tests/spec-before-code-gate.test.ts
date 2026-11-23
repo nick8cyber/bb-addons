@@ -26,6 +26,8 @@ import {
   resolveTaskSpecContract,
   isSpecBeforeCodeEnforced,
   findAcceptedSpecReview,
+  resolveRepoIdentity,
+  verifySpecReviewRange,
   type SpecContract,
 } from "../src/spec-gate.js";
 import { runRunQueue, runApprove, runReject } from "../src/workgraph.js";
@@ -4840,4 +4842,192 @@ test("§31.9 Spec review record without repo identity is strictly rejected", asy
     projectId: "proj_bb",
   });
   assert.equal(found, null, "Record without repo identity must be rejected");
+});
+
+test("§31.9: runDelegate rejects spec_review when range contains code modified and reverted", async () => {
+  const dir = makeTempDir("orch-del-code-revert-");
+  const { run, cmd } = initGitRepo(dir);
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/code.ts"), "export const x = 1;\n");
+  run(["add", "."]); run(["commit", "-qm", "code base"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Commit 1: modify code
+  writeFileSync(join(dir, "src/code.ts"), "export const x = 2;\n");
+  run(["commit", "-qam", "feat: code change"]);
+
+  // Commit 2: revert code back to original
+  writeFileSync(join(dir, "src/code.ts"), "export const x = 1;\n");
+  run(["commit", "-qam", "revert: revert code change"]);
+
+  // Commit 3: add spec
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/feat.md"), "# Spec\n§1 Intro\n");
+  run(["add", "."]); run(["commit", "-qm", "docs: add spec"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const policy = parsePolicy(POLICY_TEXT);
+
+  const result = await runDelegate(
+    {
+      taskKey: "DEL-REVERT-1",
+      level: "review",
+      kind: "spec_review",
+      baseSha,
+      headSha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coord",
+        originPluginId: null,
+        projectId: "proj_bb",
+      },
+    },
+    {
+      store,
+      bbCli: fakeCli().cli,
+      threads: {
+        spawn: async () => ({ id: "thr_auditor" }),
+        get: async () => ({ id: "thr_coord", projectId: "proj_bb" } as any),
+        list: async () => [],
+        update: async () => ({}),
+      },
+      probes: { roleByThreadId: () => "orchestrator" },
+      loadPolicy: () => policy,
+      repoRoot: dir,
+      cmd,
+    } as any,
+  );
+
+  const row = store.get(result.delegationId)!;
+  // Because intermediate code was touched, isPureSpecReview must be false:
+  // continue_from must NOT be overridden with headSha
+  assert.notEqual(row.continue_from, headSha);
+  // attach must NOT have kind: "spec_review"
+  if (row.attach) {
+    const parsed = JSON.parse(row.attach);
+    assert.notEqual(parsed.kind, "spec_review");
+  }
+});
+
+test("§31.9: Clean merge of fresh base with code does NOT disqualify spec review auto-approval", async () => {
+  const dir = makeTempDir("orch-merge-base-clean-");
+  const { run, cmd } = initGitRepo(dir);
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/base.md"), "# Base Spec\n");
+  run(["add", "."]); run(["commit", "-qm", "initial base"]);
+
+  // Feature branch: add a new spec
+  run(["checkout", "-b", "feature-spec"]);
+  writeFileSync(join(dir, "docs/specs/new-spec.md"), "# New Spec\n");
+  run(["add", "."]); run(["commit", "-qm", "docs: new spec"]);
+
+  // Main branch: develop some code
+  run(["checkout", "main"]);
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/feature.ts"), "export const a = 42;\n");
+  run(["add", "."]); run(["commit", "-qm", "feat: new code on main"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Feature branch: merge fresh main into feature branch cleanly
+  run(["checkout", "feature-spec"]);
+  run(["merge", "main", "--no-edit"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+  const repoId = run(["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim();
+
+  // Range verification should succeed because code was only in base/merged cleanly without merge conflict code
+  const rangeCheck = await verifySpecReviewRange(cmd, dir, baseSha, headSha);
+  assert.equal(rangeCheck.ok, true, "Clean merge from base must pass verifySpecReviewRange");
+  assert.deepEqual(rangeCheck.specPaths, ["docs/specs/new-spec.md"]);
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const row = store.insert({
+    taskKey: "CLEAN-MERGE-1",
+    projectId: "proj_bb",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-route",
+    preset: "auditor",
+    provider: "acp-devin",
+    round: 1,
+    continueFrom: headSha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "CLEAN-MERGE-1",
+      projectId: "proj_bb",
+      repo: repoId,
+      baseSha,
+      headSha,
+      specPaths: ["docs/specs/new-spec.md"],
+      paths: [],
+      from: headSha,
+    }),
+  });
+  store.setStatus(row.id, "running");
+  store.setStatusIf(row.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const found = await findAcceptedSpecReview({
+    taskKey: "CLEAN-MERGE-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    projectId: "proj_bb",
+  });
+  assert.ok(found, "Clean merge from base should be accepted for auto-approval");
+  assert.equal(found?.reviewedSha, headSha);
+});
+
+test("§31.9: Merge commit introducing code during conflict resolution is disqualified", async () => {
+  const dir = makeTempDir("orch-merge-conflict-code-");
+  const { run, cmd } = initGitRepo(dir);
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/base.md"), "# Base Spec\n");
+  run(["add", "."]); run(["commit", "-qm", "initial base"]);
+
+  // Feature branch: add a spec
+  run(["checkout", "-b", "feature-spec"]);
+  writeFileSync(join(dir, "docs/specs/base.md"), "# Base Spec updated on branch\n");
+  run(["commit", "-qam", "docs: update spec"]);
+
+  // Main branch: update base spec
+  run(["checkout", "main"]);
+  writeFileSync(join(dir, "docs/specs/base.md"), "# Base Spec updated on main\n");
+  run(["commit", "-qam", "docs: update spec on main"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Feature branch: merge with evil code change
+  run(["checkout", "feature-spec"]);
+  try {
+    run(["merge", "main", "--no-commit"]);
+  } catch {}
+  // Resolve conflict by modifying doc and sneaking in code!
+  writeFileSync(join(dir, "docs/specs/base.md"), "# Resolved Base Spec\n");
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/sneaky.ts"), "export const evil = true;\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "merge main with sneaky code"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Range verification must FAIL because diff-tree --cc will catch sneaky.ts
+  const rangeCheck = await verifySpecReviewRange(cmd, dir, baseSha, headSha);
+  assert.equal(rangeCheck.ok, false, "Merge commit adding code must be disqualified");
+});
+
+test("§31.9: resolveRepoIdentity returns undefined on git failure", async () => {
+  const nonGitDir = makeTempDir("orch-non-git-");
+  const failingCmd: CmdRunner = {
+    run: async () => ({ exitCode: 128, stdout: "", stderr: "fatal: not a git repository" }),
+  };
+  const res = await resolveRepoIdentity(failingCmd, nonGitDir);
+  assert.equal(res, undefined, "resolveRepoIdentity must return undefined when git fails");
 });
