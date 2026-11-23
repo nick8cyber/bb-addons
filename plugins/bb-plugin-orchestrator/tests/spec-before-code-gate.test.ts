@@ -133,6 +133,7 @@ function initGitRepo(dir: string): {
   run(["init", "-b", "main"]);
   run(["config", "user.name", "Tester"]);
   run(["config", "user.email", "test@test.local"]);
+  run(["add", "-A"]);
   run(["commit", "--allow-empty", "-m", "initial"]);
 
   const cmd: CmdRunner = {
@@ -386,9 +387,9 @@ test("§31.9 Fallback route chain: neither primary nor fallback routes spawn on 
 
   // Verify 0 spawns
   assert.equal(spawnedThreads.length, 0, "No primary or fallback thread should be spawned");
-  // Verify row route did not advance to reserve-1 or reserve-2
-  const updatedRow = store.get(row.id);
-  assert.ok(!updatedRow || updatedRow.route === "complex", "Route must not advance to fallbacks");
+  // Verify row was removed on spec-gate-violation (onDispatchFailure !== "fail")
+  assert.equal(store.get(row.id), undefined, "Row must be removed on spec-gate-violation to prevent blocking delegations_active_task_idx");
+  assert.equal(store.delegationsByTask("FALLBACK-1").length, 0);
 });
 
 // ── 4. Foreign / unreachable SHA ──────────────────────────────────────────────
@@ -3626,4 +3627,174 @@ test("§31.9 Round 12: bugfix contract without specSha and without baseSha rejec
       return true;
     },
   );
+});
+
+test("§31.9 Round 13 Repro: branch with code in commit 1 and spec in commit 2 must NOT be accepted as spec review", async () => {
+  const dir = makeTempDir("r13-repro-");
+  const { run, cmd } = initGitRepo(dir);
+  run(["update-ref", "refs/remotes/origin/main", "main"]);
+  run(["checkout", "-qb", "feature"]);
+
+  // Commit 1: code
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/a.ts"), "export const a = 1;\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "feat: code"]);
+
+  // Commit 2: spec
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/s.md"), "# S\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "docs: spec"]);
+  const revSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const rev = store.insert({
+    taskKey: "R13-1",
+    projectId: "p",
+    coordinatorThreadId: "c",
+    level: "review",
+    route: "r",
+    preset: "x",
+    provider: "y",
+    round: 1,
+    continueFrom: revSha,
+  } as any);
+  store.setStatus(rev.id, "running");
+  store.setStatusIf(rev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const found = await findAcceptedSpecReview({
+    taskKey: "R13-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    baseBranch: "main",
+  });
+  assert.equal(found, null, "Branch review with code in commit 1 must NOT be accepted as a spec review");
+});
+
+test("§31.9 Round 13 Architect Negative: attach.from == head, code in commit 1, spec in commit 2 gives no auto-approval", async () => {
+  const dir = makeTempDir("r13-arch-neg-");
+  const { run, cmd } = initGitRepo(dir);
+  run(["update-ref", "refs/remotes/origin/dev", "main"]);
+  run(["checkout", "-qb", "feature-branch"]);
+
+  // Commit 1: code change
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/lib.ts"), "export const lib = 42;\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "feat: lib code"]);
+
+  // Commit 2: spec change
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/lib.md"), "# Lib Spec\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "docs: lib spec"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.insertTask({
+    taskKey: "ARCH-NEG-1",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "fix",
+    level: "complex",
+    confirmationMode: "auto",
+  });
+
+  const rev = store.insert({
+    taskKey: "ARCH-NEG-1",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-gemini",
+    preset: "gemini",
+    provider: "agy",
+    round: 1,
+    continueFrom: headSha,
+    attach: JSON.stringify({ paths: [], from: headSha }),
+  } as any);
+  store.setStatus(rev.id, "running");
+  store.setStatusIf(rev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const found = await findAcceptedSpecReview({
+    taskKey: "ARCH-NEG-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    baseBranch: "dev",
+  });
+  assert.equal(found, null, "Review with code in history must not be accepted as spec review");
+
+  // Gate must reject code launch since spec review was not approved
+  await assert.rejects(
+    async () => {
+      await verifySpecBeforeCodeGate({
+        taskKey: "ARCH-NEG-1",
+        role: "executor",
+        level: "complex",
+        store,
+        cmd,
+        repoRoot: dir,
+        workGraphMode: "shadow",
+        baseBranchName: "dev",
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+});
+
+test("§31.9 Round 13 Non-spec files (.sql, .json, .yml) in review are not accepted as spec review", async () => {
+  const dir = makeTempDir("r13-sql-json-");
+  const { run, cmd } = initGitRepo(dir);
+  run(["update-ref", "refs/remotes/origin/main", "main"]);
+  run(["checkout", "-qb", "feat-db"]);
+
+  mkdirSync(join(dir, "migrations"), { recursive: true });
+  writeFileSync(join(dir, "migrations/001.sql"), "CREATE TABLE t (id INT);\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "db: migration"]);
+  const revSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const rev = store.insert({
+    taskKey: "SQL-1",
+    projectId: "p",
+    coordinatorThreadId: "c",
+    level: "review",
+    route: "r",
+    preset: "x",
+    provider: "y",
+    round: 1,
+    continueFrom: revSha,
+  } as any);
+  store.setStatus(rev.id, "running");
+  store.setStatusIf(rev.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const found = await findAcceptedSpecReview({
+    taskKey: "SQL-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    baseBranch: "main",
+  });
+  assert.equal(found, null, "Review modifying SQL migration must NOT be accepted as spec review");
 });

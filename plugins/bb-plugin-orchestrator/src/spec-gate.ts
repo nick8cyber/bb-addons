@@ -132,6 +132,7 @@ export async function findAcceptedSpecReview(opts: {
   cmd?: CmdRunner;
   repoRoot?: string;
   projectId?: string;
+  baseBranch?: string | null;
 }): Promise<AcceptedSpecReview | null> {
   const normKey = normalizeTaskKey(opts.taskKey);
   const delegations = opts.store.delegationsByTask(normKey);
@@ -197,56 +198,73 @@ export async function findAcceptedSpecReview(opts: {
     if (opts.cmd && opts.repoRoot && !isCodeReview) {
       try {
         let baseCommit = "";
-        const parRes = await opts.cmd.run(
-          "git",
-          ["rev-parse", "--verify", "--quiet", `${revSha}^`],
-          { cwd: opts.repoRoot },
-        );
-        if (parRes.exitCode === 0 && parRes.stdout.trim()) {
-          baseCommit = parRes.stdout.trim();
-        } else {
-          const candidateBases = [
-            (opts as any).baseBranch ? `origin/${(opts as any).baseBranch}` : undefined,
-            (opts as any).baseBranch,
-            "origin/dev",
-            "dev",
-            "origin/main",
-            "main",
-            "origin/master",
-            "master",
-          ].filter(Boolean) as string[];
+        const candidateBases = [
+          opts.baseBranch
+            ? (opts.baseBranch.startsWith("origin/")
+                ? opts.baseBranch
+                : `origin/${opts.baseBranch}`)
+            : undefined,
+          opts.baseBranch,
+          "origin/dev",
+          "origin/main",
+          "origin/master",
+          "dev",
+          "main",
+          "master",
+        ].filter(Boolean) as string[];
 
-          for (const cand of candidateBases) {
-            const mbRes = await opts.cmd.run(
-              "git",
-              ["merge-base", cand, revSha],
-              { cwd: opts.repoRoot },
-            );
-            if (mbRes.exitCode === 0 && mbRes.stdout.trim()) {
-              baseCommit = mbRes.stdout.trim();
+        for (const cand of candidateBases) {
+          const mbRes = await opts.cmd.run(
+            "git",
+            ["merge-base", cand, revSha],
+            { cwd: opts.repoRoot },
+          );
+          if (mbRes.exitCode === 0 && mbRes.stdout.trim()) {
+            const mb = mbRes.stdout.trim();
+            if (mb !== revSha) {
+              baseCommit = mb;
               break;
             }
           }
         }
-        if (!baseCommit) baseCommit = "HEAD";
-        const diffRes = await opts.cmd.run(
-          "git",
-          ["diff", "--name-only", baseCommit, revSha],
-          { cwd: opts.repoRoot },
-        );
-        if (diffRes.exitCode === 0 && diffRes.stdout.trim()) {
-          const changedFiles = diffRes.stdout
-            .split("\n")
-            .map((s) => s.trim())
-            .filter(Boolean);
-          for (const f of changedFiles) {
-            if (isCodePath(f)) {
+
+        if (!baseCommit) {
+          const parRes = await opts.cmd.run(
+            "git",
+            ["rev-parse", "--verify", "--quiet", `${revSha}^`],
+            { cwd: opts.repoRoot },
+          );
+          if (parRes.exitCode === 0 && parRes.stdout.trim()) {
+            baseCommit = parRes.stdout.trim();
+          }
+        }
+
+        if (baseCommit && baseCommit !== revSha) {
+          const diffRes = await opts.cmd.run(
+            "git",
+            ["diff", "--name-only", baseCommit, revSha],
+            { cwd: opts.repoRoot },
+          );
+          if (diffRes.exitCode === 0) {
+            const changedFiles = diffRes.stdout
+              .split("\n")
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (changedFiles.length === 0) {
               isCodeReview = true;
-              break;
+            } else {
+              for (const f of changedFiles) {
+                if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+                if (isDocOrSpecPath(f)) {
+                  if (!specPaths.includes(f)) specPaths.push(f);
+                } else {
+                  isCodeReview = true;
+                  break;
+                }
+              }
             }
-            if (isDocOrSpecPath(f)) {
-              if (!specPaths.includes(f)) specPaths.push(f);
-            }
+          } else {
+            isCodeReview = true;
           }
         } else {
           const dtRes = await opts.cmd.run(
@@ -259,18 +277,26 @@ export async function findAcceptedSpecReview(opts: {
               .split("\n")
               .map((s) => s.trim())
               .filter(Boolean);
-            for (const f of files) {
-              if (isCodePath(f)) {
-                isCodeReview = true;
-                break;
-              }
-              if (isDocOrSpecPath(f)) {
-                if (!specPaths.includes(f)) specPaths.push(f);
+            if (files.length === 0) {
+              isCodeReview = true;
+            } else {
+              for (const f of files) {
+                if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+                if (isDocOrSpecPath(f)) {
+                  if (!specPaths.includes(f)) specPaths.push(f);
+                } else {
+                  isCodeReview = true;
+                  break;
+                }
               }
             }
+          } else {
+            isCodeReview = true;
           }
         }
-      } catch {}
+      } catch {
+        isCodeReview = true;
+      }
     }
 
     if (isCodeReview) continue;
@@ -887,6 +913,10 @@ export async function verifySpecBeforeCodeGate(
       cmd: input.cmd,
       repoRoot: input.repoRoot,
       projectId: (taskRow as any)?.project_id ?? (input.project as any)?.id,
+      baseBranch:
+        input.baseBranchName ??
+        (input.project as any)?.baseBranch ??
+        (input.policy as any)?.baseBranch,
     });
     if (specRev) {
       const now = Date.now();

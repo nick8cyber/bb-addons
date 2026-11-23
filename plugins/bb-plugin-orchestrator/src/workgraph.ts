@@ -4671,9 +4671,10 @@ async function dispatchTaskNode(
       ? await Promise.resolve(deps.resolveProject(task.project_id)).catch(() => null)
       : (deps.project ?? null);
     let executorBaseSha: string | undefined;
+    let presetBaseBranch: string | null = null;
     if (deps.cmd && repoRoot) {
       const presetName = deps.policy?.routes?.[task.route]?.preset;
-      const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+      presetBaseBranch = await resolvePresetBaseBranch(presetName, {
         bbCli: deps.bbCli,
         policy: deps.policy,
       });
@@ -5106,9 +5107,10 @@ async function startQueuedTask(
       ? await Promise.resolve(deps.resolveProject(task.project_id)).catch(() => null)
       : (deps.project ?? null);
     let executorBaseSha: string | undefined;
+    let presetBaseBranch: string | null = null;
     if (deps.cmd && repoRoot) {
       const presetName = deps.policy?.routes?.[task.route]?.preset;
-      const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+      presetBaseBranch = await resolvePresetBaseBranch(presetName, {
         bbCli: deps.bbCli,
         policy: deps.policy,
       });
@@ -5127,6 +5129,7 @@ async function startQueuedTask(
         cmd: deps.cmd,
         repoRoot,
         baseSha: executorBaseSha,
+        baseBranchName: presetBaseBranch ?? (proj as any)?.baseBranch,
         workGraphMode: taskMode,
         policy: deps.policy,
         project: proj,
