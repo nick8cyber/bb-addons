@@ -819,13 +819,38 @@ export async function runDelegate(
 
     if (isSpecReview && specBaseSha && specHeadSha && deps.cmd && deps.repoRoot) {
       try {
-        const diffRes = await deps.cmd.run("git", ["diff", "--name-only", specBaseSha, specHeadSha], { cwd: deps.repoRoot });
-        if (diffRes.exitCode === 0 && diffRes.stdout.trim()) {
-          const files = diffRes.stdout.split("\n").map(s => s.trim()).filter(Boolean);
-          for (const f of files) {
-            if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
-            if (isDocOrSpecPath(f) && !specPaths.includes(f)) {
-              specPaths.push(f);
+        const anc = await deps.cmd.run("git", ["merge-base", "--is-ancestor", specBaseSha, specHeadSha], { cwd: deps.repoRoot });
+        if (anc.exitCode !== 0) {
+          isSpecReview = false;
+        } else {
+          const logRes = await deps.cmd.run(
+            "git",
+            ["log", "--format=", "--name-only", "--no-renames", "-m", `${specBaseSha}..${specHeadSha}`],
+            { cwd: deps.repoRoot },
+          );
+          let hasCode = false;
+          if (logRes.exitCode === 0 && logRes.stdout.trim()) {
+            const files = logRes.stdout.split("\n").map(s => s.trim()).filter(Boolean);
+            for (const f of files) {
+              if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+              if (isCodePath(f) || !isDocOrSpecPath(f)) {
+                hasCode = true;
+                break;
+              }
+            }
+          }
+          if (hasCode) {
+            isSpecReview = false;
+          } else {
+            const diffRes = await deps.cmd.run("git", ["diff", "--name-only", specBaseSha, specHeadSha], { cwd: deps.repoRoot });
+            if (diffRes.exitCode === 0 && diffRes.stdout.trim()) {
+              const files = diffRes.stdout.split("\n").map(s => s.trim()).filter(Boolean);
+              for (const f of files) {
+                if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+                if (isDocOrSpecPath(f) && !isCodePath(f) && !specPaths.includes(f)) {
+                  specPaths.push(f);
+                }
+              }
             }
           }
         }
@@ -843,8 +868,11 @@ export async function runDelegate(
 
   // Step 2 — the unique index makes this atomic across processes.
   let row;
+  const isPureSpecReview = Boolean(
+    isSpecReview && specBaseSha && specHeadSha && repoIdentity && specPaths.length > 0
+  );
   const effectiveContinueFrom =
-    isSpecReview && specBaseSha && specHeadSha
+    isPureSpecReview
       ? specHeadSha
       : continueFrom;
   try {
@@ -864,7 +892,7 @@ export async function runDelegate(
       // lists the same `--attach` paths in the seed prompt.
       // §31.9: Strict spec review binding persists kind, baseSha, headSha, specPaths, paths, repo, and project.
       attach:
-        isSpecReview && specBaseSha && specHeadSha
+        isPureSpecReview
           ? JSON.stringify({
               kind: "spec_review",
               taskKey,

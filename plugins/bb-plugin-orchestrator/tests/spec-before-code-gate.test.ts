@@ -4632,12 +4632,14 @@ test("§31.9 Mismatched continue_from vs att.headSha is rejected by findAccepted
   writeFileSync(join(dir, "docs/specs/m.md"), "# Spec\n");
   run(["add", "."]); run(["commit", "-qm", "docs"]);
   const headSha = run(["rev-parse", "HEAD"]).trim();
+  const repoId = run(["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim();
 
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
 
-  const row = store.insert({
+  // 1. Mismatched continue_from -> rejected
+  const rowMismatch = store.insert({
     taskKey: "MISMATCH-1",
     projectId: "proj_bb",
     coordinatorThreadId: "thr_coord",
@@ -4646,17 +4648,128 @@ test("§31.9 Mismatched continue_from vs att.headSha is rejected by findAccepted
     preset: "auditor",
     provider: "acp-devin",
     round: 1,
-    continueFrom: "0000000000000000000000000000000000000000", // corrupted/mismatched continue_from
+    continueFrom: "0000000000000000000000000000000000000000", // mismatched continue_from
     explicitRoute: false,
     noCode: true,
     attach: JSON.stringify({
       kind: "spec_review",
       taskKey: "MISMATCH-1",
       projectId: "proj_bb",
-      repo: dir,
+      repo: repoId,
       baseSha,
-      headSha, // different from continueFrom
+      headSha,
       specPaths: ["docs/specs/m.md"],
+      paths: [],
+      from: headSha,
+    }),
+  });
+  store.setStatus(rowMismatch.id, "running");
+  store.setStatusIf(rowMismatch.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const foundMismatch = await findAcceptedSpecReview({
+    taskKey: "MISMATCH-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    projectId: "proj_bb",
+  });
+  assert.equal(foundMismatch, null, "Mismatched continue_from and att.headSha must be rejected");
+
+  // 2. Matching continue_from with canonical repo -> accepted
+  const rowMatch = store.insert({
+    taskKey: "MATCH-1",
+    projectId: "proj_bb",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-route",
+    preset: "auditor",
+    provider: "acp-devin",
+    round: 1,
+    continueFrom: headSha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "MATCH-1",
+      projectId: "proj_bb",
+      repo: repoId,
+      baseSha,
+      headSha,
+      specPaths: ["docs/specs/m.md"],
+      paths: [],
+      from: headSha,
+    }),
+  });
+  store.setStatus(rowMatch.id, "running");
+  store.setStatusIf(rowMatch.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const foundMatch = await findAcceptedSpecReview({
+    taskKey: "MATCH-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    projectId: "proj_bb",
+  });
+  assert.ok(foundMatch, "Matching continue_from and att.headSha must be accepted");
+  assert.equal(foundMatch.reviewedSha, headSha);
+});
+
+test("§31.9 Code changed and reverted inside base..head range must NOT auto-approve", async () => {
+  const dir = makeTempDir("orch-code-revert-");
+  const { run, cmd } = initGitRepo(dir);
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/code.ts"), "export const x = 1;\n");
+  run(["add", "."]); run(["commit", "-qm", "code base"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Commit 1: modify code
+  writeFileSync(join(dir, "src/code.ts"), "export const x = 2;\n");
+  run(["commit", "-qam", "feat: code change"]);
+
+  // Commit 2: revert code back to original
+  writeFileSync(join(dir, "src/code.ts"), "export const x = 1;\n");
+  run(["commit", "-qam", "revert: revert code change"]);
+
+  // Commit 3: add spec
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/feat.md"), "# Spec\n§1 Intro\n");
+  run(["add", "."]); run(["commit", "-qm", "docs: add spec"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+  const repoId = run(["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim();
+
+  // Net diff has ONLY docs/specs/feat.md!
+  const netDiff = run(["diff", "--name-only", baseSha, headSha]).trim();
+  assert.equal(netDiff, "docs/specs/feat.md");
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // Even if a record claims kind: "spec_review", findAcceptedSpecReview must reject it
+  const row = store.insert({
+    taskKey: "REVERT-1",
+    projectId: "proj_bb",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-route",
+    preset: "auditor",
+    provider: "acp-devin",
+    round: 1,
+    continueFrom: headSha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "REVERT-1",
+      projectId: "proj_bb",
+      repo: repoId,
+      baseSha,
+      headSha,
+      specPaths: ["docs/specs/feat.md"],
       paths: [],
       from: headSha,
     }),
@@ -4667,11 +4780,64 @@ test("§31.9 Mismatched continue_from vs att.headSha is rejected by findAccepted
   } as any);
 
   const found = await findAcceptedSpecReview({
-    taskKey: "MISMATCH-1",
+    taskKey: "REVERT-1",
     store,
     cmd,
     repoRoot: dir,
     projectId: "proj_bb",
   });
-  assert.equal(found, null, "Mismatched continue_from and att.headSha must be rejected");
+  assert.equal(found, null, "Range with intermediate code commits must NOT auto-approve");
+});
+
+test("§31.9 Spec review record without repo identity is strictly rejected", async () => {
+  const dir = makeTempDir("orch-no-repo-att-");
+  const { run, cmd } = initGitRepo(dir);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/norepo.md"), "# No Repo\n");
+  run(["add", "."]); run(["commit", "-qm", "docs"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // Record with missing repo field in attach
+  const row = store.insert({
+    taskKey: "NOREPO-1",
+    projectId: "proj_bb",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-route",
+    preset: "auditor",
+    provider: "acp-devin",
+    round: 1,
+    continueFrom: headSha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "NOREPO-1",
+      projectId: "proj_bb",
+      // repo omitted!
+      baseSha,
+      headSha,
+      specPaths: ["docs/specs/norepo.md"],
+      paths: [],
+      from: headSha,
+    }),
+  });
+  store.setStatus(row.id, "running");
+  store.setStatusIf(row.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const found = await findAcceptedSpecReview({
+    taskKey: "NOREPO-1",
+    store,
+    cmd,
+    repoRoot: dir,
+    projectId: "proj_bb",
+  });
+  assert.equal(found, null, "Record without repo identity must be rejected");
 });

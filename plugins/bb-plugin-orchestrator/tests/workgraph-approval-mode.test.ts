@@ -1014,5 +1014,3 @@ test("§32.3: latestCoordinatorThreadId & orchestratorThreadIds ordering and saf
   const orchs = store.orchestratorThreadIds();
   assert.deepEqual(orchs, ["thr_orch_2", "thr_orch_1"]);
 });
-
-

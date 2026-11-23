@@ -224,7 +224,7 @@ export async function findAcceptedSpecReview(opts: {
       continue;
     }
 
-    if (!att || att.kind !== "spec_review" || !att.baseSha || !att.headSha) {
+    if (!att || att.kind !== "spec_review" || !att.baseSha || !att.headSha || !att.repo) {
       continue;
     }
 
@@ -253,44 +253,69 @@ export async function findAcceptedSpecReview(opts: {
     if (att.taskKey && normalizeTaskKey(att.taskKey) !== normKey) {
       continue;
     }
-    if (att.repo && opts.repoRoot) {
-      const currentRepoIdentity = await resolveRepoIdentity(opts.cmd, opts.repoRoot);
-      let match = false;
-      if (currentRepoIdentity && att.repo === currentRepoIdentity) {
-        match = true;
-      } else {
-        let attIdentity = att.repo;
-        try {
-          attIdentity = realpathSync(att.repo);
-        } catch {}
-        if (currentRepoIdentity && attIdentity === currentRepoIdentity) {
-          match = true;
-        } else if (opts.cmd) {
-          try {
-            const attCommon = await resolveRepoIdentity(opts.cmd, att.repo);
-            if (attCommon && attCommon === currentRepoIdentity) {
-              match = true;
-            }
-          } catch {}
-        }
-      }
-      if (!match) {
-        continue;
-      }
-    }
-
-    if (!opts.cmd || !opts.repoRoot) {
-      // Without cmd/repoRoot cannot verify git objects and reviewed range
+    if (!opts.repoRoot || !opts.cmd) {
+      // Without cmd/repoRoot cannot verify git objects and repository identity
       continue;
     }
 
-    // 1) Verify both Git objects exist in the repository
+    const currentRepoIdentity = await resolveRepoIdentity(opts.cmd, opts.repoRoot);
+    let match = false;
+    if (currentRepoIdentity && att.repo === currentRepoIdentity) {
+      match = true;
+    } else {
+      let attIdentity = att.repo;
+      try {
+        attIdentity = realpathSync(att.repo);
+      } catch {}
+      if (currentRepoIdentity && attIdentity === currentRepoIdentity) {
+        match = true;
+      } else if (opts.cmd) {
+        try {
+          const attCommon = await resolveRepoIdentity(opts.cmd, att.repo);
+          if (attCommon && attCommon === currentRepoIdentity) {
+            match = true;
+          }
+        } catch {}
+      }
+    }
+    if (!match) {
+      continue;
+    }
+
+    // 1) Verify both Git objects exist in the repository and base is ancestor of head
     const catBase = await opts.cmd.run("git", ["cat-file", "-e", `${baseSha}^{commit}`], { cwd: opts.repoRoot });
     if (catBase.exitCode !== 0) continue;
     const catHead = await opts.cmd.run("git", ["cat-file", "-e", `${headSha}^{commit}`], { cwd: opts.repoRoot });
     if (catHead.exitCode !== 0) continue;
 
+    const ancRes = await opts.cmd.run("git", ["merge-base", "--is-ancestor", baseSha, headSha], { cwd: opts.repoRoot });
+    if (ancRes.exitCode !== 0) continue;
+
     // 2) Verify composition of changes in reviewed range: baseSha..headSha
+    // §31.9: Commits with code in the reviewed range exclude auto-approval,
+    // even if intermediate code modifications were reverted in the net diff.
+    const logRes = await opts.cmd.run(
+      "git",
+      ["log", "--format=", "--name-only", "--no-renames", "-m", `${baseSha}..${headSha}`],
+      { cwd: opts.repoRoot },
+    );
+    if (logRes.exitCode !== 0) continue;
+
+    const allRangeFiles = logRes.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    let hasNonDoc = false;
+    for (const f of allRangeFiles) {
+      if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
+      if (!isDocOrSpecPath(f) || isCodePath(f)) {
+        hasNonDoc = true;
+        break;
+      }
+    }
+    if (hasNonDoc) continue;
+
     const diffRes = await opts.cmd.run("git", ["diff", "--name-only", baseSha, headSha], { cwd: opts.repoRoot });
     if (diffRes.exitCode !== 0) continue;
 
@@ -301,9 +326,7 @@ export async function findAcceptedSpecReview(opts: {
 
     if (changedFiles.length === 0) continue;
 
-    let hasNonDoc = false;
     const specPaths: string[] = [];
-
     for (const f of changedFiles) {
       if (f === ".orch-test-tmpdir" || f.endsWith("/.orch-test-tmpdir")) continue;
       if (!isDocOrSpecPath(f) || isCodePath(f)) {
