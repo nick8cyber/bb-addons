@@ -279,9 +279,11 @@ tools and skills the thread may use.
 
 ## Coordinator worktrees
 
-If several coordinators work in one project, start each coordinator thread in a separate BB Worktree environment with its own branch based on the current remote target. Fetch the target and integrate it in that worktree before publishing. Releases to the same repository and target branch use a single publication lock.
+Managed coordinator worktrees are governed by the policy setting `coordinatorWorktrees: off|on` (default: `off`). Until this mode is enabled by the owner, BB removes unarchived worktrees 5 minutes after a thread is archived, and unpushed local changes are lost. When working in a shared project before the mode is enabled, keep coordinator threads unarchived, save local work, and commit changes before archiving.
 
-Keep the coordinator thread unarchived while its worktree is needed. Before archiving, save local work and check that the branch's changes are on the target. The [planned lifecycle](../../docs/specs/orchestrator.md#169-жизненный-цикл-рабочей-копии-координатора) requires BB retention before managed coordinator worktrees are enabled. A promotion from executor to coordinator requires a separate integration worktree before merge or release operations.
+When enabled (`coordinatorWorktrees: on`), each coordinator thread runs in a separate BB Worktree environment with its own branch based on the current remote target. Fetch the target and integrate it in that worktree before publishing. Releases to the same repository and target branch use a single publication lock.
+
+Keep the coordinator thread unarchived while its worktree is needed. Before archiving, save local work and check that the branch's changes are on the target. The [planned lifecycle](../../docs/specs/orchestrator.md#169-жизненный-цикл-рабочей-копии-координатора) requires BB retention before managed coordinator worktrees are enabled. A promotion from executor to coordinator retains the existing environment under `coordinator-live` protection and requires a separate integration worktree before merge or release operations.
 
 ## Helpers (§19)
 
