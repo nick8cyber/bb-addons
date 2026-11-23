@@ -2565,28 +2565,77 @@ test("§17.3 Б4: merged — every merged delegation needs an OK review on its m
 });
 
 test("PLUG-395: reviewGate recognizes legacy merged delegations under coordinator's project", async () => {
-  const { coord, workTip } = makeMergedCoordinatorCopy();
-  // a second task's result merged into the same branch
-  gitR(coord, ["checkout", "work"]);
-  writeFileSync(join(coord, "task2.txt"), "x\n");
+  const { remote } = makeRepo();
+  const base = makeTempDir("rel-coord-");
+  const coord = join(base, "coord");
+  execFileSync("git", ["clone", "--branch", "main", remote, coord]);
+  gitR(coord, ["config", "user.name", "Agent"]);
+  gitR(coord, ["config", "user.email", "agent@x.io"]);
+
+  // 1. PLUG-2 (legacy task under proj_coord) on its branch feat2
+  gitR(coord, ["checkout", "-b", "feat2", "origin/main"]);
+  writeFileSync(join(coord, "task2.txt"), "task2\n");
   gitR(coord, ["add", "."]);
   gitR(coord, ["commit", "-m", "feat: task2 result"]);
   const sha2 = gitR(coord, ["rev-parse", "HEAD"]);
-  gitR(coord, ["checkout", "work-2"]);
-  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+
+  // 2. PLUG-1 (new task under proj_task) on its branch feat1
+  gitR(coord, ["checkout", "-b", "feat1", "origin/main"]);
+  writeFileSync(join(coord, "task1.txt"), "task1\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "feat: task1 result"]);
+  const sha1 = gitR(coord, ["rev-parse", "HEAD"]);
+
+  // 3. Work branch merges both feat1 and feat2 from main (first parent origin/main)
+  gitR(coord, ["checkout", "-b", "work", "origin/main"]);
+  gitR(coord, ["merge", "--no-ff", "-m", "merge feat1 and feat2", "feat1", "feat2"]);
+  const tipSha = gitR(coord, ["rev-parse", "HEAD"]);
+
+  gitR(coord, ["checkout", "-b", "work-2"]);
+
+  const { deps, store, exec, rev, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
     delegationProjectId: "proj_task",
     auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    comments: [
+      {
+        kind: "agent",
+        threadId: "thr_rev",
+        body: 'ОК, замечаний нет\n{"verdict":"OK","blockers":0}',
+        createdAt: "2026-01-01",
+      },
+      {
+        kind: "agent",
+        threadId: "thr_rev2",
+        body: 'ОК, замечаний нет\n{"verdict":"OK","blockers":0}',
+        createdAt: "2026-01-01",
+      },
+    ],
     releaseText: JSON.stringify({
       commitIdentity: "Agent <agent@x.io>",
       defaults: { target: { action: "pr", branch: "main" } },
     }),
   });
-  // PLUG-1 (current task) belongs to proj_task (via delegationProjectId)
-  store.setMerged(exec.id, { into: "work", sha: workTip });
-  bindReview(workTip);
 
-  // PLUG-2 was merged under coordinator's project proj_coord (before PLUG-395)
+  // tipSha is recorded as a pipeline commit (first parent origin/main, so candidate loop stops at c0 without an OK review)
+  const rel0 = store.insertRelease({
+    taskKey: "PLUG-0",
+    projectId: "proj_task",
+    coordinatorThreadId: "thr_coord",
+    repoPath: coord,
+    branch: "work",
+    targetAction: "pr",
+    targetBranch: "main",
+    repoRoot: coord,
+  }, deps.t);
+  store.addReleasePipelineShas(rel0.id, [tipSha]);
+  store.updateRelease(rel0.id, { status: "failed" });
+
+  // PLUG-1 merged at sha1 with OK review
+  store.setMerged(exec.id, { into: "work", sha: sha1 });
+  bindReview(sha1, rev.id);
+
+  // PLUG-2 merged under coordinator's project proj_coord at sha2 with OK review
   const exec2 = store.insert({
     taskKey: "PLUG-2",
     projectId: "proj_coord",
@@ -2599,6 +2648,7 @@ test("PLUG-395: reviewGate recognizes legacy merged delegations under coordinato
   store.setThreadInfo(exec2.id, "thr_exec2");
   store.setStatus(exec2.id, "done");
   store.setMerged(exec2.id, { into: "work", sha: sha2 });
+
   const rev2 = store.insert({
     taskKey: "PLUG-2",
     projectId: "proj_coord",
@@ -2608,7 +2658,7 @@ test("PLUG-395: reviewGate recognizes legacy merged delegations under coordinato
     preset: "r",
     provider: "p",
   });
-  store.setThreadInfo(rev2.id, "thr_rev");
+  store.setThreadInfo(rev2.id, "thr_rev2");
   store.setStatus(rev2.id, "running");
   store.setStatusIf(rev2.id, "running", "done", {
     reviewVerdict: { verdict: "OK", blockers: 0 },
@@ -2617,7 +2667,6 @@ test("PLUG-395: reviewGate recognizes legacy merged delegations under coordinato
 
   // Coordinator belongs to proj_coord
   const coordCaller = { ...COORD, projectId: "proj_coord" };
-  // Should not throw unreviewed-commits
   const res = await runRelease({ taskKey: "PLUG-1", caller: coordCaller }, deps);
   assert.equal(res.status, "auditing");
 });

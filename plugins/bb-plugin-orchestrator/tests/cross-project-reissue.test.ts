@@ -343,3 +343,128 @@ test("connected cross-project scenario: coordinator in proj_coord, task in proj_
     assert.notEqual(call.cwd, REPO_COORD, `Git call must NOT target REPO_COORD`);
   }
 });
+
+test("watchdog reissue: heals historical delegations and resolves task projectId from tracker when absent from task_queue", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const POLICY_TEXT = JSON.stringify({
+    version: 1,
+    approvalMode: "auto",
+    levels: {
+      medium: { chain: ["route-primary", "route-fallback"], autoFallback: true },
+    },
+    routes: {
+      "route-primary": { preset: "p-primary", provider: "acp-primary" },
+      "route-fallback": { preset: "p-fallback", provider: "acp-fallback" },
+    },
+  });
+  const policy = parsePolicy(POLICY_TEXT, new Set(["p-primary", "p-fallback"]));
+
+  // 1. Historical delegation under proj_coord
+  const oldRow = store.insert({
+    taskKey: "WATCH-HEAL-1",
+    projectId: "proj_coord",
+    coordinatorThreadId: "thr_coord",
+    level: "medium",
+    route: "route-primary",
+    preset: "preset_1",
+    provider: "provider_1",
+    round: 1,
+  });
+  store.setStatus(oldRow.id, "failed");
+
+  // 2. Active delegation that was also created under proj_coord before failure
+  const activeRow = store.insert({
+    taskKey: "WATCH-HEAL-1",
+    projectId: "proj_coord",
+    coordinatorThreadId: "thr_coord",
+    level: "medium",
+    route: "route-primary",
+    preset: "preset_1",
+    provider: "provider_1",
+    round: 2,
+  });
+  store.setThreadInfo(activeRow.id, "thr_active");
+  store.setStatus(activeRow.id, "running");
+
+  // Verify task_queue has NO row for WATCH-HEAL-1
+  assert.equal(store.getTask("WATCH-HEAL-1"), null);
+
+  const cli: BbCli = {
+    run: async (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks show")) {
+        return ok(
+          JSON.stringify({
+            task: { id: "t-wh-1", key: "WATCH-HEAL-1", title: "watch heal task", status: "todo", projectId: "proj_task" },
+            project: { name: "task-project", linkedBbProjectId: "proj_task" },
+            subtasks: [],
+            attachments: [],
+            comments: [],
+          }),
+        );
+      }
+      if (key.startsWith("tasks preset show")) {
+        return ok(
+          JSON.stringify({
+            preset: {
+              providerId: "fake-provider",
+              modelId: "m1",
+              reasoningLevel: "medium",
+              permissionMode: "auto",
+              environmentKind: "project-default",
+            },
+          }),
+        );
+      }
+      return ok();
+    },
+  };
+
+  let dispatchedRow: any = null;
+  const wd = createWatchdog({
+    store,
+    bbCli: cli,
+    threads: {
+      get: async (a) => ({ id: a.threadId, status: "error" }),
+      events: { list: async () => [] },
+      queuedMessages: { list: async () => [] },
+      send: async () => ({}),
+      stop: async () => ({}),
+      output: async () => null,
+      update: async () => ({}),
+    },
+    loadPolicy: async () => policy,
+    dispatch: async (fresh) => {
+      dispatchedRow = fresh;
+      return { threadId: "thr_dispatched", status: "running" as const, setupErrors: [] };
+    },
+    finalize: async () => ({ status: "running" as const, setupErrors: [] }),
+    retrySetup: async () => [],
+    enqueue: async (fn) => fn(),
+    t: T_RU,
+    now: () => Date.now(),
+    workGraphMode: () => "off",
+    resolveProject: (pid: string) => ({ id: pid, approvalMode: "auto" } as any),
+  });
+
+  // Active delegation encounters error
+  await wd.onThreadFailed(
+    { id: "thr_active", status: "error" },
+    "error",
+  );
+
+  // Watchdog reissue must resolve task project from tracker, heal DB rows, and reissue with proj_task
+  assert.ok(dispatchedRow, "expected fresh delegation to be dispatched");
+  assert.equal(dispatchedRow.project_id, "proj_task");
+
+  const fresh = store.delegationsByTask("WATCH-HEAL-1").find((d) => d.reissue_of === activeRow.id)!;
+  assert.ok(fresh, "expected reissue row in store");
+  assert.equal(fresh.project_id, "proj_task");
+
+  // Historical rows must be healed to proj_task in DB
+  assert.equal(store.get(oldRow.id)!.project_id, "proj_task");
+  assert.equal(store.get(activeRow.id)!.project_id, "proj_task");
+});
