@@ -277,6 +277,12 @@ tools and skills the thread may use.
   not, the role carries no text (agy on the ACP bridge delivers it; `acp-devin`
   restores instructions after compaction via `provider-devin`).
 
+## Coordinator worktrees
+
+If several coordinators work in one project, start each coordinator thread in a separate BB Worktree environment with its own branch based on the current remote target. Fetch the target and integrate it in that worktree before publishing. Releases to the same repository and target branch use a single publication lock.
+
+Keep the coordinator thread unarchived while its worktree is needed. Before archiving, save local work and check that the branch's changes are on the target. The [planned lifecycle](../../docs/specs/orchestrator.md#169-жизненный-цикл-рабочей-копии-координатора) adds a retention check before BB removes the environment.
+
 ## Helpers (§19)
 
 `orchestrator_helper` (agent tool) and `bb orchestrator helper` create a
