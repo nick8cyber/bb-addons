@@ -48,7 +48,7 @@ function initRepo(repoPath: string, branch = "main"): void {
   execFileSync("git", ["-C", repoPath, "config", "user.email", "agent@bb.local"]);
   execFileSync("git", ["-C", repoPath, "config", "user.name", "BB Agent"]);
   execFileSync("git", ["-C", repoPath, "checkout", "-B", branch], { stdio: "ignore" });
-  execFileSync("git", ["-C", repoPath, "commit", "--allow-empty", "-m", "init"], { stdio: "ignore" });
+  execFileSync("git", ["-c", "core.hooksPath=", "-C", repoPath, "commit", "--allow-empty", "-m", "init"], { stdio: "ignore" });
 }
 
 function setupTestHooksDir(dir: string): void {
@@ -428,6 +428,16 @@ test("§24.1 п.6 (13): postPublish с токеном: fast-forward успеше
 
   // Проверяем, что с токеном reference-transaction пропускает
   const token = "valid-test-token-123";
+  const tokenFile = join(dirname(liveDir), ".token");
+  writeFileSync(
+    tokenFile,
+    JSON.stringify({
+      token,
+      repo: liveDir,
+      expiresAt: Date.now() + 60_000,
+    }),
+  );
+
   const refHook = join(hooksDir, "reference-transaction");
   const stdinLine = `0000000000000000000000000000000000000000 ${"a".repeat(40)} refs/heads/main\n`;
 

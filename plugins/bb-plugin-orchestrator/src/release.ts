@@ -24,7 +24,7 @@ import { delimiter, dirname, isAbsolute, join, relative } from "node:path";
 import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
-import { runHooksDoctor, HOOK_NAMES } from "./hooks.js";
+import { runHooksDoctor, HOOK_NAMES, type DoctorOptions, type DoctorResult } from "./hooks.js";
 import {
   isLiveCheckoutMigrating,
   isLiveCheckoutPath,
@@ -243,6 +243,8 @@ export interface ReleaseDeps {
   now?: () => number;
   markCoordinatorAction?: (threadId: string | undefined | null) => void;
   workGraphMode?: WorkGraphMode | ((projectId?: string) => WorkGraphMode);
+  /** §24.1: проверка наличия хуков перед шагом 6. */
+  hooksDoctor?: (opts: DoctorOptions) => Promise<DoctorResult>;
   log?: {
     info?(m: string): void;
     warn?(m: string): void;
@@ -1730,9 +1732,15 @@ export function assertInstalledHookFresh(deps: ReleaseDeps): void {
           : null;
     let current: Buffer;
     try {
-      current = gateRender
-        ? gateRender(t)
-        : readFileSync(join(PLUGIN_HOOKS_DIR, "chain"));
+      if (gateRender) {
+        current = gateRender(t);
+      } else if (name === "post-checkout") {
+        current = readFileSync(join(PLUGIN_HOOKS_DIR, "post-checkout"));
+      } else if (name === "reference-transaction") {
+        current = readFileSync(join(PLUGIN_HOOKS_DIR, "reference-transaction"));
+      } else {
+        current = readFileSync(join(PLUGIN_HOOKS_DIR, "chain"));
+      }
     } catch {
       continue;
     }
@@ -4430,8 +4438,15 @@ async function publishRelease(
   const t = deps.t ?? T_RU;
   const repo = row.repo_path;
 
-  // §24.1 п.1: release перед шагом 6 вызывает doctor и отказывает с hooks-missing, если хуки не стоят.
-  const doctorRes = await runHooksDoctor({
+  // §24.1 п.1: release перед шагом 6 проверяет отсутствие миграции и вызывает doctor
+  if (isLiveCheckoutMigrating(deps.store, repo)) {
+    throw new OrchestratorError(
+      "live-checkout-migrating",
+      "live-checkout-migrating: идёт миграция служебной копии live-checkout",
+    );
+  }
+  const doctorFn = deps.hooksDoctor ?? runHooksDoctor;
+  const doctorRes = await doctorFn({
     hooksDir: deps.hooksDir(),
     repo,
     store: deps.store,
@@ -5593,26 +5608,30 @@ export async function runPostPublish(
           }
           const isLive = isLiveCheckoutPath(co);
           let liveTokenFile: string | null = null;
+          let liveTokenVal: string | null = null;
           if (isLive) {
             const tokenDir = dirname(co);
             liveTokenFile = join(tokenDir, ".token");
             mkdirSync(tokenDir, { recursive: true, mode: 0o700 });
-            const tokenVal = randomBytes(24).toString("hex");
+            liveTokenVal = randomBytes(24).toString("hex");
             writeFileSync(
               liveTokenFile,
               JSON.stringify({
-                token: tokenVal,
+                token: liveTokenVal,
+                repo: co,
                 expiresAt: Date.now() + 300_000,
               }),
             );
-            process.env.ORCH_LIVE_TOKEN = tokenVal;
             chmodRecursive(co, true);
           }
+          const liveEnv = liveTokenVal
+            ? { ...process.env, ORCH_LIVE_TOKEN: liveTokenVal }
+            : undefined;
           try {
             const fetchRes = await deps.cmd.run(
               "git",
               ["-C", co, "fetch", "origin"],
-              { timeoutMs: 180_000 },
+              { timeoutMs: 180_000, ...(liveEnv ? { env: liveEnv } : {}) },
             );
             // §22.3: инфраструктурный сбой (fetch/ff) — понятная строка,
             // сырой вывод git — только в журнал плагина.
@@ -5687,7 +5706,7 @@ export async function runPostPublish(
                   const ffRes = await deps.cmd.run(
                     "git",
                     ["-C", co, "merge", "--ff-only", origin],
-                    { timeoutMs: 120_000 },
+                    { timeoutMs: 120_000, ...(liveEnv ? { env: liveEnv } : {}) },
                   );
                   if (ffRes.exitCode !== 0) {
                     copyInfraFailed("ff", ffRes);
@@ -5719,7 +5738,6 @@ export async function runPostPublish(
               if (liveTokenFile && existsSync(liveTokenFile)) {
                 rmSync(liveTokenFile, { force: true });
               }
-              delete process.env.ORCH_LIVE_TOKEN;
             }
           }
         }
@@ -5984,6 +6002,11 @@ export async function runPostPublish(
     bits.push(t("pp.reloadPage", { list: appPlugins.join(", ") }));
   }
 
+  if (co && isLiveCheckoutPath(co)) {
+    try {
+      chmodRecursive(co, false);
+    } catch {}
+  }
   releasePostPublishLock(row.id);
   if (!bits.length) return { done: true, summary: null, selfReload };
   return {

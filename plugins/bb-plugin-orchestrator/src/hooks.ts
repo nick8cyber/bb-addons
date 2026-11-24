@@ -18,6 +18,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { OrchestratorError } from "./errors.js";
 import type { DelegationStore } from "./store.js";
 
 /**
@@ -92,6 +93,7 @@ export function writeChainConfig(hooksDir: string, cfg: ChainConfig): void {
 export interface InstallHooksOptions {
   hooksDir?: string;
   fixLocalCopy?: string;
+  confirmed?: boolean;
   hooksSrcDir?: string;
   runCmd?: (cmd: string, args: string[]) => string;
 }
@@ -117,6 +119,13 @@ export async function installHooks(
   const exec = opts.runCmd ?? ((cmd, args) => execFileSync(cmd, args, { encoding: "utf8" }).trim());
 
   if (opts.fixLocalCopy) {
+    if (!opts.confirmed) {
+      throw new OrchestratorError(
+        "fix-local-needs-confirmation",
+        "fix-local-needs-confirmation: перенос локального core.hooksPath требует подтверждения владельца (--confirm)",
+      );
+    }
+
     const copyPath = resolve(opts.fixLocalCopy);
     let localHooksPath = "";
     try {
@@ -129,10 +138,30 @@ export async function installHooks(
         message: `копия ${copyPath} не имеет локального core.hooksPath`,
       };
     }
+
+    let rootRepo = copyPath;
+    try {
+      const common = exec("git", ["-C", copyPath, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+      if (common) rootRepo = dirname(common);
+    } catch {}
+
+    const absLocalHooks = isAbsolute(localHooksPath) ? localHooksPath : resolve(rootRepo, localHooksPath);
     mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
     const chain = readChainConfig(hooksDir);
     chain.localHooks = chain.localHooks ?? {};
-    chain.localHooks[copyPath] = localHooksPath;
+    chain.localHooks[resolve(copyPath)] = absLocalHooks;
+    chain.localHooks[resolve(rootRepo)] = absLocalHooks;
+
+    try {
+      const wtOut = exec("git", ["-C", rootRepo, "worktree", "list", "--porcelain"]);
+      for (const line of wtOut.split("\n")) {
+        if (line.startsWith("worktree ")) {
+          const wtPath = line.slice("worktree ".length).trim();
+          if (wtPath) chain.localHooks[resolve(wtPath)] = absLocalHooks;
+        }
+      }
+    } catch {}
+
     writeChainConfig(hooksDir, chain);
 
     try {
@@ -152,8 +181,13 @@ export async function installHooks(
   // 1. Проверяем действующий глобальный core.hooksPath
   let existingGlobal: string | null = null;
   try {
-    const raw = exec("git", ["config", "--global", "core.hooksPath"]);
-    if (raw) existingGlobal = resolve(raw);
+    let raw = exec("git", ["config", "--global", "core.hooksPath"]);
+    if (raw) {
+      if (raw.startsWith("~/")) {
+        raw = join(homedir(), raw.slice(2));
+      }
+      existingGlobal = resolve(raw);
+    }
   } catch {}
 
   const chain = readChainConfig(hooksDir);
@@ -175,7 +209,6 @@ export async function installHooks(
     if (existsSync(srcFile)) {
       copyFileSync(srcFile, dstFile);
     } else {
-      // Запасной fallback для обёрток
       const fallback = join(hooksSrc, "chain");
       copyFileSync(fallback, dstFile);
     }
@@ -251,8 +284,10 @@ export async function runHooksDoctor(
       missingHooks.push(name);
     } else {
       try {
-        const mode = statSync(file).mode;
-        if (!(mode & 0o111)) {
+        const st = statSync(file);
+        if (!st.isFile()) {
+          missingHooks.push(name);
+        } else if (!(st.mode & 0o111)) {
           nonExecHooks.push(name);
         }
       } catch {
@@ -284,9 +319,11 @@ export async function runHooksDoctor(
 
     // Ищем основной репозиторий и его linked worktrees
     let rootRepo = targetRepo;
+    let repoCommonDir = "";
     try {
       const common = exec("git", ["-C", targetRepo, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
       if (common) {
+        repoCommonDir = resolve(common);
         rootRepo = dirname(common);
         copiesToCheck.add(rootRepo);
       }
@@ -304,20 +341,39 @@ export async function runHooksDoctor(
       }
     } catch {}
 
-    // Служебная живая копия
+    // Служебная живая копия — проверяем происхождение из того же origin
     const repoName = basename(rootRepo);
     const liveCandidate = join(homedir(), ".bb", "plugin-live", repoName);
     if (existsSync(liveCandidate)) {
-      copiesToCheck.add(resolve(liveCandidate));
+      let isSameOrigin = false;
+      try {
+        const liveOrigin = exec("git", ["-C", liveCandidate, "remote", "get-url", "origin"]);
+        const repoOrigin = exec("git", ["-C", rootRepo, "remote", "get-url", "origin"]);
+        if (liveOrigin && repoOrigin && liveOrigin === repoOrigin) {
+          isSameOrigin = true;
+        }
+      } catch {}
+      if (isSameOrigin) {
+        copiesToCheck.add(resolve(liveCandidate));
+      }
     }
 
-    // Копии координаторов из базы
+    // Копии координаторов из базы — ТОЛЬКО того же проекта!
     if (opts.store) {
       try {
         const list = opts.store.activeCoordinatorWorktrees?.() ?? [];
         for (const row of list) {
           if (row.worktree_path && existsSync(row.worktree_path)) {
-            copiesToCheck.add(resolve(row.worktree_path));
+            let isSameRepo = false;
+            try {
+              const wtCommon = exec("git", ["-C", row.worktree_path, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+              if (wtCommon && repoCommonDir && resolve(wtCommon) === repoCommonDir) {
+                isSameRepo = true;
+              }
+            } catch {}
+            if (isSameRepo) {
+              copiesToCheck.add(resolve(row.worktree_path));
+            }
           }
         }
       } catch {}

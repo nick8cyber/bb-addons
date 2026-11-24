@@ -59,6 +59,47 @@ function git(args, opts = {}) {
   });
 }
 
+async function openDb(dbPath) {
+  if (!existsSync(dbPath)) return null;
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    return {
+      prepare(sql) {
+        const stmt = db.prepare(sql);
+        return {
+          get(...args) { return stmt.get(...args); },
+          all(...args) { return stmt.all(...args); },
+          run(...args) { return stmt.run(...args); },
+        };
+      },
+      close() {
+        try { db.close(); } catch {}
+      },
+    };
+  } catch {
+    try {
+      const Database = (await import("better-sqlite3")).default;
+      const db = new Database(dbPath, { readonly: true, timeout: 2000 });
+      return {
+        prepare(sql) {
+          const stmt = db.prepare(sql);
+          return {
+            get(...args) { return stmt.get(...args); },
+            all(...args) { return stmt.all(...args); },
+            run(...args) { return stmt.run(...args); },
+          };
+        },
+        close() {
+          try { db.close(); } catch {}
+        },
+      };
+    } catch {
+      return null;
+    }
+  }
+}
+
 /** The repository's own hook (the global core.hooksPath shadows it):
  * `$GIT_DIR/hooks/<name>` — the env var first, then the common dir for
  * worktrees. Executable files only, exactly like git itself. */
@@ -114,7 +155,7 @@ function chainLocal() {
 // ── Exclusions: service repositories (same file as `pre-push`). ──────
 // In a linked worktree `--show-toplevel` names the WORKTREE, not the
 // repository root — `dirname(<common dir>)` is the main copy's path
-// (spec §22.1). An exclusion naming either path skips the gate.
+// (spec §22.1). An exclusion naming either path skips the leak scan.
 const repoTop = git(["rev-parse", "--show-toplevel"]);
 if (repoTop.status !== 0) process.exit(chainLocal());
 const common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
@@ -135,7 +176,6 @@ try {
     if (excluded) break;
   }
 } catch { /* no exclusions file — nothing excluded */ }
-if (excluded) process.exit(chainLocal());
 
 // ── §24 п.2 (а): Ветка не целевая ──────────────────────────────────────
 const branchRes = git(["symbolic-ref", "--short", "-q", "HEAD"]);
@@ -156,83 +196,75 @@ if (threadId) {
       process.env.ORCHESTRATOR_DB_PATH ??
       join(home, ".bb", "plugins", "orchestrator", "data.db");
     if (existsSync(dbPath)) {
-      const Database = (await import("better-sqlite3")).default;
-      const db = new Database(dbPath, { readonly: true, timeout: 2000 });
-      dbOpened = true;
+      const db = await openDb(dbPath);
+      if (db) {
+        dbOpened = true;
 
-      let role = null;
-      try {
-        const helperRow = db
-          .prepare("SELECT 1 FROM helpers WHERE thread_id = ?")
-          .get(threadId);
-        if (helperRow) {
-          role = "helper";
-        } else {
-          const roleRow = db
-            .prepare("SELECT role FROM thread_roles WHERE thread_id = ?")
-            .get(threadId);
-          if (roleRow && typeof roleRow === "object" && "role" in roleRow) {
-            role = String(roleRow.role);
-          }
-        }
-      } catch {}
-
-      if (role === "orchestrator") {
-        // §24.1 п.4: коммит разрешён, если все изменённые пути лежат в docs/
-        const stagedRes = git(["diff", "--cached", "--name-only"]);
-        const staged = (stagedRes.stdout ?? "")
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean);
-        if (staged.length > 0) {
-          const nonDocs = staged.filter((p) => !p.startsWith("docs/"));
-          if (nonDocs.length > 0) {
-            if (nonDocs.length === staged.length) {
-              console.error(msg("coordinatorNoCode"));
-            } else {
-              console.error(
-                msg("coordinatorMixed", { paths: nonDocs.join(", ") }),
-              );
-            }
-            db.close();
-            process.exit(1);
-          }
-        }
-      } else if (role === "helper") {
-        // §24.1 п.5: роль helper не коммитит никогда
-        console.error(msg("helperNoCommit"));
-        db.close();
-        process.exit(1);
-      } else if (
-        role === "auditor" ||
-        role === "researcher" ||
-        role === "release-auditor" ||
-        role === "architect"
-      ) {
-        console.error(msg("architectNoCode"));
-        db.close();
-        process.exit(1);
-      } else if (role === "executor" || !role) {
-        // §24.1 п.5: Корневой executor без записи в delegations: коммитит, если ветка
-        // не целевая и копия не живая и не копия координатора.
-        const cwd = process.cwd();
-        let delegation;
+        let role = null;
         try {
-          delegation = db
-            .prepare(
-              "SELECT result_env_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1",
-            )
+          const helperRow = db
+            .prepare("SELECT 1 FROM helpers WHERE thread_id = ?")
             .get(threadId);
+          if (helperRow) {
+            role = "helper";
+          } else {
+            const roleRow = db
+              .prepare("SELECT role FROM thread_roles WHERE thread_id = ?")
+              .get(threadId);
+            if (roleRow && typeof roleRow === "object" && "role" in roleRow) {
+              role = String(roleRow.role);
+            }
+          }
         } catch {}
 
-        if (delegation && delegation.result_env_id) {
-          if (!cwd.includes(delegation.result_env_id)) {
-            console.error(msg("foreignCopy"));
-            db.close();
-            process.exit(1);
+        if (role === "orchestrator") {
+          // §24.1 п.4: коммит разрешён, если все изменённые пути лежат в docs/
+          // Проверяем машинный формат с именами путей и обе стороны переименования (-z)
+          const stagedRes = git(["diff", "--cached", "--name-status", "-z"]);
+          const tokens = (stagedRes.stdout ?? "").split("\0").filter((t) => t.length > 0);
+          const stagedPaths = [];
+          for (let i = 0; i < tokens.length; i++) {
+            const status = tokens[i];
+            if (status.startsWith("R") || status.startsWith("C")) {
+              if (i + 1 < tokens.length) stagedPaths.push(tokens[++i]);
+              if (i + 1 < tokens.length) stagedPaths.push(tokens[++i]);
+            } else {
+              if (i + 1 < tokens.length) stagedPaths.push(tokens[++i]);
+            }
           }
-        } else {
-          // Корневой executor или исполнитель до фиксации результата
+
+          if (stagedPaths.length > 0) {
+            const nonDocs = stagedPaths.filter((p) => !p.startsWith("docs/"));
+            if (nonDocs.length > 0) {
+              if (nonDocs.length === stagedPaths.length) {
+                console.error(msg("coordinatorNoCode"));
+              } else {
+                console.error(
+                  msg("coordinatorMixed", { paths: [...new Set(nonDocs)].join(", ") }),
+                );
+              }
+              db.close();
+              process.exit(1);
+            }
+          }
+        } else if (role === "helper") {
+          // §24.1 п.5: роль helper не коммитит никогда
+          console.error(msg("helperNoCommit"));
+          db.close();
+          process.exit(1);
+        } else if (
+          role === "auditor" ||
+          role === "researcher" ||
+          role === "release-auditor" ||
+          role === "architect"
+        ) {
+          console.error(msg("architectNoCode"));
+          db.close();
+          process.exit(1);
+        } else if (role === "executor" || !role) {
+          // §24.1 п.5: Корневой executor без записи в delegations: коммитит, если ветка
+          // не целевая и копия не живая и не копия координатора.
+          const cwd = process.cwd();
           const isLive =
             cwd.includes(".bb/plugin-live") ||
             process.env.ORCH_IS_LIVE_COPY === "1";
@@ -251,9 +283,56 @@ if (threadId) {
             db.close();
             process.exit(1);
           }
+
+          let delegation = null;
+          try {
+            delegation = db
+              .prepare(
+                "SELECT id, status, task_key, result_env_id, coordinator_thread_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1",
+              )
+              .get(threadId);
+          } catch {}
+
+          if (delegation) {
+            let expectedPath = null;
+            const bbDbPath = join(home, ".bb", "bb.db");
+            if (existsSync(bbDbPath)) {
+              try {
+                const bbDb = await openDb(bbDbPath);
+                if (bbDb) {
+                  if (delegation.result_env_id) {
+                    const envRow = bbDb.prepare("SELECT path FROM environments WHERE id = ?").get(delegation.result_env_id);
+                    if (envRow?.path) expectedPath = resolve(envRow.path);
+                  }
+                  if (!expectedPath) {
+                    const thrRow = bbDb.prepare("SELECT e.path FROM threads t JOIN environments e ON t.environment_id = e.id WHERE t.id = ?").get(threadId);
+                    if (thrRow?.path) expectedPath = resolve(thrRow.path);
+                  }
+                  bbDb.close();
+                }
+              } catch {}
+            }
+
+            if (expectedPath) {
+              const cwdNorm = resolve(cwd);
+              if (cwdNorm !== expectedPath && !cwdNorm.startsWith(expectedPath + "/")) {
+                console.error(msg("foreignCopy"));
+                db.close();
+                process.exit(1);
+              }
+            } else if (delegation.result_env_id) {
+              const resEnv = resolve(delegation.result_env_id);
+              const cwdNorm = resolve(cwd);
+              if (cwdNorm !== resEnv && !cwdNorm.startsWith(resEnv + "/") && !cwdNorm.includes(delegation.result_env_id)) {
+                console.error(msg("foreignCopy"));
+                db.close();
+                process.exit(1);
+              }
+            }
+          }
         }
+        db.close();
       }
-      db.close();
     }
   } catch (e) {
     if (!dbOpened) {
@@ -263,6 +342,9 @@ if (threadId) {
     }
   }
 }
+
+// Если репозиторий исключён из проверки утечек, пропускаем только проверку утечек
+if (excluded) process.exit(chainLocal());
 
 // ── The project's `leaks` settings — the plugin's snapshot in the
 // COMMON git dir, so every worktree (coordinator's and executors'
@@ -298,7 +380,10 @@ try {
     }
     if (snap.excluded === true) leaks.excluded = true;
   }
-} catch { /* no snapshot — built-in rules apply */ }
+} catch { /* no snapshot — defaults hold */ }
+
+// §22.1: exclusions can also live inside `orchestrator-leaks.json`
+// (e.g. pushed from project configuration).
 if (leaks.excluded) process.exit(chainLocal());
 
 // ── Staged added lines (spec §22.1: `+` lines only — a commit that
@@ -328,9 +413,6 @@ const findings = scan.scanAddedLinesCore(added, {
   allow: leaks.allow,
   hostname: leaks.hostname,
   threadIds: leaks.threadIds,
-  // §22.1: `thr_…` in a FILE is always a finding — the `threadIds`
-  // exemption covers the `BB-Thread:` trailer in commit MESSAGES,
-  // which this hook does not scan at all.
   flagThreadIds: true,
   allowedEmails: leaks.allowedEmails,
 });

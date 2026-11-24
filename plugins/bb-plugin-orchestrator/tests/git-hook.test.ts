@@ -494,7 +494,7 @@ function stage(repo: string, file: string, text: string) {
 }
 
 function runPreCommit(repo: string, hooksDir: string) {
-  const env = { ...process.env, GIT_DIR: join(repo, ".git") };
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_DIR: join(repo, ".git") };
   delete env.BB_THREAD_ID;
   return spawnSync("node", [join(hooksDir, "pre-commit")], {
     cwd: repo,

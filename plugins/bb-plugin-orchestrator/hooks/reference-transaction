@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /**
- * Shared git reference-transaction hook (spec orchestrator §24.1 п.3).
- * Живую копию меняет только postPublish: хук reference-transaction
- * в состоянии `prepared` отклоняет любое изменение ссылок служебной копии
- * (HEAD, ветки), если нет действующего токена postPublish.
+ * Shared git reference-transaction hook (spec orchestrator §24 п.3).
+ * Отклоняет изменение ссылок в служебной живой копии (~/.bb/plugin-live/<repo>),
+ * если нет действующего токена postPublish / live-checkout setup.
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
@@ -76,18 +75,32 @@ if (state === "prepared") {
 
   if (isLiveCopy) {
     const home = process.env.HOME ?? "/home/ubuntu";
-    const tokenFile = join(home, ".bb", "plugin-live", ".token");
-    let hasToken = false;
+    const candidates = [
+      join(dirname(cwd), ".token"),
+      join(dirname(gitDir), ".token"),
+      join(dirname(dirname(gitDir)), ".token"),
+      join(home, ".bb", "plugin-live", ".token"),
+    ];
 
-    if (process.env.ORCH_LIVE_TOKEN) {
-      hasToken = true;
-    } else if (existsSync(tokenFile)) {
-      try {
-        const raw = JSON.parse(readFileSync(tokenFile, "utf8"));
-        if (raw.token && (!raw.expiresAt || raw.expiresAt > Date.now())) {
-          hasToken = true;
+    let hasToken = false;
+    const envToken = process.env.ORCH_LIVE_TOKEN;
+
+    if (envToken) {
+      for (const tokenFile of candidates) {
+        if (existsSync(tokenFile)) {
+          try {
+            const raw = JSON.parse(readFileSync(tokenFile, "utf8"));
+            if (raw.token && raw.token === envToken) {
+              const notExpired = !raw.expiresAt || raw.expiresAt > Date.now();
+              const repoMatches = !raw.repo || cwd.startsWith(raw.repo) || raw.repo.startsWith(cwd);
+              if (notExpired && repoMatches) {
+                hasToken = true;
+                break;
+              }
+            }
+          } catch {}
         }
-      } catch {}
+      }
     }
 
     if (!hasToken) {

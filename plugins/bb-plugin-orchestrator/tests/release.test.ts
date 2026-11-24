@@ -783,6 +783,7 @@ function makeDeps(repo: string, overrides: Partial<{
         id === "thr_coord" ? "orchestrator" : undefined,
     },
     hooksDir: () => tmp,
+    hooksDoctor: async () => ({ ok: true, code: 0, issues: [], message: "OK" }),
     packetDir: () => makeTempDir("pkt-"),
     localHostId: async () => overrides.localHostId ?? "host_test",
     enqueue: <T>(f: () => Promise<T>) => f(),

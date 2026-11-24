@@ -12,6 +12,47 @@ import { fileURLToPath } from "node:url";
 const HOOK_NAME = "post-checkout";
 const dir = dirname(fileURLToPath(import.meta.url));
 
+async function openDb(dbPath) {
+  if (!existsSync(dbPath)) return null;
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath, { readOnly: false });
+    return {
+      prepare(sql) {
+        const stmt = db.prepare(sql);
+        return {
+          get(...args) { return stmt.get(...args); },
+          all(...args) { return stmt.all(...args); },
+          run(...args) { return stmt.run(...args); },
+        };
+      },
+      close() {
+        try { db.close(); } catch {}
+      },
+    };
+  } catch {
+    try {
+      const Database = (await import("better-sqlite3")).default;
+      const db = new Database(dbPath, { readonly: false, timeout: 2000 });
+      return {
+        prepare(sql) {
+          const stmt = db.prepare(sql);
+          return {
+            get(...args) { return stmt.get(...args); },
+            all(...args) { return stmt.all(...args); },
+            run(...args) { return stmt.run(...args); },
+          };
+        },
+        close() {
+          try { db.close(); } catch {}
+        },
+      };
+    } catch {
+      return null;
+    }
+  }
+}
+
 function chainLocal() {
   const candidates = [];
   if (process.env.GIT_DIR) {
@@ -63,14 +104,13 @@ const isBranchCheckout = process.argv[4] === "1"; // $3 = 1 branch checkout, 0 f
 
 if (threadId && isBranchCheckout) {
   try {
-    const Database = (await import("better-sqlite3")).default;
     const home = process.env.HOME ?? "/home/ubuntu";
     const dbPath =
       process.env.ORCHESTRATOR_DB_PATH ??
       join(home, ".bb", "plugins", "orchestrator", "data.db");
 
-    if (existsSync(dbPath)) {
-      const db = new Database(dbPath, { readonly: true, timeout: 2000 });
+    const db = await openDb(dbPath);
+    if (db) {
       let role = null;
       try {
         const helperRow = db
@@ -89,17 +129,41 @@ if (threadId && isBranchCheckout) {
       if (role && role !== "none") {
         const cwd = process.cwd();
         let isOwnCopy = false;
+
         if (role === "executor") {
-          try {
-            const del = db
-              .prepare(
-                "SELECT result_env_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1",
-              )
-              .get(threadId);
-            if (del && del.result_env_id && cwd.includes(del.result_env_id)) {
+          let expectedPath = null;
+          const bbDbPath = join(home, ".bb", "bb.db");
+          if (existsSync(bbDbPath)) {
+            try {
+              const bbDb = await openDb(bbDbPath);
+              if (bbDb) {
+                const thrRow = bbDb.prepare("SELECT e.path FROM threads t JOIN environments e ON t.environment_id = e.id WHERE t.id = ?").get(threadId);
+                if (thrRow?.path) expectedPath = resolve(thrRow.path);
+                bbDb.close();
+              }
+            } catch {}
+          }
+          if (expectedPath) {
+            const cwdNorm = resolve(cwd);
+            if (cwdNorm === expectedPath || cwdNorm.startsWith(expectedPath + "/")) {
               isOwnCopy = true;
             }
-          } catch {}
+          } else {
+            try {
+              const del = db
+                .prepare(
+                  "SELECT result_env_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1",
+                )
+                .get(threadId);
+              if (del && del.result_env_id) {
+                const resEnv = resolve(del.result_env_id);
+                const cwdNorm = resolve(cwd);
+                if (cwdNorm === resEnv || cwdNorm.startsWith(resEnv + "/") || cwdNorm.includes(del.result_env_id)) {
+                  isOwnCopy = true;
+                }
+              }
+            } catch {}
+          }
         } else if (role === "orchestrator") {
           try {
             const coord = db
@@ -129,6 +193,32 @@ if (threadId && isBranchCheckout) {
           newBranch = newBranch || "detached";
           const msg = `тред ${threadId} переключил копию ${cwd} на ${newBranch}`;
           console.warn(msg);
+
+          try {
+            db.prepare(
+              "INSERT INTO events (kind, payload, created_at) VALUES (?, ?, ?)",
+            ).run(
+              "checkout.foreign",
+              JSON.stringify({ threadId, cwd, branch: newBranch, message: msg }),
+              Date.now(),
+            );
+          } catch {}
+
+          let notifyTarget = null;
+          try {
+            const h = db.prepare("SELECT caller_thread_id, coordinator_thread_id FROM helpers WHERE thread_id = ?").get(threadId);
+            if (h) notifyTarget = h.caller_thread_id || h.coordinator_thread_id;
+            else {
+              const d = db.prepare("SELECT coordinator_thread_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1").get(threadId);
+              if (d) notifyTarget = d.coordinator_thread_id;
+            }
+          } catch {}
+
+          if (notifyTarget) {
+            try {
+              execFileSync("bb", ["thread", "tell", notifyTarget, "--message", msg], { stdio: "ignore" });
+            } catch {}
+          }
         }
       }
       db.close();

@@ -141,6 +141,7 @@ import {
   writeLeaksSnapshot,
 } from "./src/release.js";
 import {
+  defaultHooksDir,
   installHooks,
   runHooksDoctor,
 } from "./src/hooks.js";
@@ -1349,7 +1350,7 @@ export async function createPlugin(
       try {
         if (
           syncInstalledGateHooks(
-            joinPath(pluginDataDir(), "git-hooks"),
+            defaultHooksDir(),
             t,
           )
         ) {
@@ -1861,7 +1862,7 @@ export async function createPlugin(
     loadPolicy: async () => policyLoad,
     loadReleaseConfig: () => releaseConfig,
     probes,
-    hooksDir: () => joinPath(pluginDataDir(), "git-hooks"),
+    hooksDir: () => defaultHooksDir(),
     packetDir: () => joinPath(pluginDataDir(), "release-audit"),
     // §17.3 (С1): only the release-auditor dispatch goes through the
     // delegate queue — the outer release flow runs outside it.
@@ -4905,9 +4906,15 @@ export async function createPlugin(
           if (sub === "install") {
             const fixLocal = flag("--fix-local");
             const hooksDir = flag("--hooks-dir");
+            const confirmed =
+              argv.includes("--confirm") ||
+              argv.includes("--yes") ||
+              argv.includes("-y") ||
+              argv.includes("--approved");
             const res = await installHooks({
               fixLocalCopy: fixLocal,
               hooksDir,
+              confirmed,
             });
             return json
               ? jsonOk(res)
