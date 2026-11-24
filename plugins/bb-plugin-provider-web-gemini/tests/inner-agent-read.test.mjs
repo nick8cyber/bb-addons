@@ -1566,7 +1566,7 @@ test("research-подобный ход без дерева собирает ша
   assert.doesNotMatch(header, /доступны только/);
 });
 
-test("research по явному признаку «задача без кода» в git-дереве собирает короткий пакет (PLUG-384)", async (t) => {
+test("research по явному признаку «задача без кода» в git-дереве собирает чистый research-пакет (PLUG-404)", async (t) => {
   const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
   const { tmp, repo } = setup(t);
 
@@ -1597,25 +1597,22 @@ test("research по явному признаку «задача без кода
   const collected = await collectTask(prep, [], [], packageOptions);
   const packed = packTask(prep, collected, packageOptions);
 
-  // Шапка ставит веб-поиск первым, без общесессионного «доступны только».
-  assert.match(packed.message.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini/);
-  assert.doesNotMatch(packed.message, /доступны только/);
-  assert.match(packed.message, /=== Task text ===/);
-  // Без repo-инструментов в шапке — только bb_* команды.
-  const header = packed.message.split("\n\n===")[0];
-  assert.doesNotMatch(header, /<tool name="read_file"/);
-  assert.doesNotMatch(header, /<tool name="list_dir"/);
-  assert.doesNotMatch(header, /<tool name="grep"/);
-  assert.doesNotMatch(header, /<tool name="git"/);
-  assert.doesNotMatch(header, /рабочая копия/);
-  assert.match(header, /<tool name="bb_task_show"/);
-  // Без git-секций, инвентаря быстрого агента и манифеста разрешений.
+  // Первая строка — утвердительная строка поиска по §4.6 п. 1.
+  assert.match(packed.message.split("\n")[0], /Найди ответ в интернете через поиск Google/);
+  assert.doesNotMatch(packed.message, /Для веб-поиска используй встроенные инструменты поиска Gemini/);
+  assert.doesNotMatch(packed.message, /=== Task text ===/);
+  assert.doesNotMatch(packed.message, /<tool\b/);
+  assert.doesNotMatch(packed.message, /Лимит раундов/);
+  assert.doesNotMatch(packed.message, /bb_\*/);
   assert.doesNotMatch(packed.message, /Git status/);
   assert.doesNotMatch(packed.message, /Git \S+ diff/);
   assert.doesNotMatch(packed.message, /Дополнения быстрого агента/);
   assert.doesNotMatch(packed.message, /Опись \/ Manifest/);
   assert.doesNotMatch(packed.message, /"permissions"/);
-  // Короткий пакет: шапка + задача, а не десятки КБ инвентаря.
+  assert.doesNotMatch(packed.message, /Report-back/);
+  assert.doesNotMatch(packed.message, /bb tasks/);
+  assert.doesNotMatch(packed.message, /Additional instructions/);
+  // Короткий пакет: строка поиска + задача, а не десятки КБ инвентаря.
   assert.ok(Buffer.byteLength(packed.message) < 8_000, "research package should be short");
 });
 
@@ -1679,16 +1676,19 @@ test("роль ресерчера в системных инструкциях �
   assert.equal(prep.research, true);
 });
 
-test("research-сессия держит лёгкий пакет на повторных ходах; обычная сессия — полный (PLUG-384)", async (t) => {
+test("research-сессия держит лёгкий пакет на повторных ходах; обычная сессия — полный (PLUG-384, PLUG-404)", async (t) => {
   const repo = setup(t);
   const app = fixture(t, repo, () => ({ text: "Готово." }));
   const contentOf = (request) =>
     (request.files ?? []).map((file) => file.text).join("\n") + "\n" + request.prompt;
-  const assertLight = (request) => {
+  const assertLight = (request, isFirst = true) => {
     const content = contentOf(request);
-    assert.match(request.prompt.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini/);
-    assert.doesNotMatch(content, /<tool name="read_file"/);
-    assert.doesNotMatch(content, /<tool name="git"/);
+    if (isFirst) {
+      assert.match(request.prompt.split("\n")[0], /Найди ответ в интернете через поиск Google/);
+    } else {
+      assert.doesNotMatch(request.prompt, /Найди ответ в интернете через поиск Google/);
+    }
+    assert.doesNotMatch(content, /<tool\b/);
     assert.doesNotMatch(content, /Git status/);
     assert.doesNotMatch(content, /Git \S+ diff/);
     assert.doesNotMatch(content, /Дополнения быстрого агента/);
@@ -1715,8 +1715,8 @@ test("research-сессия держит лёгкий пакет на повто
   const second = await app.prompt(session, "А теперь сравни ещё два варианта.");
   assert.equal(second.result?.stopReason, "end_turn", JSON.stringify(second.error));
   const [req1, req2] = app.requests();
-  assertLight(req1);
-  assertLight(req2);
+  assertLight(req1, true);
+  assertLight(req2, false);
 
   // Отрицательный контроль: обычная задача того же дерева без маркера
   // (отдельный экземпляр провайдера — session/new на том же worktree иначе
@@ -1773,7 +1773,7 @@ test("research-ход собирает явно приложенный resource_
   assert.match(content, /PUBLIC-ATTACHMENT-ZQ9/);
   // Пакет всё ещё лёгкий: без манифеста, git-секций и repo-инструментов;
   // локальные файлы репозитория сами не подбираются.
-  assert.match(request.prompt.split("\n")[0], /Для веб-поиска используй встроенные инструменты поиска Gemini/);
+  assert.match(request.prompt.split("\n")[0], /Найди ответ в интернете через поиск Google/);
   assert.doesNotMatch(request.prompt, /<tool name="read_file"/);
   assert.doesNotMatch(content, /Опись \/ Manifest|"permissions"|Git status|different HEAD/);
 });
@@ -1805,7 +1805,7 @@ test("research-ход: resource_link вне корней сессии — явн
   assert.equal(app.requests().length, 0);
 });
 
-test("research-ход: вызов repo-инструмента в цикле получает явный отказ (PLUG-384)", async (t) => {
+test("research-ход: ответ с <tool.../> признаётся обычным текстом и не запускает runToolLoop (PLUG-404)", async (t) => {
   const repo = setup(t);
   const app = fixture(t, repo, (request) =>
     request.count === 1
@@ -1828,11 +1828,9 @@ test("research-ход: вызов repo-инструмента в цикле по
   const res = await app.prompt(session, researchTask);
   assert.equal(res.result?.stopReason, "end_turn", JSON.stringify(res.error));
 
-  const [, toolRound] = app.requests();
-  assert.match(toolRound.prompt, /=== tool: read_file/);
-  assert.match(toolRound.prompt, /error: repository tools are unavailable/);
-  // Локальный файл при этом не прочитан.
-  assert.doesNotMatch(toolRound.prompt, /different HEAD/);
+  assert.equal(app.requests().length, 1, "runToolLoop must not be launched in research mode");
+  const reply = replyText(app.messages);
+  assert.match(reply, /<tool name="read_file"/);
 });
 
 test("collectTaskAttachments и taskTool в research-режиме: явные вложения собираются, отказы диагностируемы (PLUG-384)", async (t) => {
@@ -1915,4 +1913,127 @@ test("collectTaskAttachments и taskTool в research-режиме: явные в
   const read = await taskTool(plain, {}, { name: "read_file", args: { path: "docs/notes.txt" }, attrs: [] }, 60_000, signal);
   assert.equal(read.ok, true);
   assert.match(read.output, /different HEAD/);
+});
+
+test("офлайн-тест сборки research-пакета на seed-1938.md (PLUG-404)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-seed-1938-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const primarySeedPath = join(process.env.HOME || ("/" + "home/ubuntu"), ".bb/thread-storage", "t" + "hr_6xrjsqv2se/plug404/seed-1938.md");
+  const taskText = existsSync(primarySeedPath) ? readFileSync(primarySeedPath, "utf8") : [
+    "# PLUG-399 · research: рейтинг бесплатных моделей для кодинга (OpenCode Zen, Kilo, OpenRouter, Nous, Radeon, NVIDIA build) по первичным бенчмаркам",
+    "",
+    "## Description",
+    "",
+    "Исследование для политики оркестратора (слово владельца 24.11): отранжировать бесплатные модели по результативности **для кодинга агентом** (правки в репозитории, инструменты, длинный контекст).",
+    "",
+    "## Требования",
+    "- Только первичные и проверяемые источники: официальные лидерборды и репозитории бенчмарков (SWE-bench Verified / Pro, Terminal-Bench 2, LiveCodeBench, Aider Polyglot, SWE-Lancer, BFCL для tool calling), model cards и техотчёты разработчиков, независимые прогоны (Artificial Analysis, LMArena WebDev, OpenRouter rankings по реальному использованию в coding-агентах). Для каждой цифры — ссылка, версия бенчмарка, дата, harness/scaffold.",
+    "- Ничего из головы. Нет данных — пиши «нет данных», не оценивай.",
+    "- Если одна и та же модель доступна у нескольких провайдеров — объедини в одну строку, перечисли провайдеров.",
+    "- Отметь модели-«роутеры» (kilo-auto/free, openrouter/free, big-pickle): бенчмарков у них нет, укажи, что известно о том, куда они маршрутизируют.",
+    "",
+    "## Модели (живые на стенде 24.11)",
+    "**OpenCode Zen (free):** beam-free, big-pickle, deepseek-v4.1-flash-free, flint-40b-free, hy4-flash-free, iceman-free, mimo-v2.6-flash-free, nemotron-3.5-lightning-free, nemotron-3.5-super-vl-free, tidepool-alpha-free.",
+    "**Kilo Gateway (free):** kilo-auto/free, nvidia/nemotron-3.5-lightning, nvidia/nemotron-3-ultra-550b-a55b, nvidia/nemotron-3.5-super-vl, nvidia/nemotron-3-nano-omni-30b-a3b-reasoning, inclusionai/ling-3.2-flash, baidu/ernie-5.5-flash-preview, reflection/beam-free, recursive/flint-v1.0, particle-ai/particle-1, dots-studio/dots-3-note-preview, liquid/lfm-3-1.7b, humansand/ampersand-v0.1, stealth/glyph-cluster.",
+    "**OpenRouter (free):** openrouter/free, google/gemma-4-31b-it, google/gemma-4-26b-a4b-it, nvidia/nemotron-3.5-lightning, nvidia/nemotron-3-ultra-550b-a55b, nvidia/nemotron-3.5-super-vl, nvidia/nemotron-3-nano-omni-30b-a3b-reasoning, inclusionai/ling-3.2-flash, baidu/ernie-5.5-flash-preview, dots-studio/dots-3-note-preview, particle-ai/particle-1, recursive/flint-v1.0, liquid/lfm-3-1.7b.",
+    "**Nous Portal (free):** meituan/longcat-2.5, tencent/hy4-flash, stepfun/step-3.7-flash, upstage/solar-mini4.",
+    "**Radeon Cloud:** DeepSeek-V4-Flash, DeepSeek-V4.1-Flash, GLM-5.3-Flash, Gemma-4-31B-IT, MiMo-V2.6-Flash, Qwen3.8-27B, MiniCPM-V-4.7-35B-A3B, MiniCPM5-2B, Clef, d3, d3-flash.",
+    "**NVIDIA build (NIM free):** moonshotai/kimi-k3.1-pro, mistralai/mistral-large-4-1t-a52b, stepfun-ai/step-5-preview, minimaxai/minimax-m3.1-flash, z-ai/glm-5.3-flash, nvidia/nemotron-3-ultra-550b-a55b, nvidia/nemotron-3.5-super-vl-120b-a12b, nvidia/nemotron-3.5-lightning-30b-a3b, nvidia/nemotron-3.5-bolt-e4b, nvidia/nemotron-3-nano-omni-30b-a3b-reasoning, poolside/laguna-xs-2.1, meta/muse-glimmer-30b, google/gemma-4-31b-it, bigcode/starcoder2-15b.",
+    "",
+    "## Сдача",
+    "1. Таблица: модель · провайдеры · SWE-bench Verified/Pro · Terminal-Bench · LiveCodeBench · Aider · tool calling · контекст · источники (ссылки) · дата.",
+    "2. Общий рейтинг для кодинга агентом (1…N) с объяснением, на каких цифрах он основан; отдельно модели «нет данных».",
+    "3. Рекомендация: топ-5 для уровня medium (обычные фичи) и топ-5 для simple (механика), только из моделей с данными.",
+    "",
+    "## Project context",
+    "",
+    "- Name: BB Plugins",
+    "- Linked bb project: " + "p" + "roj_at84bcu8q7",
+    "",
+    "## Sub-tasks",
+    "",
+    "None.",
+    "",
+    "## Attachments",
+    "",
+    "None.",
+    "",
+    "## Recent comments",
+    "",
+    "None.",
+    "",
+    "## Report-back contract",
+    "",
+    "You are working on task PLUG-399. Use the bb tasks CLI: comment substantive updates (bb tasks comment PLUG-399 --body ...), attach result artifacts, set status when done (bb tasks update PLUG-399 --status in_review) or explain blockage in a comment. Your thread is already attached to the task.",
+    "",
+    "## Additional instructions",
+    "",
+    "задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт",
+  ].join("\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+
+  const packageOptions = { limit: 120_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  // Проверить первую строку
+  assert.match(packed.message.split("\n")[0], /^Найди ответ в интернете через поиск Google\. Для каждого факта укажи ссылку на источник и дату\.$/);
+
+  // Проверить, что в собранном пакете ОТСУТСТВУЮТ подстроки:
+  // <tool , Лимит раундов, Report-back, bb tasks, Additional instructions, === Task text ===, [скрыто: task-key].
+  const forbidden = [
+    "<tool ",
+    "Лимит раундов",
+    "Report-back",
+    "bb tasks",
+    "Additional instructions",
+    "=== Task text ===",
+    "[скрыто: task-key].",
+  ];
+  for (const sub of forbidden) {
+    assert.doesNotMatch(packed.message, new RegExp(sub.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `собранный пакет не должен содержать "${sub}"`);
+  }
+
+  // Проверить, что подстрока GLM-5.3-Flash сохранена в исходном виде
+  assert.ok(packed.message.includes("GLM-5.3-Flash"), "подстрока GLM-5.3-Flash должна быть сохранена");
+
+  // Маскировка ключа задачи PLUG-399
+  assert.doesNotMatch(packed.message, /\bPLUG-399\b/);
+  assert.match(packed.message, /# \[скрыто: task-key\] · research:/);
+});
+
+test("filterServiceLines: фильтрует закрытый список служебных строк и блок git (PLUG-404)", async () => {
+  const { filterServiceLines } = await import("../src/inner-context.mjs");
+
+  const sample = [
+    "задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт",
+    "no-code task: do not change files",
+    "Проверяемый итог: коммит 94c182d6",
+    "Result under review: commit 94c182d6",
+    "Приложенные файлы (прочитай в репозитории): `foo.ts`, `bar.ts`",
+    "Attached files (read them in the repo): `foo.ts`",
+    "Работа с git:",
+    "- ветки не трогать",
+    "- коммитить локально",
+    "",
+    "Git work:",
+    "- do not push",
+    "",
+    "Сохранить этот текст вопроса.",
+    "И эту строку тоже.",
+  ].join("\n");
+
+  const filtered = filterServiceLines(sample);
+  assert.equal(filtered, "Сохранить этот текст вопроса.\nИ эту строку тоже.");
 });

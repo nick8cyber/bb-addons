@@ -25,6 +25,18 @@ const FILE_ATTACHMENT_ID = "[0-9A-HJKMNP-TV-Z]{26}";
 const TRACKER_ATTACHMENT = new RegExp("^- (.+) · (" + FILE_ATTACHMENT_ID + ")$");
 const THREAD_TOKEN = new RegExp("\\b" + tools.THREAD_ID_RE.source.slice(1, -1) + "\\b", "gi");
 const TASK_TOKEN = /\b[A-Z][A-Z0-9]{1,9}-\d+\b(?!\s*(?:charset|encoding))/g;
+export const TRACKER_PROJECT_PREFIXES = ["IAM", "PLUG", "GH", "NET", "SMK", "CRM", "TGD", "VERBA", "ZE", "RU"];
+export const TRACKER_TASK_KEY_RE = new RegExp(`\\b(?:${TRACKER_PROJECT_PREFIXES.join("|")})-\\d+\\b(?!\\.\\d)`, "g");
+export const SEARCH_DIRECTIVE = "Найди ответ в интернете через поиск Google. Для каждого факта укажи ссылку на источник и дату.";
+export const BB_SERVICE_HEADINGS = [
+  "## Project context",
+  "## Sub-tasks",
+  "## Attachments",
+  "## Recent comments",
+  "## Report-back contract",
+  "## Preset instructions",
+  "## Additional instructions",
+];
 const bytes = (text) => Buffer.byteLength(text);
 const digest = (text) => createHash("sha256").update(text).digest("hex");
 const record = (value) => !!value && typeof value === "object" && !Array.isArray(value);
@@ -92,6 +104,18 @@ export function loadSettings(stateDir, projectId) {
         .replace(/(\b(?:https?|ftp):\/\/)[^\s/@]+(?=@)/gi, "$1[скрыто: credentials]")
         .replace(THREAD_TOKEN, "[скрыто: bb-thread-id]")
         .replace(TASK_TOKEN, (token) => tools.isTaskKeyToken(token) ? "[скрыто: task-key]" : token);
+    },
+    maskResearch(text, currentKey = null) {
+      let value = String(text);
+      for (const { type, re } of compiled) value = value.replace(re, () => "[скрыто: " + type + "]");
+      value = tools.maskForWeb(value)
+        .replace(/(\b(?:https?|ftp):\/\/)[^\s/@]+(?=@)/gi, "$1[скрыто: credentials]")
+        .replace(THREAD_TOKEN, "[скрыто: bb-thread-id]");
+      if (currentKey && tools.isTaskKeyToken(currentKey)) {
+        const escaped = currentKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        value = value.replace(new RegExp(`\\b${escaped}\\b(?!\\.\\d)`, "g"), "[скрыто: task-key]");
+      }
+      return value.replace(TRACKER_TASK_KEY_RE, (token) => tools.isTaskKeyToken(token) ? "[скрыто: task-key]" : token);
     },
     maskResponse(text) {
       let value = String(text);
@@ -247,8 +271,13 @@ export function checkedAnswer(context, response) {
   if (isFileEnvelope(source) || isFileEnvelope(page) || response?.files?.length || response?.hasGeneratedFile) {
     return { denied: "file output requires a write-enabled preset and a dedicated worktree; full grants read-only access" };
   }
-  if (!source.trim() || tools.parseToolCalls(source).length || tools.parseToolCalls(page).length ||
-      /<tool\b/i.test(source) || /<tool\b/i.test(page)) return { repair: "empty or unfinished tool response" };
+  const isLightResearch = context.research && !context.write;
+  if (!isLightResearch) {
+    if (!source.trim() || tools.parseToolCalls(source).length || tools.parseToolCalls(page).length ||
+        /<tool\b/i.test(source) || /<tool\b/i.test(page)) return { repair: "empty or unfinished tool response" };
+  } else {
+    if (!source.trim()) return { repair: "empty response" };
+  }
   if (context.settings.maskResponse(source) !== source || context.settings.maskResponse(page) !== page) {
     return { repair: "response contains material prohibited for publication" };
   }
@@ -329,11 +358,13 @@ export async function collectTaskAttachments(context, blocks, options) {
   const { signal, maxUploadBytes, maxUploadCount, validateUploads, spillDir } = options;
   const { root, pin, settings } = context;
   const maxBytes = settings.maxTotalBytes;
+  const isLightResearch = context.research && !context.write;
+  const mask = isLightResearch ? (str) => settings.maskResearch(str, context.key) : settings.mask;
   const materials = [];
   let uploadCount = 0;
   let materialBytes = 0;
   const add = (source, text, { name, at, upload = false }) => {
-    const size = bytes(settings.mask(text));
+    const size = bytes(mask(text));
     if (upload && (++uploadCount > maxUploadCount || bytes(text) > maxUploadBytes || size > maxUploadBytes)) {
       throw new Error("mandatory attachment exceeds upload count or size limit");
     }
@@ -417,7 +448,8 @@ export async function collectTask(context, blocks, materials, options) {
   const { root, pin, settings } = context;
   const maxBytes = settings.maxTotalBytes;
   const revision = pin?.sha ?? "working copy";
-  const mask = settings.mask;
+  const isLightResearch = context.research && !context.write;
+  const mask = isLightResearch ? (str) => settings.maskResearch(str, context.key) : settings.mask;
   const core = [], omitted = [], materialFiles = [];
   let coreBytes = 0;
   const add = (source, value, { name, at = revision, delivery = "package", included = "full" } = {}) => {
@@ -483,16 +515,123 @@ export async function collectTask(context, blocks, materials, options) {
     files: Object.freeze(materialFiles), reviewDiff, fileBases });
 }
 
+export function filterServiceLines(text) {
+  if (!text) return "";
+  const lines = text.split(/\r?\n/);
+  const result = [];
+  let inGit = false;
+  for (const line of lines) {
+    if (inGit) {
+      if (line.trim() === "") {
+        inGit = false;
+      }
+      continue;
+    }
+    if (/^\s*(?:Работа с git|Git work):?/i.test(line)) {
+      inGit = true;
+      continue;
+    }
+    if (/^\s*(?:задача без кода|no-code task)/i.test(line)) continue;
+    if (/^\s*(?:Проверяемый итог: коммит|Result under review: commit)/i.test(line)) continue;
+    if (/^\s*(?:Приложенные файлы \(прочитай в репозитории\)|Attached files \(read them in the repo\))/i.test(line)) continue;
+    result.push(line);
+  }
+  while (result.length && result[0].trim() === "") result.shift();
+  while (result.length && result[result.length - 1].trim() === "") result.pop();
+  return result.join("\n");
+}
+
+export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) {
+  const text = context.text ?? "";
+  const mask = (str) => context.settings?.maskResearch ? context.settings.maskResearch(str, context.key) : str;
+
+  const lines = text.split(/\r?\n/);
+  const firstNonEmpty = lines.find((l) => l.trim() !== "");
+  const hasTaskHeader = firstNonEmpty ? /^#\s+[A-Z][A-Z0-9]{1,9}-\d+\s+·\s+/.test(firstNonEmpty) : false;
+  const descIdx = lines.findIndex((l) => /^##\s+Description[ \t]*$/i.test(l));
+  const isBbTemplate = hasTaskHeader && descIdx !== -1;
+
+  if (!isBbTemplate) {
+    const filtered = filterServiceLines(text);
+    const raw = isFirstTurn ? [SEARCH_DIRECTIVE, filtered].filter(Boolean).join("\n\n") : filtered;
+    return mask(raw);
+  }
+
+  if (!isFirstTurn) {
+    const filtered = filterServiceLines(text);
+    return mask(filtered);
+  }
+
+  const SERVICE_HEADINGS_SET = new Set(BB_SERVICE_HEADINGS.map((h) => h.toLowerCase()));
+  const isServiceHeading = (line) => /^##\s+/.test(line) && SERVICE_HEADINGS_SET.has(line.trim().toLowerCase());
+  let firstServiceIdx = lines.findIndex((l, idx) => idx > descIdx && isServiceHeading(l));
+  if (firstServiceIdx === -1) firstServiceIdx = lines.length;
+
+  const descText = lines.slice(descIdx + 1, firstServiceIdx).join("\n").trim();
+
+  let presetText = "";
+  const presetIdx = lines.findIndex((l) => /^##\s+Preset instructions[ \t]*$/i.test(l));
+  if (presetIdx !== -1) {
+    const nextIdx = lines.findIndex((l, idx) => idx > presetIdx && /^##\s+/.test(l));
+    const rawPreset = lines.slice(presetIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
+    presetText = filterServiceLines(rawPreset);
+  }
+
+  let addText = "";
+  const addIdx = lines.findIndex((l) => /^##\s+(?:Additional instructions|Дополнительные инструкции)[ \t]*$/i.test(l));
+  if (addIdx !== -1) {
+    const nextIdx = lines.findIndex((l, idx) => idx > addIdx && /^##\s+/.test(l));
+    const rawAdd = lines.slice(addIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
+    addText = filterServiceLines(rawAdd);
+  }
+
+  const parts = [
+    SEARCH_DIRECTIVE,
+    firstNonEmpty,
+    descText,
+    presetText,
+    addText,
+  ].filter(Boolean);
+
+  return mask(parts.join("\n\n"));
+}
+
 function renderTaskPackage(context, collected, options, supplements, agentOmissions, compact = false) {
   const { limit, spillDir } = options;
   const pin = context.pin;
   const repo = Boolean(pin || context.root);
-  // PLUG-384: публичный research — короткий пакет: ни добавок быстрого
-  // агента, ни манифеста разрешений. Write-режим манифест сохраняет.
+  // PLUG-404: чистый research-пакет без шапки инструментов, протокола и описи.
   const light = context.research && !context.write;
+
+  if (light) {
+    const isFirstTurn = options.isFirstTurn !== false;
+    const body = buildCleanResearchPackage(context, { isFirstTurn });
+    const { message, payload, spilledFile } = tools.packFirstMessage({
+      maxBytes: limit,
+      spillDir,
+      spillId: randomUUID(),
+      completePackage: {
+        header: "",
+        render: () => body,
+      },
+    });
+    const totalBytes = bytes(message) + (spilledFile ? bytes(payload) : 0) +
+      (collected.core ?? []).filter(({ entry }) => entry?.delivery !== "package").reduce((total, { entry }) => total + (entry?.bytes ?? 0), 0);
+    if (bytes(message) > limit || totalBytes + (options.reserveBytes ?? 0) > context.settings.maxTotalBytes) {
+      if (spilledFile) rmSync(spilledFile, { force: true });
+      throw new Error("mandatory task context exceeds delivery budget");
+    }
+    if (spilledFile) options.ownedFiles?.push(spilledFile);
+    return {
+      message,
+      files: Object.freeze([...(collected.files ?? []), ...(spilledFile ? [spilledFile] : [])]),
+      packageSha256: digest(payload),
+      totalBytes,
+    };
+  }
+
   const header = [
-    // В лёгком research-режиме шапка без repo-инструментов — только bb_*.
-    tools.toolSystemHeader(undefined, { pinned: Boolean(pin), repo: repo && !light }),
+    tools.toolSystemHeader(undefined, { pinned: Boolean(pin), repo }),
     pin ? "All repository tools use the pinned review tree: " + pin.sha : "",
     taskInstruction(context),
   ].filter(Boolean).join("\n\n");
@@ -508,16 +647,15 @@ function renderTaskPackage(context, collected, options, supplements, agentOmissi
       return { ...entry, delivery, range: [start, start + entry.bytes] };
     };
     const included = collected.core.map(({ entry, text }) => append(entry, text));
-    if (!light && supplements.length) {
+    if (supplements.length) {
       const heading = "=== Дополнения быстрого агента / Fast agent additions ===\n";
       body += heading;
       offset += bytes(heading);
     }
-    const added = light ? [] : supplements.map(({ text, partial, ...item }) => append({
+    const added = supplements.map(({ text, partial, ...item }) => append({
       ...item, delivery: "package", required: false, included: partial ? "partial" : "full",
       bytes: bytes(text), sha256: digest(text),
     }, text));
-    if (light) return body;
     const manifest = {
       version: 1,
       revision: pin?.sha ?? "working copy",
@@ -549,6 +687,13 @@ function renderTaskPackage(context, collected, options, supplements, agentOmissi
 }
 
 export function packTask(context, collected, options) {
+  const light = context.research && !context.write;
+  if (light) {
+    return Object.freeze({
+      ...renderTaskPackage(context, collected, options, [], []),
+      agentDeliveryLimited: false,
+    });
+  }
   const supplements = [...(collected.agent?.supplements ?? [])];
   let omissions = collected.agent?.omitted ?? [];
   let dropped = 0, compact = false, summarized = false;
