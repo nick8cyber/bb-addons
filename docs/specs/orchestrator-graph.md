@@ -1,8 +1,8 @@
 ---
 title: Orchestrator — граф задачи и очередь кодом (Work Graphs)
 status: approved
-updated: 2026-11-23
-revision: 34.8 (r34.8 / PLUG-398 — наблюдатель-сверка shadow §32.5, ADR-0041; r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
+updated: 2026-11-24
+revision: 34.10 (r34.10 — действия по закрытым записям §32.5.4 п. 3, одна строка task-not-enqueued; r34.9 / PLUG-400 — уровень high, §32.6; r34.8 / PLUG-398 — наблюдатель-сверка shadow §32.5, ADR-0041; r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
 ---
 
 # Граф задачи и очередь кодом (Work Graphs)
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS task_queue (
   project_id TEXT NOT NULL,
   coordinator_thread_id TEXT NOT NULL,
   route TEXT NOT NULL CHECK(route IN ('feature', 'fix', 'docs', 'simple', 'research')),
-  level TEXT NOT NULL CHECK(level IN ('complex', 'medium', 'simple', 'spec', 'research', 'architect')),
+  level TEXT NOT NULL CHECK(level IN ('complex', 'high', 'medium', 'simple', 'spec', 'research', 'architect')),
   node TEXT NOT NULL CHECK(node IN (
     'start', 'design', 'spec', 'spec_review', 'owner_gate', 'code', 'checks',
     'review', 'design_check', 'release', 'research'
@@ -117,7 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 - **`research` (исследование и сбор данных):**
   - `start → research → done` (уровень `research`, без кода, без ревью, без выкладки).
 
-При постановке задачи `enqueue` параметр `--level` задаёт уровень цепочки для узла реализации кода (`complex`, `medium`, `simple`) либо узла документации (`spec` для маршрута `docs`) или исследования (`research` для маршрута `research`). На маршрутах с кодом (`feature`, `fix`, `simple`) уровень ОБЯЗАН иметь роль `executor`. Попытка указать `--level spec` или `--level architect` для маршрутов с кодом отклоняется с ошибкой `invalid-level: узел code требует уровня с инструментами написания кода (роль executor)`. Узлы `design` и `design_check` ВСЕГДА выполняются ролью `architect` независимо от `--level` задачи.
+При постановке задачи `enqueue` параметр `--level` задаёт уровень цепочки для узла реализации кода (`complex`, `high`, `medium`, `simple`) либо узла документации (`spec` для маршрута `docs`) или исследования (`research` для маршрута `research`). На маршрутах с кодом (`feature`, `fix`, `simple`) уровень ОБЯЗАН иметь роль `executor`. Попытка указать `--level spec` или `--level architect` для маршрутов с кодом отклоняется с ошибкой `invalid-level: узел code требует уровня с инструментами написания кода (роль executor)`. Узлы `design` и `design_check` ВСЕГДА выполняются ролью `architect` независимо от `--level` задачи.
 
 ### 27.3 Тест связи цепочки раздачи (урок 4 аудита)
 
@@ -179,7 +179,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | `feature`, `fix`, `simple`, `docs` | `owner_gate` | Владелец (человек, без `BB_THREAD_ID`) | Отложено владельцем через UI (кнопка `[Отложить]`, Б2) / `defer` | `owner_gate` | `deferred` | Запись `deferred_by = "owner"`. При наличии `BB_THREAD_ID` отказ `permission-denied: owner-only` |
 | `feature`, `fix`, `simple`, `docs` | `owner_gate` | `run-queue` | Таймаут карточки взаимодействия / рестарт сервера | `owner_gate` | `waiting_approval` | Автоматический перевыпуск `PluginInteractionRequest`; постоянный статус в UI без повторных напоминаний (r34.5) |
 | `fix`, `simple` | `code` | Уровень задачи | Сдан коммит кода, но обнаружен выход за рамки маршрута (§31.7, Б3, r34.2) | `design` | `running` | Машинный контроль маршрута (Б3, r34.2): затронуты пути спек, миграций, публичных API или нетто-дифф без тестов превысил лимиты проекта `routeLimits` (по умолчанию >3 файлов, >150 строк). Автоматический перевод задачи на маршрут `feature` (`task.route = 'feature'`, сброс счётчиков), передача архитектору на redesign |
-| `feature`, `fix`, `simple` | `code` | Уровень задачи (`complex`/`medium`/`simple`) | Сдан коммит кода (`done`, чистая копия, `commits > 0`), рамки соблюдены, договор не изменён | `checks` | `running` | Фиксация `result_sha`. Проверка: diff `acceptance_sha..result_sha -- docs/specs/acceptance/<KEY>.md` пуст. Счётчик `check_attempts` не сбрасывается при каждой сдаче (накапливается до порога 3 отказов проверок) |
+| `feature`, `fix`, `simple` | `code` | Уровень задачи (`complex`/`high`/`medium`/`simple`) | Сдан коммит кода (`done`, чистая копия, `commits > 0`), рамки соблюдены, договор не изменён | `checks` | `running` | Фиксация `result_sha`. Проверка: diff `acceptance_sha..result_sha -- docs/specs/acceptance/<KEY>.md` пуст. Счётчик `check_attempts` не сбрасывается при каждой сдаче (накапливается до порога 3 отказов проверок) |
 | `feature`, `fix`, `simple` | `code` | Уровень задачи | Исполнитель изменил `docs/specs/acceptance/<KEY>.md` (§31.5) | `code` | `running` | Отказ захода: `acceptance-contract-tampered`. Инкремент `code_attempts` (при ≥ 3 → `blocked`) |
 | `feature`, `fix`, `simple` | `code` | Уровень задачи | Сдача со статусом done без коммитов (урок 7) | `code` | `running` | Отказ приёмки (если не `no_code`), инкремент `code_attempts` (при ≥ 3 → `blocked`), повтор с требованием коммита |
 | `feature`, `fix`, `simple` | `code` | Уровень задачи | Сбой / таймаут / квота / отмена исполнителя | `code` | `running` (перевыпуск) / `stalled` | Перевыпуск по цепочке уровня задачи; при исчерпании — `stalled` |
@@ -585,13 +585,13 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
    - любые раздачи без ключа задачи трекера.
 2. Поля принятой записи:
    - `project_id` — по порядку §32.2 п. 2; `coordinator_thread_id` — тред, выполнивший `delegate`; `priority = 100`; `payload.origin = "shadow-adopt"`, `payload.adopted_delegation_id`;
-   - `route` — из `payload.route` трекера; если его нет — по первой принятой раздаче: уровень `research` → `research`; уровни `complex`/`medium`/`spec`/`architect` → `feature`; уровень `simple` → `simple`; раздача уровня ревью с видом `spec_review` → `docs`, если все пути её диапазона в `docs/` или `*.md` и задача помечена `no_code`, иначе `feature`; ревью кода → по уровню, найденному обратным поиском `reviewByLevel` (`complex`/`medium` → `feature`, `simple` → `simple`), без совпадения → `feature`;
-   - `level` — уровень раздачи; если первая принятая раздача — ревью, `level` берётся обратным поиском по `reviewByLevel` политики (`review` → `complex`, `review-medium` → `medium`, `review-simple` → `simple`), при отсутствии совпадения — `complex`. Значение всегда входит в CHECK §27.1; для `route = feature` допустимы любые уровни из CHECK, включая `spec` и `architect` (уровень описывает первую раздачу, а не весь маршрут);
+   - `route` — из `payload.route` трекера; если его нет — по первой принятой раздаче: уровень `research` → `research`; уровни `complex`/`high`/`medium`/`spec`/`architect` → `feature`; уровень `simple` → `simple`; раздача уровня ревью с видом `spec_review` → `docs`, если все пути её диапазона в `docs/` или `*.md` и задача помечена `no_code`, иначе `feature`; ревью кода → по уровню, найденному обратным поиском `reviewByLevel` (`complex`/`high`/`medium` → `feature`, `simple` → `simple`), без совпадения → `feature`;
+   - `level` — уровень раздачи; если первая принятая раздача — ревью, `level` берётся обратным поиском по `reviewByLevel` политики; если уровню ревью соответствуют несколько исполнительских уровней, берётся старший по порядку `complex` > `high` > `medium` > `simple` (при политике 24.11: `review` → `complex`, `review-medium` → `medium`, `review-simple` → `simple`); при отсутствии совпадения — `complex`. Значение всегда входит в CHECK §27.1; для `route = feature` допустимы любые уровни из CHECK, включая `spec` и `architect` (уровень описывает первую раздачу, а не весь маршрут);
    - `confirmation_mode` — по §29.3; `branch` — фактическая ветка раздачи, для `route = research` — `NULL` (§27.1).
 3. Узел и статус записи сразу выставляются по таблице §32.5.2 для этой раздачи (а не `start/queued`). Принятая задача **никогда не берётся** `run-queue` в `shadow`: конвейер в `shadow` только вычисляет `shadow_eval` (§32.1).
 4. Запись `task_transitions`: `actor = "shadow:adopt"`, `from_node = "none"`, `from_status = "none"`, `to_node`/`to_status` — по п. 3, `reason = "shadow-adopt:<command>"`. Класс вердикта (§32.5.3) приём не получает.
 5. В `strict` приёма нет: отказ `graph-required` по §32.1 сохраняется. В `off` — правило абсолютного молчания §32.2 п. 3.
-6. Служебная запись `task-not-enqueued` (§32.1) после выкладки §32.5 пишется только для ручных `merge`/`release` по задаче вне очереди и для раздач без ключа задачи трекера или с неопределённым проектом. Записи до момента выкладки §32.5 — история, в метрики отчёта §32.5.5 не входят.
+6. Служебная запись `task-not-enqueued` (§32.1) после выкладки §32.5 пишется только для ручных `merge`/`release` по задаче вне очереди и для раздач без ключа задачи трекера или с неопределённым проектом — **ровно одна строка на одно действие** (проверка до действия и наблюдение после не дублируют её); пробные запуски (`merge --dry-run`) записей не создают. Записи до момента выкладки §32.5 — история, в метрики отчёта §32.5.5 не входят.
 
 #### 32.5.2 Продвижение зеркала вслед за фактом
 
@@ -610,7 +610,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | `delegate` уровня `spec` | — | `spec` | `running` |
 | `delegate` уровня `research` | — | `research` | `running` |
 | `delegate` уровня ревью, вид `spec_review` (§31.9) | — | `spec_review` | `running` |
-| `delegate` уровня кода (`complex`/`medium`/`simple`) | — | `code` | `running` |
+| `delegate` уровня с ролью `executor` (`complex`/`high`/`medium`/`simple`) | — | `code` | `running` |
 | `delegate` уровня ревью, вид ревью кода | — | `review` | `running` |
 | `approve <KEY>` (одобрение до кода) | `route` ∈ {`feature`, `fix`, `simple`} и текущий узел ∈ {`start`, `design`, `spec`, `spec_review`} | `code` | `running` |
 | `approve <KEY>` (одобрение до выкладки) | `route = docs` и текущий узел ∈ {`spec`, `spec_review`}; либо `route` ∈ {`feature`, `fix`, `simple`} и текущий узел ∈ {`code`, `checks`, `review`, `design_check`} | `release` | `running` |
@@ -659,11 +659,15 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
    - трекер `canceled`/`cancelled` → `status = 'cancelled'`;
    - запись `task_transitions`: `actor = "shadow:sync"`, `reason = "tracker-terminal:<status>"`.
 2. В `shadow` `run-queue` не вычисляет `would_transition` для записей, у которых задача в трекере закрыта. Закрытая задача не может быть «взята заново со `start`».
-3. При первом запуске версии с этим разделом плагин пишет событие `shadow-reconcile-started` с меткой времени, и существующие записи очереди проходят синхронизацию п. 1 один раз (урок 8: новое правило не создаёт напоминаний и раздач по прошлому). Записи, оставшиеся открытыми, остаются как есть, их узел не реконструируется задним числом.
+3. **Действие по закрытой записи** (`status` ∈ {`done`, `cancelled`}) решается по трекеру — он источник правды:
+   - задача в трекере **открыта** (доработка): `delegate` переоткрывает запись — `status` и узел выставляются по таблице §32.5.2, счётчики кругов и `payload.mirror` сбрасываются как при повторной постановке из `done` (§32.1, `enqueue`), строка `shadow:adopt` с `reason = "shadow-reopen:<command>"`; класс вердикта не присваивается;
+   - задача в трекере **закрыта**: запись не меняется, пишется одна строка `task_transitions` с `actor = "shadow:coordinator"`, маркерами `'none'` и `reason = "closed-task-action"` (`payload.command`, id делегирования). Отчёт §32.5.5 выводит такие строки отдельным счётчиком; в долю готовности они не входят, но каждое должно быть разобрано, как `skip`;
+   - `approve`, `merge`, `release` по закрытой записи запись не переоткрывают ни в каком случае (только `closed-task-action`).
+4. При первом запуске версии с этим разделом плагин пишет событие `shadow-reconcile-started` с меткой времени, и существующие записи очереди проходят синхронизацию п. 1 один раз (урок 8: новое правило не создаёт напоминаний и раздач по прошлому). Записи, оставшиеся открытыми, остаются как есть, их узел не реконструируется задним числом.
 
 #### 32.5.5 Отчёт сверки и критерий готовности к `strict`
 
-1. Команда `bb orchestrator shadow-report [--project <id>] [--since <iso>] [--json]`: по каждому проекту — число задач, полных циклов (`spec_review` → `release done` либо `code` → `release done`), количество и доля каждого класса §32.5.3, доля служебных `task-not-enqueued`, список всех `skip` и `unmapped` с деталями. По умолчанию `--since` равно метке однократной стартовой синхронизации §32.5.4 п. 3 (событие `shadow-reconcile-started` в `events`). Первым шагом команда выполняет синхронизацию §32.5.4 (пишет только строки `shadow:sync`); больше ничего не меняет. В отчёт входят и все действующие переопределения `workGraphProjects`: строковые (бессрочные) помечаются `permanent`, объектные — с `until` и `reason`.
+1. Команда `bb orchestrator shadow-report [--project <id>] [--since <iso>] [--json]`: по каждому проекту — число задач, полных циклов (`spec_review` → `release done` либо `code` → `release done`), количество и доля каждого класса §32.5.3, доля служебных `task-not-enqueued`, список всех `skip` и `unmapped` с деталями. По умолчанию `--since` равно метке однократной стартовой синхронизации §32.5.4 п. 4 (событие `shadow-reconcile-started` в `events`). Первым шагом команда выполняет синхронизацию §32.5.4 (пишет только строки `shadow:sync`); больше ничего не меняет. В отчёт входят и все действующие переопределения `workGraphProjects`: строковые (бессрочные) помечаются `permanent`, объектные — с `until` и `reason`.
 2. **Проект готов к `strict`**, когда в окне не короче 48 часов одновременно:
    - не меньше 3 полных циклов;
    - `unmapped = 0`;
@@ -697,3 +701,11 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 5. **Срок переопределения:** `{ "mode": "off", "until": now+1s }` → до срока `off`, после — наследуемый режим, ключ удалён, событие смены настройки с `reason: 'override-expired'`, сообщение координатору; `until` = now+48h обрезается до 24h.
 6. **Отчёт:** на фикстуре из тестов 1–4 `shadow-report --json` возвращает точные числа по классам и список `skip`.
 7. **`off` молчит:** все сценарии 1–5 в проекте `off` дают 0 строк `task_transitions` и 0 записей очереди (§32.2 п. 5.1).
+
+### 32.6 Уровни исполнения: четыре уровня сложности (24.11, слово владельца)
+
+1. Исполнительские уровни кода: `complex` (редкий, дорогие модели с малыми лимитами), `high`, `medium`, `simple` (постоянные, почти безлимитные модели). Координатор раздаёт большинство задач в `high`/`medium`/`simple`; `complex` — только крупные многофайловые фичи, миграции, большой рефакторинг, поиск причин сложных сбоев. Цепочки моделей задаёт только политика плагина (§2).
+2. `task_queue.level` допускает `high` (§27.1). Существующая база мигрирует пересборкой таблицы с новым CHECK в одной транзакции, данные и индексы сохраняются; миграция идемпотентна.
+3. `enqueue --level` принимает `complex|high|medium|simple|spec|research`; `architect` остаётся в CHECK и в `validLevels` только для записей узла `design`, через `enqueue --level` не ставится; проверки маршрутов (§27.2) для `high` такие же, как для `medium` (в том числе маршрут `docs` разрешён).
+4. Уровень `spec` (писатель спек) обслуживается только сильными моделями; его цепочка — в политике.
+5. Обязательные тесты: миграция базы со строками старого CHECK сохраняет все записи и принимает `level = 'high'`; `enqueue --level high` и приём §32.5.1 раздачи уровня `high` создают запись без ошибки CHECK; обратный поиск при нескольких совпадениях выбирает старший уровень.
