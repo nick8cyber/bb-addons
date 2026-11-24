@@ -16,6 +16,7 @@
  */
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { T_RU, type T } from "./i18n/index.js";
 import type { CmdRunner } from "./cmd.js";
 import { OrchestratorError } from "./errors.js";
 import type { JanitorLog } from "./janitor.js";
@@ -136,6 +137,19 @@ export function environmentShowVerdict(res: {
   return "failed";
 }
 
+/**
+ * §7/§16.9: the `bb environment show <id> --json` verdict — `gone` is
+ * ONLY the structured BB answer — see `environmentShowVerdict` above.
+ * §13.5: an env is gone once BB reports it destroyed or a teardown phase
+ * owns it.
+ */
+const envGone = (env: CoordinatorEnvDto | null): boolean => {
+  if (!env) return true;
+  if (env.status === "destroyed") return true;
+  const phase = env.lifecycle?.phase;
+  return phase === "teardown" || phase === "destroyed";
+};
+
 export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? {};
@@ -206,13 +220,6 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
     );
   };
 
-  const envGone = (env: CoordinatorEnvDto | null): boolean => {
-    if (!env) return true;
-    if (env.status === "destroyed") return true;
-    const phase = env.lifecycle?.phase;
-    return phase === "teardown" || phase === "destroyed";
-  };
-
   /**
    * §13.5 п.2: `git fetch origin <target>` then require
    * `git log origin/<target>..<base_sha>` to be empty — a base the
@@ -232,7 +239,7 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
         "refs/remotes/origin/HEAD",
       ]))?.trim().replace(/^origin\//, "");
     if (!target) return; // no remote HEAD — the check proves nothing
-    if (!(await gitOk(worktreePath, ["fetch", "origin", target]))) {
+    if (!(await gitOk(worktreePath, ["fetch", "origin", "--", target]))) {
       throw new OrchestratorError(
         "remote-unavailable",
         `git fetch origin ${target} failed in ${worktreePath}`,
@@ -241,6 +248,7 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
     const ahead = await gitOut(worktreePath, [
       "log",
       "--format=%H",
+      "--end-of-options",
       `origin/${target}..${baseSha}`,
     ]);
     if (ahead === null) {
@@ -714,5 +722,231 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
     reevaluate,
     reconcileEnvGone,
     isCoordinatorThread,
+  };
+}
+
+// ── §13.5 п.1 (PLUG-406): `worktree create` — a fresh coordinator thread
+// on a dedicated BB Worktree, provisioned, then bound (§7 → `active`).
+const DEFAULT_PROVISION_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_POLL_INTERVAL_MS = 2_000;
+
+/** The managed-worktree spawn of the new coordinator thread — the
+ * base is the immutable named SHA of the fresh `origin/<target>`
+ * (`--base-branch <полный SHA свежего origin/<target>>`), the title
+ * `coordinator` (§13.5: `bb/coordinator-<threadId>`). */
+export interface CoordinatorWorktreeSpawnArgs {
+  projectId: string;
+  title: string;
+  prompt: string;
+  environment: {
+    type: "host";
+    hostId: string;
+    workspace: {
+      type: "managed-worktree";
+      baseBranch: { kind: "named"; name: string };
+    };
+  };
+}
+
+export interface CoordinatorWorktreeCreateDeps {
+  /** The bb project the new coordinator copy is created in. */
+  projectId: string;
+  /** The fresh published base — full SHA of `origin/<target>`. */
+  baseSha: string;
+  /**
+   * §13.5: the published target branch the fresh base came from — the
+   * `--target` flag, else the release-config target, else `main`. The
+   * binding registers against THIS branch (`base-unpublished` compares
+   * the copy with `origin/<target>` of it).
+   */
+  targetBranch?: string;
+  /** Spawn seam — the SDK `threads.spawn` (managed-worktree env). */
+  spawn: (
+    args: CoordinatorWorktreeSpawnArgs,
+  ) => Promise<{ id?: string | null; environmentId?: string | null }>;
+  /** `bb environment show <id> --json` — `null` only when gone. */
+  showEnvironment: (envId: string) => Promise<CoordinatorEnvDto | null>;
+  /** §7 binding registration — writes the `active` row. */
+  register: (
+    bind: CoordinatorWorktreeBind,
+    opts?: { targetBranch?: string; skipBaseCheck?: boolean },
+  ) => Promise<CoordinatorWorktreeRow>;
+  /** git seam — resolves the copy's repo root; absent → skipped. */
+  cmd?: CmdRunner;
+  /** The host the managed worktree is provisioned on. */
+  hostId?: string;
+  /** The seed prompt of the coordinator thread. */
+  prompt?: string;
+  /** Clock for tests. */
+  now?: () => number;
+  /** Provisioning wait budget in ms. */
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  log?: JanitorLog;
+  t?: T;
+}
+
+export interface CoordinatorWorktreeCreateResult {
+  threadId: string;
+  envId: string;
+  branch: string;
+  worktreePath: string;
+  baseSha: string;
+}
+
+/**
+ * §13.5 п.1 (PLUG-406): `bb orchestrator worktree create` — spawn a new
+ * coordinator thread on a dedicated BB Worktree, wait for the
+ * provisioning to finish, register the binding (`active`). The copy is
+ * based on the fresh `origin/<target>` SHA; a base the local repo is
+ * ahead of refuses `base-unpublished` at registration.
+ */
+export async function createCoordinatorWorktree(
+  deps: CoordinatorWorktreeCreateDeps,
+): Promise<CoordinatorWorktreeCreateResult> {
+  const t = deps.t ?? T_RU;
+  const now = deps.now ?? Date.now;
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_PROVISION_TIMEOUT_MS;
+  const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  if (!deps.baseSha) {
+    throw new OrchestratorError(
+      "invalid-arguments",
+      t("wt.baseMissing", { project: deps.projectId }),
+      t("wt.baseMissingHint"),
+    );
+  }
+  if (!deps.spawn) {
+    throw new OrchestratorError(
+      "invalid-arguments",
+      t("wt.spawnMissing", { project: deps.projectId }),
+    );
+  }
+  const spawned = await deps.spawn({
+    projectId: deps.projectId,
+    title: "coordinator",
+    prompt: deps.prompt ?? "",
+    environment: {
+      type: "host",
+      hostId: deps.hostId ?? "",
+      workspace: {
+        type: "managed-worktree",
+        baseBranch: { kind: "named", name: deps.baseSha },
+      },
+    },
+  });
+  const threadId = spawned?.id ?? null;
+  const envId = spawned?.environmentId ?? null;
+  if (!threadId || !envId) {
+    throw new OrchestratorError(
+      "spawn-failed",
+      t("wt.spawnNoThread", { threadId: threadId ?? "" }),
+      t("wt.spawnNoThreadHint"),
+    );
+  }
+  const deadline = now() + timeoutMs;
+  let env: CoordinatorEnvDto | null | undefined;
+  for (;;) {
+    let next: CoordinatorEnvDto | null | undefined;
+    let transient = false;
+    try {
+      next = await deps.showEnvironment(envId);
+    } catch {
+      // §7: a transient `bb environment show` failure keeps the
+      // property — retry until the provisioning deadline instead of
+      // aborting the wait.
+      transient = true;
+    }
+    env = next;
+    if (env) {
+      if (env.status === "ready" && env.path && env.branchName) break;
+      if (envGone(env)) {
+        throw new OrchestratorError(
+          "env-gone",
+          t("wt.envGone", { envId, threadId }),
+          t("wt.envGoneHint"),
+          { threadId, envId },
+        );
+      }
+    } else if (!transient) {
+      // `null` — the structured BB answer: the env is definitively gone.
+      throw new OrchestratorError(
+        "env-gone",
+        t("wt.envGone", { envId, threadId }),
+        t("wt.envGoneHint"),
+        { threadId, envId },
+      );
+    }
+    if (now() >= deadline) {
+      throw new OrchestratorError(
+        "provisioning-timeout",
+        t("wt.provisioningTimeout", { envId, threadId, timeoutMs }),
+        t("wt.provisioningTimeoutHint"),
+        { threadId, envId },
+      );
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+  const path = env!.path!;
+  const branch = env!.branchName!;
+  const repoRoot = deps.cmd
+    ? (
+        await deps.cmd.run("git", [
+          "-C",
+          path,
+          "rev-parse",
+          "--git-common-dir",
+        ])
+      ).stdout.trim() || null
+    : null;
+  const tipSha = deps.cmd
+    ? (
+        await deps.cmd.run("git", ["-C", path, "rev-parse", "--verify", "HEAD"])
+      ).stdout.trim() || null
+    : null;
+  try {
+    await deps.register(
+      {
+        projectId: deps.projectId,
+        coordinatorThreadId: threadId,
+        envId,
+        hostId: env.hostId ?? null,
+        repoRoot: repoRoot ?? null,
+        worktreePath: path,
+        branch,
+        baseSha: deps.baseSha,
+        tipSha: tipSha ?? null,
+      },
+      // The binding registers against the TARGET BRANCH the caller asked
+      // for (`--target`, else the release-config target, else `main`) —
+      // not the env's recorded merge-base guess.
+      { targetBranch: deps.targetBranch },
+    );
+  } catch (e) {
+    // The ids travel with the error — the caller (CLI / `--json`) must be
+    // able to see which thread/env the failed round belonged to. A raw
+    // failure (e.g. a SQLite error in the store) is wrapped into the same
+    // structured error so its `details` survive to the CLI output.
+    const err =
+      e instanceof OrchestratorError
+        ? e
+        : new OrchestratorError(
+            "internal-error",
+            message(e),
+            undefined,
+            { threadId, envId },
+          );
+    throw new OrchestratorError(
+      err.code,
+      err.message,
+      err.hint,
+      { threadId, envId },
+    );
+  }
+  return {
+    threadId,
+    envId,
+    branch,
+    worktreePath: path,
+    baseSha: deps.baseSha,
   };
 }
