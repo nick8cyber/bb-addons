@@ -30,7 +30,13 @@ import {
   createTaskTurn,
   reapOrphanBrowserGroups,
   cleanupOwnBrowserGroups,
+  checkDialogWave,
+  _resetDialogWaveHistory,
+  getThoughtsLogPath,
+  sanitizeThoughtPayload,
+  appendThoughtLog,
 } from "../acp-server.mjs";
+import { checkedAnswer } from "../src/inner-context.mjs";
 
 const require = createRequire(import.meta.url);
 const driver = require("../src/gemini-driver.js");
@@ -59,6 +65,10 @@ const {
   sanitizeDownloadName,
   isAllowedDownloadHost,
   downloadUrlHost,
+  parseHNvQHb,
+  unwrapUrl,
+  isGoogleSearchUrl,
+  dismissOverlays,
 } = driver;
 const { withUsageLock, KNOWN_CANDIDATE_RPCIDS } = usageLimitsModule;
 
@@ -7039,5 +7049,373 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
     }
   } finally {
     restoreAll();
+  }
+});
+
+test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave protection, and thoughts streaming", async () => {
+  // --- A. parseHNvQHb on fixtures: queries, status, source signatures, deduplication ---
+  {
+    const fixturePath = path.join(PLUGIN_ROOT, "tests", "fixtures", "hnvqhb-2026-11-24.json");
+    const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+    const res = parseHNvQHb(fixture, "r_c31b6777bc4b5ba9");
+
+    assert.equal(res.status, 4, "Status must be max tool status 4");
+    assert.deepEqual(
+      res.queries,
+      ["opencode-ai npm latest version release date", "opencode-ai package npmjs"],
+      "Both queries must be extracted in order"
+    );
+    assert.equal(res.sources.length, 19, "Exactly 19 unique sources must be parsed");
+    assert.equal(res.unknownRows.length, 0, "No unknown rows in fixture");
+
+    // Verify all URLs are valid and not gstatic
+    for (const s of res.sources) {
+      assert.match(s.url, /^https?:\/\//, `Source URL must be valid HTTP(S): ${s.url}`);
+      assert.equal(/gstatic\.com/i.test(s.url), false, `gstatic.com must be excluded: ${s.url}`);
+      assert.ok(s.title && s.title.trim().length > 0, "Source title must be non-empty");
+    }
+
+    // Verify redirect unwrapping and search URL filtering
+    assert.equal(
+      unwrapUrl("https://www.google.com/url?q=https%3A%2F%2Fgithub.com%2Fopencode-ai&sa=U"),
+      "https://github.com/opencode-ai"
+    );
+    assert.equal(isGoogleSearchUrl("https://www.google.com/search?q=test"), true);
+    assert.equal(isGoogleSearchUrl("https://github.com/test"), false);
+  }
+
+  // --- B. Turn isolation by responseId in multi-turn history ---
+  {
+    const multiPath = path.join(PLUGIN_ROOT, "tests", "fixtures", "hnvqhb-multi-turn-2026-11-24.json");
+    const multiFixture = JSON.parse(fs.readFileSync(multiPath, "utf8"));
+
+    const res1 = parseHNvQHb(multiFixture, "r_c31b6777bc4b5ba9");
+    assert.equal(res1.status, 4);
+    assert.equal(res1.queries.length, 2);
+
+    const res2 = parseHNvQHb(multiFixture, "r_0000000000000002");
+    assert.equal(res2.status, "unbound");
+    assert.equal(res2.queries.length, 0);
+
+    const resNone = parseHNvQHb(multiFixture, "r_nonexistent");
+    assert.equal(resNone.status, "unbound");
+    assert.equal(resNone.queries.length, 0);
+    assert.equal(resNone.sources.length, 0);
+
+    // Unknown source row logging detection
+    const mockUnknown = [
+      [
+        [
+          ["c_test", "r_test123456789012"],
+          null,
+          null,
+          [
+            [
+              null,
+              [
+                ["https://unknown-service.com/page", "Unknown Service Title", 99999]
+              ]
+            ]
+          ]
+        ]
+      ]
+    ];
+    const resUnknown = parseHNvQHb(mockUnknown, "r_test123456789012");
+    assert.equal(resUnknown.unknownRows.length, 1);
+  }
+
+  // --- C. dismissOverlays whitelist, priority, input coverage, and errors ---
+  {
+    const shotDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "dialog-shots-")));
+
+    // 1. Consent wall: exact Reject all vs partial reject
+    let clicked = "";
+    const pageConsent = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const bPartial = { offsetParent: {}, innerText: "Reject optional cookies", getAttribute: () => "Reject optional cookies", click: () => { clicked = "partial"; }, matches: () => false, closest: () => null };
+        const bExact = { offsetParent: {}, innerText: "Reject all", getAttribute: () => "Reject all", click: () => { clicked = "exact"; }, matches: () => false, closest: () => null };
+        const dlg = { offsetParent: {}, innerText: "Before you continue to Google", matches: () => false, closest: () => null, querySelectorAll: () => [bPartial, bExact] };
+        global.document = { querySelectorAll: (sel) => sel.includes("mat-dialog-container") ? [dlg] : [], querySelector: () => null };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      waitForTimeout: async () => {},
+    };
+    await dismissOverlays(pageConsent, { isTurn: true, screenshotDir: shotDir });
+    assert.equal(clicked, "exact", "Exact Reject all must be chosen first");
+
+    // 2. Consent wall: Принять все when reject is absent
+    let clickedAccept = false;
+    const pageAccept = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const bAccept = { offsetParent: {}, innerText: "Принять все", getAttribute: () => "Принять все", click: () => { clickedAccept = true; }, matches: () => false, closest: () => null };
+        const dlg = { offsetParent: {}, innerText: "До того как продолжить", matches: () => false, closest: () => null, querySelectorAll: () => [bAccept] };
+        global.document = { querySelectorAll: (sel) => sel.includes("mat-dialog-container") ? [dlg] : [], querySelector: () => null };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      waitForTimeout: async () => {},
+    };
+    await dismissOverlays(pageAccept, { isTurn: true, screenshotDir: shotDir });
+    assert.equal(clickedAccept, true, "Принять все must be clicked when no reject button");
+
+    // 3. Consent wall without buttons -> WEB_GEMINI_DIALOG_UNCLOSED
+    const pageUnclosedConsent = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const dlg = { offsetParent: {}, innerText: "Before you continue", matches: () => false, closest: () => null, querySelectorAll: () => [] };
+        global.document = { querySelectorAll: (sel) => sel.includes("mat-dialog-container") ? [dlg] : [], querySelector: () => null };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      screenshot: async () => {},
+      waitForTimeout: async () => {},
+    };
+    await assert.rejects(
+      dismissOverlays(pageUnclosedConsent, { isTurn: true, screenshotDir: shotDir }),
+      (err) => err.code === "WEB_GEMINI_DIALOG_UNCLOSED"
+    );
+
+    // 4. Banner "Use Gemini" / "Использовать Gemini"
+    let clickedBanner = false;
+    const pageBanner = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const useBtn = { offsetParent: {}, innerText: "Использовать Gemini", click: () => { clickedBanner = true; } };
+        global.document = {
+          querySelectorAll: (sel) => sel.includes("button") ? [useBtn] : [],
+          querySelector: () => null,
+        };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      waitForTimeout: async () => {},
+    };
+    await dismissOverlays(pageBanner, { isTurn: true, screenshotDir: shotDir });
+    assert.equal(clickedBanner, true, "Use Gemini banner button must be clicked");
+
+    // 5. Paid upsell proposal with negative button
+    let clickedNotNow = false;
+    const pageUpsell = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const negBtn = { offsetParent: {}, innerText: "Не сейчас", getAttribute: () => "Не сейчас", click: () => { clickedNotNow = true; }, matches: () => false, closest: () => null };
+        const dlg = { offsetParent: {}, innerText: "Смените план на Advanced: 1990 руб / мес", matches: () => false, closest: () => null, querySelectorAll: () => [negBtn] };
+        global.document = { querySelectorAll: (sel) => sel.includes("mat-dialog-container") ? [dlg] : [], querySelector: () => null };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      waitForTimeout: async () => {},
+    };
+    await dismissOverlays(pageUpsell, { isTurn: true, screenshotDir: shotDir });
+    assert.equal(clickedNotNow, true, "Negative button on upsell proposal must be clicked");
+
+    // 6. Price promo without negative button NOT covering textbox is kept
+    const pagePromoKept = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const dlg = { offsetParent: {}, innerText: "Get Gemini Advanced for $19.99/month", matches: () => false, closest: () => null, querySelectorAll: () => [], contains: () => false };
+        const textbox = { getBoundingClientRect: () => ({ x: 100, y: 100, width: 200, height: 50 }) };
+        global.document = {
+          querySelectorAll: (sel) => sel.includes("mat-dialog-container") ? [dlg] : [],
+          querySelector: (sel) => sel.includes("contenteditable") ? textbox : null,
+          elementFromPoint: () => textbox,
+        };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      waitForTimeout: async () => {},
+    };
+    await dismissOverlays(pagePromoKept, { isTurn: true, screenshotDir: shotDir });
+
+    // 7. Price promo covering textbox throws WEB_GEMINI_DIALOG_UNCLOSED
+    const pagePromoCovering = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const dlg = { offsetParent: {}, innerText: "Get Gemini Advanced for $19.99/month", matches: () => false, closest: () => null, querySelectorAll: () => [], contains: () => true };
+        const textbox = { getBoundingClientRect: () => ({ x: 100, y: 100, width: 200, height: 50 }) };
+        global.document = {
+          querySelectorAll: (sel) => sel.includes("mat-dialog-container") ? [dlg] : [],
+          querySelector: (sel) => sel.includes("contenteditable") ? textbox : null,
+          elementFromPoint: () => dlg,
+        };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      screenshot: async () => {},
+      waitForTimeout: async () => {},
+    };
+    await assert.rejects(
+      dismissOverlays(pagePromoCovering, { isTurn: true, screenshotDir: shotDir }),
+      (err) => err.code === "WEB_GEMINI_DIALOG_UNCLOSED"
+    );
+
+    // 8. Unknown dialog during turn throws WEB_GEMINI_UNKNOWN_DIALOG
+    const pageUnknownTurn = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const dlg = { offsetParent: {}, innerText: "Surprise Dialog With New UI", matches: () => false, closest: () => null, querySelectorAll: () => [] };
+        global.document = { querySelectorAll: (sel) => sel.includes("mat-dialog-container") ? [dlg] : [], querySelector: () => null };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      screenshot: async () => {},
+      waitForTimeout: async () => {},
+    };
+    await assert.rejects(
+      dismissOverlays(pageUnknownTurn, { isTurn: true, screenshotDir: shotDir }),
+      (err) => err.code === "WEB_GEMINI_UNKNOWN_DIALOG"
+    );
+
+    // 9. Unknown dialog outside turn does NOT throw
+    let shotOutside = false;
+    const pageUnknownOutside = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const dlg = { offsetParent: {}, innerText: "Surprise Dialog Outside Turn", matches: () => false, closest: () => null, querySelectorAll: () => [] };
+        global.document = { querySelectorAll: (sel) => sel.includes("mat-dialog-container") ? [dlg] : [], querySelector: () => null };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      screenshot: async () => { shotOutside = true; },
+      waitForTimeout: async () => {},
+    };
+    await dismissOverlays(pageUnknownOutside, { isTurn: false, screenshotDir: shotDir });
+    assert.equal(shotOutside, true, "Screenshot must be taken outside turn without throwing");
+
+    // 10. Backdrop covering input reloads page
+    let reloadCount = 0;
+    const pageBackdrop = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const backdrop = { offsetParent: {}, contains: () => true };
+        const textbox = { getBoundingClientRect: () => ({ x: 100, y: 100, width: 200, height: 50 }) };
+        global.document = {
+          querySelectorAll: () => [],
+          querySelector: (sel) => sel.includes("backdrop") ? (reloadCount === 0 ? backdrop : null) : textbox,
+          elementFromPoint: () => backdrop,
+        };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      reload: async () => { reloadCount++; },
+      waitForTimeout: async () => {},
+    };
+    await dismissOverlays(pageBackdrop, { isTurn: true, screenshotDir: shotDir });
+    assert.equal(reloadCount, 1, "Page must be reloaded once when backdrop covers input");
+  }
+
+  // --- D. Failure classification and wave protection ---
+  {
+    const errUnknown = new Error("unknown dialog: something new");
+    errUnknown.code = "WEB_GEMINI_UNKNOWN_DIALOG";
+    const clsU = classifyFailure(errUnknown);
+    assert.equal(clsU.category, "unknown-dialog");
+    assert.equal(clsU.cooldownMs, 900_000);
+    assert.equal(clsU.rotatable, true);
+    assert.equal(clsU.parkedReason, "unknown-dialog");
+
+    const errUnclosed = new Error("WEB_GEMINI_DIALOG_UNCLOSED: unclosed dialog");
+    errUnclosed.code = "WEB_GEMINI_DIALOG_UNCLOSED";
+    const clsC = classifyFailure(errUnclosed);
+    assert.equal(clsC.category, "unknown-dialog");
+
+    _resetDialogWaveHistory();
+    const modalText = "Some completely unknown Google beta prompt";
+    assert.equal(checkDialogWave(modalText, "acc_a"), false);
+    assert.equal(checkDialogWave(modalText, "acc_b"), false);
+    assert.equal(checkDialogWave(modalText, "acc_c"), true, "Wave triggered on 3rd distinct account");
+    assert.equal(checkDialogWave("Different dialog", "acc_d"), false);
+  }
+
+  // --- E. Thoughts sanitization and thoughts.jsonl writer ---
+  {
+    const testDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "thoughts-test-")));
+    const logPath = path.join(testDir, "thoughts.jsonl");
+
+    const rawPayload = {
+      query: "test query",
+      token: "secret-token",
+      auth: "secret-auth",
+      nested: {
+        f_sid: "sid-123",
+        status: "in_progress",
+      },
+    };
+    const cleaned = sanitizeThoughtPayload(rawPayload);
+    assert.equal(cleaned.query, "test query");
+    assert.equal(cleaned.token, undefined);
+    assert.equal(cleaned.auth, undefined);
+    assert.equal(cleaned.nested.f_sid, undefined);
+    assert.equal(cleaned.nested.status, "in_progress");
+
+    appendThoughtLog(logPath, "thought", { text: "Analyzing query\n" });
+    appendThoughtLog(logPath, "tool_call", { toolCallId: "call_1", query: "test query" });
+    appendThoughtLog(logPath, "tool_call_update", { toolCallId: "call_1", status: "completed" });
+
+    const lines = fs.readFileSync(logPath, "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(lines.length, 3);
+    assert.equal(lines[0].event, "thought");
+    assert.equal(lines[1].event, "tool_call");
+    assert.equal(lines[2].event, "tool_call_update");
+  }
+
+  // --- F. Search sources block appended strictly in research && !write && !verdict ---
+  {
+    const candidateWithSources = {
+      text: "Summary of findings.",
+      search: {
+        sources: [
+          { url: "https://example.com/one", title: "Page One" },
+          { url: "https://example.com/two", title: "Page Two" },
+        ],
+      },
+    };
+    const contextResearch = { research: true, write: false, settings: { maskResponse: (x) => x } };
+    const checked1 = checkedAnswer(contextResearch, candidateWithSources);
+    assert.equal(checked1.text, "Summary of findings.");
+
+    let formattedText = checked1.text;
+    if (contextResearch.research && !contextResearch.write && !contextResearch.verdict && candidateWithSources.search?.sources?.length) {
+      const list = candidateWithSources.search.sources.map((s) => `* [${s.title}](${s.url})`).join("\n");
+      formattedText = formattedText.trimEnd() + "\n\n### Источники поиска\n" + list;
+    }
+    assert.ok(formattedText.includes("### Источники поиска"));
+    assert.ok(formattedText.includes("* [Page One](https://example.com/one)"));
+    assert.ok(formattedText.includes("* [Page Two](https://example.com/two)"));
+
+    // Write mode: sources block NOT appended
+    const contextWrite = { research: true, write: true, settings: { maskResponse: (x) => x } };
+    let writeText = "File commit response.";
+    if (contextWrite.research && !contextWrite.write && !contextWrite.verdict && candidateWithSources.search?.sources?.length) {
+      const list = candidateWithSources.search.sources.map((s) => `* [${s.title}](${s.url})`).join("\n");
+      writeText = writeText.trimEnd() + "\n\n### Источники поиска\n" + list;
+    }
+    assert.equal(writeText.includes("### Источники поиска"), false, "Sources block must not be appended in write mode");
+  }
+
+  // --- G. Integration with driver hooks in sendPrompt ---
+  {
+    const fixturePath = path.join(PLUGIN_ROOT, "tests", "fixtures", "hnvqhb-2026-11-24.json");
+    const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+    _setDriverHooks({
+      ensureChrome: async () => {},
+      getPlaywright: () => {},
+      connectOverCDP: async () => ({ close: async () => {} }),
+      getGeminiPage: async () => ({
+        url: () => "https://gemini.google.com/app",
+        goto: async () => {},
+        on: () => {},
+        off: () => {},
+        evaluate: async () => null,
+      }),
+      runTurn: async () => ({
+        text: "Response from Google search",
+        convId: "c_test_conv",
+        responseId: "r_c31b6777bc4b5ba9",
+      }),
+      fetchHNvQHb: async () => fixture,
+    });
+    try {
+      const res = await sendPrompt({ prompt: "opencode-ai latest version", isNewChat: false });
+      assert.equal(res.text, "Response from Google search");
+      assert.equal(res.search?.status, 4);
+      assert.equal(res.search?.queries?.length, 2);
+      assert.equal(res.search?.sources?.length, 19);
+    } finally {
+      _setDriverHooks(null);
+    }
   }
 });

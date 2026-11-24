@@ -11,6 +11,159 @@ function _setDriverHooks(hooks) {
   driverHooks = hooks;
 }
 
+function driverLog(stage, extra) {
+  try {
+    const dir = process.env.WEB_GEMINI_STATE_DIR || process.env.ARGON_STATE_DIR || path.join(os.homedir(), '.bb', 'plugins', 'provider-web-gemini');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(
+      path.join(dir, 'acp-server.log'),
+      `${new Date().toISOString()} pid=${process.pid} ${stage}${extra ? ' ' + JSON.stringify(extra) : ''}\n`
+    );
+  } catch {}
+}
+
+function unwrapUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if ((u.hostname === 'google.com' || u.hostname.endsWith('.google.com')) && u.pathname === '/url') {
+      const q = u.searchParams.get('q');
+      if (q) return q;
+    }
+    return urlStr;
+  } catch {
+    return urlStr;
+  }
+}
+
+function isGoogleSearchUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    return (u.hostname === 'google.com' || u.hostname.endsWith('.google.com')) && u.pathname === '/search';
+  } catch {
+    return false;
+  }
+}
+
+function parseHNvQHb(raw, targetResponseId) {
+  let data = raw;
+  if (typeof raw === 'string') {
+    const frames = usageLimits.extractWrbFrames(raw).filter((f) => f[1] === 'hNvQHb');
+    if (frames.length > 0 && typeof frames[0][2] === 'string') {
+      try {
+        data = JSON.parse(frames[0][2]);
+      } catch {
+        return { status: 'unbound', queries: [], sources: [], unknownRows: [] };
+      }
+    } else {
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        return { status: 'unbound', queries: [], sources: [], unknownRows: [] };
+      }
+    }
+  }
+
+  const turns = data?.[0];
+  if (!Array.isArray(turns)) {
+    return { status: 'unbound', queries: [], sources: [], unknownRows: [] };
+  }
+
+  let targetTurn = null;
+  if (targetResponseId) {
+    const norm = targetResponseId.startsWith('r_') ? targetResponseId : 'r_' + targetResponseId;
+    targetTurn = turns.find((t) => t?.[0]?.[1] === norm);
+  }
+
+  if (!targetTurn) {
+    return { status: 'unbound', queries: [], sources: [], unknownRows: [] };
+  }
+
+  const convId = targetTurn[0]?.[0]?.replace(/^c_/, '') || null;
+  const responseId = targetTurn[0]?.[1]?.replace(/^r_/, '') || null;
+  const T3 = targetTurn[3];
+  if (!Array.isArray(T3)) {
+    return { status: 'unbound', convId, responseId, queries: [], sources: [], unknownRows: [] };
+  }
+
+  let queries = [];
+  let maxStatusCode = null;
+  const rawSig1 = [];
+  const rawSig2 = [];
+  const unknownRows = [];
+
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      if (node.length > 0 && node.every((x) => Array.isArray(x) && x.length === 2 && typeof x[0] === 'string' && x[1] === 1)) {
+        if (queries.length === 0) {
+          queries = node.map((x) => x[0]);
+        }
+      }
+      if (node.length === 2 && node[0] === null && Array.isArray(node[1]) && node[1][0] === 'google' && typeof node[1][2] === 'number') {
+        const code = node[1][2];
+        if (maxStatusCode === null || code > maxStatusCode) {
+          maxStatusCode = code;
+        }
+      }
+      if (
+        typeof node[0] === 'string' && /^https:\/\/t\d*\.gstatic\.com\/faviconV2/i.test(node[0]) &&
+        typeof node[1] === 'string' && /^https?:\/\//i.test(node[1]) &&
+        typeof node[2] === 'string' && !/^https?:\/\//i.test(node[2])
+      ) {
+        rawSig1.push({ url: unwrapUrl(node[1]), title: node[2] });
+        return;
+      }
+      if (
+        typeof node[0] === 'string' && /^https?:\/\//i.test(node[0]) && !/gstatic\.com/i.test(node[0]) &&
+        typeof node[1] === 'string' && !/^https?:\/\//i.test(node[1]) &&
+        typeof node[2] === 'string' && /favicon-tbn/i.test(node[2])
+      ) {
+        rawSig2.push({ url: unwrapUrl(node[0]), title: node[1], snippet: node[3] });
+        return;
+      }
+
+      const hasNonGstaticHttp = node.some((x) => typeof x === 'string' && /^https?:\/\//i.test(x) && !/gstatic\.com/i.test(x));
+      const hasTitle = node.some((x) => typeof x === 'string' && x.trim() && !/^https?:\/\//i.test(x));
+      if (hasNonGstaticHttp && hasTitle) {
+        const isLeaf = node.every((x) => x === null || typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean');
+        if (isLeaf) {
+          unknownRows.push(node);
+          return;
+        }
+      }
+
+      for (let i = 0; i < node.length; i++) {
+        walk(node[i]);
+      }
+    } else {
+      for (const k of Object.keys(node)) {
+        walk(node[k]);
+      }
+    }
+  }
+
+  walk(T3);
+
+  const allSources = [];
+  const seenUrls = new Set();
+  for (const s of [...rawSig1, ...rawSig2]) {
+    if (!s.url || isGoogleSearchUrl(s.url) || /gstatic\.com/i.test(s.url)) continue;
+    if (!seenUrls.has(s.url)) {
+      seenUrls.add(s.url);
+      allSources.push({ url: s.url, title: s.title });
+    }
+  }
+
+  return {
+    status: maxStatusCode ?? (queries.length ? 1 : 'unbound'),
+    convId,
+    responseId,
+    queries,
+    sources: allSources,
+    unknownRows,
+  };
+}
+
 let CDP_PORT = process.env.GEMINI_CDP_PORT || '9222';
 const cdpUrl = (port) => `http://localhost:${port ?? CDP_PORT}`;
 function setCdpPort(port) { CDP_PORT = String(port); }
@@ -968,12 +1121,32 @@ function checkTurnStatus(doc, idx, promptPrefix) {
   let hasFinishedContent = false;
   let hasActionButtons = false;
 
+  const parentOf = (el) => (el ? el.parentElement || el.parentNode || el.parent || null : null);
+  const getTextExcludingThoughts = (root) => {
+    if (!root) return '';
+    const thoughts = Array.from(root.querySelectorAll ? root.querySelectorAll('model-thoughts') : []);
+    if (!thoughts.length) return root.innerText || '';
+    let out = '';
+    function collect(node) {
+      if (!node) return;
+      const tag = (node.tagName || '').toLowerCase();
+      if (tag === 'model-thoughts') return;
+      if (node.children && node.children.length > 0) {
+        for (const child of node.children) collect(child);
+      } else {
+        out += (node.innerText || '');
+      }
+    }
+    collect(root);
+    return out;
+  };
+
   if (target) {
     const mc = target.querySelector('message-content');
     if (mc) {
       currentText = { src: 'mc', text: mc.innerText || '' };
     } else {
-      currentText = { src: 'raw', text: target.innerText || '' };
+      currentText = { src: 'raw', text: getTextExcludingThoughts(target) };
     }
 
     const hasText = mc ? (mc.innerText || '').trim().length > 0 : false;
@@ -1032,7 +1205,6 @@ function checkTurnStatus(doc, idx, promptPrefix) {
     'Думаю...',
   ];
   const normStatus = (s) => (s || '').replace(/…/g, '...').replace(/\s+/g, ' ').trim();
-  const parentOf = (el) => (el ? el.parentElement || el.parentNode || el.parent || null : null);
   const insideContentOrThoughts = (el) => {
     for (let p = el; p; p = parentOf(p)) {
       const tag = (p.tagName || '').toLowerCase();
@@ -1068,6 +1240,24 @@ function checkTurnStatus(doc, idx, promptPrefix) {
     }
   }
 
+  let childCount = 0;
+  let targetTextLength = 0;
+  let thoughtText = null;
+  if (target) {
+    const thoughts = Array.from(target.querySelectorAll ? target.querySelectorAll('model-thoughts') : []);
+    if (thoughts.length > 0) {
+      thoughtText = (thoughts[0].innerText || '').trim();
+    }
+    const allChildren = Array.from(target.querySelectorAll('*'));
+    childCount = allChildren.filter((el) => {
+      for (let p = el; p; p = parentOf(p)) {
+        if ((p.tagName || '').toLowerCase() === 'model-thoughts') return false;
+      }
+      return true;
+    }).length;
+    targetTextLength = getTextExcludingThoughts(target).length;
+  }
+
   return {
     targetFound: target !== null,
     hasStopButton,
@@ -1076,8 +1266,9 @@ function checkTurnStatus(doc, idx, promptPrefix) {
     hasActionButtons,
     hasActiveThinkingOrTool,
     statusText,
-    childCount: target ? target.querySelectorAll('*').length : 0,
-    targetTextLength: target ? (target.innerText || '').length : 0,
+    thoughtText,
+    childCount,
+    targetTextLength,
     currentText,
   };
 }
@@ -1206,6 +1397,7 @@ async function sendPrompt({
   convId = null,
   signal = null,
   onChunk = null,
+  onThoughtChunk = null,
   headless = null,
   profile = null,
   restart = false,
@@ -1226,6 +1418,7 @@ async function sendPrompt({
   accountId = null,
   tier = null,
   stateDir = null,
+  screenshotDir = null,
   verifyConversation = false,
   fileCapture = null,
   stallMs = null,
@@ -1260,14 +1453,41 @@ async function sendPrompt({
 
   let resObj = null;
   let returnedConvId = convId;
+  let capturedResponseId = null;
+  let lastHNvQHbBody = null;
+  let onPageResponse = null;
   try {
     page = driverHooks?.getGeminiPage
       ? await driverHooks.getGeminiPage(browser, { waitForVerification, port })
       : await getGeminiPage(browser, { waitForVerification, port });
     await throwIfCancelled();
 
+    onPageResponse = async (resp) => {
+      try {
+        const u = typeof resp.url === 'function' ? resp.url() : String(resp.url || '');
+        if (u.includes('StreamGenerate')) {
+          const text = await resp.text().catch(() => '');
+          const m = text.match(/\["c_([a-zA-Z0-9_-]+)","r_([a-f0-9]{16})"]/);
+          if (m) {
+            if (!returnedConvId) returnedConvId = m[1];
+            capturedResponseId = m[2];
+          } else {
+            const mr = text.match(/["']r_([a-f0-9]{16})["']/);
+            if (mr) capturedResponseId = mr[1];
+          }
+        } else if (u.includes('batchexecute') && u.includes('hNvQHb')) {
+          const body = await resp.text().catch(() => '');
+          if (body) lastHNvQHbBody = body;
+        }
+      } catch {}
+    };
+    if (page && typeof page.on === 'function') {
+      page.on('response', onPageResponse);
+    }
+
     let lastText = '';
     let rawText = null;
+    let initialCount = 0;
     let fileResponse;
     let downloadedPath = null;
     let generatedFiles = [];
@@ -1302,6 +1522,8 @@ async function sendPrompt({
       downloadedPath = turnRes.downloaded || null;
       generatedFiles = turnRes.files || [];
       skippedDownloads = turnRes.skippedDownloads || [];
+      if (turnRes.responseId) capturedResponseId = turnRes.responseId;
+      if (turnRes.search) resObj = { search: turnRes.search };
     } else {
     const atSavedConversation = () => new URL(page.url()).pathname === '/app/' + convId;
     const lostConversation = () => {
@@ -1318,7 +1540,13 @@ async function sendPrompt({
       await page.goto(GEMINI_APP_URL, { waitUntil: 'domcontentloaded' });
     }
 
-    await dismissOverlays(page);
+    const overlayOpts = {
+      account: accountId || (backend && backend.id) || profile,
+      isTurn: true,
+      stateDir,
+      screenshotDir,
+    };
+    await dismissOverlays(page, overlayOpts);
     await throwIfCancelled();
     if (verifyConversation && convId && !atSavedConversation()) throw lostConversation();
 
@@ -1326,7 +1554,7 @@ async function sendPrompt({
     try {
       await page.waitForSelector(textboxSelector, { timeout: 15000 });
     } catch (err) {
-      await dismissOverlays(page);
+      await dismissOverlays(page, overlayOpts);
       await checkRobotVerification(page, { waitForVerification, port });
       await page.waitForSelector(textboxSelector, { timeout: 10000 });
     }
@@ -1349,7 +1577,7 @@ async function sendPrompt({
 
     await upload();
 
-    const initialCount = await waitForHistoryStabilization(page, convId, { throwIfCancelled, requireHistory: verifyConversation });
+    initialCount = await waitForHistoryStabilization(page, convId, { throwIfCancelled, requireHistory: verifyConversation });
 
     // §7.3: проверяемое восстановление — ненулевой convId сам по себе не
     // доказывает, что разговор доступен: после навигации и стабилизации
@@ -1499,6 +1727,9 @@ async function sendPrompt({
     const streamStartTime = Date.now();
     let lastProgressTime = streamStartTime;
     let lastDomSignature = null;
+    let lastStatusText = null;
+    let lastThoughtText = '';
+    let accordionExpanded = false;
 
     while (Date.now() - streamStartTime < SESSION_CAP_MS) {
       await throwIfCancelled();
@@ -1532,6 +1763,7 @@ async function sendPrompt({
             hasActionButtons: false,
             hasActiveThinkingOrTool: false,
             statusText: null,
+            thoughtText: null,
             childCount,
             targetTextLength: (target.innerText || '').length,
             currentText: { src, text: ((mc || target).innerText || '') },
@@ -1544,6 +1776,50 @@ async function sendPrompt({
           checkSrc: checkTurnStatus.toString(),
         }
       );
+
+      if (status && status.statusText && status.statusText !== lastStatusText) {
+        lastStatusText = status.statusText;
+        if (onThoughtChunk && typeof onThoughtChunk === 'function') {
+          onThoughtChunk(status.statusText + '\n');
+        }
+      }
+
+      if (status && status.targetFound && !accordionExpanded) {
+        const expanded = await safeEval(page, ({ idx, promptPrefix, fnSrc }) => {
+          const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
+          const target = fn ? fn(document, idx, promptPrefix) : null;
+          if (!target) return false;
+          const thoughts = target.querySelectorAll ? target.querySelectorAll('model-thoughts') : [];
+          if (!thoughts.length) return false;
+          const mt = thoughts[0];
+          const btn = mt.querySelector ? (mt.querySelector('button[aria-expanded], [role="button"][aria-expanded], [aria-expanded]') || mt.querySelector('button, [role="button"]')) : null;
+          if (btn) {
+            if (btn.getAttribute('aria-expanded') === 'true') {
+              return true;
+            }
+            btn.click();
+            return true;
+          }
+          return true;
+        }, { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }).catch(() => false);
+        if (expanded) {
+          accordionExpanded = true;
+        }
+      }
+
+      if (status && status.thoughtText && status.thoughtText.length > lastThoughtText.length) {
+        if (status.thoughtText.startsWith(lastThoughtText)) {
+          const delta = status.thoughtText.slice(lastThoughtText.length);
+          if (delta && onThoughtChunk && typeof onThoughtChunk === 'function') {
+            onThoughtChunk(delta);
+          }
+        } else {
+          if (onThoughtChunk && typeof onThoughtChunk === 'function') {
+            onThoughtChunk(status.thoughtText);
+          }
+        }
+        lastThoughtText = status.thoughtText;
+      }
 
       const stopButton = await safeQuery(
         page,
@@ -1743,6 +2019,69 @@ async function sendPrompt({
     }
     }
 
+    let searchResult = resObj?.search || null;
+    if (!capturedResponseId && page) {
+      capturedResponseId = await safeEval(page, ({ idx, promptPrefix, fnSrc }) => {
+        const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
+        const target = fn ? fn(document, idx, promptPrefix) : null;
+        if (!target) return null;
+        const html = target.outerHTML || '';
+        const m = html.match(/r_([0-9a-f]{16})/i);
+        return m ? m[1] : null;
+      }, { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }).catch(() => null);
+    }
+
+    if (!searchResult) {
+      searchResult = { status: 'unbound', queries: [], sources: [], unknownRows: [] };
+      for (let retry = 0; retry < 3; retry++) {
+        let rawHNvQHb = null;
+        if (driverHooks?.fetchHNvQHb) {
+          rawHNvQHb = await driverHooks.fetchHNvQHb(page, returnedConvId, capturedResponseId);
+        } else if (lastHNvQHbBody && parseHNvQHb(lastHNvQHbBody, capturedResponseId).status !== 'unbound') {
+          rawHNvQHb = lastHNvQHbBody;
+        } else if (page && typeof page.evaluate === 'function') {
+          rawHNvQHb = await safeEval(page, async (cId) => {
+            try {
+              const payload = JSON.stringify([[["hNvQHb", JSON.stringify([["c_" + cId, 10, null, 1, [1], [4, 12], null, 1]])]]]);
+              const res = await window.fetch('/_/BardChatUi/data/batchexecute?rpcids=hNvQHb', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                body: 'f.req=' + encodeURIComponent(payload),
+              });
+              if (!res.ok) return null;
+              return await res.text();
+            } catch {
+              return null;
+            }
+          }, returnedConvId).catch(() => null);
+        }
+        if (rawHNvQHb) {
+          const parsed = parseHNvQHb(rawHNvQHb, capturedResponseId);
+          if (parsed.status !== 'unbound') {
+            searchResult = parsed;
+            break;
+          }
+        }
+        if (retry < 2 && page && typeof page.waitForTimeout === 'function') {
+          await page.waitForTimeout(2000);
+        }
+      }
+      driverLog('driver:search', {
+        account: accountId || (backend && backend.id) || profile,
+        queriesCount: searchResult.queries.length,
+        status: searchResult.status,
+        sourcesCount: searchResult.sources.length,
+      });
+      if (searchResult.unknownRows && searchResult.unknownRows.length > 0) {
+        for (const row of searchResult.unknownRows) {
+          driverLog('driver:thoughts-error', {
+            kind: 'unknown-source-row',
+            row,
+          });
+        }
+      }
+    }
+
     resObj = new String(lastText);
     resObj.text = lastText;
     if (typeof rawText === 'string') resObj.rawText = rawText;
@@ -1754,9 +2093,14 @@ async function sendPrompt({
     resObj.files = generatedFiles;
     if (hasGeneratedFile) resObj.hasGeneratedFile = true;
     resObj.skippedDownloads = skippedDownloads;
+    resObj.search = searchResult;
+    resObj.responseId = capturedResponseId;
 
     return resObj;
   } finally {
+    if (page && typeof page.off === 'function' && onPageResponse) {
+      page.off('response', onPageResponse);
+    }
     // Capture usage limits post-turn on every turn (including rate-limited / failed turns)
     // before parking tab on about:blank
     try {
@@ -1803,110 +2147,199 @@ async function sendPrompt({
   }
 }
 
-async function dismissOverlays(page) {
-  try {
-    // 0. Google consent wall ("Before you continue to Google") mounts late —
-    //    retry up to ~4s until the mat-dialog-container is gone.
-    for (let i = 0; i < 5; i++) {
-      const consent = await safeEval(page, () => {
-        const dlg = document.querySelector('mat-dialog-container, .cdk-overlay-pane [role="dialog"], .cdk-overlay-pane');
-        if (!dlg || !(dlg.innerText || '').includes('Before you continue')) return 'none';
-        const btns = Array.from(dlg.querySelectorAll('button,[role="button"],a'));
-        const pick = (re) => btns.find((b) => re.test((b.innerText || b.getAttribute('aria-label') || '').trim()));
-        const reject = pick(/^reject all$/i) || pick(/reject/i);
-        const accept = pick(/^accept all$/i) || pick(/accept/i) || pick(/i agree/i);
-        const t = reject || accept;
-        if (!t) return 'nobtn';
-        t.click();
-        return 'clicked';
-      });
-      if (consent === 'none') break;
-      if (consent === 'clicked') await page.waitForTimeout(700);
-      else await page.waitForTimeout(800);
-    }
+async function dismissOverlays(page, opts = {}) {
+  if (driverHooks?.dismissOverlays) {
+    return await driverHooks.dismissOverlays(page, opts);
+  }
+  const account = opts.account || opts.accountId || null;
+  const isTurn = Boolean(opts.isTurn);
+  const stateDir = opts.stateDir || process.env.WEB_GEMINI_STATE_DIR || process.env.ARGON_STATE_DIR || path.join(os.homedir(), '.bb', 'plugins', 'provider-web-gemini');
+  const screenshotDir = opts.screenshotDir || path.join(stateDir, 'screenshots');
 
-    // 0.5. Gemini apps opt-in banner ("Use Gemini" / "Использовать Gemini").
-    //     Signed-in users who never consented are bounced from /app to the
-    //     landing page until this button is clicked; the choice persists
-    //     server-side, so this runs only once per account.
-    for (let i = 0; i < 4; i++) {
-      const useBtn = await safeEval(page, () => {
-        const vis = (el) => !!(el && el.offsetParent !== null);
-        const e = [...document.querySelectorAll('button,[role="button"]')]
-          .filter(vis)
-          .find((el) => /использовать gemini|use gemini/i.test(el.innerText));
-        if (!e) return null;
-        const r = e.getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-      });
-      if (!useBtn) break;
-      await page.mouse.click(useBtn.x, useBtn.y).catch(() => {});
-      await page.waitForTimeout(1500);
-    }
+  let reloadedBackdrop = false;
 
-    // 0.7. Paid-tier upsell dialog (locked model click → "Сменить план / Не сейчас").
-    //     Dismiss via the negative button; the plan is never changed.
-    for (let i = 0; i < 3; i++) {
-      const dismissed = await safeEval(page, () => {
-        const dlgs = [...document.querySelectorAll('mat-dialog-container, [role="dialog"]')]
-          .filter((e) => e.offsetParent !== null);
-        const dlg = dlgs.find((d) =>
-          /сменить план|change (plan|subscription)|\/\s*мес|per month|\/month/i.test(d.innerText || '')
+  for (let iter = 0; iter < 5; iter++) {
+    let outcome = null;
+    try {
+      outcome = await safeEval(page, () => {
+        // 1. "Use Gemini" / "Использовать Gemini" banner anywhere on the page
+        const useBtn = Array.from(document.querySelectorAll('button, [role="button"]'))
+          .filter((el) => el.offsetParent !== null)
+          .find((el) => /использовать gemini|use gemini/i.test((el.innerText || '').trim()));
+        if (useBtn) {
+          const text = (useBtn.innerText || '').trim();
+          useBtn.click();
+          return { type: 'dismissed', text, button: text };
+        }
+
+        // 2. Visible dialog container: mat-dialog-container, [role="dialog"], .cdk-overlay-pane with text
+        // Exclude menu and tooltip
+        const candidates = Array.from(
+          document.querySelectorAll('mat-dialog-container, [role="dialog"], .cdk-overlay-pane')
         );
-        if (!dlg) return false;
-        const btn = [...dlg.querySelectorAll('button,[role="button"],a')]
-          .find((b) => /не сейчас|not now|no thanks|maybe later/i.test((b.innerText || '').trim()));
-        if (!btn) return false;
-        btn.click();
-        return true;
+        const visibleDialogs = candidates.filter((el) => {
+          if (el.offsetParent === null) return false;
+          if (
+            el.matches('[role="menu"], mat-menu-panel, [role="tooltip"]') ||
+            el.closest('[role="menu"], mat-menu-panel, [role="tooltip"]')
+          ) {
+            return false;
+          }
+          const text = (el.innerText || '').trim();
+          return text.length > 0;
+        });
+
+        if (!visibleDialogs.length) {
+          const backdrop = document.querySelector('.cdk-overlay-backdrop');
+          if (backdrop && backdrop.offsetParent !== null) {
+            const textbox = document.querySelector('div[contenteditable="true"][role="textbox"], textarea, input[type="text"]');
+            if (textbox) {
+              const r = textbox.getBoundingClientRect();
+              const cx = r.x + r.width / 2;
+              const cy = r.y + r.height / 2;
+              const elAtPoint = document.elementFromPoint(cx, cy);
+              if (elAtPoint && (elAtPoint === backdrop || backdrop.contains(elAtPoint) || elAtPoint.closest('.cdk-overlay-backdrop'))) {
+                return { type: 'backdrop-covers-input' };
+              }
+            }
+          }
+          return { type: 'none' };
+        }
+
+        const dlg = visibleDialogs[0];
+        const text = (dlg.innerText || '').trim();
+
+        // 1. Google consent wall: "Before you continue" / "До того как продолжить"
+        if (/before you continue|до того как продолжить/i.test(text)) {
+          const btns = Array.from(dlg.querySelectorAll('button, [role="button"], a'))
+            .filter((b) => b.offsetParent !== null);
+          const getBtnText = (b) => (b.innerText || '').trim();
+          const getAria = (b) => (b.getAttribute('aria-label') || '').trim();
+
+          const pick = (predicate) => btns.find((b) => predicate(getBtnText(b)) || predicate(getAria(b)));
+
+          // Order: exact Reject all -> any reject/отклонить -> exact Accept all/Принять все/всё -> any accept/принять -> I agree/Согласен
+          const rejectExact = pick((t) => /^reject all$/i.test(t));
+          const rejectAny = pick((t) => /reject|отклонить/i.test(t));
+          const acceptExact = pick((t) => /^(accept all|принять все|принять всё)$/i.test(t));
+          const acceptAny = pick((t) => /accept|принять/i.test(t));
+          const agree = pick((t) => /^(i agree|согласен)$/i.test(t) || /i agree|согласен/i.test(t));
+
+          const btn = rejectExact || rejectAny || acceptExact || acceptAny || agree;
+          if (btn) {
+            const btnText = (getBtnText(btn) || getAria(btn) || 'Consent button').trim();
+            btn.click();
+            return { type: 'dismissed', text, button: btnText };
+          }
+          return { type: 'unclosed', text };
+        }
+
+        // 2. Paid-tier upsell proposal
+        if (/сменить план|change (?:plan|subscription)|\/\s*мес|per month|\/month/i.test(text)) {
+          const btns = Array.from(dlg.querySelectorAll('button, [role="button"], a'))
+            .filter((b) => b.offsetParent !== null);
+          const negBtn = btns.find((b) =>
+            /не сейчас|not now|no thanks|maybe later/i.test(
+              ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '')).trim()
+            )
+          );
+          if (negBtn) {
+            const btnText = (negBtn.innerText || negBtn.getAttribute('aria-label') || '').trim();
+            negBtn.click();
+            return { type: 'dismissed', text, button: btnText };
+          }
+          // Promo with price without negative button
+          const textbox = document.querySelector('div[contenteditable="true"][role="textbox"], textarea, input[type="text"]');
+          let coversInput = false;
+          if (textbox) {
+            const r = textbox.getBoundingClientRect();
+            const cx = r.x + r.width / 2;
+            const cy = r.y + r.height / 2;
+            const elAtPoint = document.elementFromPoint(cx, cy);
+            if (elAtPoint && (elAtPoint === dlg || dlg.contains(elAtPoint) || elAtPoint.closest('.cdk-overlay-backdrop'))) {
+              coversInput = true;
+            }
+          }
+          if (coversInput) {
+            return { type: 'unclosed', text };
+          }
+          return { type: 'promo-kept', text };
+        }
+
+        // 3. Unknown dialog
+        return { type: 'unknown', text };
       });
-      if (!dismissed) break;
-      await page.waitForTimeout(600);
+    } catch (e) {
+      break;
     }
 
-    // 1. Google Cookie / Privacy Consent dialogs ("Before you continue to Google")
-    const consentBtn = await safeQuery(page,
-      'button:has-text("Accept all"), button:has-text("Принять все"), button:has-text("Принять всё"), [aria-label*="Accept all" i], button:has-text("I agree"), button:has-text("Согласен"), [aria-label*="I agree" i]'
-    );
-    if (consentBtn) {
-      const isVisible = await consentBtn.isVisible().catch(() => false);
-      if (isVisible) {
-        await consentBtn.click({ timeout: 5000 }).catch(() => {});
-        await page.waitForTimeout(400);
+    if (!outcome || outcome.type === 'none' || outcome.type === 'promo-kept') {
+      break;
+    }
+
+    if (outcome.type === 'dismissed') {
+      driverLog('driver:dialog', {
+        account,
+        text: outcome.text.slice(0, 300),
+        button: outcome.button,
+      });
+      await page.waitForTimeout(500);
+      continue;
+    }
+
+    if (outcome.type === 'backdrop-covers-input') {
+      if (!reloadedBackdrop) {
+        reloadedBackdrop = true;
+        if (typeof page.reload === 'function') {
+          await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+        }
+        driverLog('driver:dialog', { account, action: 'reload' });
+        await page.waitForTimeout(500);
+        continue;
       }
+      break;
     }
 
-    // 2. "Stay signed out" / "Dismiss" prompts
-    const staySignedOutBtn = await safeQuery(page,
-      'button:has-text("Stay signed out"), button:has-text("Не входить в аккаунт"), [aria-label*="Stay signed out" i], button:has-text("Dismiss"), button:has-text("No thanks"), button:has-text("Не сейчас"), button:has-text("Спасибо, не надо")'
-    );
-    if (staySignedOutBtn) {
-      const isVisible = await staySignedOutBtn.isVisible().catch(() => false);
-      if (isVisible) {
-        await staySignedOutBtn.click({ timeout: 5000 }).catch(() => {});
-        await page.waitForTimeout(300);
+    if (outcome.type === 'unclosed') {
+      const ts = Date.now();
+      try { fs.mkdirSync(screenshotDir, { recursive: true }); } catch {}
+      const shotPath = path.join(screenshotDir, `dialog-unclosed-${ts}.png`);
+      if (typeof page.screenshot === 'function') {
+        await page.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
       }
+      driverLog('driver:dialog-unclosed', {
+        account,
+        text: outcome.text.slice(0, 300),
+      });
+      const err = new Error('WEB_GEMINI_DIALOG_UNCLOSED: ' + outcome.text.slice(0, 120));
+      err.code = 'WEB_GEMINI_DIALOG_UNCLOSED';
+      err.dialogText = outcome.text;
+      err.screenshotPath = shotPath;
+      throw err;
     }
 
-    // 3. Onboarding / "Got it" / "Next" dialogs
-    const gotItBtn = await safeQuery(page,
-      'button:has-text("Got it"), button:has-text("Понятно"), [aria-label*="Got it" i], button:has-text("Done"), button:has-text("Готово"), [aria-label*="Done" i], button:has-text("Continue"), button:has-text("Продолжить")'
-    );
-    if (gotItBtn) {
-      const isVisible = await gotItBtn.isVisible().catch(() => false);
-      if (isVisible) {
-        await gotItBtn.click({ timeout: 5000 }).catch(() => {});
-        await page.waitForTimeout(300);
+    if (outcome.type === 'unknown') {
+      const ts = Date.now();
+      try { fs.mkdirSync(screenshotDir, { recursive: true }); } catch {}
+      const shotPath = path.join(screenshotDir, `dialog-unknown-${ts}.png`);
+      if (typeof page.screenshot === 'function') {
+        await page.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
       }
+      if (!isTurn) {
+        driverLog('driver:dialog', {
+          account,
+          action: 'unknown',
+          text: outcome.text.slice(0, 300),
+        });
+        break;
+      }
+      const err = new Error('unknown dialog: ' + outcome.text.slice(0, 120));
+      err.code = 'WEB_GEMINI_UNKNOWN_DIALOG';
+      err.dialogText = outcome.text;
+      err.screenshotPath = shotPath;
+      throw err;
     }
-
-    // 4. Any leftover CDK backdrop
-    const backdrop = await safeQuery(page, '.cdk-overlay-backdrop');
-    if (backdrop && (await backdrop.isVisible().catch(() => false))) {
-      await page.keyboard.press('Escape');
-      await page.waitForTimeout(200);
-    }
-  } catch {}
+  }
 }
 
 async function ensureSidebarOpen(page) {
@@ -3643,6 +4076,9 @@ module.exports = {
   findMetricRecords: usageLimits.findMetricRecords,
   readAccountsUsage: usageLimits.readAccountsUsage,
   updateAccountUsage: usageLimits.updateAccountUsage,
+  parseHNvQHb,
+  unwrapUrl,
+  isGoogleSearchUrl,
   usageLimits,
   profileManager,
   _setDriverHooks

@@ -761,8 +761,82 @@ export function collectUploadFiles(promptBlocks, s) {
 const DRIVER_TRANSIENT_RE =
   /timeout|timed out|waiting for selector|waiting failed|target (?:closed|crashed|destroyed)|session closed|protocol error|websocket|connection (?:closed|refused|reset)|net::err_|navigation (?:failed|timeout)|frame (?:was )?detached|execution context (?:was destroyed|is not available)|inspected target navigated|browser (?:has been |was )?closed|page crashed|econnrefused|econnreset|socket hang up|failed to become ready|did not start within/i;
 
+const dialogWaveHistory = [];
+export function checkDialogWave(dialogText, accountId, now = Date.now()) {
+  const text120 = String(dialogText || "").slice(0, 120).trim();
+  const windowMs = 30 * 60_000;
+  while (dialogWaveHistory.length > 0 && now - dialogWaveHistory[0].ts > windowMs) {
+    dialogWaveHistory.shift();
+  }
+  dialogWaveHistory.push({ text120, accountId, ts: now });
+  const accounts = new Set(
+    dialogWaveHistory
+      .filter((e) => e.text120 === text120 && e.accountId)
+      .map((e) => e.accountId)
+  );
+  const isWave = accounts.size >= 3;
+  if (isWave) {
+    slog("driver:dialog-wave", { text120, accountCount: accounts.size, accounts: Array.from(accounts) });
+    console.warn(`[web-gemini] Dialog wave detected across ${accounts.size} accounts for: ${text120}`);
+  }
+  return isWave;
+}
+export function _resetDialogWaveHistory() {
+  dialogWaveHistory.length = 0;
+}
+
+export function getThoughtsLogPath(stateDir, sessionId, tj = null) {
+  if (tj && tj.sessKey && tj.turn) {
+    const dir = journal.turnDir(stateDir, tj.sessKey, tj.turn.turnNo);
+    return join(dir, "thoughts.jsonl");
+  }
+  return join(stateDir, "sessions", sessionId, "thoughts.jsonl");
+}
+
+export function sanitizeThoughtPayload(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  const sanitized = Array.isArray(payload) ? [] : {};
+  for (const [k, v] of Object.entries(payload)) {
+    if (/cookie|token|auth|authorization|sid|f\.sid|f_sid|password|secret|bearer/i.test(k)) {
+      continue;
+    }
+    if (typeof v === "object" && v !== null) {
+      sanitized[k] = sanitizeThoughtPayload(v);
+    } else {
+      sanitized[k] = v;
+    }
+  }
+  return sanitized;
+}
+
+export function appendThoughtLog(filePath, eventType, payload) {
+  try {
+    mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+    const entry = JSON.stringify({
+      time: new Date().toISOString(),
+      event: eventType,
+      payload: sanitizeThoughtPayload(payload),
+    }) + "\n";
+    appendFileSync(filePath, entry, { mode: 0o600 });
+  } catch {}
+}
+
 export function classifyFailure(err, authHint = null) {
   const message = (err?.message || String(err || "")).trim();
+
+  // 0. unknown-dialog
+  if (
+    (err && (err.code === "WEB_GEMINI_UNKNOWN_DIALOG" || err.code === "ARGON_UNKNOWN_DIALOG" || err.code === "WEB_GEMINI_DIALOG_UNCLOSED")) ||
+    /unknown dialog/i.test(message)
+  ) {
+    return {
+      category: "unknown-dialog",
+      cooldownMs: 900_000,
+      untilMs: Date.now() + 900_000,
+      rotatable: true,
+      parkedReason: "unknown-dialog",
+    };
+  }
 
   // 1. auth-dead
   if (
@@ -1623,6 +1697,10 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
   const write = context?.write;
   const writer = context?.writer;
 
+  const streamThoughtsEnv = process.env.WEB_GEMINI_STREAM_THOUGHTS ?? process.env.ARGON_STREAM_THOUGHTS ?? "1";
+  const streamThoughtsEnabled = streamThoughtsEnv !== "0";
+  const thoughtsLogPath = getThoughtsLogPath(STATE_DIR, sessionId, tj);
+
   const persistJournal = (write = () => journal.saveTurn(STATE_DIR, tj.sessKey, tj.turn)) => {
     try {
       write();
@@ -2040,6 +2118,16 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 // что страница осталась тем же разговором.
                 verifyConversation: convVerify,
                 ...(fileCapture ? { fileCapture } : {}),
+                onThoughtChunk: (chunk) => {
+                  if (!chunk || s.cancelled || s.activeGen !== gen) return;
+                  appendThoughtLog(thoughtsLogPath, "thought", { text: chunk });
+                  if (streamThoughtsEnabled) {
+                    upd({
+                      sessionUpdate: "agent_thought_chunk",
+                      content: { type: "text", text: chunk },
+                    });
+                  }
+                },
                 onChunk: task ? null : (c) => {
                   if (c && !s.cancelled && s.activeGen === gen) {
                     streamedAny = true;
@@ -2050,10 +2138,82 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   }
                 },
               };
+              const openSearchToolCalls = [];
               let res;
               try {
                 res = await sendWebPrompt(request);
+                if (res?.search?.queries?.length) {
+                  let turnIdx = budgets?.toolRounds ?? 0;
+                  if (tj?.turn?.turnNo) turnIdx = tj.turn.turnNo;
+                  const activeConvId = res.convId || s.convId || sessionId;
+                  for (let qIdx = 0; qIdx < res.search.queries.length; qIdx++) {
+                    const q = res.search.queries[qIdx];
+                    const toolCallId = `call_${activeConvId}_${turnIdx}_${qIdx}`;
+                    openSearchToolCalls.push(toolCallId);
+                    if (streamThoughtsEnabled) {
+                      upd({
+                        sessionUpdate: "tool_call",
+                        toolCallId,
+                        kind: "search",
+                        title: `Google Search: ${q}`,
+                        status: "in_progress",
+                      });
+                    }
+                    appendThoughtLog(thoughtsLogPath, "tool_call", {
+                      toolCallId,
+                      query: q,
+                      status: "in_progress",
+                    });
+
+                    if (res.search.status === 4) {
+                      if (streamThoughtsEnabled) {
+                        upd({
+                          sessionUpdate: "tool_call_update",
+                          toolCallId,
+                          status: "completed",
+                          content: res.search.sources?.map((src) => ({
+                            type: "resource_link",
+                            uri: src.url,
+                            name: src.title,
+                          })) || [],
+                        });
+                      }
+                      appendThoughtLog(thoughtsLogPath, "tool_call_update", {
+                        toolCallId,
+                        status: "completed",
+                        sources: res.search.sources || [],
+                      });
+                    } else {
+                      if (streamThoughtsEnabled) {
+                        upd({
+                          sessionUpdate: "tool_call_update",
+                          toolCallId,
+                          status: "failed",
+                        });
+                      }
+                      appendThoughtLog(thoughtsLogPath, "tool_call_update", {
+                        toolCallId,
+                        status: "failed",
+                      });
+                    }
+                    openSearchToolCalls.pop();
+                  }
+                }
               } catch (error) {
+                for (const toolCallId of openSearchToolCalls) {
+                  if (streamThoughtsEnabled) {
+                    upd({
+                      sessionUpdate: "tool_call_update",
+                      toolCallId,
+                      status: "failed",
+                    });
+                  }
+                  appendThoughtLog(thoughtsLogPath, "tool_call_update", {
+                    toolCallId,
+                    status: "failed",
+                  });
+                }
+                openSearchToolCalls.length = 0;
                 if (task && (error.code === "WEB_GEMINI_STALLED" || error.code === "ARGON_STALLED" || /generation stalled|stalled generation/i.test(error?.message || ""))) {
                   budgets.contextBytes = Math.max(0, budgets.contextBytes - outboundBytes);
                   persistJournal();
@@ -2227,7 +2387,14 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   final = { repair: checked.repair ?? checked.recapture, plan: checked.plan };
                   recordFirstResponse({ outcome: "rejected", code: checked.code ?? "unknown" });
                 } else final = checkedAnswer(context, candidate);
-                if (final.text !== undefined) return { text: final.text };
+                if (final.text !== undefined) {
+                  let text = final.text;
+                  if (context.research && !write && !context.verdict && candidate?.search?.sources?.length) {
+                    const list = candidate.search.sources.map((s) => `* [${s.title}](${s.url})`).join("\n");
+                    text = text.trimEnd() + "\n\n### Источники поиска\n" + list;
+                  }
+                  return { text };
+                }
                 if (final.denied) throw new TaskTurnError(final.denied);
                 if ((budgets.repairRounds ?? 0) >= maxRepairRounds) throw new TaskTurnError(final.repair);
                 task.ping("request_more");
@@ -2357,6 +2524,23 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           }
           const hint = await (task ? Promise.race([probeAuthHint(backend), task.aborted.then(() => null)]) : probeAuthHint(backend));
           const cls = classifyFailure(err, hint);
+          if (cls.category === "unknown-dialog") {
+            const isPinned = Boolean(s.convId || streamedAny);
+            const dialogText = err.dialogText || err.message || "";
+            const isWave = checkDialogWave(dialogText, backend.id);
+            if (isWave) {
+              cls.untilMs = 0;
+              cls.parkedReason = null;
+            }
+            if (isPinned) {
+              cls.untilMs = 0;
+              cls.parkedReason = null;
+              cls.rotatable = false;
+              const text120 = String(dialogText).slice(0, 120);
+              err = new Error("unknown dialog: " + text120);
+              err.code = "WEB_GEMINI_UNKNOWN_DIALOG";
+            }
+          }
           const cooled = await settleBackend(backend.id, sessionId, cls.untilMs, task ? "task request failed" : hint || err.message, cls.parkedReason, cls.lockedModel);
           activeBackendId = null;
           activeAbort = null;
