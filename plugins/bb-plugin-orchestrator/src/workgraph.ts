@@ -33,6 +33,7 @@ import {
   resolvePresetBaseBranch,
   resolveTaskSpecContract,
   parseContractFromText,
+  resolveEffectiveApprovalMode,
   type SpecContract,
 } from "./spec-gate.js";
 import {
@@ -3957,6 +3958,7 @@ export interface RunQueueDeps {
   resolveProject?: (
     projectId: string,
   ) => Promise<ResolvedProject | null> | ResolvedProject | null;
+  approvalMode?: "auto" | "manual" | null;
   getThread?: (threadId: string) => Promise<{ status?: string } | null>;
   stopThread?: (threadId: string) => Promise<void>;
   dispatchNode?: (
@@ -4483,6 +4485,7 @@ export async function runRunQueue(
               workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               project: proj,
+              approvalMode: deps.approvalMode,
               task: t,
               payload,
             });
@@ -4672,6 +4675,7 @@ export async function runRunQueue(
               workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               project: proj,
+              approvalMode: deps.approvalMode,
               task: t,
               payload,
             });
@@ -4749,6 +4753,7 @@ async function dispatchTaskNode(
       workGraphMode: taskMode,
       policy: deps.policy,
       project: proj,
+      approvalMode: deps.approvalMode,
       task,
     });
   }
@@ -4765,6 +4770,12 @@ async function startQueuedTask(
   const normKey = normalizeTaskKey(task.task_key);
   const payload = parsePayload(task.payload);
   const now = deps.now ? deps.now() : Date.now();
+  const effectiveMode =
+    resolveEffectiveApprovalMode({
+      taskConfirmationMode: task.confirmation_mode,
+      approvalMode: deps.approvalMode,
+      route: task.route,
+    }) ?? (task.route === "feature" ? "manual" : "auto");
 
   let branch = task.branch;
   if (task.route !== "research") {
@@ -4817,7 +4828,7 @@ async function startQueuedTask(
               node: "start",
               status: "queued",
               event: { type: "queue_take", branchExistsWithCommits: true, branch },
-              mode: task.confirmation_mode,
+              mode: effectiveMode,
               counters: extractCounters(task),
             });
             const tr = deps.store.transitionTask({
@@ -4856,7 +4867,7 @@ async function startQueuedTask(
             node: "start",
             status: "queued",
             event: { type: "git_failure", reason, gitError: reason },
-            mode: task.confirmation_mode,
+            mode: effectiveMode,
             counters: extractCounters(task),
           });
           if (!failTr.allowed) {
@@ -4885,7 +4896,7 @@ async function startQueuedTask(
     node: "start",
     status: "queued",
     event: { type: "queue_take" },
-    mode: task.confirmation_mode,
+    mode: effectiveMode,
     counters: extractCounters(task),
   });
 
@@ -4904,7 +4915,7 @@ async function startQueuedTask(
           node: "start",
           status: "queued",
           event: { type: "git_failure", reason },
-          mode: task.confirmation_mode,
+          mode: effectiveMode,
           counters: extractCounters(task),
         });
         if (!failTr.allowed) {
@@ -5106,7 +5117,7 @@ async function startQueuedTask(
   // ONLY if explicit and valid acceptance contract text was provided
   if (
     (task.route === "fix" || task.route === "simple") &&
-    task.confirmation_mode === "auto"
+    effectiveMode === "auto"
   ) {
     const existingContract = deps.store.getSpecContract(task.task_key);
     if (!existingContract?.approval_id && payload.acceptance_text) {
@@ -5187,6 +5198,7 @@ async function startQueuedTask(
         workGraphMode: taskMode,
         policy: deps.policy,
         project: proj,
+        approvalMode: deps.approvalMode,
         task: { ...task, payload: JSON.stringify(cleanedPayload), acceptance_sha: acceptanceSha },
         payload: cleanedPayload,
       });

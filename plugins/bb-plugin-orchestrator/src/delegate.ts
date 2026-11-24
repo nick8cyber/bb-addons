@@ -267,6 +267,7 @@ export interface DelegateDeps {
   resolveProject?: (
     projectId: string,
   ) => Promise<ResolvedProject | null> | ResolvedProject | null;
+  approvalMode?: "auto" | "manual" | (() => "auto" | "manual" | null) | null;
 }
 
 /**
@@ -305,6 +306,7 @@ export interface DispatchStepsDeps {
   resolveProject?: (
     projectId: string,
   ) => Promise<ResolvedProject | null> | ResolvedProject | null;
+  approvalMode?: "auto" | "manual" | (() => "auto" | "manual" | null) | null;
 }
 
 export interface DispatchStepsResult {
@@ -751,6 +753,7 @@ export async function runDelegate(
       baseBranchName: presetBaseBranch,
       presetName,
       workGraphMode: mode,
+      approvalMode: deps.approvalMode,
       specBeforeCode: params.specBeforeCode,
       repoRoot: deps.repoRoot,
       task: taskRow ?? undefined,
@@ -1166,6 +1169,7 @@ export async function dispatchToRoute(
         baseBranchName: presetBaseBranch,
         presetName,
         workGraphMode: mode,
+        approvalMode: deps.approvalMode,
         specBeforeCode: opts.specBeforeCode,
         repoRoot: taskRepoRoot,
         task: taskRow,
