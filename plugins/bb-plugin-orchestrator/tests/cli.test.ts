@@ -191,6 +191,66 @@ test("CLI delegate without a calling thread is refused", async () => {
   assert.equal(body.error.code, "no-caller-thread");
 });
 
+test("PLUG-406 r2: CLI worktree create --target must be a non-empty branch name", async () => {
+  const host = await hostWith(
+    {},
+    fakeCli().cli,
+    {
+      threads: {
+        get: async () => ({
+          id: "thr_coord",
+          parentThreadId: null,
+          title: "coordinator",
+          titleFallback: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        }),
+      },
+    },
+  );
+  const res = await host.harness.runCli(
+    ["worktree", "create", "--target", "", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(res.exitCode, 1);
+  const body = JSON.parse(res.stdout) as {
+    ok: boolean;
+    error: { code: string };
+  };
+  assert.equal(body.ok, false);
+  assert.equal(body.error.code, "invalid-arguments");
+});
+
+test("PLUG-406 r2: CLI worktree create --target refuses option-like branch names", async () => {
+  const host = await hostWith(
+    {},
+    fakeCli().cli,
+    {
+      threads: {
+        get: async () => ({
+          id: "thr_coord",
+          parentThreadId: null,
+          title: "coordinator",
+          titleFallback: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        }),
+      },
+    },
+  );
+  const res = await host.harness.runCli(
+    ["worktree", "create", "--target", "-bad-branch", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(res.exitCode, 1);
+  const body = JSON.parse(res.stdout) as {
+    ok: boolean;
+    error: { code: string };
+  };
+  assert.equal(body.ok, false);
+  assert.equal(body.error.code, "invalid-arguments");
+});
+
 test("CLI delegate end-to-end through the fake host", async () => {
   const { cli, calls } = fakeCli();
   const updates: unknown[] = [];
