@@ -2093,6 +2093,9 @@ test("research-пакет не обрезает Preset/Additional instructions �
     "## Description",
     "Основное описание.",
     "",
+    "## Report-back contract",
+    "Служебный раздел контракта, который должен быть отсечён.",
+    "",
     "## Preset instructions",
     "Вводная часть пресета.",
     "## Авторский подраздел в пресете",
@@ -2103,9 +2106,6 @@ test("research-пакет не обрезает Preset/Additional instructions �
     "Вводная часть дополнительных инструкций.",
     "## Авторский подраздел в дополнительных",
     "Содержимое авторского подраздела дополнительных инструкций.",
-    "",
-    "## Report-back contract",
-    "Служебный раздел контракта, который должен быть отсечён.",
   ].join("\n");
 
   const prep = await prepareTask({
@@ -2364,7 +2364,7 @@ test("research-пакет: цитирование ## Additional instructions и 
   assert.doesNotMatch(packed.message, /Recent comments/);
 });
 
-test("research-режим: пропускает вложения трекера (attachments = []) и не скачивает их (PLUG-404)", async (t) => {
+test("research-режим: пропускает вложения трекера в лёгком режиме, скачивает при research с записью (PLUG-404)", async (t) => {
   const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
   const tmp = mkdtempSync(join(tmpdir(), "web-gemini-tracker-skip-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -2392,8 +2392,11 @@ test("research-режим: пропускает вложения трекера 
   });
 
   assert.equal(prep.research, true);
-  assert.deepEqual(prep.attachments, [], "В research-режиме attachments должен быть пустым массивом");
-  assert.deepEqual(prep.attachmentOmissions, [], "В research-режиме attachmentOmissions должен быть пустым массивом");
+  // Вложения трекера парсятся всегда, так как write на момент prepareTask ещё не известен
+  assert.equal(prep.attachments.length, 1);
+  assert.equal(prep.attachments[0].name, "test-attachment.md");
+  assert.equal(prep.attachments[0].id, "01M85QQVY9XWZPR2HK6JAXAVE1");
+  assert.deepEqual(prep.attachmentOmissions, []);
 
   const nonResearchText = taskText.replace("задача без кода: не менять файлы\n", "");
   const prepNonResearch = await prepareTask({
@@ -2418,13 +2421,88 @@ test("research-режим: пропускает вложения трекера 
     validateUploads: () => ({ files: [] }),
   };
 
+  // Лёгкий research-режим (без write): ничего не скачано, omitted пуст по ним
   const materials = await collectTaskAttachments(prep, [], packageOptions);
   assert.equal(materials.length, 0);
 
   const collected = await collectTask(prep, [], materials, packageOptions);
+  assert.deepEqual(collected.omitted.filter((o) => o.source.includes("Tracker attachment")), []);
   const packed = packTask(prep, collected, packageOptions);
   assert.doesNotMatch(packed.message, /test-attachment\.md/);
   assert.doesNotMatch(packed.message, /01M85QQVY9XWZPR2HK6JAXAVE1/);
+
+  // Случай research с записью (context.write = { allowedPaths: [] }): вложение парсится и попадает в materials
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    '    attachments: [{ id: "01M85QQVY9XWZPR2HK6JAXAVE1", fileName: "test-attachment.md" }],\n' +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    '  const outIdx = args.indexOf("--out");\n' +
+    '  writeFileSync(args[outIdx + 1], "Tracker attachment content for research-write\\n");\n' +
+    "} else {\n" +
+    "  process.exit(1);\n" +
+    "}\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const prepWithWrite = {
+      ...prep,
+      write: { allowedPaths: [] },
+    };
+    const writeMaterials = await collectTaskAttachments(prepWithWrite, [], packageOptions);
+    assert.equal(writeMaterials.length, 1);
+    assert.equal(writeMaterials[0].source, "Tracker attachment");
+    assert.equal(writeMaterials[0].name, "test-attachment.md");
+    assert.ok(writeMaterials[0].text.includes("Tracker attachment content for research-write"));
+  } finally {
+    if (oldCli !== undefined) {
+      process.env.BB_CLI = oldCli;
+    } else {
+      delete process.env.BB_CLI;
+    }
+  }
+});
+
+test("buildCleanResearchPackage: цитата ## Preset instructions в Recent comments со строкой СЕКРЕТНЫЙ КОММЕНТАРИЙ не попадает в пакет без Preset (PLUG-404)", async (t) => {
+  const { buildCleanResearchPackage } = await import("../src/inner-context.mjs");
+  const taskText = [
+    "# PLUG-404 · research: цитата в комментариях",
+    "",
+    "## Description",
+    "Основное описание задачи исследования.",
+    "",
+    "## Project context",
+    "Контекст проекта BB Plugins.",
+    "",
+    "## Recent comments",
+    "### user · 2026-11-24",
+    "Посмотри цитату:",
+    "## Preset instructions",
+    "СЕКРЕТНЫЙ КОММЕНТАРИЙ",
+    "",
+    "## Report-back contract",
+    "Отчитайся о результате через bb tasks.",
+    "",
+    "## Additional instructions",
+    "Инструкции координатора: факты с датами.",
+  ].join("\n");
+
+  const pkg = buildCleanResearchPackage({ text: taskText });
+  assert.ok(!pkg.includes("СЕКРЕТНЫЙ КОММЕНТАРИЙ"), "СЕКРЕТНЫЙ КОММЕНТАРИЙ не должен попадать в пакет");
+  assert.ok(!pkg.includes("Preset instructions"), "Заголовок Preset instructions не должен появляться без настоящего раздела");
+  assert.ok(pkg.includes("Основное описание задачи исследования."));
+  assert.ok(pkg.includes("Инструкции координатора: факты с датами."));
+  assert.doesNotMatch(pkg, /Recent comments/);
+  assert.doesNotMatch(pkg, /Report-back contract/);
 });
 
 test("research-пакет: при запрещённом материале повторный запрос отправляет короткое 'Удали запрещённый к публикации материал...' (PLUG-404)", async (t) => {

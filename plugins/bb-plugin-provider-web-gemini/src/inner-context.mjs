@@ -193,20 +193,18 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
       additional.some((line) => NO_CODE.test(line)) || RESEARCHER.test(system ?? ""));
   const attachments = [];
   const attachmentOmissions = [];
-  if (!research) {
-    const pairMatches = [...text.matchAll(/(?:^|\n)## Attachments[ \t]*\r?\n((?:(?!##[ \t])[^\n]*\r?\n)*?)(?=## Recent comments[ \t]*(?:\r?\n|$))/g)];
-    const attachmentRows = pairMatches.length
-      ? pairMatches.at(-1)[1].split(/\r?\n/)
-      : section(text, /^## Attachments[ \t]*$/, { last: true });
-    for (const line of attachmentRows) {
-      if (!line.startsWith("- ")) continue;
-      const match = TRACKER_ATTACHMENT.exec(line);
-      if (!match) {
-        attachmentOmissions.push({ line, reason: "malformed tracker attachment entry" });
-        continue;
-      }
-      attachments.push({ name: match[1], id: match[2] });
+  const pairMatches = [...text.matchAll(/(?:^|\n)## Attachments[ \t]*\r?\n((?:(?!##[ \t])[^\n]*\r?\n)*?)(?=## Recent comments[ \t]*(?:\r?\n|$))/g)];
+  const attachmentRows = pairMatches.length
+    ? pairMatches.at(-1)[1].split(/\r?\n/)
+    : section(text, /^## Attachments[ \t]*$/, { last: true });
+  for (const line of attachmentRows) {
+    if (!line.startsWith("- ")) continue;
+    const match = TRACKER_ATTACHMENT.exec(line);
+    if (!match) {
+      attachmentOmissions.push({ line, reason: "malformed tracker attachment entry" });
+      continue;
     }
+    attachments.push({ name: match[1], id: match[2] });
   }
   return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions, key, thread: thread.thread, research };
 }
@@ -475,8 +473,10 @@ export async function collectTask(context, blocks, materials, options) {
     }
     add(source, text, { name, at, delivery });
   }
-  for (const item of context.attachmentOmissions) {
-    omit("Tracker attachment: " + item.line, item.reason);
+  if (!isLightResearch) {
+    for (const item of context.attachmentOmissions) {
+      omit("Tracker attachment: " + item.line, item.reason);
+    }
   }
 
   const linkSourceText = isLightResearch ? buildCleanResearchPackage(context) : context.text;
@@ -571,8 +571,11 @@ export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) 
 
   const descText = lines.slice(descIdx + 1, firstServiceIdx).join("\n").trim();
 
+  const reportBackIdx = lines.findLastIndex((l) => l.replace(/[ \t\r]+$/, "") === "## Report-back contract");
+  const isAfterBoundary = (idx) => (reportBackIdx !== -1 ? idx > reportBackIdx : idx >= firstServiceIdx);
+
   let addText = "";
-  const addIdx = lines.findLastIndex((l, idx) => idx >= firstServiceIdx && l.replace(/[ \t\r]+$/, "") === "## Additional instructions");
+  const addIdx = lines.findLastIndex((l, idx) => isAfterBoundary(idx) && l.replace(/[ \t\r]+$/, "") === "## Additional instructions");
   if (addIdx !== -1) {
     const nextIdx = lines.findIndex((l, idx) => idx > addIdx && isServiceHeading(l));
     const rawAdd = lines.slice(addIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
@@ -581,7 +584,7 @@ export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) 
 
   let presetText = "";
   const presetLimit = addIdx !== -1 ? addIdx : lines.length;
-  const presetIdx = lines.findLastIndex((l, idx) => idx >= firstServiceIdx && idx < presetLimit && l.replace(/[ \t\r]+$/, "") === "## Preset instructions");
+  const presetIdx = lines.findLastIndex((l, idx) => isAfterBoundary(idx) && idx < presetLimit && l.replace(/[ \t\r]+$/, "") === "## Preset instructions");
   if (presetIdx !== -1) {
     const nextIdx = lines.findIndex((l, idx) => idx > presetIdx && isServiceHeading(l));
     const rawPreset = lines.slice(presetIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
