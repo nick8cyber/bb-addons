@@ -1412,11 +1412,11 @@ export function packFirstMessage({
   if (completePackage) {
     const { header, render } = completePackage;
     let payload = render("text");
-    let message = header + "\n\n" + payload;
+    let message = header ? header + "\n\n" + payload : payload;
     if (Buffer.byteLength(message) <= maxBytes) return { message, payload };
     payload = render("spill attachment");
     const { pkgName, pkgPath } = writeSpillPackage(spillDir, spillId, payload);
-    message = header + "\n\nRead the entire task and its manifest in the attached " + pkgName + ".";
+    message = header ? header + "\n\nRead the entire task and its manifest in the attached " + pkgName + "." : "Read the entire task in the attached " + pkgName + ".";
     return { message, payload, spilledFile: pkgPath };
   }
   const seen = new Set();

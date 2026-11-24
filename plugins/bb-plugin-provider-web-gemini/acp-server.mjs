@@ -1822,7 +1822,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             task.packageSha256 = task.resume.pkg.packageSha256;
             slog("task:package-resume", { sessionId, packageSha256: task.packageSha256, turnNo: tj.turn.turnNo });
           } else {
-            packageOptions = { ...taskAttachmentOptions(s, task), limit: messageLimit, reserveBytes: write ? FILE_CAPTURE_MARKER_BYTES : 0 };
+            packageOptions = { ...taskAttachmentOptions(s, task), limit: messageLimit, reserveBytes: write ? FILE_CAPTURE_MARKER_BYTES : 0, isFirstTurn: !s.convId };
             const materials = attachments.materials ?? await collectTaskAttachments(context, attachments.blocks, packageOptions);
             tj.turn.taskSha256 = taskInputSha256(tj.turn.inputBlocksSha256, materials);
             tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
@@ -2121,55 +2121,63 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               slog("driver:done", { sessionId, convId: s.convId || null, streamedAny });
               return res;
             };
-            let toolSeq = 0;
-            const loop = await webTools.runToolLoop({
-              firstMessage: task ? (resumedConv ? [task.resume.instruction, write ? contract : ""].filter(Boolean).join("\n\n") : packed.message)
-                : s.convId ? text : packed.message,
-              send: sendOnce,
-              execute: (call) => task ? taskTool(context, collected, call, toolLimit, task.signal) : webTools.executeTool(call, { cwd: s.cwd }),
-              onToolRound: task ? (_round, forcedFinal) => {
-                if (!forcedFinal) {
-                  budgets.toolRounds = (budgets.toolRounds ?? 0) + 1;
-                  persistJournal();
-                }
-                task.ping("request_more");
-              } : null,
-              ...(task ? {
-                formatResult: (call, result) => {
-                  const formatted = formatTaskToolResult(context, call, result);
-                  recordExchange({ kind: "tool-result", name: call.name, ok: result.ok !== false, text: formatted });
-                  return formatted;
+            let loop;
+            if (task && context.research && !write) {
+              const firstMessage = resumedConv ? [task.resume.instruction, write ? contract : ""].filter(Boolean).join("\n\n") : packed.message;
+              const res = await sendOnce(firstMessage);
+              const raw = typeof res?.rawText === "string" && res.rawText.trim() ? res.rawText : null;
+              loop = { cancelled: false, forcedFinal: false, finalText: String(raw ?? res?.text ?? res ?? ""), rounds: 1, executed: [], lastRes: res };
+            } else {
+              let toolSeq = 0;
+              loop = await webTools.runToolLoop({
+                firstMessage: task ? (resumedConv ? [task.resume.instruction, write ? contract : ""].filter(Boolean).join("\n\n") : packed.message)
+                  : s.convId ? text : packed.message,
+                send: sendOnce,
+                execute: (call) => task ? taskTool(context, collected, call, toolLimit, task.signal) : webTools.executeTool(call, { cwd: s.cwd }),
+                onToolRound: task ? (_round, forcedFinal) => {
+                  if (!forcedFinal) {
+                    budgets.toolRounds = (budgets.toolRounds ?? 0) + 1;
+                    persistJournal();
+                  }
+                  task.ping("request_more");
+                } : null,
+                ...(task ? {
+                  formatResult: (call, result) => {
+                    const formatted = formatTaskToolResult(context, call, result);
+                    recordExchange({ kind: "tool-result", name: call.name, ok: result.ok !== false, text: formatted });
+                    return formatted;
+                  },
+                } : {}),
+                ...(write ? { toolText: (text) => fileEnvelope.isFileToolReply(text) ? text : "" } : {}),
+                onToolStart: (call) => {
+                  const toolCallId = task ? "gemini-read-" + randomUUID() : "argtool-" + (++toolSeq);
+                  upd({
+                    sessionUpdate: "tool_call",
+                    toolCallId,
+                    title: task ? context.settings.mask(webTools.toolTitle(call)) : webTools.toolTitle(call),
+                    kind: webTools.toolKind(call.name),
+                    status: "in_progress",
+                    ...(task ? {} : { rawInput: { name: call.name, args: call.args } }),
+                  });
+                  return toolCallId;
                 },
-              } : {}),
-              ...(write ? { toolText: (text) => fileEnvelope.isFileToolReply(text) ? text : "" } : {}),
-              onToolStart: (call) => {
-                const toolCallId = task ? "gemini-read-" + randomUUID() : "argtool-" + (++toolSeq);
-                upd({
-                  sessionUpdate: "tool_call",
-                  toolCallId,
-                  title: task ? context.settings.mask(webTools.toolTitle(call)) : webTools.toolTitle(call),
-                  kind: webTools.toolKind(call.name),
-                  status: "in_progress",
-                  ...(task ? {} : { rawInput: { name: call.name, args: call.args } }),
-                });
-                return toolCallId;
-              },
-              onToolEnd: (toolCallId, call, r) => {
-                upd({
-                  sessionUpdate: "tool_call_update",
-                  toolCallId,
-                  status: r.ok ? "completed" : "failed",
-                  content: [
-                    {
-                      type: "content",
-                      content: { type: "text", text: String(r.output ?? "").slice(0, 2000) },
-                    },
-                  ],
-                });
-              },
-              maxRounds: Math.max(0, maxToolRounds - (budgets?.toolRounds ?? 0)),
-              isCancelled: () => s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted,
-            });
+                onToolEnd: (toolCallId, call, r) => {
+                  upd({
+                    sessionUpdate: "tool_call_update",
+                    toolCallId,
+                    status: r.ok ? "completed" : "failed",
+                    content: [
+                      {
+                        type: "content",
+                        content: { type: "text", text: String(r.output ?? "").slice(0, 2000) },
+                      },
+                    ],
+                  });
+                },
+                maxRounds: Math.max(0, maxToolRounds - (budgets?.toolRounds ?? 0)),
+                isCancelled: () => s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted,
+              });
+            }
             if (loop.cancelled) {
               const e = new Error("prompt cancelled by user");
               e.code = "ARGON_CANCELLED";
