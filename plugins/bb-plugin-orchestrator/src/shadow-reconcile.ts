@@ -748,6 +748,8 @@ export interface AdoptInput {
   approvalMode?: "auto" | "manual" | null;
   policy?: Policy | null;
   now?: number;
+  /** §32.5.4 п. 3: переоткрытие закрытой записи (задача открыта в трекере) */
+  reopen?: boolean;
 }
 
 export function shadowAdopt(store: DelegationStore, input: AdoptInput): TaskQueueRow | null {
@@ -777,6 +779,7 @@ export function shadowAdopt(store: DelegationStore, input: AdoptInput): TaskQueu
     origin: SHADOW_ADOPT_ORIGIN,
     adopted_delegation_id: input.delegationId ?? null,
     project_id: input.projectId,
+    ...(input.reopen ? { reopened: true } : {}),
     mirror: { dispatched: true, last_verdict: {} } satisfies MirrorState,
   };
   return store.adoptTask(
@@ -792,6 +795,7 @@ export function shadowAdopt(store: DelegationStore, input: AdoptInput): TaskQueu
       branch: route === "research" ? null : (input.branch ?? null),
       payload: JSON.stringify(payload),
       command: "delegate",
+      reasonPrefix: input.reopen ? "shadow-reopen" : "shadow-adopt",
       transitionPayload: JSON.stringify({
         event: "manual_command",
         command: "delegate",
@@ -830,22 +834,87 @@ export function recordTaskNotEnqueued(
   });
 }
 
-/** Ручная раздача: приём или следование. Только `shadow`; release-audit и помощники — молчание. */
+/**
+ * §32.5.4 п. 3: действие по закрытой записи (`done`/`cancelled`), которое
+ * её не переоткрывает: запись не меняется, одна строка с маркерами `none`.
+ */
+export function recordClosedTaskAction(
+  store: DelegationStore,
+  taskKey: string,
+  command: string,
+  opts: {
+    delegationId?: number | null;
+    projectId?: string | null;
+    trackerStatus?: string | null;
+    now?: number;
+  } = {},
+): void {
+  store.insertTransition({
+    taskKey: normalizeTaskKey(taskKey),
+    fromNode: "none",
+    toNode: "none",
+    fromStatus: "none",
+    toStatus: "none",
+    actor: "shadow:coordinator",
+    reason: "closed-task-action",
+    payload: JSON.stringify({
+      event: "manual_command",
+      command,
+      delegation_id: opts.delegationId ?? null,
+      ...(opts.projectId ? { project_id: opts.projectId } : {}),
+      ...(opts.trackerStatus !== undefined ? { tracker_status: opts.trackerStatus } : {}),
+    }),
+    ...(opts.now !== undefined ? { createdAt: opts.now } : {}),
+  });
+}
+
+/** Задача в трекере открыта: статус известен и не конечный. */
+export function trackerStatusIsOpen(raw: string | null | undefined): boolean {
+  return typeof raw === "string" && raw.trim() !== "" && normalizeTrackerStatus(raw) === null;
+}
+
+/**
+ * Ручная раздача: приём, переоткрытие или следование. Только `shadow`;
+ * release-audit и помощники — молчание.
+ *
+ * `trackerStatus` — статус задачи в трекере на момент действия; нужен только
+ * для закрытой записи (§32.5.4 п. 3): открыта в трекере — запись
+ * переоткрывается (`shadow-reopen:delegate`), закрыта или статус неизвестен —
+ * запись не меняется, пишется `closed-task-action`.
+ */
 export function shadowObserveDelegate(
   store: DelegationStore,
-  input: AdoptInput & { mode: WorkGraphMode | null | undefined },
-): { kind: "adopted" | "followed" | "not-enqueued" | "silent"; verdict?: ShadowVerdict } {
+  input: AdoptInput & {
+    mode: WorkGraphMode | null | undefined;
+    trackerStatus?: string | null;
+  },
+): {
+  kind: "adopted" | "reopened" | "closed-action" | "followed" | "silent";
+  verdict?: ShadowVerdict;
+} {
   if (input.mode !== "shadow") return { kind: "silent" };
   if (input.level === "release-audit") return { kind: "silent" };
+  // без проекта `task-not-enqueued` уже записала проверка до действия
+  // (§32.5.1 п. 6: одна строка на действие)
+  if (!input.projectId) return { kind: "silent" };
   const key = normalizeTaskKey(input.taskKey);
   const task = store.getTask(key);
-  if (!task || task.status === "done" || task.status === "cancelled") {
-    if (!input.projectId) {
-      recordTaskNotEnqueued(store, key, "delegate", null, input.now);
-      return { kind: "not-enqueued" };
-    }
+  if (!task) {
     const adopted = shadowAdopt(store, input);
     return adopted ? { kind: "adopted" } : { kind: "silent" };
+  }
+  if (task.status === "done" || task.status === "cancelled") {
+    if (trackerStatusIsOpen(input.trackerStatus)) {
+      const reopened = shadowAdopt(store, { ...input, reopen: true });
+      return reopened ? { kind: "reopened" } : { kind: "silent" };
+    }
+    recordClosedTaskAction(store, key, "delegate", {
+      delegationId: input.delegationId ?? null,
+      projectId: input.projectId,
+      trackerStatus: input.trackerStatus ?? null,
+      now: input.now,
+    });
+    return { kind: "closed-action" };
   }
   const res = shadowFollow(
     store,
@@ -861,7 +930,11 @@ export function shadowObserveDelegate(
   return { kind: "followed", verdict: res.verdict };
 }
 
-/** Ручной merge: следование для задачи в очереди, иначе `task-not-enqueued`. */
+/**
+ * Ручной merge: следование для задачи в очереди. Задачи вне очереди —
+ * молчание: `task-not-enqueued` уже записала проверка до действия
+ * (assertGraphAllowsDirectAction), вторая строка завысила бы долю в отчёте.
+ */
 export function shadowObserveMerge(
   store: DelegationStore,
   input: {
@@ -872,14 +945,11 @@ export function shadowObserveMerge(
     policy?: Policy | null;
     now?: number;
   },
-): { kind: "followed" | "not-enqueued" | "silent"; verdict?: ShadowVerdict } {
+): { kind: "followed" | "silent"; verdict?: ShadowVerdict } {
   if (input.mode !== "shadow") return { kind: "silent" };
   const key = normalizeTaskKey(input.taskKey);
   const task = store.getTask(key);
-  if (!task) {
-    recordTaskNotEnqueued(store, key, "merge", input.projectId, input.now);
-    return { kind: "not-enqueued" };
-  }
+  if (!task) return { kind: "silent" };
   if (task.status === "done" || task.status === "cancelled") return { kind: "silent" };
   const res = shadowFollow(
     store,
@@ -1101,6 +1171,11 @@ export async function syncShadowTerminalStatuses(
     /** минимальный интервал между запросами трекера по одной задаче */
     minIntervalMs?: number;
     lastChecked?: Map<string, number>;
+    /**
+     * Записи, которые проверяются без пропуска по интервалу: те, что
+     * `run-queue` сейчас будет оценивать (§32.5.4 п. 2).
+     */
+    forceKeys?: ReadonlySet<string>;
   },
 ): Promise<{ checked: number; synced: { taskKey: string; status: "done" | "cancelled" }[] }> {
   const synced: { taskKey: string; status: "done" | "cancelled" }[] = [];
@@ -1111,7 +1186,8 @@ export async function syncShadowTerminalStatuses(
     const now = deps.now?.() ?? Date.now();
     if (deps.minIntervalMs && deps.lastChecked) {
       const last = deps.lastChecked.get(task.task_key);
-      if (last !== undefined && now - last < deps.minIntervalMs) continue;
+      const forced = deps.forceKeys?.has(task.task_key) ?? false;
+      if (!forced && last !== undefined && now - last < deps.minIntervalMs) continue;
       deps.lastChecked.set(task.task_key, now);
     }
     let raw: string | null | undefined;
@@ -1218,6 +1294,14 @@ export interface ShadowReportEntry {
   transitionId: number;
 }
 
+export interface ShadowClosedActionEntry {
+  taskKey: string;
+  command: string;
+  delegationId: number | null;
+  at: number;
+  transitionId: number;
+}
+
 export interface ShadowProjectReport {
   projectId: string;
   mode: WorkGraphMode | "unknown";
@@ -1227,6 +1311,14 @@ export interface ShadowProjectReport {
   shares: Record<"match" | "repeat" | "skip" | "unmapped", number>;
   manualActions: number;
   adopted: number;
+  /** §32.5.4 п. 3: переоткрытия закрытых записей (`shadow-reopen:*`) */
+  reopened: number;
+  /**
+   * §32.5.4 п. 3: действия по закрытым записям без переоткрытия — отдельный
+   * счётчик; в долю готовности не входят, каждое разбирается вручную, как skip.
+   */
+  closedTaskActions: number;
+  closedActions: ShadowClosedActionEntry[];
   taskNotEnqueued: number;
   taskNotEnqueuedShare: number;
   primaryRatio: number | null;
@@ -1284,7 +1376,9 @@ export function buildShadowReport(
     tasks: Set<string>;
     classes: Record<ShadowVerdictClass, number>;
     adopted: number;
+    reopened: number;
     tne: number;
+    closed: ShadowClosedActionEntry[];
     skips: ShadowReportEntry[];
     unmapped: ShadowReportEntry[];
     cycles: number;
@@ -1297,7 +1391,9 @@ export function buildShadowReport(
         tasks: new Set(),
         classes: emptyClasses(),
         adopted: 0,
+        reopened: 0,
         tne: 0,
+        closed: [],
         skips: [],
         unmapped: [],
         cycles: 0,
@@ -1320,8 +1416,19 @@ export function buildShadowReport(
       a.tne++;
       continue;
     }
+    if (r.reason === "closed-task-action") {
+      a.closed.push({
+        taskKey: r.task_key,
+        command: String(payload.command ?? ""),
+        delegationId: typeof payload.delegation_id === "number" ? payload.delegation_id : null,
+        at: r.created_at,
+        transitionId: r.id,
+      });
+      continue;
+    }
     if (r.actor === "shadow:adopt") {
-      a.adopted++;
+      if (r.reason?.startsWith("shadow-reopen:")) a.reopened++;
+      else a.adopted++;
       a.tasks.add(r.task_key);
       if (r.to_node === "spec_review" || r.to_node === "code") cycleOpen.set(r.task_key, true);
       continue;
@@ -1365,7 +1472,8 @@ export function buildShadowReport(
   for (const [pid, a] of [...acc.entries()].sort((x, y) => x[0].localeCompare(y[0]))) {
     const c = a.classes;
     const primary = c.match + c.repeat + c.skip + c.unmapped;
-    const manualActions = primary + a.adopted + a.tne;
+    // closed-task-action в долю готовности не входят (§32.5.4 п. 3)
+    const manualActions = primary + a.adopted + a.reopened + a.tne;
     const share = (n: number) => (primary > 0 ? n / primary : 0);
     const tneShare = manualActions > 0 ? a.tne / manualActions : 0;
     const ratio = primary > 0 ? (c.match + c.repeat) / primary : null;
@@ -1375,7 +1483,9 @@ export function buildShadowReport(
       unmappedZero: c.unmapped === 0,
       notEnqueuedMax5pct: tneShare <= 0.05,
       primaryRatio90pct: ratio !== null && ratio >= 0.9,
-      skipsReviewed: (c.skip > 0 ? "manual" : "none") as "manual" | "none",
+      skipsReviewed: (c.skip > 0 || a.closed.length > 0 ? "manual" : "none") as
+        | "manual"
+        | "none",
     };
     projects.push({
       projectId: pid,
@@ -1391,6 +1501,9 @@ export function buildShadowReport(
       },
       manualActions,
       adopted: a.adopted,
+      reopened: a.reopened,
+      closedTaskActions: a.closed.length,
+      closedActions: a.closed,
       taskNotEnqueued: a.tne,
       taskNotEnqueuedShare: tneShare,
       primaryRatio: ratio,
@@ -1440,8 +1553,9 @@ export function formatShadowReport(report: ShadowReport): string {
       `  match ${c.match} (${pct(p.shares.match)}), repeat ${c.repeat} (${pct(p.shares.repeat)}), skip ${c.skip} (${pct(p.shares.skip)}), unmapped ${c.unmapped} (${pct(p.shares.unmapped)}), graph-only ${c["graph-only"]}`,
     );
     lines.push(
-      `  adopted ${p.adopted}, task-not-enqueued ${p.taskNotEnqueued} (${pct(p.taskNotEnqueuedShare)}), (match+repeat)/primary ${pct(p.primaryRatio)}`,
+      `  adopted ${p.adopted}, reopened ${p.reopened}, task-not-enqueued ${p.taskNotEnqueued} (${pct(p.taskNotEnqueuedShare)}), (match+repeat)/primary ${pct(p.primaryRatio)}`,
     );
+    lines.push(`  closed-task-action ${p.closedTaskActions} (each must be reviewed, like skip)`);
     lines.push(
       `  ready for strict: ${p.readyForStrict ? "yes (by numbers; every skip must be reviewed; switch — owner's word)" : "no"}`,
     );
@@ -1449,6 +1563,11 @@ export function formatShadowReport(report: ShadowReport): string {
       const d = s.detail ?? {};
       lines.push(
         `  - ${s.verdict} ${s.taskKey} ${s.command}: expected ${String(d.expected_node ?? "—")}${d.expected_gate ? ` (${String(d.expected_gate)})` : ""}, actual ${String(d.actual_node ?? "—")}, ${String(d.reason ?? "")}`,
+      );
+    }
+    for (const a of p.closedActions) {
+      lines.push(
+        `  - closed-task-action ${a.taskKey} ${a.command}${a.delegationId !== null ? ` #${a.delegationId}` : ""}`,
       );
     }
   }

@@ -168,6 +168,7 @@ import {
   shadowObserveMerge,
   shadowObserveRelease,
   shadowObserveStoreEvent,
+  trackerStatusIsOpen,
   releaseRefusalCountedByEvent,
   syncShadowTerminalStatuses,
   trackerRouteViaCli,
@@ -2036,11 +2037,23 @@ export async function createPlugin(
         existing?.node === "spec_review"
           ? ("spec_review" as const)
           : ("review" as const);
-      const adopting =
-        !existing || existing.status === "done" || existing.status === "cancelled";
-      const trackerRoute = adopting
-        ? await trackerRouteViaCli(bbCli, input.taskKey)
-        : null;
+      const closed =
+        !!existing && (existing.status === "done" || existing.status === "cancelled");
+      const adopting = !existing || closed;
+      // §32.5.4 п. 3: по закрытой записи решает трекер — открыта (доработка)
+      // → переоткрытие, закрыта или неизвестно → `closed-task-action`.
+      let trackerStatus: string | null = null;
+      if (closed) {
+        try {
+          trackerStatus = (await getTrackerStatus(input.taskKey)) ?? null;
+        } catch (e) {
+          bb.log.warn(`orchestrator: shadow observe delegate tracker: ${describeError(e)}`);
+        }
+      }
+      const trackerRoute =
+        !existing || trackerStatusIsOpen(trackerStatus)
+          ? await trackerRouteViaCli(bbCli, input.taskKey)
+          : null;
       shadowObserveDelegate(store, {
         taskKey: input.taskKey,
         projectId,
@@ -2053,6 +2066,7 @@ export async function createPlugin(
         delegationId: input.delegationId,
         branch: row?.result_branch ?? null,
         trackerRoute,
+        trackerStatus,
         approvalMode: getApprovalMode(),
         policy: policyLoad.policy,
         mode,
@@ -3222,22 +3236,27 @@ export async function createPlugin(
       watchdog.markCoordinatorAction(ctx.threadId);
       try {
         let taskKey = params.ref;
+        let mergeDelegationId: number | null = null;
         if (/^\d+$/.test(taskKey)) {
           const row = store.get(Number(taskKey));
           if (row) {
             taskKey = row.task_key;
+            mergeDelegationId = row.id;
             if (row.coordinator_thread_id) {
               watchdog.markCoordinatorAction(row.coordinator_thread_id);
             }
           }
         } else {
           const row = store.latestDoneResultByTask(taskKey);
+          mergeDelegationId = row?.id ?? null;
           if (row?.coordinator_thread_id) {
             watchdog.markCoordinatorAction(row.coordinator_thread_id);
           }
         }
         await assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode, {
           command: "merge",
+          dryRun: params.dryRun === true,
+          delegationId: mergeDelegationId,
           actor: "shadow:coordinator",
           policy: policyLoad.policy,
           log: bb.log,
@@ -4263,22 +4282,27 @@ export async function createPlugin(
               t("cli.mergeUsage"),
             );
           }
+          let mergeDelegationId: number | null = null;
           if (/^\d+$/.test(ref)) {
             const row = store.get(Number(ref));
             if (row) {
               ref = row.task_key;
+              mergeDelegationId = row.id;
               if (row.coordinator_thread_id) {
                 watchdog.markCoordinatorAction(row.coordinator_thread_id);
               }
             }
           } else {
             const row = store.latestDoneResultByTask(ref);
+            mergeDelegationId = row?.id ?? null;
             if (row?.coordinator_thread_id) {
               watchdog.markCoordinatorAction(row.coordinator_thread_id);
             }
           }
           await assertGraphAllowsDirectAction(store, ref, getWorkGraphMode, {
             command: "merge",
+            dryRun: argv.includes("--dry-run"),
+            delegationId: mergeDelegationId,
             actor: "shadow:coordinator",
             policy: policyLoad.policy,
             log: bb.log,
@@ -4450,6 +4474,7 @@ export async function createPlugin(
           }
           await assertGraphAllowsDirectAction(store, key, getWorkGraphMode, {
             command: "release",
+            delegationId: store.latestDoneResultByTask(key)?.id ?? null,
             actor: "shadow:coordinator",
             policy: policyLoad.policy,
             log: bb.log,
@@ -5023,6 +5048,15 @@ abandoned: ${res.reported
               );
             }
           }
+          // §32.5.5 п. 1: окно по умолчанию — от метки стартовой сверки;
+          // нет метки — фиксируем её сейчас (с разовой синхронизацией), а не
+          // берём since = 0 с историей до выкладки §32.5.
+          await ensureShadowReconcileStarted(store, {
+            getMode: getWorkGraphMode,
+            getTrackerStatus,
+            now,
+            log: bb.log,
+          });
           const sync = await runShadowSync(false);
           const report = buildShadowReport(store, {
             since,

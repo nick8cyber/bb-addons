@@ -79,6 +79,7 @@ export {
 
 import {
   recordTaskNotEnqueued,
+  recordClosedTaskAction,
   shadowFollow,
   isShadowAdopted,
   syncShadowTerminalStatuses,
@@ -410,6 +411,10 @@ export async function resolveTaskProjectId(
 
 export interface DirectActionOptions {
   command?: "delegate" | "merge" | "release";
+  /** §32.5.1 (PLUG-398): проверка без действия (`merge --dry-run`) — в shadow ничего не пишет */
+  dryRun?: boolean;
+  /** id делегирования действия — в payload строки `closed-task-action` (§32.5.4 п. 3) */
+  delegationId?: number | null;
   level?: string;
   route?: string;
   actor?: string;
@@ -485,8 +490,25 @@ export async function assertGraphAllowsDirectAction(
       // §32.5.1 п. 1: release-audit — полное молчание (0 строк, включая
       // task-not-enqueued), даже при неопределённом проекте.
       if (command === "delegate" && action?.level === "release-audit") return;
-      if (!store.getTask(key) && (command !== "delegate" || !projectId)) {
+      // `merge --dry-run` — не действие: строки не пишутся.
+      if (action?.dryRun) return;
+      // Единственное место записи `task-not-enqueued` для merge/release вне
+      // очереди: наблюдатель после действия её не дублирует.
+      const task = store.getTask(key);
+      if (!task && (command !== "delegate" || !projectId)) {
         recordTaskNotEnqueued(store, key, command, projectId);
+      } else if (
+        task &&
+        command !== "delegate" &&
+        (task.status === "done" || task.status === "cancelled")
+      ) {
+        // §32.5.4 п. 3: merge/release по закрытой записи её не переоткрывают
+        // ни в каком случае — одна строка `closed-task-action` на действие;
+        // раздачу решает наблюдатель после действия по статусу трекера.
+        recordClosedTaskAction(store, key, command, {
+          delegationId: action?.delegationId ?? null,
+          projectId,
+        });
       }
     } catch {
       // Silent isolation: shadow audit must never break manual coordinator actions
@@ -2126,8 +2148,13 @@ export async function runApprove(
     deps.workGraphMode === "shadow" &&
     (task.status === "done" || task.status === "cancelled")
   ) {
-    // §32.5.4: закрытая запись зеркала не открывается заново — узел и
-    // статус не трогаем, штатное действие (запись одобрения §31.9) ниже.
+    // §32.5.4 п. 3: закрытая запись зеркала не открывается заново — узел и
+    // статус не трогаем, одна строка `closed-task-action`; штатное действие
+    // (запись одобрения §31.9) ниже.
+    recordClosedTaskAction(deps.store, key, "approve", {
+      projectId: task.project_id,
+      now,
+    });
     approvedTask = task;
   } else if (deps.workGraphMode === "shadow" && task.node !== "owner_gate") {
     // §32.5.2 (PLUG-398): зеркало не входит в owner_gate — вид одобрения
@@ -4105,7 +4132,20 @@ export async function runRunQueue(
   // закрываются в очереди до любых вычислений — их не «берут заново».
   if (deps.getTrackerStatus) {
     try {
+      // Записи, которые ниже получат `shadow_eval`, проверяются в трекере
+      // без пропуска по интервалу: закрытая в трекере задача не должна
+      // получить would_transition ещё 60–120 с (§32.5.4 п. 2).
+      const evaluatedKeys = new Set<string>();
+      if (!deps.autoAdvance) {
+        for (const t of [
+          ...deps.store.listQueuedTasks(),
+          ...deps.store.listActiveTasks(),
+        ]) {
+          if (getTaskMode(t.project_id) === "shadow") evaluatedKeys.add(t.task_key);
+        }
+      }
       await syncShadowTerminalStatuses(deps.store, {
+        forceKeys: evaluatedKeys,
         getMode: getTaskMode,
         getTrackerStatus: deps.getTrackerStatus,
         now: deps.now,

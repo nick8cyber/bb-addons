@@ -19,12 +19,13 @@ import {
   buildShadowReport,
   matrixEdges,
   releaseRefusalCountedByEvent,
+  SHADOW_RECONCILE_STARTED_EVENT,
 } from "../src/shadow-reconcile.js";
 import {
   parseWorkGraphProjects,
-  rewriteWorkGraphProjects,
   OFF_OVERRIDE_MAX_MS,
 } from "../src/workgraph-mode.js";
+import { runRunQueue } from "../src/workgraph.js";
 
 const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
 delete process.env.BB_THREAD_ID;
@@ -333,6 +334,30 @@ async function mergeCli(c: Ctx, key: string) {
   return res.body;
 }
 
+/**
+ * Раздача вне очереди: задача разослана до выкладки §32.5 (записи в
+ * task_queue нет), исполнитель сдал итог круга на настоящих копиях.
+ */
+function outOfQueueDelegation(c: Ctx, key: string) {
+  const row = c.store.insert({
+    taskKey: key,
+    projectId: PROJECT,
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "simple",
+    provider: "acp-opencode",
+    round: 1,
+  });
+  finish(c, row.id);
+  recordRound(c, row.id, setupMergeCopies(c, key), key);
+  return row.id;
+}
+
+function reasonRows(c: Ctx, key: string, reason: string) {
+  return c.store.listTransitions(key).filter((r) => r.reason === reason);
+}
+
 function followRows(rows: TaskTransitionRow[]) {
   return rows
     .filter((r) => r.actor === "shadow:follow")
@@ -627,19 +652,37 @@ test("§32.5.8 5: { mode: off, until: now+1s } → до срока off, посл
     `сообщение координатору: ${JSON.stringify(c.sent)}`,
   );
 
-  // обрезка off до 24 ч
-  const rw = rewriteWorkGraphProjects(
-    JSON.stringify({ [PROJECT]: { mode: "off", until: new Date(clock.now + 48 * 3600_000).toISOString() } }),
-    { now: clock.now },
-  )!;
-  assert.deepEqual(rw.capped, [PROJECT]);
-  assert.equal(Date.parse(JSON.parse(rw.value)[PROJECT].until), clock.now + OFF_OVERRIDE_MAX_MS);
+  // обрезка off до 24 ч — через смену настроек (§19.7), как это делает владелец
+  await c.host.harness.setSettings({
+    workGraphProjects: JSON.stringify({
+      [PROJECT]: { mode: "off", until: new Date(clock.now + 48 * 3600_000).toISOString() },
+    }),
+  });
+  let capped: any;
+  for (let i = 0; i < 50 && !capped; i++) {
+    await new Promise((r) => setImmediate(r));
+    capped = c.store
+      .listEvents("setting.changed")
+      .map((e) => JSON.parse(e.payload))
+      .find((p) => p.reason === "off-override-capped");
+  }
+  assert.ok(capped, "событие смены настройки с reason off-override-capped");
+  assert.equal(capped.setting, "workGraphProjects");
+  assert.equal(capped.source, "menu");
+  assert.equal(
+    Date.parse(JSON.parse(capped.newValue)[PROJECT].until),
+    clock.now + OFF_OVERRIDE_MAX_MS,
+    "срок off обрезан до 24 ч от записи",
+  );
 });
 
 // ── 6. Отчёт ────────────────────────────────────────────────────────────
 
 test("§32.5.8 6: shadow-report --json на фикстуре — точные числа по классам и список skip", async () => {
   const c = (await makeHost({ approvalMode: "auto" })) as Ctx;
+  // метка стартовой сверки §32.5.4 п. 4 (в работе её ставит первый такт)
+  const first = await cli(c, ["shadow-report", "--project", PROJECT], null);
+  assert.equal(first.exitCode, 0, first.stdout);
   // приём (1)
   await delegate(c, "SMK-20", "medium");
   // auto-поток (2а): приём spec + 5 match + 2 graph-only
@@ -658,7 +701,10 @@ test("§32.5.8 6: shadow-report --json на фикстуре — точные ч
     confirmationMode: "auto",
   });
   c.tracker.set("SMK-23", { status: "done" });
-  // вне очереди merge без проекта → task-not-enqueued
+  // ручной merge по задаче вне очереди → ровно одна строка task-not-enqueued
+  outOfQueueDelegation(c, "SMK-24");
+  const merged = await mergeCli(c, "SMK-24");
+  assert.equal(merged.mergeStatus, "merged", JSON.stringify(merged));
   const rep = await cli(c, ["shadow-report", "--project", PROJECT], null);
   assert.equal(rep.exitCode, 0, rep.stdout);
   const p = rep.body.projects.find((x: any) => x.projectId === PROJECT);
@@ -671,8 +717,11 @@ test("§32.5.8 6: shadow-report --json на фикстуре — точные ч
   assert.equal(p.skips[0].detail.expected_node, "spec_review");
   assert.equal(p.unmapped.length, 0);
   assert.equal(p.primaryRatio, 5 / 6);
-  assert.equal(p.manualActions, 9);
-  assert.equal(p.taskNotEnqueued, 0);
+  assert.equal(p.manualActions, 10);
+  assert.equal(p.taskNotEnqueued, 1);
+  assert.equal(p.taskNotEnqueuedShare, 1 / 10);
+  assert.equal(p.reopened, 0);
+  assert.equal(p.closedTaskActions, 0);
   assert.equal(p.readyForStrict, false);
   assert.deepEqual(rep.body.synced, [{ taskKey: "SMK-23", status: "done" }]);
   assert.equal(c.store.getTask("SMK-23")!.status, "done", "отчёт первым шагом синхронизирует");
@@ -823,6 +872,8 @@ test("§32.5.4: approve в shadow не открывает закрытую за�
   await cli(c, ["run-queue", "--once"], null);
   assert.equal(c.store.getTask(k)!.status, "done");
   const before = c.store.listTransitions(k).length;
+  // даже при открытой в трекере задаче approve запись не переоткрывает
+  c.tracker.set(k, { status: "in_progress" });
   await cli(c, ["approve", k], null);
   const t = c.store.getTask(k)!;
   assert.equal(t.status, "done", "закрытая запись остаётся закрытой");
@@ -831,7 +882,12 @@ test("§32.5.4: approve в shadow не открывает закрытую за�
     c.store.listTransitions(k).filter((r) => r.actor === "shadow:follow").length,
     0,
   );
-  assert.equal(c.store.listTransitions(k).length, before);
+  assert.equal(c.store.listTransitions(k).length, before + 1, "одна строка closed-task-action");
+  const [row] = reasonRows(c, k, "closed-task-action");
+  assert.equal(row!.actor, "shadow:coordinator");
+  assert.equal(row!.from_node, "none");
+  assert.equal(row!.to_status, "none");
+  assert.equal(JSON.parse(row!.payload ?? "{}").command, "approve");
 });
 
 test("§32.5.2: run-queue пишет shadow_eval поверх свежего payload — следование зеркала за время await не теряется", async () => {
@@ -857,4 +913,191 @@ test("§32.5.2: run-queue пишет shadow_eval поверх свежего pay
   const p = JSON.parse(c.store.getTask("SMK-35")!.payload ?? "{}");
   assert.ok(p.shadow_eval, "shadow_eval записан");
   assert.equal(p.mirror.last_verdict.review, "OK", "свежий payload.mirror не затёрт");
+});
+
+// ── регрессии ревью PLUG-398 (заход 2) и уточнение спеки r34.10 ─────────
+
+test("§32.5.1 п. 6: ручной merge вне очереди — ровно одна строка task-not-enqueued; merge --dry-run — ни одной", async () => {
+  const c = (await makeHost()) as Ctx;
+  const k = "SMK-40";
+  const id = outOfQueueDelegation(c, k);
+  const dry = await cli(c, ["merge", k, "--dry-run"]);
+  assert.equal(dry.exitCode, 0, dry.stdout);
+  assert.equal(c.store.listTransitions(k).length, 0, "пробный запуск записей не создаёт");
+  const res = await mergeCli(c, k);
+  assert.equal(res.mergeStatus, "merged", JSON.stringify(res));
+  const rows = c.store.listTransitions(k);
+  assert.equal(rows.length, 1, JSON.stringify(rows));
+  assert.equal(rows[0]!.reason, "task-not-enqueued");
+  const payload = JSON.parse(rows[0]!.payload ?? "{}");
+  assert.equal(payload.command, "merge");
+  assert.equal(payload.project_id, PROJECT);
+  assert.equal(c.store.getTask(k), null, "merge вне очереди задачу не принимает");
+  void id;
+});
+
+test("§32.5.4 п. 3: delegate по закрытой записи, задача открыта в трекере — переоткрытие shadow-reopen:delegate, счётчики и mirror сброшены, без класса", async () => {
+  const c = (await makeHost({ approvalMode: "auto" })) as Ctx;
+  const k = "SMK-41";
+  const code = await delegate(c, k, "complex");
+  finish(c, code);
+  const rv = await delegate(c, k, "review");
+  finish(c, rv, "CHANGES");
+  assert.equal(c.store.getTask(k)!.code_review_rounds, 1);
+  c.tracker.set(k, { status: "done" });
+  await cli(c, ["run-queue", "--once"], null);
+  assert.equal(c.store.getTask(k)!.status, "done");
+  const classesBefore = verdicts(c, k).length;
+  // доработка: в трекере задача снова открыта
+  c.tracker.set(k, { status: "in_progress" });
+  const again = await delegate(c, k, "medium");
+  const t = c.store.getTask(k)!;
+  assert.equal(t.node, "code");
+  assert.equal(t.status, "running");
+  assert.equal(t.code_review_rounds, 0, "счётчики кругов сброшены");
+  const payload = JSON.parse(t.payload ?? "{}");
+  assert.deepEqual(payload.mirror, { dispatched: true, last_verdict: {} }, "mirror сброшен");
+  assert.equal(payload.adopted_delegation_id, again);
+  const reopen = reasonRows(c, k, "shadow-reopen:delegate");
+  assert.equal(reopen.length, 1);
+  assert.equal(reopen[0]!.actor, "shadow:adopt");
+  assert.equal(reopen[0]!.from_node, "none");
+  assert.equal(verdicts(c, k).length, classesBefore, "класс вердикта не присваивается");
+  assert.equal(reasonRows(c, k, "closed-task-action").length, 0);
+  const rep = await cli(c, ["shadow-report", "--project", PROJECT, "--since", "2000-01-01T00:00:00Z"], null);
+  const p = rep.body.projects.find((x: any) => x.projectId === PROJECT);
+  assert.equal(p.reopened, 1);
+  assert.equal(p.adopted, 1);
+});
+
+test("§32.5.4 п. 3: delegate по закрытой записи, задача закрыта в трекере — запись не меняется, одна строка closed-task-action, отдельный счётчик отчёта", async () => {
+  const c = (await makeHost()) as Ctx;
+  const k = "SMK-42";
+  finish(c, await delegate(c, k, "medium"));
+  c.tracker.set(k, { status: "done" });
+  await cli(c, ["run-queue", "--once"], null);
+  const closed = c.store.getTask(k)!;
+  assert.equal(closed.status, "done");
+  const before = c.store.listTransitions(k).length;
+  const id = await delegate(c, k, "simple");
+  const t = c.store.getTask(k)!;
+  assert.deepEqual(
+    { node: t.node, status: t.status, payload: t.payload, updated: t.updated_at },
+    { node: closed.node, status: closed.status, payload: closed.payload, updated: closed.updated_at },
+    "запись не меняется",
+  );
+  const rows = c.store.listTransitions(k).slice(before);
+  assert.equal(rows.length, 1, JSON.stringify(rows));
+  assert.equal(rows[0]!.reason, "closed-task-action");
+  assert.equal(rows[0]!.actor, "shadow:coordinator");
+  assert.equal(rows[0]!.from_node, "none");
+  assert.equal(rows[0]!.to_node, "none");
+  const payload = JSON.parse(rows[0]!.payload ?? "{}");
+  assert.equal(payload.command, "delegate");
+  assert.equal(payload.delegation_id, id);
+  const rep = await cli(c, ["shadow-report", "--project", PROJECT, "--since", "2000-01-01T00:00:00Z"], null);
+  const p = rep.body.projects.find((x: any) => x.projectId === PROJECT);
+  assert.equal(p.closedTaskActions, 1);
+  assert.equal(p.closedActions[0].taskKey, k);
+  assert.equal(p.closedActions[0].delegationId, id);
+  assert.equal(p.manualActions, 1, "closed-task-action в долю готовности не входит");
+  assert.equal(p.criteria.skipsReviewed, "manual");
+});
+
+test("§32.5.4 п. 3: merge и release по закрытой записи её не переоткрывают — по одной строке closed-task-action", async () => {
+  const c = (await makeHost({ approvalMode: "auto" })) as Ctx;
+  const k = "SMK-43";
+  const code = await delegate(c, k, "complex");
+  finish(c, code);
+  recordRound(c, code, setupMergeCopies(c, k), k);
+  c.tracker.set(k, { status: "done" });
+  await cli(c, ["run-queue", "--once"], null);
+  const closed = c.store.getTask(k)!;
+  assert.equal(closed.status, "done");
+  // в трекере задача снова открыта — merge/release всё равно не переоткрывают
+  c.tracker.set(k, { status: "in_progress" });
+  const before = c.store.listTransitions(k).length;
+  const dry = await cli(c, ["merge", k, "--dry-run"]);
+  assert.equal(dry.exitCode, 0, dry.stdout);
+  assert.equal(c.store.listTransitions(k).length, before, "--dry-run — не действие");
+  const m = await mergeCli(c, k);
+  assert.equal(m.mergeStatus, "merged");
+  const rel = await cli(c, ["release", k]);
+  assert.notEqual(rel.exitCode, 0, "выкладка без конфигурации — отказ");
+  const rows = c.store.listTransitions(k).slice(before);
+  assert.deepEqual(
+    rows.map((r) => [r.reason, JSON.parse(r.payload ?? "{}").command]),
+    [
+      ["closed-task-action", "merge"],
+      ["closed-task-action", "release"],
+    ],
+  );
+  assert.equal(JSON.parse(rows[0]!.payload ?? "{}").delegation_id, code);
+  const t = c.store.getTask(k)!;
+  assert.equal(t.status, "done");
+  assert.equal(t.node, closed.node);
+  assert.equal(t.release_attempts, closed.release_attempts);
+});
+
+test("§32.5.5 п. 1: shadow-report без метки стартовой сверки фиксирует её сейчас — история до выкладки §32.5 в отчёт не входит", async () => {
+  const clock = { now: Date.parse("2026-11-24T00:00:00Z") };
+  const c = (await makeHost({}, { clock })) as Ctx;
+  // история: строка до выкладки §32.5
+  c.store.insertTransition({
+    taskKey: "OLD-1",
+    fromNode: "none",
+    toNode: "none",
+    fromStatus: "none",
+    toStatus: "none",
+    actor: "shadow:coordinator",
+    reason: "task-not-enqueued",
+    payload: JSON.stringify({ command: "delegate", project_id: PROJECT }),
+    createdAt: clock.now - 3600_000,
+  });
+  assert.equal(c.store.listEvents(SHADOW_RECONCILE_STARTED_EVENT).length, 0);
+  const rep = await cli(c, ["shadow-report"], null);
+  assert.equal(rep.exitCode, 0, rep.stdout);
+  assert.equal(rep.body.since, clock.now, "since — метка, а не 0");
+  assert.equal(c.store.listEvents(SHADOW_RECONCILE_STARTED_EVENT).length, 1);
+  assert.equal(
+    rep.body.projects.reduce((n: number, p: any) => n + p.taskNotEnqueued, 0),
+    0,
+    "строка до метки не считается",
+  );
+});
+
+test("§32.5.4 п. 2: run-queue проверяет в трекере оцениваемые записи без пропуска по интервалу", async () => {
+  const c = (await makeHost()) as Ctx;
+  const k = "SMK-44";
+  c.store.insertTask({
+    taskKey: k,
+    projectId: PROJECT,
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  });
+  const t0 = Date.now();
+  // проход reconcile только что проверил запись (трекер тогда был открыт)
+  const lastChecked = new Map<string, number>([[k, t0]]);
+  const asked: string[] = [];
+  await runRunQueue({
+    store: c.store,
+    workGraphMode: "off",
+    workGraphProjects: { [PROJECT]: "shadow" },
+    getWorkGraphMode: (pid?: string | null) => (pid === PROJECT ? "shadow" : "off"),
+    maxActiveTasks: 1,
+    now: () => t0 + 1000,
+    cmd: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) } as any,
+    getTrackerStatus: async (key: string) => {
+      asked.push(key);
+      return "done";
+    },
+    trackerSyncMinIntervalMs: 60_000,
+    trackerSyncLastChecked: lastChecked,
+  } as any);
+  assert.deepEqual(asked, [k], "оцениваемая запись проверена, несмотря на интервал");
+  const t = c.store.getTask(k)!;
+  assert.equal(t.status, "done");
+  assert.equal(JSON.parse(t.payload ?? "{}").shadow_eval?.would_transition, undefined);
 });

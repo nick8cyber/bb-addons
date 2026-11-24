@@ -4472,6 +4472,8 @@ export class DelegationStore {
       payload: string;
       command: string;
       transitionPayload?: string | null;
+      /** §32.5.4 п. 3: `shadow-reopen` при переоткрытии закрытой записи */
+      reasonPrefix?: "shadow-adopt" | "shadow-reopen";
     },
     now: number = Date.now(),
   ): TaskQueueRow | null {
@@ -4549,7 +4551,7 @@ export class DelegationStore {
           key,
           input.node,
           input.status,
-          `shadow-adopt:${input.command}`,
+          `${input.reasonPrefix ?? "shadow-adopt"}:${input.command}`,
           input.transitionPayload ?? null,
           now,
         );
