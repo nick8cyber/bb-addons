@@ -761,28 +761,59 @@ export function collectUploadFiles(promptBlocks, s) {
 const DRIVER_TRANSIENT_RE =
   /timeout|timed out|waiting for selector|waiting failed|target (?:closed|crashed|destroyed)|session closed|protocol error|websocket|connection (?:closed|refused|reset)|net::err_|navigation (?:failed|timeout)|frame (?:was )?detached|execution context (?:was destroyed|is not available)|inspected target navigated|browser (?:has been |was )?closed|page crashed|econnrefused|econnreset|socket hang up|failed to become ready|did not start within/i;
 
-const dialogWaveHistory = [];
-export function checkDialogWave(dialogText, accountId, now = Date.now()) {
+function withWaveLock(stateDir, fn) {
+  const lockPath = join(stateDir, "dialog-wave.lock");
+  acquireLock(lockPath);
+  try {
+    return fn();
+  } finally {
+    releaseLock(lockPath);
+  }
+}
+
+export function checkDialogWave(dialogText, accountId, now = Date.now(), stateDir = STATE_DIR) {
   const text120 = String(dialogText || "").slice(0, 120).trim();
   const windowMs = 30 * 60_000;
-  while (dialogWaveHistory.length > 0 && now - dialogWaveHistory[0].ts > windowMs) {
-    dialogWaveHistory.shift();
-  }
-  dialogWaveHistory.push({ text120, accountId, ts: now });
-  const accounts = new Set(
-    dialogWaveHistory
-      .filter((e) => e.text120 === text120 && e.accountId)
-      .map((e) => e.accountId)
-  );
-  const isWave = accounts.size >= 3;
-  if (isWave) {
-    slog("driver:dialog-wave", { text120, accountCount: accounts.size, accounts: Array.from(accounts) });
-    console.warn(`[web-gemini] Dialog wave detected across ${accounts.size} accounts for: ${text120}`);
-  }
-  return isWave;
+  return withWaveLock(stateDir, () => {
+    const waveFile = join(stateDir, "dialog-wave.json");
+    let state = { entries: [], warned: [] };
+    try {
+      if (existsSync(waveFile)) {
+        state = JSON.parse(readFileSync(waveFile, "utf8"));
+        if (!Array.isArray(state.entries)) state.entries = [];
+        if (!Array.isArray(state.warned)) state.warned = [];
+      }
+    } catch {}
+
+    state.entries = state.entries.filter((e) => now - e.ts <= windowMs);
+    state.entries.push({ text120, accountId, ts: now });
+
+    const accounts = new Set(
+      state.entries
+        .filter((e) => e.text120 === text120 && e.accountId)
+        .map((e) => e.accountId)
+    );
+    const isWave = accounts.size >= 3;
+    if (isWave && !state.warned.includes(text120)) {
+      state.warned.push(text120);
+      slog("driver:dialog-wave", { text120, accountCount: accounts.size, accounts: Array.from(accounts) });
+      console.warn(`[web-gemini] Dialog wave detected across ${accounts.size} accounts for: ${text120}`);
+    }
+    try {
+      const tmp = `${waveFile}.${process.pid}.${Date.now()}.tmp`;
+      writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
+      renameSync(tmp, waveFile);
+    } catch {}
+    return isWave;
+  });
 }
-export function _resetDialogWaveHistory() {
-  dialogWaveHistory.length = 0;
+export function _resetDialogWaveHistory(stateDir = STATE_DIR) {
+  try {
+    const lockPath = join(stateDir, "dialog-wave.lock");
+    try { unlinkSync(lockPath); } catch {}
+    const waveFile = join(stateDir, "dialog-wave.json");
+    try { unlinkSync(waveFile); } catch {}
+  } catch {}
 }
 
 export function getThoughtsLogPath(stateDir, sessionId, tj = null) {
@@ -793,14 +824,36 @@ export function getThoughtsLogPath(stateDir, sessionId, tj = null) {
   return join(stateDir, "sessions", sessionId, "thoughts.jsonl");
 }
 
+export function sanitizeThoughtString(str) {
+  if (typeof str !== "string") return str;
+  let val = str;
+  // 1. Strip URL credentials: https://user:pass@host -> https://host
+  val = val.replace(/(\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@]+@/g, "$1");
+  // 2. Mask Authorization headers and Bearer tokens
+  val = val.replace(/\b(?:authorization\s*:\s*)(?:bearer|basic)\s+[^\s,;]+/gi, "Authorization: [REDACTED]");
+  val = val.replace(/\b(?:authorization\s*:\s*)[^\s,;]+/gi, "Authorization: [REDACTED]");
+  val = val.replace(/\bbearer\s+[A-Za-z0-9_\-\.~+/]{8,}=*/gi, "Bearer [REDACTED]");
+  // 3. Mask Cookie headers
+  val = val.replace(/\bcookie\s*:\s*[^\s,;]+/gi, "Cookie: [REDACTED]");
+  // 4. Mask sensitive parameters in query strings or assignments
+  val = val.replace(/(^|[\s?&;])(f\.sid|f_sid|sid|cookie|auth_token|token|password)=[^&\s#;,]*/gi, "$1$2=[REDACTED]");
+  return val;
+}
+
 export function sanitizeThoughtPayload(payload) {
+  if (typeof payload === "string") {
+    return sanitizeThoughtString(payload);
+  }
   if (!payload || typeof payload !== "object") return payload;
   const sanitized = Array.isArray(payload) ? [] : {};
   for (const [k, v] of Object.entries(payload)) {
-    if (/cookie|token|auth|authorization|sid|f\.sid|f_sid|password|secret|bearer/i.test(k)) {
+    if (/^(?:cookie|token|auth|authorization|sid|f\.sid|f_sid|password|secret|bearer)$/i.test(k) ||
+        /(?:cookie|token|auth|authorization|password|secret)/i.test(k)) {
       continue;
     }
-    if (typeof v === "object" && v !== null) {
+    if (typeof v === "string") {
+      sanitized[k] = sanitizeThoughtString(v);
+    } else if (typeof v === "object" && v !== null) {
       sanitized[k] = sanitizeThoughtPayload(v);
     } else {
       sanitized[k] = v;
@@ -2114,17 +2167,23 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 accountId: backend.id,
                 tier: backend.tier,
                 stateDir: STATE_DIR,
+                screenshotDir: (tj && tj.sessKey && tj.turn)
+                  ? journal.turnDir(STATE_DIR, tj.sessKey, tj.turn.turnNo)
+                  : join(STATE_DIR, "screenshots"),
                 // §7.3: проверяемое восстановление — драйвер подтверждает,
                 // что страница осталась тем же разговором.
                 verifyConversation: convVerify,
                 ...(fileCapture ? { fileCapture } : {}),
                 onThoughtChunk: (chunk) => {
                   if (!chunk || s.cancelled || s.activeGen !== gen) return;
-                  appendThoughtLog(thoughtsLogPath, "thought", { text: chunk });
+                  const cleanChunk = sanitizeThoughtString(chunk);
+                  if (!cleanChunk) return;
+                  appendThoughtLog(thoughtsLogPath, "thought", { text: cleanChunk });
                   if (streamThoughtsEnabled) {
+                    streamedAny = true;
                     upd({
                       sessionUpdate: "agent_thought_chunk",
-                      content: { type: "text", text: chunk },
+                      content: { type: "text", text: cleanChunk },
                     });
                   }
                 },
@@ -2141,13 +2200,16 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               const openSearchToolCalls = [];
               let res;
               try {
+                s.geminiTurnCount = (s.geminiTurnCount ?? 0) + 1;
                 res = await sendWebPrompt(request);
                 if (res?.search?.queries?.length) {
-                  let turnIdx = budgets?.toolRounds ?? 0;
+                  let turnIdx = s.geminiTurnCount;
                   if (tj?.turn?.turnNo) turnIdx = tj.turn.turnNo;
+                  else if (budgets?.toolRounds) turnIdx = budgets.toolRounds;
                   const activeConvId = res.convId || s.convId || sessionId;
                   for (let qIdx = 0; qIdx < res.search.queries.length; qIdx++) {
                     const q = res.search.queries[qIdx];
+                    const cleanQ = sanitizeThoughtString(q);
                     const toolCallId = `call_${activeConvId}_${turnIdx}_${qIdx}`;
                     openSearchToolCalls.push(toolCallId);
                     if (streamThoughtsEnabled) {
@@ -2155,33 +2217,41 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                         sessionUpdate: "tool_call",
                         toolCallId,
                         kind: "search",
-                        title: `Google Search: ${q}`,
+                        title: `Google Search: ${cleanQ}`,
                         status: "in_progress",
                       });
                     }
                     appendThoughtLog(thoughtsLogPath, "tool_call", {
                       toolCallId,
-                      query: q,
+                      query: cleanQ,
                       status: "in_progress",
                     });
 
-                    if (res.search.status === 4) {
+                    const isCancelled = s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted;
+                    if (!isCancelled && res.search.status === 4) {
                       if (streamThoughtsEnabled) {
                         upd({
                           sessionUpdate: "tool_call_update",
                           toolCallId,
                           status: "completed",
                           content: res.search.sources?.map((src) => ({
-                            type: "resource_link",
-                            uri: src.url,
-                            name: src.title,
+                            type: "content",
+                            content: {
+                              type: "resource_link",
+                              uri: sanitizeThoughtString(src.url),
+                              name: sanitizeThoughtString(src.title),
+                            },
                           })) || [],
                         });
                       }
                       appendThoughtLog(thoughtsLogPath, "tool_call_update", {
                         toolCallId,
                         status: "completed",
-                        sources: res.search.sources || [],
+                        sources: res.search.sources?.map((src) => ({
+                          url: sanitizeThoughtString(src.url),
+                          title: sanitizeThoughtString(src.title),
+                          ...(src.snippet ? { snippet: sanitizeThoughtString(src.snippet) } : {}),
+                        })) || [],
                       });
                     } else {
                       if (streamThoughtsEnabled) {
@@ -2390,8 +2460,13 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 if (final.text !== undefined) {
                   let text = final.text;
                   if (context.research && !write && !context.verdict && candidate?.search?.sources?.length) {
-                    const list = candidate.search.sources.map((s) => `* [${s.title}](${s.url})`).join("\n");
+                    const list = candidate.search.sources
+                      .map((s) => `* [${sanitizeThoughtString(s.title)}](${sanitizeThoughtString(s.url)})`)
+                      .join("\n");
                     text = text.trimEnd() + "\n\n### Источники поиска\n" + list;
+                  }
+                  if (context.settings?.maskResponse) {
+                    text = context.settings.maskResponse(text);
                   }
                   return { text };
                 }
@@ -2653,8 +2728,12 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         const isStalled = Boolean(
           err && (err.code === "WEB_GEMINI_STALLED" || err.code === "ARGON_STALLED" || /generation stalled|stalled generation/i.test(err.message || ""))
         );
+        const isDialogError = Boolean(
+          err && (err.code === "WEB_GEMINI_UNKNOWN_DIALOG" || err.code === "ARGON_UNKNOWN_DIALOG" || err.code === "WEB_GEMINI_DIALOG_UNCLOSED" || /unknown dialog/i.test(err.message || ""))
+        );
         const reason = task.signal.reason === "deadline exceeded" && !err.message?.startsWith("recovery_required:") ? "deadline exceeded" :
           isStalled ? "stalled" :
+          isDialogError ? (err.message || "unknown dialog") :
           err instanceof TaskTurnError ? err.message : "web model request failed at " + task.stage;
         if (tj && reason.startsWith("recovery_required:")) tj.turn.recoveryRequired = true;
         await task.finish("failed", reason);

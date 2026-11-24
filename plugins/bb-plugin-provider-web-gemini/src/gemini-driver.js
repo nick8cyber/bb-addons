@@ -27,11 +27,22 @@ function unwrapUrl(urlStr) {
     const u = new URL(urlStr);
     if ((u.hostname === 'google.com' || u.hostname.endsWith('.google.com')) && u.pathname === '/url') {
       const q = u.searchParams.get('q');
-      if (q) return q;
+      if (q) {
+        try {
+          const target = new URL(q);
+          if ((target.protocol === 'http:' || target.protocol === 'https:') && !target.hostname.endsWith('gstatic.com')) {
+            return target.toString();
+          }
+        } catch {}
+      }
+      return null;
     }
-    return urlStr;
+    if ((u.protocol === 'http:' || u.protocol === 'https:') && !u.hostname.endsWith('gstatic.com')) {
+      return u.toString();
+    }
+    return null;
   } catch {
-    return urlStr;
+    return null;
   }
 }
 
@@ -78,11 +89,17 @@ function parseHNvQHb(raw, targetResponseId) {
     return { status: 'unbound', queries: [], sources: [], unknownRows: [] };
   }
 
-  const convId = targetTurn[0]?.[0]?.replace(/^c_/, '') || null;
-  const responseId = targetTurn[0]?.[1]?.replace(/^r_/, '') || null;
+  const convId = String(targetTurn[0]?.[0] || '').replace(/^c_/, '') || null;
+  const responseId = String(targetTurn[0]?.[1] || '').replace(/^r_/, '') || null;
   const T3 = targetTurn[3];
   if (!Array.isArray(T3)) {
-    return { status: 'unbound', convId, responseId, queries: [], sources: [], unknownRows: [] };
+    return { status: null, convId, responseId, queries: [], sources: [], unknownRows: [] };
+  }
+
+  let thoughtText = null;
+  const t00 = T3[0]?.[0];
+  if (Array.isArray(t00) && Array.isArray(t00[37]) && Array.isArray(t00[37][0]) && typeof t00[37][0][0] === 'string') {
+    thoughtText = t00[37][0][0];
   }
 
   let queries = [];
@@ -99,7 +116,15 @@ function parseHNvQHb(raw, targetResponseId) {
           queries = node.map((x) => x[0]);
         }
       }
-      if (node.length === 2 && node[0] === null && Array.isArray(node[1]) && node[1][0] === 'google' && typeof node[1][2] === 'number') {
+      if (
+        node.length === 2 &&
+        node[0] === null &&
+        Array.isArray(node[1]) &&
+        node[1][0] === 'google' &&
+        Array.isArray(node[1][1]) &&
+        node[1][1].some((x) => typeof x === 'string' && /google search/i.test(x)) &&
+        typeof node[1][2] === 'number'
+      ) {
         const code = node[1][2];
         if (maxStatusCode === null || code > maxStatusCode) {
           maxStatusCode = code;
@@ -110,26 +135,30 @@ function parseHNvQHb(raw, targetResponseId) {
         typeof node[1] === 'string' && /^https?:\/\//i.test(node[1]) &&
         typeof node[2] === 'string' && !/^https?:\/\//i.test(node[2])
       ) {
-        rawSig1.push({ url: unwrapUrl(node[1]), title: node[2] });
+        const unwrapped = unwrapUrl(node[1]);
+        if (unwrapped && !isGoogleSearchUrl(unwrapped)) {
+          rawSig1.push({ url: unwrapped, title: node[2] });
+        }
         return;
       }
       if (
         typeof node[0] === 'string' && /^https?:\/\//i.test(node[0]) && !/gstatic\.com/i.test(node[0]) &&
         typeof node[1] === 'string' && !/^https?:\/\//i.test(node[1]) &&
-        typeof node[2] === 'string' && /favicon-tbn/i.test(node[2])
+        typeof node[2] === 'string' && /favicon-tbn/i.test(node[2]) &&
+        typeof node[3] === 'string' && node[3].trim().length > 0
       ) {
-        rawSig2.push({ url: unwrapUrl(node[0]), title: node[1], snippet: node[3] });
+        const unwrapped = unwrapUrl(node[0]);
+        if (unwrapped && !isGoogleSearchUrl(unwrapped)) {
+          rawSig2.push({ url: unwrapped, title: node[1], snippet: node[3] });
+        }
         return;
       }
 
       const hasNonGstaticHttp = node.some((x) => typeof x === 'string' && /^https?:\/\//i.test(x) && !/gstatic\.com/i.test(x));
       const hasTitle = node.some((x) => typeof x === 'string' && x.trim() && !/^https?:\/\//i.test(x));
       if (hasNonGstaticHttp && hasTitle) {
-        const isLeaf = node.every((x) => x === null || typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean');
-        if (isLeaf) {
-          unknownRows.push(node);
-          return;
-        }
+        unknownRows.push(node);
+        return;
       }
 
       for (let i = 0; i < node.length; i++) {
@@ -150,17 +179,18 @@ function parseHNvQHb(raw, targetResponseId) {
     if (!s.url || isGoogleSearchUrl(s.url) || /gstatic\.com/i.test(s.url)) continue;
     if (!seenUrls.has(s.url)) {
       seenUrls.add(s.url);
-      allSources.push({ url: s.url, title: s.title });
+      allSources.push({ url: s.url, title: s.title, ...(s.snippet ? { snippet: s.snippet } : {}) });
     }
   }
 
   return {
-    status: maxStatusCode ?? (queries.length ? 1 : 'unbound'),
+    status: maxStatusCode ?? (queries.length ? 1 : null),
     convId,
     responseId,
     queries,
     sources: allSources,
     unknownRows,
+    thoughtText,
   };
 }
 
@@ -1019,6 +1049,10 @@ async function stopGeneration(page) {
   } catch {}
 }
 
+function parentOf(el) {
+  return el ? el.parentElement || el.parentNode || el.parent || null : null;
+}
+
 function findTurnTarget(doc, idx, promptPrefix) {
   const queries = doc.querySelectorAll('user-query');
   if (queries.length === 0) return null;
@@ -1106,7 +1140,18 @@ function checkTurnStatus(doc, idx, promptPrefix) {
 
   let isBusyOrThinking = false;
   if (target) {
-    if (target.getAttribute('aria-busy') === 'true' || target.querySelector(busySelector) !== null) {
+    if (target.getAttribute('aria-busy') === 'true') {
+      isBusyOrThinking = true;
+    } else if (target.querySelectorAll) {
+      const busyEls = Array.from(target.querySelectorAll(busySelector));
+      const nonThoughtBusy = busyEls.filter((el) => {
+        for (let p = el; p && p !== target; p = parentOf(p)) {
+          if ((p.tagName || '').toLowerCase() === 'model-thoughts') return false;
+        }
+        return true;
+      });
+      if (nonThoughtBusy.length > 0) isBusyOrThinking = true;
+    } else if (target.querySelector && target.querySelector(busySelector) !== null) {
       isBusyOrThinking = true;
     }
   }
@@ -1121,24 +1166,27 @@ function checkTurnStatus(doc, idx, promptPrefix) {
   let hasFinishedContent = false;
   let hasActionButtons = false;
 
-  const parentOf = (el) => (el ? el.parentElement || el.parentNode || el.parent || null : null);
   const getTextExcludingThoughts = (root) => {
     if (!root) return '';
-    const thoughts = Array.from(root.querySelectorAll ? root.querySelectorAll('model-thoughts') : []);
-    if (!thoughts.length) return root.innerText || '';
-    let out = '';
     function collect(node) {
-      if (!node) return;
-      const tag = (node.tagName || '').toLowerCase();
-      if (tag === 'model-thoughts') return;
-      if (node.children && node.children.length > 0) {
-        for (const child of node.children) collect(child);
-      } else {
-        out += (node.innerText || '');
+      if (!node) return '';
+      if (node.nodeType === 3) {
+        return node.nodeValue || '';
       }
+      if (node.nodeType === 1) {
+        const tag = (node.tagName || '').toLowerCase();
+        if (tag === 'model-thoughts') return '';
+        let text = '';
+        const children = node.childNodes || [];
+        for (let i = 0; i < children.length; i++) {
+          text += collect(children[i]);
+        }
+        return text;
+      }
+      return '';
     }
-    collect(root);
-    return out;
+    const res = collect(root);
+    return res || (root.innerText || '');
   };
 
   if (target) {
@@ -1456,6 +1504,7 @@ async function sendPrompt({
   let capturedResponseId = null;
   let lastHNvQHbBody = null;
   let onPageResponse = null;
+  let submissionStartTime = 0;
   try {
     page = driverHooks?.getGeminiPage
       ? await driverHooks.getGeminiPage(browser, { waitForVerification, port })
@@ -1464,13 +1513,19 @@ async function sendPrompt({
 
     onPageResponse = async (resp) => {
       try {
+        if (!submissionStartTime) return;
         const u = typeof resp.url === 'function' ? resp.url() : String(resp.url || '');
         if (u.includes('StreamGenerate')) {
           const text = await resp.text().catch(() => '');
           const m = text.match(/\["c_([a-zA-Z0-9_-]+)","r_([a-f0-9]{16})"]/);
           if (m) {
-            if (!returnedConvId) returnedConvId = m[1];
-            capturedResponseId = m[2];
+            const respConvId = m[1];
+            const respResponseId = m[2];
+            if (convId && respConvId !== convId) {
+              return;
+            }
+            if (!returnedConvId) returnedConvId = respConvId;
+            capturedResponseId = respResponseId;
           } else {
             const mr = text.match(/["']r_([a-f0-9]{16})["']/);
             if (mr) capturedResponseId = mr[1];
@@ -1667,12 +1722,14 @@ async function sendPrompt({
     let sent = false;
     if (sendBtn && !(await sendBtn.isDisabled().catch(() => true))) {
       try {
+        submissionStartTime = Date.now();
         await sendBtn.click({ timeout: 8000 });
         sent = true;
       } catch {}
     }
     await throwIfCancelled();
     if (!sent) {
+      submissionStartTime = Date.now();
       await page.keyboard.press('Enter').catch(() => {});
     }
 
@@ -1681,6 +1738,9 @@ async function sendPrompt({
     const genDeadline = Date.now() + 120000;
     for (;;) {
       await throwIfCancelled();
+      await dismissOverlays(page, overlayOpts).catch((e) => {
+        if (e.code === 'WEB_GEMINI_UNKNOWN_DIALOG' || e.code === 'WEB_GEMINI_DIALOG_UNCLOSED') throw e;
+      });
       const started = await safeEval(page,
         ({ idx, promptPrefix, fnSrc }) => {
           const stopBtn = document.querySelector(
@@ -2020,66 +2080,126 @@ async function sendPrompt({
     }
 
     let searchResult = resObj?.search || null;
-    if (!capturedResponseId && page) {
-      capturedResponseId = await safeEval(page, ({ idx, promptPrefix, fnSrc }) => {
-        const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
-        const target = fn ? fn(document, idx, promptPrefix) : null;
-        if (!target) return null;
-        const html = target.outerHTML || '';
-        const m = html.match(/r_([0-9a-f]{16})/i);
-        return m ? m[1] : null;
-      }, { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }).catch(() => null);
-    }
-
-    if (!searchResult) {
-      searchResult = { status: 'unbound', queries: [], sources: [], unknownRows: [] };
-      for (let retry = 0; retry < 3; retry++) {
-        let rawHNvQHb = null;
-        if (driverHooks?.fetchHNvQHb) {
-          rawHNvQHb = await driverHooks.fetchHNvQHb(page, returnedConvId, capturedResponseId);
-        } else if (lastHNvQHbBody && parseHNvQHb(lastHNvQHbBody, capturedResponseId).status !== 'unbound') {
-          rawHNvQHb = lastHNvQHbBody;
-        } else if (page && typeof page.evaluate === 'function') {
-          rawHNvQHb = await safeEval(page, async (cId) => {
-            try {
-              const payload = JSON.stringify([[["hNvQHb", JSON.stringify([["c_" + cId, 10, null, 1, [1], [4, 12], null, 1]])]]]);
-              const res = await window.fetch('/_/BardChatUi/data/batchexecute?rpcids=hNvQHb', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-                body: 'f.req=' + encodeURIComponent(payload),
-              });
-              if (!res.ok) return null;
-              return await res.text();
-            } catch {
-              return null;
+    try {
+      if (page) {
+        const domRespId = await safeEval(page, ({ idx, promptPrefix, fnSrc }) => {
+          const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
+          const target = fn ? fn(document, idx, promptPrefix) : null;
+          if (!target) return null;
+          const checkAttrs = (el) => {
+            if (!el || !el.attributes) return null;
+            for (let i = 0; i < el.attributes.length; i++) {
+              const m = String(el.attributes[i].value || '').match(/\br_([0-9a-f]{16})\b/i);
+              if (m) return m[1];
             }
-          }, returnedConvId).catch(() => null);
+            return null;
+          };
+          const direct = checkAttrs(target);
+          if (direct) return direct;
+          const els = Array.from(target.querySelectorAll ? target.querySelectorAll('*') : []);
+          for (const el of els) {
+            const tag = (el.tagName || '').toLowerCase();
+            if (tag === 'message-content' || tag === 'model-thoughts') continue;
+            const found = checkAttrs(el);
+            if (found) return found;
+          }
+          return null;
+        }, { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }).catch(() => null);
+        if (domRespId) {
+          capturedResponseId = domRespId;
         }
-        if (rawHNvQHb) {
-          const parsed = parseHNvQHb(rawHNvQHb, capturedResponseId);
-          if (parsed.status !== 'unbound') {
-            searchResult = parsed;
-            break;
+      }
+
+      if (!searchResult) {
+        searchResult = { status: 'unbound', queries: [], sources: [], unknownRows: [] };
+        for (let retry = 0; retry < 3; retry++) {
+          await throwIfCancelled();
+          let rawHNvQHb = null;
+          if (driverHooks?.fetchHNvQHb) {
+            rawHNvQHb = await driverHooks.fetchHNvQHb(page, returnedConvId, capturedResponseId);
+          } else if (lastHNvQHbBody && parseHNvQHb(lastHNvQHbBody, capturedResponseId).status !== 'unbound') {
+            rawHNvQHb = lastHNvQHbBody;
+          } else if (page && typeof page.evaluate === 'function') {
+            rawHNvQHb = await safeEval(page, async (cId) => {
+              try {
+                const wiz = window.WIZ_global_data || {};
+                const at = wiz.SNlM0e;
+                const bl = wiz.cfb2h || '';
+                const fsid = wiz.FdrFJe || '';
+                const reqid = Math.floor(100000 + Math.random() * 900000);
+                const params = new URLSearchParams({
+                  rpcids: 'hNvQHb',
+                  'source-path': '/',
+                  bl,
+                  'f.sid': fsid,
+                  hl: 'en',
+                  _reqid: String(reqid),
+                  rt: 'c',
+                });
+                const url = `/_/BardChatUi/data/batchexecute?${params.toString()}`;
+                const args = ["c_" + cId, 10, null, 1, [1], [4, 12], null, 1];
+                const reqPayload = [[["hNvQHb", JSON.stringify(args), null, "generic"]]];
+                let body = 'f.req=' + encodeURIComponent(JSON.stringify(reqPayload));
+                if (at) body += '&at=' + encodeURIComponent(at);
+                const controller = new AbortController();
+                const tid = setTimeout(() => controller.abort(), 6000);
+                const res = await window.fetch(url, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                  body,
+                  signal: controller.signal,
+                });
+                clearTimeout(tid);
+                if (!res.ok) return null;
+                return await res.text();
+              } catch {
+                return null;
+              }
+            }, returnedConvId).catch(() => null);
+          }
+          if (rawHNvQHb) {
+            const parsed = parseHNvQHb(rawHNvQHb, capturedResponseId);
+            if (parsed.status !== 'unbound') {
+              searchResult = parsed;
+              break;
+            }
+          }
+          if (retry < 2 && page && typeof page.waitForTimeout === 'function') {
+            await page.waitForTimeout(2000);
           }
         }
-        if (retry < 2 && page && typeof page.waitForTimeout === 'function') {
-          await page.waitForTimeout(2000);
+        driverLog('driver:search', {
+          account: accountId || (backend && backend.id) || profile,
+          queriesCount: searchResult.queries.length,
+          status: searchResult.status,
+          sourcesCount: searchResult.sources.length,
+        });
+        if (searchResult.unknownRows && searchResult.unknownRows.length > 0) {
+          for (const row of searchResult.unknownRows) {
+            driverLog('driver:thoughts-error', {
+              kind: 'unknown-source-row',
+              row,
+            });
+          }
+        }
+        if (searchResult.thoughtText && onThoughtChunk && typeof onThoughtChunk === 'function') {
+          if (searchResult.thoughtText.length > lastThoughtText.length) {
+            if (searchResult.thoughtText.startsWith(lastThoughtText)) {
+              const delta = searchResult.thoughtText.slice(lastThoughtText.length);
+              if (delta) onThoughtChunk(delta);
+            } else {
+              onThoughtChunk(searchResult.thoughtText);
+            }
+            lastThoughtText = searchResult.thoughtText;
+          }
         }
       }
-      driverLog('driver:search', {
-        account: accountId || (backend && backend.id) || profile,
-        queriesCount: searchResult.queries.length,
-        status: searchResult.status,
-        sourcesCount: searchResult.sources.length,
+    } catch (searchErr) {
+      driverLog('driver:thoughts-error', {
+        kind: 'search-extraction-failed',
+        message: searchErr?.message || String(searchErr),
       });
-      if (searchResult.unknownRows && searchResult.unknownRows.length > 0) {
-        for (const row of searchResult.unknownRows) {
-          driverLog('driver:thoughts-error', {
-            kind: 'unknown-source-row',
-            row,
-          });
-        }
-      }
+      searchResult = { status: 'unbound', queries: [], sources: [], unknownRows: [] };
     }
 
     resObj = new String(lastText);
@@ -2165,9 +2285,13 @@ async function dismissOverlays(page, opts = {}) {
         // 1. "Use Gemini" / "Использовать Gemini" banner anywhere on the page
         const useBtn = Array.from(document.querySelectorAll('button, [role="button"]'))
           .filter((el) => el.offsetParent !== null)
-          .find((el) => /использовать gemini|use gemini/i.test((el.innerText || '').trim()));
+          .find((el) => {
+            const text = (el.innerText || '').trim().toLowerCase();
+            const aria = (typeof el.getAttribute === 'function' ? (el.getAttribute('aria-label') || '') : '').trim().toLowerCase();
+            return text === 'использовать gemini' || text === 'use gemini' || aria === 'использовать gemini' || aria === 'use gemini';
+          });
         if (useBtn) {
-          const text = (useBtn.innerText || '').trim();
+          const text = (useBtn.innerText || (typeof useBtn.getAttribute === 'function' ? useBtn.getAttribute('aria-label') : '') || '').trim();
           useBtn.click();
           return { type: 'dismissed', text, button: text };
         }
@@ -2311,6 +2435,9 @@ async function dismissOverlays(page, opts = {}) {
         account,
         text: outcome.text.slice(0, 300),
       });
+      if (!isTurn) {
+        break;
+      }
       const err = new Error('WEB_GEMINI_DIALOG_UNCLOSED: ' + outcome.text.slice(0, 120));
       err.code = 'WEB_GEMINI_DIALOG_UNCLOSED';
       err.dialogText = outcome.text;

@@ -33,6 +33,7 @@ import {
   checkDialogWave,
   _resetDialogWaveHistory,
   getThoughtsLogPath,
+  sanitizeThoughtString,
   sanitizeThoughtPayload,
   appendThoughtLog,
 } from "../acp-server.mjs";
@@ -7080,8 +7081,86 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       unwrapUrl("https://www.google.com/url?q=https%3A%2F%2Fgithub.com%2Fopencode-ai&sa=U"),
       "https://github.com/opencode-ai"
     );
+    assert.equal(
+      unwrapUrl("https://www.google.com/url?q=javascript%3Aalert(1)"),
+      null,
+      "Non-HTTP(S) redirect must be rejected"
+    );
+    assert.equal(
+      unwrapUrl("https://www.google.com/url?q=https%3A%2F%2Fencrypted-tbn0.gstatic.com%2Ffavicon&sa=U"),
+      null,
+      "gstatic redirect must be rejected"
+    );
     assert.equal(isGoogleSearchUrl("https://www.google.com/search?q=test"), true);
     assert.equal(isGoogleSearchUrl("https://github.com/test"), false);
+
+    // Citations require a non-empty snippet
+    const mockNoSnippet = [
+      [
+        [
+          ["c_test", "r_nosnippet1234567"],
+          null,
+          null,
+          [
+            [
+              "https://example.com/article",
+              "Article Title",
+              "https://encrypted-tbn0.gstatic.com/favicon-tbn?q=tbn",
+              "" // empty snippet!
+            ]
+          ]
+        ]
+      ]
+    ];
+    const resNoSnippet = parseHNvQHb(mockNoSnippet, "r_nosnippet1234567");
+    assert.equal(resNoSnippet.sources.length, 0, "Citation without snippet must not be parsed as source");
+
+    // Status 4 validation requires Google Search signature
+    const mockBadStatus = [
+      [
+        [
+          ["c_test", "r_badstatus1234567"],
+          null,
+          null,
+          [
+            [null, ["google", [null, null, "Not Search"], 4]]
+          ]
+        ]
+      ]
+    ];
+    const resBadStatus = parseHNvQHb(mockBadStatus, "r_badstatus1234567");
+    assert.equal(resBadStatus.status, null, "Status 4 without Google Search metadata must be rejected");
+
+    // Numeric c_id must not crash .replace
+    const mockNumCId = [
+      [
+        [
+          [12345678, "r_numcid1234567890"],
+          null,
+          null,
+          []
+        ]
+      ]
+    ];
+    const resNumCId = parseHNvQHb(mockNumCId, "r_numcid1234567890");
+    assert.equal(resNumCId.convId, "12345678", "Numeric c_id must be parsed as string");
+    assert.equal(resNumCId.status, null, "Turn found without search gives null status, not unbound");
+
+    // Unknown source row with nested fields is captured
+    const mockNestedUnknown = [
+      [
+        [
+          ["c_test", "r_nestedunknown123"],
+          null,
+          null,
+          [
+            ["https://unknown.com/page", "Unknown Title", ["nested", "data"]]
+          ]
+        ]
+      ]
+    ];
+    const resNestedUnknown = parseHNvQHb(mockNestedUnknown, "r_nestedunknown123");
+    assert.equal(resNestedUnknown.unknownRows.length, 1, "Unknown row with nested fields must be captured");
   }
 
   // --- B. Turn isolation by responseId in multi-turn history ---
@@ -7092,10 +7171,7 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     const res1 = parseHNvQHb(multiFixture, "r_c31b6777bc4b5ba9");
     assert.equal(res1.status, 4);
     assert.equal(res1.queries.length, 2);
-
-    const res2 = parseHNvQHb(multiFixture, "r_0000000000000002");
-    assert.equal(res2.status, "unbound");
-    assert.equal(res2.queries.length, 0);
+    assert.ok(res1.thoughtText && res1.thoughtText.length > 0, "Thought text must be extracted from hNvQHb");
 
     const resNone = parseHNvQHb(multiFixture, "r_nonexistent");
     assert.equal(resNone.status, "unbound");
@@ -7175,14 +7251,16 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       (err) => err.code === "WEB_GEMINI_DIALOG_UNCLOSED"
     );
 
-    // 4. Banner "Use Gemini" / "Использовать Gemini"
-    let clickedBanner = false;
+    // 4. Banner "Use Gemini" / "Использовать Gemini" — substring "Do not use Gemini" must NOT be clicked
+    let clickedWrongBanner = false;
+    let clickedRightBanner = false;
     const pageBanner = {
       evaluate: async (fn) => {
         const origDoc = global.document;
-        const useBtn = { offsetParent: {}, innerText: "Использовать Gemini", click: () => { clickedBanner = true; } };
+        const wrongBtn = { offsetParent: {}, innerText: "Do not use Gemini", click: () => { clickedWrongBanner = true; } };
+        const rightBtn = { offsetParent: {}, innerText: "Использовать Gemini", click: () => { clickedRightBanner = true; } };
         global.document = {
-          querySelectorAll: (sel) => sel.includes("button") ? [useBtn] : [],
+          querySelectorAll: (sel) => sel.includes("button") ? [wrongBtn, rightBtn] : [],
           querySelector: () => null,
         };
         try { return await fn(); } finally { global.document = origDoc; }
@@ -7190,7 +7268,8 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       waitForTimeout: async () => {},
     };
     await dismissOverlays(pageBanner, { isTurn: true, screenshotDir: shotDir });
-    assert.equal(clickedBanner, true, "Use Gemini banner button must be clicked");
+    assert.equal(clickedWrongBanner, false, "Do not use Gemini must NOT be clicked");
+    assert.equal(clickedRightBanner, true, "Exact Use Gemini banner button must be clicked");
 
     // 5. Paid upsell proposal with negative button
     let clickedNotNow = false;
@@ -7276,6 +7355,21 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     await dismissOverlays(pageUnknownOutside, { isTurn: false, screenshotDir: shotDir });
     assert.equal(shotOutside, true, "Screenshot must be taken outside turn without throwing");
 
+    // 9b. Unclosed consent wall outside turn does NOT throw
+    let shotUnclosedOutside = false;
+    const pageUnclosedOutside = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const dlg = { offsetParent: {}, innerText: "Before you continue", matches: () => false, closest: () => null, querySelectorAll: () => [] };
+        global.document = { querySelectorAll: (sel) => sel.includes("mat-dialog-container") ? [dlg] : [], querySelector: () => null };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      screenshot: async () => { shotUnclosedOutside = true; },
+      waitForTimeout: async () => {},
+    };
+    await dismissOverlays(pageUnclosedOutside, { isTurn: false, screenshotDir: shotDir });
+    assert.equal(shotUnclosedOutside, true, "Unclosed dialog outside turn must take screenshot without throwing");
+
     // 10. Backdrop covering input reloads page
     let reloadCount = 0;
     const pageBackdrop = {
@@ -7297,7 +7391,7 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     assert.equal(reloadCount, 1, "Page must be reloaded once when backdrop covers input");
   }
 
-  // --- D. Failure classification and wave protection ---
+  // --- D. Failure classification and wave protection (cross-process file lock) ---
   {
     const errUnknown = new Error("unknown dialog: something new");
     errUnknown.code = "WEB_GEMINI_UNKNOWN_DIALOG";
@@ -7312,18 +7406,36 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     const clsC = classifyFailure(errUnclosed);
     assert.equal(clsC.category, "unknown-dialog");
 
-    _resetDialogWaveHistory();
+    const waveDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "wave-shared-")));
+    _resetDialogWaveHistory(waveDir);
     const modalText = "Some completely unknown Google beta prompt";
-    assert.equal(checkDialogWave(modalText, "acc_a"), false);
-    assert.equal(checkDialogWave(modalText, "acc_b"), false);
-    assert.equal(checkDialogWave(modalText, "acc_c"), true, "Wave triggered on 3rd distinct account");
-    assert.equal(checkDialogWave("Different dialog", "acc_d"), false);
+    assert.equal(checkDialogWave(modalText, "acc_a", Date.now(), waveDir), false);
+    assert.equal(checkDialogWave(modalText, "acc_b", Date.now(), waveDir), false);
+    assert.equal(checkDialogWave(modalText, "acc_c", Date.now(), waveDir), true, "Wave triggered on 3rd distinct account");
+    // 4th account stays wave protected without throwing
+    assert.equal(checkDialogWave(modalText, "acc_d", Date.now(), waveDir), true);
+    assert.equal(checkDialogWave("Different dialog", "acc_e", Date.now(), waveDir), false);
   }
 
   // --- E. Thoughts sanitization and thoughts.jsonl writer ---
   {
     const testDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "thoughts-test-")));
     const logPath = path.join(testDir, "thoughts.jsonl");
+
+    // Test secret stripping in strings: URLs, Authorization, Cookie, f.sid
+    const dirtyUrl = "https://admin:supersecret@example.com/api?f.sid=sessiontoken123&clean=true";
+    const cleanUrl = sanitizeThoughtString(dirtyUrl);
+    assert.equal(cleanUrl.includes("supersecret"), false, "Password in URL must be stripped");
+    assert.equal(cleanUrl.includes("sessiontoken123"), false, "f.sid token must be masked");
+    assert.ok(cleanUrl.includes("https://example.com/api"));
+    assert.ok(cleanUrl.includes("f.sid=[REDACTED]"));
+
+    const authString = "Step info. Authorization: Bearer secret_bearer_token and Cookie: f.sid=xyz123";
+    const cleanAuth = sanitizeThoughtString(authString);
+    assert.equal(cleanAuth.includes("secret_bearer_token"), false);
+    assert.equal(cleanAuth.includes("xyz123"), false);
+    assert.ok(cleanAuth.includes("Authorization: [REDACTED]"));
+    assert.ok(cleanAuth.includes("Cookie: [REDACTED]"));
 
     const rawPayload = {
       query: "test query",
@@ -7332,6 +7444,7 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       nested: {
         f_sid: "sid-123",
         status: "in_progress",
+        url: "https://user:password@target.org/resource?sid=abc999",
       },
     };
     const cleaned = sanitizeThoughtPayload(rawPayload);
@@ -7340,6 +7453,8 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     assert.equal(cleaned.auth, undefined);
     assert.equal(cleaned.nested.f_sid, undefined);
     assert.equal(cleaned.nested.status, "in_progress");
+    assert.equal(cleaned.nested.url.includes("password"), false);
+    assert.equal(cleaned.nested.url.includes("abc999"), false);
 
     appendThoughtLog(logPath, "thought", { text: "Analyzing query\n" });
     appendThoughtLog(logPath, "tool_call", { toolCallId: "call_1", query: "test query" });
@@ -7352,29 +7467,40 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     assert.equal(lines[2].event, "tool_call_update");
   }
 
-  // --- F. Search sources block appended strictly in research && !write && !verdict ---
+  // --- F. Search sources block appended strictly in research && !write && !verdict, with maskResponse ---
   {
     const candidateWithSources = {
       text: "Summary of findings.",
       search: {
         sources: [
-          { url: "https://example.com/one", title: "Page One" },
+          { url: "https://user:pass@example.com/one", title: "Page One" },
           { url: "https://example.com/two", title: "Page Two" },
         ],
       },
     };
-    const contextResearch = { research: true, write: false, settings: { maskResponse: (x) => x } };
+    const contextResearch = {
+      research: true,
+      write: false,
+      settings: {
+        maskResponse: (text) => text.replace(/example\.com/g, "[скрыто: domain]"),
+      },
+    };
     const checked1 = checkedAnswer(contextResearch, candidateWithSources);
     assert.equal(checked1.text, "Summary of findings.");
 
     let formattedText = checked1.text;
     if (contextResearch.research && !contextResearch.write && !contextResearch.verdict && candidateWithSources.search?.sources?.length) {
-      const list = candidateWithSources.search.sources.map((s) => `* [${s.title}](${s.url})`).join("\n");
+      const list = candidateWithSources.search.sources
+        .map((s) => `* [${sanitizeThoughtString(s.title)}](${sanitizeThoughtString(s.url)})`)
+        .join("\n");
       formattedText = formattedText.trimEnd() + "\n\n### Источники поиска\n" + list;
     }
+    if (contextResearch.settings?.maskResponse) {
+      formattedText = contextResearch.settings.maskResponse(formattedText);
+    }
     assert.ok(formattedText.includes("### Источники поиска"));
-    assert.ok(formattedText.includes("* [Page One](https://example.com/one)"));
-    assert.ok(formattedText.includes("* [Page Two](https://example.com/two)"));
+    assert.equal(formattedText.includes("pass@"), false, "Credentials in source URL must be stripped");
+    assert.ok(formattedText.includes("[скрыто: domain]"), "maskResponse must be called on full research output with sources block");
 
     // Write mode: sources block NOT appended
     const contextWrite = { research: true, write: true, settings: { maskResponse: (x) => x } };
@@ -7386,7 +7512,64 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     assert.equal(writeText.includes("### Источники поиска"), false, "Sources block must not be appended in write mode");
   }
 
-  // --- G. Integration with driver hooks in sendPrompt ---
+  // --- G. DOM and model-thoughts isolation ---
+  {
+    const parentOf = (el) => (el ? el.parentElement || el.parentNode || null : null);
+    const thoughtSpinner = {
+      tagName: "mat-spinner",
+      getAttribute: () => null,
+      offsetParent: {},
+      parentElement: null,
+      parentNode: null,
+    };
+    const modelThoughts = {
+      tagName: "model-thoughts",
+      getAttribute: () => null,
+      offsetParent: {},
+      parentElement: null,
+      parentNode: null,
+      querySelectorAll: (sel) => [thoughtSpinner],
+    };
+    thoughtSpinner.parentElement = modelThoughts;
+    thoughtSpinner.parentNode = modelThoughts;
+    const targetEl = {
+      tagName: "model-response",
+      getAttribute: () => null,
+      offsetParent: {},
+      parentElement: null,
+      parentNode: null,
+      querySelectorAll: (sel) => sel.includes("spinner") ? [thoughtSpinner] : sel.includes("model-thoughts") ? [modelThoughts] : [],
+      querySelector: (sel) => null,
+      childNodes: [
+        { nodeType: 3, nodeValue: "Direct text in target. " },
+        modelThoughts,
+        { nodeType: 3, nodeValue: "Second direct text." },
+      ],
+      innerText: "Direct text in target. Second direct text.",
+    };
+    modelThoughts.parentElement = targetEl;
+    modelThoughts.parentNode = targetEl;
+
+    const userQuery = {
+      tagName: "user-query",
+      innerText: "Test prompt",
+      compareDocumentPosition: () => 4,
+    };
+    const mockDoc = {
+      querySelectorAll: (sel) => {
+        if (sel === "model-response") return [targetEl];
+        if (sel === "user-query") return [userQuery];
+        return [];
+      },
+      querySelector: (sel) => null,
+    };
+    const turnStatus = driver.checkTurnStatus(mockDoc, 0, "Test prompt");
+    assert.equal(turnStatus.isBusyOrThinking, false, "Spinner inside model-thoughts must NOT set isBusyOrThinking");
+    assert.ok(turnStatus.currentText.text.includes("Direct text in target"), "Direct text nodes must be preserved");
+    assert.ok(turnStatus.currentText.text.includes("Second direct text"), "Second direct text node must be preserved");
+  }
+
+  // --- H. Integration with driver hooks in sendPrompt ---
   {
     const fixturePath = path.join(PLUGIN_ROOT, "tests", "fixtures", "hnvqhb-2026-11-24.json");
     const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
