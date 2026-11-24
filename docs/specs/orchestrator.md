@@ -21,7 +21,7 @@ revision: 34.6 (r34.5 — неблокирующие улучшения архи
 |---|---|
 | координатор | тред, который раздаёт работу (`BB_THREAD_ID` вызывающего агента) |
 | исполнитель | тред, созданный раздачей; дочерний к координатору |
-| уровень | сложность задачи для исполнителя: `complex` (сложная), `medium` (средняя), `simple` (простая), `review` (проверка); имена задаёт политика |
+| уровень | сложность задачи для исполнителя или роль: например `complex` (редкая сложная), `high`, `medium`, `simple`, `review` (проверка), `architect`, `research`; имена задаёт политика, принципы шкалы — [ADR-0042](../adr/0042-orchestrator-levels-and-chains.md) |
 | маршрут | пресет `bb tasks` + атрибуты для сторожа и квот (§2) |
 | цепочка | упорядоченный список маршрутов уровня; следующий берётся при сбое предыдущего |
 | делегирование | одна запись плагина: задача, исполнитель, маршрут, состояние (§7) |
@@ -79,7 +79,7 @@ revision: 34.6 (r34.5 — неблокирующие улучшения архи
 Плагин не содержит готовых наборов моделей. Настройку делает агент пользователя по навыку `orchestrator-setup` (поставляется в плагине):
 1. Спросить пользователя, какие подписки и провайдеры у него есть и что жалко тратить.
 2. Посмотреть, что реально доступно: `bb provider list`, `bb provider models <id>` (модели и уровни рассуждений — только из этого вывода).
-3. Предложить, какой пресет на каком уровне (`complex` — сложное, `medium` — среднее, `simple` — простое, `review` — проверка) и цепочку резерва; показать таблицу пользователю и получить согласие.
+3. Предложить, какой пресет на каком уровне (`complex` — редкое сложное, `high` — сложное постоянное, `medium` — среднее, `simple` — простое, `review` — проверка) и цепочку резерва; показать таблицу пользователю и получить согласие.
 4. Создать недостающие пресеты (`bb tasks preset create … --permission full --environment worktree` с контрактом исполнителя; ревьюеру — контракт «только чтение») или использовать уже существующие пресеты пользователя.
 5. Записать политику (`bb plugin config orchestrator set policy …`), проверить `bb orchestrator policy validate`.
 
@@ -94,7 +94,7 @@ revision: 34.6 (r34.5 — неблокирующие улучшения архи
 **Ревью по сложности.** Необязательное поле политики `reviewByLevel` — какой уровень ревью брать по сложности проверяемой работы:
 
 ```json
-"reviewByLevel": { "complex": "review", "medium": "review-medium", "simple": "review-simple" }
+"reviewByLevel": { "complex": "review", "high": "review", "medium": "review-medium", "simple": "review-simple" }
 ```
 
 `delegate <KEY> --level review` при заданном `reviewByLevel`: плагин берёт уровень **последнего по времени** делегирования задачи с ролью `executor` (любого уровня, есть он в карте или нет) и раздаёт на уровень `reviewByLevel[<он>]`; в ответе и комментарии — «review → review-medium по сложности исполнения medium». Нет делегирований исполнителя (ревью спеки, плана) или уровня нет в карте — остаётся `review`. Явный уровень ревью (`--level review-simple`) карту не применяет. Валидация: каждое значение карты — уровень политики с ролью `auditor`.
@@ -133,6 +133,7 @@ revision: 34.6 (r34.5 — неблокирующие улучшения архи
 Плагин — единственный источник правил раздачи. Два слоя:
 
 1. **Навык `orchestrator-coordinator`** (скилл в манифесте плагина, полный порядок работы): план — не команда; спека до раздачи; шаблон описания задачи; выбор уровня («сомневаешься — выше», «сложное не понижать»); раздача только через `delegate`; не ждать в форграунде — отчёт придёт сообщением; что делать по исходам сторожа; ревью до и после — на уровне `review`; проверка результата координатором; push и PR — только координатор. Текст навыка не содержит имён моделей и провайдеров — уровни и маршруты он берёт из `bb orchestrator instructions`.
+   Правило выбора уровня в инструкции роли оркестратора (24.11, ADR-0042): описание уровня в политике главнее общего правила; уровень, помеченный как редкий, — только при совпадении задачи с описанием; «сомневаешься — бери выше» — между постоянными уровнями; архитектуру — уровню с ролью `architect`, спеки — уровню спек. Текст `role.body.orchestrator` (ru/en) приводится к этому правилу.
 2. **Короткое правило** (генерируется из политики, ≤ 1500 символов, без ID тредов и путей): уровни с описаниями, лимиты, команда `delegate`, отсылка к навыку. `bb orchestrator instructions` печатает его.
 
 > [!CAUTION]
@@ -381,7 +382,7 @@ bb orchestrator instructions                                     # правил�
 bb orchestrator reconcile                                        # принудительная сверка §7: незавершённые шаги, сторож, сверка с трекером (done/canceled) и git (автопроставление merged-upstream для влитых result_sha)
 bb orchestrator merge <KEY|delegationId> [--into <ветка>] [--no-autofix] [--dry-run] [--mark-merged [sha]] [--json]   # вливание итога захода, §14
 bb orchestrator janitor [run|report] [--dry-run] [--json]       # уборщик, §15
-bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|medium|simple|spec|research] [--privacy <normal|strict>] [--acceptance <файл|текст>] [--release-note "<текст>"] [--depends-on "<k1,k2>"] [--force-reset-branch] [--json] # постановка в очередь графа, §27, §32, §33
+bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|high|medium|simple|spec|research] [--privacy <normal|strict>] [--acceptance <файл|текст>] [--release-note "<текст>"] [--depends-on "<k1,k2>"] [--force-reset-branch] [--json] # постановка в очередь графа, §27, §32, §33
 bb orchestrator release-note <KEY> "<заметка>" [--json]         # передать заметку релиза при статусе waiting_release_note, §28.1
 bb orchestrator defer <KEY> --reason "<причина>" [--json]       # отложить задачу (только владелец, статус deferred), §27.1, §29
 bb orchestrator dequeue <KEY> [--reason "<причина>"] [--json]         # снять задачу с очереди графа (только владелец, статус cancelled), §27.1, §28.1
@@ -1258,7 +1259,7 @@ CREATE TABLE IF NOT EXISTS task_queue (
   project_id TEXT NOT NULL,
   coordinator_thread_id TEXT NOT NULL,
   route TEXT NOT NULL CHECK(route IN ('feature', 'fix', 'docs', 'simple', 'research')),
-  level TEXT NOT NULL CHECK(level IN ('complex', 'medium', 'simple', 'spec', 'research', 'architect')),
+  level TEXT NOT NULL CHECK(level IN ('complex', 'high', 'medium', 'simple', 'spec', 'research', 'architect')),
   node TEXT NOT NULL CHECK(node IN (
     'start', 'design', 'spec', 'spec_review', 'owner_gate', 'code', 'checks',
     'review', 'design_check', 'release', 'research'
@@ -1339,7 +1340,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 - **`research` (исследование и сбор данных):**
   - `start → research → done` (уровень `research`, без кода, без ревью, без выкладки).
 
-При постановке задачи `enqueue` параметр `--level` задаёт уровень цепочки для узла реализации кода (`complex`, `medium`, `simple`) либо узла документации (`spec` для маршрута `docs`) или исследования (`research` для маршрута `research`). На маршрутах с кодом (`feature`, `fix`, `simple`) уровень ОБЯЗАН иметь роль `executor`. Попытка указать `--level spec` или `--level architect` для маршрутов с кодом отклоняется с ошибкой `invalid-level: узел code требует уровня с инструментами написания кода (роль executor)`. Узлы `design` и `design_check` ВСЕГДА выполняются ролью `architect` независимо от `--level` задачи.
+При постановке задачи `enqueue` параметр `--level` задаёт уровень цепочки для узла реализации кода (`complex`, `high`, `medium`, `simple`) либо узла документации (`spec` для маршрута `docs`) или исследования (`research` для маршрута `research`). На маршрутах с кодом (`feature`, `fix`, `simple`) уровень ОБЯЗАН иметь роль `executor`. Попытка указать `--level spec` или `--level architect` для маршрутов с кодом отклоняется с ошибкой `invalid-level: узел code требует уровня с инструментами написания кода (роль executor)`. Узлы `design` и `design_check` ВСЕГДА выполняются ролью `architect` независимо от `--level` задачи.
 
 ### 27.3 Тест связи цепочки раздачи (урок 4 аудита)
 
@@ -1401,7 +1402,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | `feature`, `fix`, `simple`, `docs` | `owner_gate` | Владелец (человек, без `BB_THREAD_ID`) | Отложено владельцем через UI (кнопка `[Отложить]`, Б2) / `defer` | `owner_gate` | `deferred` | Запись `deferred_by = "owner"`. При наличии `BB_THREAD_ID` отказ `permission-denied: owner-only` |
 | `feature`, `fix`, `simple`, `docs` | `owner_gate` | `run-queue` | Таймаут карточки взаимодействия / рестарт сервера | `owner_gate` | `waiting_approval` | Автоматический перевыпуск `PluginInteractionRequest`; постоянный статус в UI без повторных напоминаний (r34.5) |
 | `fix`, `simple` | `code` | Уровень задачи | Сдан коммит кода, но обнаружен выход за рамки маршрута (§31.7, Б3, r34.2) | `design` | `running` | Машинный контроль маршрута (Б3, r34.2): затронуты пути спек, миграций, публичных API или нетто-дифф без тестов превысил лимиты проекта `routeLimits` (по умолчанию >3 файлов, >150 строк). Автоматический перевод задачи на маршрут `feature` (`task.route = 'feature'`, сброс счётчиков), передача архитектору на redesign |
-| `feature`, `fix`, `simple` | `code` | Уровень задачи (`complex`/`medium`/`simple`) | Сдан коммит кода (`done`, чистая копия, `commits > 0`), рамки соблюдены, договор не изменён | `checks` | `running` | Фиксация `result_sha`. Проверка: diff `acceptance_sha..result_sha -- docs/specs/acceptance/<KEY>.md` пуст. Счётчик `check_attempts` не сбрасывается при каждой сдаче (накапливается до порога 3 отказов проверок) |
+| `feature`, `fix`, `simple` | `code` | Уровень задачи (`complex`/`high`/`medium`/`simple`) | Сдан коммит кода (`done`, чистая копия, `commits > 0`), рамки соблюдены, договор не изменён | `checks` | `running` | Фиксация `result_sha`. Проверка: diff `acceptance_sha..result_sha -- docs/specs/acceptance/<KEY>.md` пуст. Счётчик `check_attempts` не сбрасывается при каждой сдаче (накапливается до порога 3 отказов проверок) |
 | `feature`, `fix`, `simple` | `code` | Уровень задачи | Исполнитель изменил `docs/specs/acceptance/<KEY>.md` (§31.5) | `code` | `running` | Отказ захода: `acceptance-contract-tampered`. Инкремент `code_attempts` (при ≥ 3 → `blocked`) |
 | `feature`, `fix`, `simple` | `code` | Уровень задачи | Сдача со статусом done без коммитов (урок 7) | `code` | `running` | Отказ приёмки (если не `no_code`), инкремент `code_attempts` (при ≥ 3 → `blocked`), повтор с требованием коммита |
 | `feature`, `fix`, `simple` | `code` | Уровень задачи | Сбой / таймаут / квота / отмена исполнителя | `code` | `running` (перевыпуск) / `stalled` | Перевыпуск по цепочке уровня задачи; при исчерпании — `stalled` |

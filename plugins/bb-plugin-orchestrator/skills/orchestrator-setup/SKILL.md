@@ -16,6 +16,8 @@ There are no ready-made model bundles in the plugin: you choose what sits on eac
    - `medium` — ordinary features and tests against a clear spec;
    - `simple` — mechanical edits, documents, data gathering;
    - `review` — checking specs before dispatch and results after; read-only.
+   Typical stand scale (24.11): a rare expensive `complex` plus standing `high`, `medium`, `simple` on near-unlimited models; separate role levels — `architect` (strongest models), a spec level (strong models only, never weak ones), `research`. Write "RARE" in the rare level description — the coordinator reads descriptions.
+   If one model is offered by several providers, put its routes consecutively — free first, paid last within that model group: one provider may be down while another answers. Probe every route live before writing it.
    A level can have a route chain: when the first fails (quota, stall) the watchdog takes the next one. For `complex` and `review` auto-reissue is usually off (`autoFallback: false`) — the coordinator decides about reissue.
    There can be several review levels — give the level `"role": "auditor"` (e.g. `review-complex`, `review-medium`, `review-simple`); without the field the level is an executor one, and the name `review` still counts as auditor. Binding complexity to review — `"reviewByLevel": {"complex": "review-complex", …}`: `delegate --level review` then picks the auditor level itself by the task's last execution.
 4. **Create the missing presets**:
