@@ -277,6 +277,14 @@ tools and skills the thread may use.
   not, the role carries no text (agy on the ACP bridge delivers it; `acp-devin`
   restores instructions after compaction via `provider-devin`).
 
+## Coordinator worktrees
+
+Managed coordinator worktrees are governed by `coordinatorWorktrees: "off" | "on"` (default: `"off"`) in `bb.settings.define` under §23 protection. Until this mode is enabled by the owner, BB removes a thread's worktree 5 minutes after the last thread using it is archived, and unpushed local changes are lost. When working in a shared project before the mode is enabled, keep coordinator threads unarchived, save local work, and commit changes before archiving.
+
+When enabled (`coordinatorWorktrees: "on"`), each coordinator thread runs in a separate BB Worktree environment with its own branch based on the current remote target. Fetch the target and integrate it in that worktree before publishing. Releases to the same repository and target branch use a single publication lock.
+
+Keep the coordinator thread unarchived while its worktree is needed. Before archiving, save local work and check that the branch's changes are on the target. The [planned lifecycle](../../docs/specs/orchestrator.md#169-жизненный-цикл-рабочей-копии-координатора) requires BB retention before managed coordinator worktrees are enabled. A promotion from executor to coordinator unbinds the promoted thread from its parent (`bb thread update <id> --clear-parent-thread`), retains the existing environment under `coordinator-live` protection, and requires a separate integration worktree before merge or release operations. Branches registered in `coordinator_worktrees` are protected from post-release cleanup.
+
 ## Helpers (§19)
 
 `orchestrator_helper` (agent tool) and `bb orchestrator helper` create a

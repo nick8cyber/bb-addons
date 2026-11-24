@@ -557,6 +557,42 @@ test("CLI enqueue rejects code route with spec or architect level", async () => 
   assert.equal(JSON.parse(resDocsComplex.stdout).error.code, "invalid-level");
 });
 
+test("§32.6 (PLUG-400): CLI enqueue accepts --level high for feature and docs routes", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  const resFeature = await host.harness.runCli([
+    "enqueue",
+    "PLUG-401",
+    "--route",
+    "feature",
+    "--level",
+    "high",
+    "--json",
+  ]);
+  assert.equal(resFeature.exitCode, 0);
+  const dataFeature = JSON.parse(resFeature.stdout);
+  assert.equal(dataFeature.ok, true);
+  assert.equal(dataFeature.task.task_key, "PLUG-401");
+  assert.equal(dataFeature.task.level, "high");
+  assert.equal(dataFeature.task.route, "feature");
+
+  // docs route accepts high (rules like medium, §32.6 п. 3)
+  const resDocs = await host.harness.runCli([
+    "enqueue",
+    "PLUG-402",
+    "--route",
+    "docs",
+    "--level",
+    "high",
+    "--json",
+  ]);
+  assert.equal(resDocs.exitCode, 0);
+  const dataDocs = JSON.parse(resDocs.stdout);
+  assert.equal(dataDocs.ok, true);
+  assert.equal(dataDocs.task.task_key, "PLUG-402");
+  assert.equal(dataDocs.task.level, "high");
+  assert.equal(dataDocs.task.route, "docs");
+});
+
 test("CLI enqueue prevents double active enqueue", async () => {
   const host = await hostWith({ workGraph: "shadow" });
   await host.harness.runCli(["enqueue", "PLUG-202", "--route", "feature", "--json"]);

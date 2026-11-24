@@ -31,6 +31,8 @@ import {
   verifySpecBeforeCodeGate,
   resolveExecutorBaseSha,
   resolvePresetBaseBranch,
+  resolveSpecGateBase,
+  presetForLevel,
   resolveTaskSpecContract,
   parseContractFromText,
   resolveEffectiveApprovalMode,
@@ -75,6 +77,14 @@ export {
   type TransitionRule,
 };
 
+import {
+  recordTaskNotEnqueued,
+  recordClosedTaskAction,
+  shadowFollow,
+  isShadowAdopted,
+  syncShadowTerminalStatuses,
+  type TrackerStatusFn,
+} from "./shadow-reconcile.js";
 import {
   type WorkGraphMode,
   normalizeWorkGraphMode,
@@ -136,15 +146,6 @@ export function assertOwnerOnly(
   if (!isOwnerCalling(ctx)) {
     throw new OrchestratorError("permission-denied", message);
   }
-}
-
-export interface ShadowActionParams {
-  command: "delegate" | "merge" | "release";
-  taskKey: string;
-  level?: string;
-  route?: string;
-  actor?: string;
-  policy?: Policy | null;
 }
 
 /** Resolves the effective role for a level against policy or conventions (§2.3 / §27.3). */
@@ -212,100 +213,6 @@ export function matchesNodeLevel(
       return levelName === "research" || role === "researcher";
     default:
       return false;
-  }
-}
-
-/** §32 (Б4): In shadow mode, mirror manual coordinator actions and log shadow_eval. */
-export function recordShadowAction(
-  store: DelegationStore,
-  params: ShadowActionParams,
-  mode: WorkGraphMode,
-): void {
-  if (mode !== "shadow") return;
-  try {
-    const key = normalizeTaskKey(params.taskKey);
-    const task = store.getTask(key);
-    const actor = params.actor ?? "shadow:coordinator";
-
-    if (!task) {
-      // §32 (Б4): For un-enqueued tasks, log service transition with 'none' sentinels
-      store.insertTransition({
-        taskKey: key,
-        fromNode: "none",
-        toNode: "none",
-        fromStatus: "none",
-        toStatus: "none",
-        actor: "shadow:coordinator",
-        reason: "task-not-enqueued",
-        payload: JSON.stringify({
-          event: "manual_command",
-          command: params.command,
-          would_reject: "graph-required",
-          would_block: { reason: "graph-required" },
-        }),
-      });
-      return;
-    }
-
-    // §32 (Б4): For enqueued tasks, evaluate whether the action would be allowed or rejected
-    const payload = parsePayload(task.payload);
-    let wouldAllow: string | undefined;
-    let wouldReject: string | undefined;
-
-    if (params.command === "delegate") {
-      const level = params.level ?? "";
-      if (matchesNodeLevel(task.node, level, params.policy)) {
-        wouldAllow = "delegate";
-      } else {
-        wouldReject = `invalid_node: expected ${task.node}, got delegate level ${level}`;
-      }
-    } else if (params.command === "merge") {
-      if (task.node === "code") {
-        wouldAllow = "merge";
-      } else {
-        wouldReject = `invalid_node: merge called while at node ${task.node}`;
-      }
-    } else if (params.command === "release") {
-      if (task.node === "release" && task.status === "running") {
-        wouldAllow = "release";
-      } else {
-        wouldReject = `node-not-release: release called while at ${task.node}:${task.status}`;
-      }
-    }
-
-    const shadowEval = {
-      command: params.command,
-      evaluated_at: Date.now(),
-      would_allow: wouldAllow,
-      would_reject: wouldReject,
-      would_block: wouldReject ? { reason: wouldReject } : undefined,
-      current_node: task.node,
-      current_status: task.status,
-    };
-
-    store.insertTransition({
-      taskKey: key,
-      fromNode: task.node,
-      toNode: task.node,
-      fromStatus: task.status,
-      toStatus: task.status,
-      actor,
-      reason: `shadow-mirror:${params.command}`,
-      payload: JSON.stringify({
-        event: "manual_command",
-        command: params.command,
-        shadow_eval: shadowEval,
-      }),
-    });
-
-    store.updateTask(key, {
-      payload: JSON.stringify({
-        ...payload,
-        shadow_eval: shadowEval,
-      }),
-    });
-  } catch {
-    // Silent isolation: shadow mode audit must never break manual coordinator actions
   }
 }
 
@@ -504,6 +411,10 @@ export async function resolveTaskProjectId(
 
 export interface DirectActionOptions {
   command?: "delegate" | "merge" | "release";
+  /** §32.5.1 (PLUG-398): проверка без действия (`merge --dry-run`) — в shadow ничего не пишет */
+  dryRun?: boolean;
+  /** id делегирования действия — в payload строки `closed-task-action` (§32.5.4 п. 3) */
+  delegationId?: number | null;
   level?: string;
   route?: string;
   actor?: string;
@@ -563,27 +474,45 @@ export async function assertGraphAllowsDirectAction(
     }
   }
 
-  // 3. Complete silence for 'off' mode: 0 transitions, recordShadowAction not called
+  // 3. Complete silence for 'off' mode: 0 transitions, 0 queue rows (§32.2 п. 3)
   if (effectiveMode === "off") {
     return;
   }
 
-  // 4. In shadow mode, mirror coordinator manual action
+  // 4. §32.5.1 (PLUG-398): shadow. Приём и следование зеркала пишутся ПОСЛЕ
+  // действия (shadowObserveDelegate/Merge/Release); здесь — только служебная
+  // запись `task-not-enqueued` для действий, которые приём не покрывает:
+  // ручные merge/release по задаче вне очереди и раздачи без определённого
+  // проекта (§32.5.1 п. 6).
   if (effectiveMode === "shadow") {
     try {
-      recordShadowAction(
-        store,
-        {
-          command: action?.command ?? "delegate",
-          taskKey: key,
-          level: action?.level,
-          route: action?.route,
-          actor: action?.actor ?? "shadow:coordinator",
-          policy: action?.policy,
-        },
-        effectiveMode,
-      );
-    } catch {}
+      const command = action?.command ?? "delegate";
+      // §32.5.1 п. 1: release-audit — полное молчание (0 строк, включая
+      // task-not-enqueued), даже при неопределённом проекте.
+      if (command === "delegate" && action?.level === "release-audit") return;
+      // `merge --dry-run` — не действие: строки не пишутся.
+      if (action?.dryRun) return;
+      // Единственное место записи `task-not-enqueued` для merge/release вне
+      // очереди: наблюдатель после действия её не дублирует.
+      const task = store.getTask(key);
+      if (!task && (command !== "delegate" || !projectId)) {
+        recordTaskNotEnqueued(store, key, command, projectId);
+      } else if (
+        task &&
+        command !== "delegate" &&
+        (task.status === "done" || task.status === "cancelled")
+      ) {
+        // §32.5.4 п. 3: merge/release по закрытой записи её не переоткрывают
+        // ни в каком случае — одна строка `closed-task-action` на действие;
+        // раздачу решает наблюдатель после действия по статусу трекера.
+        recordClosedTaskAction(store, key, command, {
+          delegationId: action?.delegationId ?? null,
+          projectId,
+        });
+      }
+    } catch {
+      // Silent isolation: shadow audit must never break manual coordinator actions
+    }
     return;
   }
 
@@ -1087,6 +1016,7 @@ export async function runEnqueue(
 
   const validLevels = [
     "complex",
+    "high",
     "medium",
     "simple",
     "spec",
@@ -2173,6 +2103,8 @@ export async function runApprove(
     ctx: PluginCliContext;
     workGraphMode: WorkGraphMode;
     now?: () => number;
+    /** §32.5 (PLUG-398): роли уровней для следования зеркала */
+    policy?: Policy | null;
   },
 ): Promise<{ ok: boolean; task: TaskQueueRow }> {
   assertOwnerOnly(deps.ctx);
@@ -2211,54 +2143,89 @@ export async function runApprove(
     );
   }
 
-  const resolution = resolveTransition({
-    route: task.route,
-    node: task.node,
-    status: task.status,
-    event: { type: "owner_approve", isOwner: isOwnerCalling(deps.ctx), comment },
-    mode: task.confirmation_mode,
-    counters: extractCounters(task),
-    gateStage,
-  });
-
-  if (!resolution.allowed) {
-    if (resolution.errorCode === "permission-denied") {
-      throw new OrchestratorError("permission-denied", resolution.errorMessage ?? "owner-only");
-    }
-    throw new OrchestratorError(
-      "invalid-status",
-      `task is not waiting for approval (current: node=${task.node}, status=${task.status})`,
-    );
-  }
-
   const now = deps.now ? deps.now() : Date.now();
-  const res = deps.store.transitionTask(
-    {
-      taskKey: key,
-      expectedNode: task.node,
-      expectedStatus: task.status,
-      toNode: resolution.toNode,
-      toStatus: resolution.toStatus,
-      actor: "owner",
-      reason: comment || "approved",
+  let approvedTask: TaskQueueRow;
+  if (
+    deps.workGraphMode === "shadow" &&
+    (task.status === "done" || task.status === "cancelled")
+  ) {
+    // §32.5.4 п. 3: закрытая запись зеркала не открывается заново — узел и
+    // статус не трогаем, одна строка `closed-task-action`; штатное действие
+    // (запись одобрения §31.9) ниже.
+    recordClosedTaskAction(deps.store, key, "approve", {
+      projectId: task.project_id,
       now,
-    },
-    now,
-  );
-  if (!res.ok) {
-    throw new OrchestratorError(
-      "transition-failed",
-      `не удалось одобрить задачу ${key}: конфликт CAS`,
+    });
+    approvedTask = task;
+  } else if (deps.workGraphMode === "shadow" && task.node !== "owner_gate") {
+    // §32.5.2 (PLUG-398): зеркало не входит в owner_gate — вид одобрения
+    // определяется маршрутом и текущим узлом; узел двигает следование
+    // зеркала, штатное действие (запись одобрения §31.9) сохраняется ниже.
+    const fr = shadowFollow(
+      deps.store,
+      key,
+      { command: "approve" },
+      { policy: deps.policy ?? null, now },
     );
+    if (!fr.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось одобрить задачу ${key}: конфликт CAS`,
+      );
+    }
+    approvedTask = deps.store.getTask(key)!;
+    // следование обновило payload.mirror — дальнейшие записи payload идут поверх
+    payloadObj = parsePayload(approvedTask.payload);
+  } else {
+    const resolution = resolveTransition({
+      route: task.route,
+      node: task.node,
+      status: task.status,
+      event: { type: "owner_approve", isOwner: isOwnerCalling(deps.ctx), comment },
+      mode: task.confirmation_mode,
+      counters: extractCounters(task),
+      gateStage,
+    });
+
+    if (!resolution.allowed) {
+      if (resolution.errorCode === "permission-denied") {
+        throw new OrchestratorError("permission-denied", resolution.errorMessage ?? "owner-only");
+      }
+      throw new OrchestratorError(
+        "invalid-status",
+        `task is not waiting for approval (current: node=${task.node}, status=${task.status})`,
+      );
+    }
+
+    const res = deps.store.transitionTask(
+      {
+        taskKey: key,
+        expectedNode: task.node,
+        expectedStatus: task.status,
+        toNode: resolution.toNode,
+        toStatus: resolution.toStatus,
+        actor: "owner",
+        reason: comment || "approved",
+        now,
+      },
+      now,
+    );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось одобрить задачу ${key}: конфликт CAS`,
+      );
+    }
+    approvedTask = res.task!;
   }
 
-  let approvedContract = resolveTaskSpecContract(key, deps.store, payloadObj, { task: res.task! });
+  let approvedContract = resolveTaskSpecContract(key, deps.store, payloadObj, { task: approvedTask });
   if (
     !approvedContract ||
     !approvedContract.specPath ||
     approvedContract.specPath.includes("/acceptance/")
   ) {
-    const targetSha = res.task?.spec_sha ?? task.spec_sha;
+    const targetSha = approvedTask.spec_sha ?? task.spec_sha;
     const proj = task.project_id && (deps as any).resolveProject
       ? await Promise.resolve((deps as any).resolveProject(task.project_id)).catch(() => null)
       : (deps as any).project ?? null;
@@ -2321,7 +2288,7 @@ export async function runApprove(
       deps.store.updateTask(key, { payload: JSON.stringify(payloadObj) });
     } else {
       let specSha: string | undefined =
-        (res.task!.spec_sha ||
+        (approvedTask.spec_sha ||
         task.spec_sha ||
         approvedContract.specSha ||
         (payloadObj?.spec_sha ?? payloadObj?.specSha) ||
@@ -2380,7 +2347,7 @@ export async function runApprove(
     }
   }
 
-  return { ok: true, task: res.task! };
+  return { ok: true, task: approvedTask };
 }
 
 export async function runReleaseNote(
@@ -4004,6 +3971,11 @@ export interface RunQueueDeps {
     mergeCommit?: string;
     error?: string;
   }>;
+  /** §32.5.4 (PLUG-398): статус задачи в трекере для синхронизации shadow. */
+  getTrackerStatus?: TrackerStatusFn;
+  /** §32.5.4: интервал между запросами трекера по одной задаче (такт сервиса). */
+  trackerSyncMinIntervalMs?: number;
+  trackerSyncLastChecked?: Map<string, number>;
 }
 
 export interface RunQueueResult {
@@ -4157,6 +4129,39 @@ export async function runRunQueue(
     );
   }
 
+  // §32.5.4 (PLUG-398): закрытые в трекере задачи shadow-проектов
+  // закрываются в очереди до любых вычислений — их не «берут заново».
+  if (deps.getTrackerStatus) {
+    try {
+      // Записи, которые ниже получат `shadow_eval`, проверяются в трекере
+      // без пропуска по интервалу: закрытая в трекере задача не должна
+      // получить would_transition ещё 60–120 с (§32.5.4 п. 2).
+      const evaluatedKeys = new Set<string>();
+      if (!deps.autoAdvance) {
+        for (const t of [
+          ...deps.store.listQueuedTasks(),
+          ...deps.store.listActiveTasks(),
+        ]) {
+          if (getTaskMode(t.project_id) === "shadow") evaluatedKeys.add(t.task_key);
+        }
+      }
+      await syncShadowTerminalStatuses(deps.store, {
+        forceKeys: evaluatedKeys,
+        getMode: getTaskMode,
+        getTrackerStatus: deps.getTrackerStatus,
+        now: deps.now,
+        log: deps.log,
+        minIntervalMs: deps.trackerSyncMinIntervalMs,
+        lastChecked: deps.trackerSyncLastChecked,
+      });
+    } catch (e) {
+      deps.log?.warn?.(`orchestrator: shadow-sync failed: ${String(e)}`);
+    }
+  }
+  // §32.5.1 п. 3: принятая в shadow задача никогда не берётся конвейером.
+  const skipForShadow = (t: TaskQueueRow, mode: WorkGraphMode): boolean =>
+    mode === "shadow" && (!deps.autoAdvance || isShadowAdopted(t));
+
   const maxActiveTasks = Math.max(1, deps.maxActiveTasks ?? 1);
   const repoRoot = deps.repoRoot ?? process.cwd();
   const mergeBaseBranch = deps.mergeBaseBranch ?? "main";
@@ -4181,7 +4186,7 @@ export async function runRunQueue(
       for (const task of activeTasks) {
         const taskMode = getTaskMode(task.project_id);
         if (taskMode === "off") continue;
-        if (taskMode === "shadow" && !deps.autoAdvance) continue;
+        if (skipForShadow(task, taskMode)) continue;
         try {
           const taskRepo = deps.resolveTaskRepoContext
             ? await deps.resolveTaskRepoContext(task)
@@ -4218,7 +4223,7 @@ export async function runRunQueue(
         for (const task of waitingTasks) {
           const taskMode = getTaskMode(task.project_id);
           if (taskMode === "off") continue;
-          if (taskMode === "shadow" && !deps.autoAdvance) continue;
+          if (skipForShadow(task, taskMode)) continue;
           if (!task.interaction_id) {
             try {
               const payload = parsePayload(task.payload);
@@ -4256,7 +4261,7 @@ export async function runRunQueue(
       for (const qt of allQueued) {
         const taskMode = getTaskMode(qt.project_id);
         if (taskMode === "off") continue;
-        if (taskMode === "shadow" && !deps.autoAdvance) continue;
+        if (skipForShadow(qt, taskMode)) continue;
         if (qt.node_alarm_at !== null && now >= qt.node_alarm_at) {
           const elapsedSeconds = Math.max(
             0,
@@ -4301,7 +4306,7 @@ export async function runRunQueue(
       for (const pt of prOpenTasks) {
         const taskMode = getTaskMode(pt.project_id);
         if (taskMode === "off") continue;
-        if (taskMode === "shadow" && !deps.autoAdvance) continue;
+        if (skipForShadow(pt, taskMode)) continue;
         try {
           const advanced = await advancePrOpenTask(
             pt,
@@ -4333,7 +4338,7 @@ export async function runRunQueue(
           if (availableSlots <= 0) break;
           const taskMode = getTaskMode(t.project_id);
           if (taskMode === "off") continue;
-          if (taskMode === "shadow" && !deps.autoAdvance) continue;
+          if (skipForShadow(t, taskMode)) continue;
 
           let depsSatisfied = true;
           if (t.depends_on) {
@@ -4423,6 +4428,17 @@ export async function runRunQueue(
     finalQueued.some((t) => getTaskMode(t.project_id) === "shadow") ||
     finalActive.some((t) => getTaskMode(t.project_id) === "shadow");
   if (hasShadowTasks && !deps.autoAdvance) {
+    // §32.5.2 (PLUG-398): payload перечитывается в момент записи — между
+    // чтением списка и записью идут await (гейт §31.9), за которые
+    // следование зеркала могло обновить payload.mirror; устаревшая копия
+    // его бы затёрла.
+    const writeShadowEval = (taskKey: string, ev: Record<string, unknown>) => {
+      const fresh = deps.store.getTask(taskKey);
+      if (!fresh) return;
+      deps.store.updateTask(taskKey, {
+        payload: JSON.stringify({ ...parsePayload(fresh.payload), shadow_eval: ev }),
+      });
+    };
     // 1. Evaluate queued tasks: start -> <target_node>
     for (const t of finalQueued) {
       if (getTaskMode(t.project_id) !== "shadow") continue;
@@ -4451,37 +4467,31 @@ export async function runRunQueue(
           current_node: t.node,
           current_status: t.status,
         };
-        deps.store.updateTask(t.task_key, {
-          payload: JSON.stringify({
-            ...payload,
-            shadow_eval: shadowEval,
-          }),
-        });
+        writeShadowEval(t.task_key, shadowEval);
 
         if (res.allowed && res.toNode === "code") {
           try {
             const tRepo = deps.resolveTaskRepoContext ? await Promise.resolve(deps.resolveTaskRepoContext(t)).catch(() => null) : null;
             const proj = t.project_id && deps.resolveProject ? await Promise.resolve(deps.resolveProject(t.project_id)).catch(() => null) : (deps.project ?? null);
-            const tPreset = deps.policy?.routes?.[t.route]?.preset;
-            const presetBaseBranch = await resolvePresetBaseBranch(tPreset, {
-              bbCli: deps.bbCli,
-              policy: deps.policy,
-            });
             const effectiveRepo = tRepo?.repoRoot ?? repoRoot;
-            let executorBaseSha: string | undefined;
-            if (deps.cmd && effectiveRepo) {
-              executorBaseSha = await resolveExecutorBaseSha({
-                cmd: deps.cmd,
-                repoRoot: effectiveRepo,
-                baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? tRepo?.mergeBaseBranch,
-              });
-            }
+            // §32.5.7 (PLUG-398): те же входы гейта, что и на прямом delegate
+            const gateBase = await resolveSpecGateBase({
+              cmd: deps.cmd,
+              repoRoot: effectiveRepo,
+              presetName: presetForLevel(deps.policy, t.level) ?? deps.policy?.routes?.[t.route]?.preset,
+              policy: deps.policy,
+              project: (proj as any) ?? (tRepo?.mergeBaseBranch ? { baseBranch: tRepo.mergeBaseBranch } : null),
+            });
             await verifySpecBeforeCodeGate({
               taskKey: t.task_key,
+              role: "executor",
+              level: t.level,
               store: deps.store,
               cmd: deps.cmd,
               repoRoot: effectiveRepo,
-              baseSha: executorBaseSha,
+              baseSha: gateBase.baseSha,
+              baseBranchName: gateBase.baseBranchName,
+              presetName: gateBase.presetName,
               workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               project: proj,
@@ -4501,12 +4511,7 @@ export async function runRunQueue(
                 current_node: t.node,
                 current_status: t.status,
               };
-              deps.store.updateTask(t.task_key, {
-                payload: JSON.stringify({
-                  ...payload,
-                  shadow_eval: blockedEval,
-                }),
-              });
+              writeShadowEval(t.task_key, blockedEval);
             }
           }
         }
@@ -4641,37 +4646,31 @@ export async function runRunQueue(
           current_node: t.node,
           current_status: t.status,
         };
-        deps.store.updateTask(t.task_key, {
-          payload: JSON.stringify({
-            ...payload,
-            shadow_eval: shadowEval,
-          }),
-        });
+        writeShadowEval(t.task_key, shadowEval);
 
         if (t.node === "code" || wouldTrans?.to_node === "code") {
           try {
             const tRepo = deps.resolveTaskRepoContext ? await Promise.resolve(deps.resolveTaskRepoContext(t)).catch(() => null) : null;
             const proj = t.project_id && deps.resolveProject ? await Promise.resolve(deps.resolveProject(t.project_id)).catch(() => null) : (deps.project ?? null);
-            const tPreset = deps.policy?.routes?.[t.route]?.preset;
-            const presetBaseBranch = await resolvePresetBaseBranch(tPreset, {
-              bbCli: deps.bbCli,
-              policy: deps.policy,
-            });
             const effectiveRepo = tRepo?.repoRoot ?? repoRoot;
-            let executorBaseSha: string | undefined;
-            if (deps.cmd && effectiveRepo) {
-              executorBaseSha = await resolveExecutorBaseSha({
-                cmd: deps.cmd,
-                repoRoot: effectiveRepo,
-                baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? tRepo?.mergeBaseBranch,
-              });
-            }
+            // §32.5.7 (PLUG-398): те же входы гейта, что и на прямом delegate
+            const gateBase = await resolveSpecGateBase({
+              cmd: deps.cmd,
+              repoRoot: effectiveRepo,
+              presetName: presetForLevel(deps.policy, t.level) ?? deps.policy?.routes?.[t.route]?.preset,
+              policy: deps.policy,
+              project: (proj as any) ?? (tRepo?.mergeBaseBranch ? { baseBranch: tRepo.mergeBaseBranch } : null),
+            });
             await verifySpecBeforeCodeGate({
               taskKey: t.task_key,
+              role: "executor",
+              level: t.level,
               store: deps.store,
               cmd: deps.cmd,
               repoRoot: effectiveRepo,
-              baseSha: executorBaseSha,
+              baseSha: gateBase.baseSha,
+              baseBranchName: gateBase.baseBranchName,
+              presetName: gateBase.presetName,
               workGraphMode: getTaskMode(t.project_id),
               policy: deps.policy,
               project: proj,
@@ -4691,12 +4690,7 @@ export async function runRunQueue(
                 current_node: t.node,
                 current_status: t.status,
               };
-              deps.store.updateTask(t.task_key, {
-                payload: JSON.stringify({
-                  ...payload,
-                  shadow_eval: blockedEval,
-                }),
-              });
+              writeShadowEval(t.task_key, blockedEval);
             }
           }
         }
@@ -4728,28 +4722,24 @@ async function dispatchTaskNode(
     const proj = task.project_id && deps.resolveProject
       ? await Promise.resolve(deps.resolveProject(task.project_id)).catch(() => null)
       : (deps.project ?? null);
-    let executorBaseSha: string | undefined;
-    let presetBaseBranch: string | null = null;
-    if (deps.cmd && repoRoot) {
-      const presetName = deps.policy?.routes?.[task.route]?.preset;
-      presetBaseBranch = await resolvePresetBaseBranch(presetName, {
-        bbCli: deps.bbCli,
-        policy: deps.policy,
-      });
-      try {
-        executorBaseSha = await resolveExecutorBaseSha({
-          cmd: deps.cmd,
-          repoRoot,
-          baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch,
-        });
-      } catch {}
-    }
+    // §32.5.7 (PLUG-398): те же входы гейта, что и на прямом delegate
+    const gateBase = await resolveSpecGateBase({
+      cmd: deps.cmd,
+      repoRoot,
+      presetName: presetForLevel(deps.policy, task.level) ?? deps.policy?.routes?.[task.route]?.preset,
+      policy: deps.policy,
+      project: proj as any,
+    });
     await verifySpecBeforeCodeGate({
       taskKey: task.task_key,
+      role: "executor",
+      level: task.level,
       store: deps.store,
       cmd: deps.cmd,
       repoRoot,
-      baseSha: executorBaseSha,
+      baseSha: gateBase.baseSha,
+      baseBranchName: gateBase.baseBranchName,
+      presetName: gateBase.presetName,
       workGraphMode: taskMode,
       policy: deps.policy,
       project: proj,
@@ -5171,30 +5161,25 @@ async function startQueuedTask(
     const proj = task.project_id && deps.resolveProject
       ? await Promise.resolve(deps.resolveProject(task.project_id)).catch(() => null)
       : (deps.project ?? null);
-    let executorBaseSha: string | undefined;
-    let presetBaseBranch: string | null = null;
-    if (deps.cmd && repoRoot) {
-      const presetName = deps.policy?.routes?.[task.route]?.preset;
-      presetBaseBranch = await resolvePresetBaseBranch(presetName, {
-        bbCli: deps.bbCli,
-        policy: deps.policy,
-      });
-      try {
-        executorBaseSha = await resolveExecutorBaseSha({
-          cmd: deps.cmd,
-          repoRoot,
-          baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch,
-        });
-      } catch {}
-    }
+    // §32.5.7 (PLUG-398): те же входы гейта, что и на прямом delegate
+    const gateBase = await resolveSpecGateBase({
+      cmd: deps.cmd,
+      repoRoot,
+      presetName: presetForLevel(deps.policy, task.level) ?? deps.policy?.routes?.[task.route]?.preset,
+      policy: deps.policy,
+      project: proj as any,
+    });
     try {
       await verifySpecBeforeCodeGate({
         taskKey: task.task_key,
+        role: "executor",
+        level: task.level,
         store: deps.store,
         cmd: deps.cmd,
         repoRoot,
-        baseSha: executorBaseSha,
-        baseBranchName: presetBaseBranch ?? (proj as any)?.baseBranch,
+        baseSha: gateBase.baseSha,
+        baseBranchName: gateBase.baseBranchName,
+        presetName: gateBase.presetName,
         workGraphMode: taskMode,
         policy: deps.policy,
         project: proj,

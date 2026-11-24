@@ -851,6 +851,57 @@ export async function resolvePresetBaseBranch(
   return null;
 }
 
+/** §32.5.7 (PLUG-398): пресет первого маршрута цепочки уровня — одинаково
+ * для run-queue и прямого delegate (а не policy.routes[<маршрут графа>]). */
+export function presetForLevel(
+  policy: Policy | null | undefined,
+  level: string | null | undefined,
+): string | undefined {
+  if (!policy || !level) return undefined;
+  const first = policy.levels?.[level]?.chain?.[0];
+  return first ? policy.routes?.[first]?.preset : undefined;
+}
+
+/**
+ * §32.5.7 (PLUG-398): один расчёт входов гейта §31.9 на обоих путях —
+ * пресет и его базовая ветка, ревизия запускаемой базы (`targetSha`).
+ * Эффективный approvalMode и выбор последнего принятого ревью,
+ * покрывающего базу, считает сам verifySpecBeforeCodeGate.
+ */
+export async function resolveSpecGateBase(input: {
+  cmd?: CmdRunner;
+  repoRoot?: string | null;
+  from?: string | null;
+  presetName?: string | null;
+  policy?: Policy | null;
+  project?: { baseBranch?: string | null } | null;
+}): Promise<{
+  presetName?: string;
+  baseBranchName: string | null;
+  baseSha?: string;
+}> {
+  const presetName = input.presetName ?? undefined;
+  const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+    policy: input.policy,
+    presetDetails: (input.policy as any)?.presetDetails,
+  });
+  let baseSha: string | undefined;
+  if (input.cmd && input.repoRoot) {
+    try {
+      baseSha = await resolveExecutorBaseSha({
+        cmd: input.cmd,
+        repoRoot: input.repoRoot,
+        from: input.from,
+        baseBranch:
+          presetBaseBranch ??
+          (input.project as any)?.baseBranch ??
+          (input.policy as any)?.baseBranch,
+      });
+    } catch {}
+  }
+  return { presetName, baseBranchName: presetBaseBranch, baseSha };
+}
+
 /**
  * Resolve the exact base commit SHA from which the executor starts (§31.9).
  * Executor starts from `origin/<baseBranch>` (after git fetch) or from `--from`.

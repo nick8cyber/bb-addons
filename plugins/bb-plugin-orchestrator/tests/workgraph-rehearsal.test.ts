@@ -219,8 +219,27 @@ test("5в Shadow: un-enqueued manual command logs 'none' sentinels in task_trans
   assert.equal(payload.would_block?.reason, "graph-required");
 });
 
-test("5в Shadow: enqueued task manual command records would_allow / would_reject in shadow_eval", async () => {
-  const host = await createRehearsalHost({ workGraph: "shadow" });
+test("5в Shadow (§32.5.2, PLUG-398): direct delegate on an enqueued task is evaluated against the current node and the mirror follows the fact", async () => {
+  const host = await createRehearsalHost(
+    {
+      workGraph: "shadow",
+      // гейт §31.9 проверяется своими тестами; здесь — только следование зеркала
+      policy: JSON.stringify({ ...JSON.parse(POLICY_TEXT), specBeforeCode: false }),
+    },
+    fakeCli((args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset list")) {
+        return ok(JSON.stringify({ presets: [{ name: "simple-preset", id: "p1" }, { name: "spec-preset", id: "p2" }] }));
+      }
+      if (key.startsWith("tasks preset show")) {
+        return ok(JSON.stringify({ preset: { providerId: "p", modelId: "m", permissionMode: "auto", environmentKind: "project-default" } }));
+      }
+      if (key.startsWith("tasks show")) {
+        return ok(JSON.stringify({ task: { id: "t1", key: args[2], title: "t", status: "in_progress" }, project: { name: "p", linkedBbProjectId: "proj_rehearsal" } }));
+      }
+      return undefined;
+    }).cli,
+  );
   const store = new DelegationStore(host.bb.storage.database());
 
   // Enqueue task at node: start -> code
@@ -244,57 +263,52 @@ test("5в Shadow: enqueued task manual command records would_allow / would_rejec
     reason: "test-advance",
   });
 
-  // 1. Manual delegate matching current node (code) with level simple
-  await host.harness.runCli([
-    "delegate",
-    "TASK-ENQ-1",
-    "--level",
-    "simple",
-    "--json",
-  ]);
+  let spawned = 0;
+  host.harness.sdk.stub("threads.get", async () => ({
+    id: "thr_coord",
+    parentThreadId: null,
+    title: "coordinator",
+    titleFallback: null,
+    originPluginId: null,
+    projectId: store.getTask("TASK-ENQ-1")!.project_id,
+  }));
+  host.harness.sdk.stub("threads.spawn", async () => ({ id: `thr_exec_${++spawned}` }));
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.update", async () => ({}));
 
-  let task = store.getTask("TASK-ENQ-1")!;
-  let payload = JSON.parse(task.payload ?? "{}");
-  assert.equal(payload.shadow_eval.command, "delegate");
-  assert.equal(payload.shadow_eval.would_allow, "delegate");
-  assert.equal(payload.shadow_eval.would_reject, undefined);
+  const follow = () =>
+    store
+      .listTransitions("TASK-ENQ-1")
+      .filter((r) => r.actor === "shadow:follow")
+      .map((r) => ({ to: r.to_node, ...JSON.parse(r.payload ?? "{}") }));
 
-  // 2. Manual delegate with mismatched level (e.g. spec while at code)
-  await host.harness.runCli([
-    "delegate",
-    "TASK-ENQ-1",
-    "--level",
-    "spec",
-    "--json",
-  ]);
+  // 1. Manual delegate into the current node (code), nothing dispatched yet → match (rule 4)
+  const d1 = await host.harness.runCli(
+    ["delegate", "TASK-ENQ-1", "--level", "simple", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(d1.exitCode, 0, d1.stdout);
+  let rows = follow();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].command, "delegate");
+  assert.equal(rows[0].verdict, "match");
+  assert.equal(rows[0].rule, "4");
+  assert.equal(store.getTask("TASK-ENQ-1")!.node, "code");
+  for (const d of store.delegationsByTask("TASK-ENQ-1")) store.setStatus(d.id, "done");
 
-  task = store.getTask("TASK-ENQ-1")!;
-  payload = JSON.parse(task.payload ?? "{}");
-  assert.equal(payload.shadow_eval.command, "delegate");
-  assert.match(payload.shadow_eval.would_reject, /invalid_node/);
-
-  // 3. Move to node review and test custom auditor level from policy
-  store.transitionTask({
-    taskKey: "TASK-ENQ-1",
-    expectedNode: "code",
-    expectedStatus: "running",
-    toNode: "review",
-    toStatus: "running",
-    actor: "test",
-    reason: "test-advance",
-  });
-
-  await host.harness.runCli([
-    "delegate",
-    "TASK-ENQ-1",
-    "--level",
-    "review",
-    "--json",
-  ]);
-  task = store.getTask("TASK-ENQ-1")!;
-  payload = JSON.parse(task.payload ?? "{}");
-  assert.equal(payload.shadow_eval.would_allow, "delegate");
-  assert.equal(payload.shadow_eval.would_reject, undefined);
+  // 2. Manual delegate with a level that maps to another node (spec while at code) → skip, mirror follows to spec
+  const d2 = await host.harness.runCli(
+    ["delegate", "TASK-ENQ-1", "--level", "spec", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(d2.exitCode, 0, d2.stdout);
+  rows = follow();
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].verdict, "skip");
+  assert.equal(rows[1].verdict_detail.reason, "matrix-violation");
+  assert.equal(rows[1].verdict_detail.current_node, "code");
+  assert.equal(rows[1].verdict_detail.actual_node, "spec");
+  assert.equal(store.getTask("TASK-ENQ-1")!.node, "spec");
 });
 
 test("5в Shadow: run-queue logs 'вычислено, но не подключено' in shadow mode", async () => {

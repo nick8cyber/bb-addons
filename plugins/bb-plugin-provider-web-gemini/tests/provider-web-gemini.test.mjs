@@ -62,6 +62,118 @@ const {
 } = driver;
 const { withUsageLock, KNOWN_CANDIDATE_RPCIDS } = usageLimitsModule;
 
+// --- Shared mock-DOM helpers (turn-status tests: PLUG-304, PLUG-407) ---
+const NODE_FOLLOWING = 4;
+const NODE_PRECEDING = 2;
+
+function createMockElement({
+  id = "el",
+  tagName = "div",
+  innerText = "",
+  attributes = {},
+  children = [],
+  preceding = [],
+  following = [],
+} = {}) {
+  const el = {
+    id,
+    tagName: tagName.toUpperCase(),
+    innerText,
+    disabled: Boolean(attributes.disabled),
+    parent: null,
+    getAttribute(attr) {
+      return attributes[attr] ?? null;
+    },
+    setAttribute(attr, val) {
+      attributes[attr] = String(val);
+    },
+    removeAttribute(attr) {
+      delete attributes[attr];
+    },
+    compareDocumentPosition(other) {
+      if (following.includes(other.id)) return NODE_FOLLOWING;
+      if (preceding.includes(other.id)) return NODE_PRECEDING;
+      return 0;
+    },
+    querySelector(sel) {
+      const matches = this.querySelectorAll(sel);
+      return matches.length > 0 ? matches[0] : null;
+    },
+    querySelectorAll(sel) {
+      const results = [];
+      const check = (node) => {
+        if (nodeMatchesSelector(node, sel)) results.push(node);
+        for (const ch of node.children || []) {
+          ch.parent = node;
+          check(ch);
+        }
+      };
+      for (const ch of this.children || []) {
+        ch.parent = this;
+        check(ch);
+      }
+      return results;
+    },
+    children,
+  };
+  for (const ch of children) ch.parent = el;
+  return el;
+}
+
+function nodeMatchesSelector(node, selector) {
+  const parts = selector.split(",").map((s) => s.trim());
+  for (const part of parts) {
+    if (matchSingle(node, part)) return true;
+  }
+  return false;
+}
+
+function matchSingle(node, sel) {
+  sel = sel.replace(/\s+i(?=\])/g, "");
+  if (sel.includes(" ")) {
+    const subParts = sel.split(/\s+/);
+    if (subParts.length >= 2) {
+      const parentSel = subParts.slice(0, -1).join(" ");
+      const childSel = subParts[subParts.length - 1];
+      if (!matchSingle(node, childSel)) return false;
+      let p = node.parent;
+      while (p) {
+        if (matchSingle(p, parentSel)) return true;
+        p = p.parent;
+      }
+      return false;
+    }
+  }
+  if (/^[a-z0-9_-]+$/i.test(sel)) {
+    return node.tagName.toLowerCase() === sel.toLowerCase();
+  }
+  if (sel.startsWith(".")) {
+    const cls = sel.slice(1).toLowerCase();
+    const nodeClass = (node.getAttribute("class") || "").toLowerCase();
+    return nodeClass.split(/\s+/).includes(cls);
+  }
+  const tagMatch = sel.match(/^([a-z0-9_-]+)?\[([^\]]+)\]/i);
+  if (tagMatch) {
+    const wantTag = tagMatch[1];
+    if (wantTag && node.tagName.toLowerCase() !== wantTag.toLowerCase()) return false;
+    const attrExpr = tagMatch[2];
+    if (attrExpr.includes("*=")) {
+      const [a, val] = attrExpr.split("*=");
+      const cleanVal = val.replace(/["'\s]/g, "").replace(/\s*i$/, "").toLowerCase();
+      const actual = node.getAttribute(a.trim());
+      if (actual == null) return false;
+      return actual.toLowerCase().includes(cleanVal);
+    }
+    if (attrExpr.includes("=")) {
+      const [a, val] = attrExpr.split("=");
+      const cleanVal = val.replace(/["']/g, "");
+      return node.getAttribute(a.trim()) === cleanVal;
+    }
+    return node.getAttribute(attrExpr.trim()) !== null;
+  }
+  return false;
+}
+
 test("required attachment accepts a new visible chip when Send is enabled", async (t) => {
   const tmp = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "gemini-attachment-")));
   const name = "pkg-17b6d6ea-71e7-4eff-ab61-020cc8ff8cf9-1795070189688.md";
@@ -371,7 +483,7 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
     "gemini-driver.js must not fallback to responses[responses.length - 1]"
   );
   assert.ok(
-    driverSrc.includes("const target = responses[idx];"),
+    driverSrc.includes("responses[idx]"),
     "gemini-driver.js must use responses[idx]"
   );
   assert.ok(
@@ -3510,117 +3622,6 @@ test("19. PLUG-291: uploads/downloads — collectUploadFiles, pruneDir, spill ho
 });
 
 test("20. PLUG-304: turn completion predicate and thinking/pause guards", async () => {
-  const NODE_FOLLOWING = 4;
-  const NODE_PRECEDING = 2;
-
-  function createMockElement({
-    id = "el",
-    tagName = "div",
-    innerText = "",
-    attributes = {},
-    children = [],
-    preceding = [],
-    following = [],
-  } = {}) {
-    const el = {
-      id,
-      tagName: tagName.toUpperCase(),
-      innerText,
-      disabled: Boolean(attributes.disabled),
-      parent: null,
-      getAttribute(attr) {
-        return attributes[attr] ?? null;
-      },
-      setAttribute(attr, val) {
-        attributes[attr] = String(val);
-      },
-      removeAttribute(attr) {
-        delete attributes[attr];
-      },
-      compareDocumentPosition(other) {
-        if (following.includes(other.id)) return NODE_FOLLOWING;
-        if (preceding.includes(other.id)) return NODE_PRECEDING;
-        return 0;
-      },
-      querySelector(sel) {
-        const matches = this.querySelectorAll(sel);
-        return matches.length > 0 ? matches[0] : null;
-      },
-      querySelectorAll(sel) {
-        const results = [];
-        const check = (node) => {
-          if (nodeMatchesSelector(node, sel)) results.push(node);
-          for (const ch of node.children || []) {
-            ch.parent = node;
-            check(ch);
-          }
-        };
-        for (const ch of this.children || []) {
-          ch.parent = this;
-          check(ch);
-        }
-        return results;
-      },
-      children,
-    };
-    for (const ch of children) ch.parent = el;
-    return el;
-  }
-
-  function nodeMatchesSelector(node, selector) {
-    const parts = selector.split(",").map((s) => s.trim());
-    for (const part of parts) {
-      if (matchSingle(node, part)) return true;
-    }
-    return false;
-  }
-
-  function matchSingle(node, sel) {
-    sel = sel.replace(/\s+i(?=\])/g, "");
-    if (sel.includes(" ")) {
-      const subParts = sel.split(/\s+/);
-      if (subParts.length >= 2) {
-        const parentSel = subParts.slice(0, -1).join(" ");
-        const childSel = subParts[subParts.length - 1];
-        if (!matchSingle(node, childSel)) return false;
-        let p = node.parent;
-        while (p) {
-          if (matchSingle(p, parentSel)) return true;
-          p = p.parent;
-        }
-        return false;
-      }
-    }
-    if (/^[a-z0-9_-]+$/i.test(sel)) {
-      return node.tagName.toLowerCase() === sel.toLowerCase();
-    }
-    if (sel.startsWith(".")) {
-      const cls = sel.slice(1).toLowerCase();
-      const nodeClass = (node.getAttribute("class") || "").toLowerCase();
-      return nodeClass.split(/\s+/).includes(cls);
-    }
-    const tagMatch = sel.match(/^([a-z0-9_-]+)?\[([^\]]+)\]/i);
-    if (tagMatch) {
-      const wantTag = tagMatch[1];
-      if (wantTag && node.tagName.toLowerCase() !== wantTag.toLowerCase()) return false;
-      const attrExpr = tagMatch[2];
-      if (attrExpr.includes("*=")) {
-        const [a, val] = attrExpr.split("*=");
-        const cleanVal = val.replace(/["'\s]/g, "").replace(/\s*i$/, "").toLowerCase();
-        const actual = node.getAttribute(a.trim());
-        if (actual == null) return false;
-        return actual.toLowerCase().includes(cleanVal);
-      }
-      if (attrExpr.includes("=")) {
-        const [a, val] = attrExpr.split("=");
-        const cleanVal = val.replace(/["']/g, "");
-        return node.getAttribute(a.trim()) === cleanVal;
-      }
-      return node.getAttribute(attrExpr.trim()) !== null;
-    }
-    return false;
-  }
-
   // --- Scenario 1 (PLUG-304 symptom): 42 chars in message-content + spinner (thinking) + no stop button ---
   const spinnerNode = createMockElement({ tagName: "mat-spinner", attributes: { class: "spinner" } });
   const mcThinking = createMockElement({
@@ -6346,10 +6347,10 @@ test("32. browser-groups: no flock on linux fails closed — no in-process degra
 
   const noFlockPath = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-nopath-")));
   const waitFile = async (f, what) => {
-    for (let i = 0; i < 100 && !fs.existsSync(f); i++) {
+    for (let i = 0; i < 100 && (!fs.existsSync(f) || fs.statSync(f).size === 0); i++) {
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert.ok(fs.existsSync(f), `child did not signal ${what}`);
+    assert.ok(fs.existsSync(f) && fs.statSync(f).size > 0, `child did not signal ${what}`);
   };
   const readyA = path.join(stateDir, "z7-holder-ready");
   const resB = path.join(stateDir, "z7-noflock-result.json");
@@ -6420,4 +6421,623 @@ test("32. browser-groups: no flock on linux fails closed — no in-process degra
   assert.equal(browserGroups.groupExists(pgid), true, "group alive — teardown never reached the signal path");
   assert.equal(browserGroups.isPidAlive(holder.pid), true, "holder untouched");
   holder.kill("SIGKILL");
+});
+
+test("35. PLUG-407: thinking/search progress extends stall, pending-response target, STALL_MS floors", async () => {
+  const PROMPT = "Deep research the repository layout";
+  const PREFIX = PROMPT.replace(/\s+/g, " ").trim().slice(0, 40);
+  const ENV_KEYS = [
+    "WEB_GEMINI_STALL_MS",
+    "ARGON_STALL_MS",
+    "WEB_GEMINI_SESSION_CAP_MS",
+    "ARGON_SESSION_CAP_MS",
+  ];
+  const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+  const realDateNow = Date.now;
+  const restoreAll = () => {
+    for (const k of ENV_KEYS) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    Date.now = realDateNow;
+    _setDriverHooks(null);
+  };
+
+  const stopBtnEl = () =>
+    createMockElement({
+      id: "stop-0",
+      tagName: "button",
+      attributes: { "aria-label": "Stop generating", "data-test-id": "stop-button" },
+    });
+  const uq = (following) =>
+    createMockElement({ id: "q0", tagName: "user-query", innerText: PROMPT, following });
+  const docOf = (children) => {
+    const root = createMockElement({ id: "doc-root", tagName: "body", children });
+    return {
+      querySelectorAll(sel) {
+        const res = root.querySelectorAll(sel);
+        if (nodeMatchesSelector(root, sel)) res.unshift(root);
+        return res;
+      },
+      querySelector(sel) {
+        return this.querySelectorAll(sel)[0] || null;
+      },
+    };
+  };
+  const animatedThinking = (text = "Searching the web…") =>
+    createMockElement({
+      id: "an0",
+      tagName: "div",
+      innerText: text,
+      attributes: { class: "animated-thinking-content" },
+    });
+  const thinkingDoc = ({ stop = true } = {}) =>
+    docOf([
+      uq(["p0", "r0"]),
+      createMockElement({
+        id: "p0",
+        tagName: "pending-response",
+        preceding: ["q0"],
+        children: [
+          createMockElement({
+            id: "ov0",
+            tagName: "thinking-overlay",
+            children: [animatedThinking()],
+          }),
+        ],
+      }),
+      ...(stop ? [stopBtnEl()] : []),
+    ]);
+  const streamDoc = (text, { stop = true, done = false } = {}) =>
+    docOf([
+      uq(["p0", "r0"]),
+      createMockElement({
+        id: "r0",
+        tagName: "model-response",
+        preceding: ["q0"],
+        innerText: text,
+        children: [
+          createMockElement({ id: "mc0", tagName: "message-content", innerText: text }),
+          ...(done ? [createMockElement({ id: "fb0", tagName: "response-feedback" })] : []),
+        ],
+      }),
+      ...(stop ? [stopBtnEl()] : []),
+    ]);
+  const frozenDoc = () => streamDoc("");
+
+  // Harness: page-level evaluations run the REAL findTurnTarget /
+  // checkTurnStatus against a mutable mock document.
+  const harness = ({ advanceMs = 200 } = {}) => {
+    const state = {
+      doc: frozenDoc(),
+      stopVisible: true,
+      stopClicked: false,
+      now: 1_000_000,
+      poll: 0,
+      firstStatusAt: null,
+      onPoll: null,
+    };
+    Date.now = () => state.now;
+    const page = {
+      url: () => "https://gemini.google.com/app",
+      goto: async () => {},
+      waitForSelector: async () => ({
+        click: async () => {},
+        innerText: async () => "",
+        getAttribute: async () => null,
+      }),
+      waitForTimeout: async () => {
+        state.now += advanceMs;
+      },
+      keyboard: { press: async () => {}, insertText: async () => {} },
+      $: async (sel) => {
+        if (sel && /stop/i.test(sel) && state.stopVisible) {
+          return {
+            click: async () => {
+              state.stopClicked = true;
+            },
+            isDisabled: async () => false,
+          };
+        }
+        return null;
+      },
+      $$: async () => [],
+      evaluate: async (fn, arg) => {
+        const src = typeof fn === "function" ? fn.toString() : "";
+        if (src.includes("maxLength")) return null;
+        if (src.includes("Before you continue")) return "none";
+        if (arg && arg.sel) return true;
+        if (arg && arg.checkSrc) {
+          state.firstStatusAt ??= state.now;
+          const status = checkTurnStatus(state.doc, arg.idx, arg.promptPrefix);
+          const p = state.poll++;
+          state.onPoll?.(p, status);
+          return status;
+        }
+        if (arg && arg.fnSrc) {
+          const target = findTurnTarget(state.doc, arg.idx, arg.promptPrefix);
+          if (src.includes("querySelector('message-content')")) {
+            const mc = target && target.querySelector("message-content");
+            return mc ? mc.innerText : null;
+          }
+          return target !== null || state.stopVisible;
+        }
+        return null;
+      },
+    };
+    const drive = (args) => {
+      _setDriverHooks({
+        ensureChrome: async () => {},
+        connectOverCDP: async () => ({ close: async () => {} }),
+        getGeminiPage: async () => page,
+      });
+      return sendPrompt(args);
+    };
+    return { state, drive };
+  };
+
+  // Bound every negative scenario: a buggy non-stalling turn must exit via the
+  // session cap quickly instead of looping forever.
+  process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+
+  try {
+    // --- 1. Active .animated-thinking-content + visible stop button: no stall ---
+    {
+      const st = checkTurnStatus(thinkingDoc(), 0, PREFIX);
+      assert.equal(st.targetFound, true, "pending-response must be the turn target");
+      assert.equal(
+        st.hasActiveThinkingOrTool,
+        true,
+        ".animated-thinking-content with text must be an active indicator"
+      );
+      assert.equal(
+        st.statusText,
+        "Searching the web...",
+        "statusText must carry normalized status text (ellipsis normalized)"
+      );
+
+      // Rule 2: a status phrase inside .tool-status counts as active too.
+      const toolDoc = (text) =>
+        docOf([
+          uq(["p0"]),
+          createMockElement({
+            id: "p0",
+            tagName: "pending-response",
+            preceding: ["q0"],
+            children: [
+              createMockElement({
+                id: "ts0",
+                tagName: "div",
+                innerText: text,
+                attributes: { class: "tool-status" },
+              }),
+            ],
+          }),
+          stopBtnEl(),
+        ]);
+      assert.equal(
+        checkTurnStatus(toolDoc("Ищу в интернете…"), 0, PREFIX).hasActiveThinkingOrTool,
+        true,
+        "status phrase in .tool-status must be active"
+      );
+      assert.equal(
+        checkTurnStatus(toolDoc("Sources panel"), 0, PREFIX).hasActiveThinkingOrTool,
+        false,
+        ".tool-status without a status phrase must not be active"
+      );
+
+      const h = harness();
+      h.state.doc = thinkingDoc();
+      let thinkingSpanMs = null;
+      const FINAL = "Part one. Part two. Part three. Final answer.";
+      const grows = [
+        "Part one. ",
+        "Part one. Part two. ",
+        "Part one. Part two. Part three. ",
+      ];
+      h.state.onPoll = (p) => {
+        if (p < 3) return; // polls 0-3: still thinking (600ms+ > stallMs=300)
+        if (p === 3) {
+          thinkingSpanMs = h.state.now - h.state.firstStatusAt;
+          h.state.doc = streamDoc(grows[0]);
+          return;
+        }
+        if (p === 4) {
+          h.state.doc = streamDoc(grows[1]);
+          return;
+        }
+        if (p === 5) {
+          h.state.doc = streamDoc(grows[2]);
+          return;
+        }
+        h.state.doc = streamDoc(FINAL, { stop: false, done: true });
+        h.state.stopVisible = false;
+      };
+      const res = await h.drive({ prompt: PROMPT, isNewChat: false, stallMs: 300 });
+      assert.equal(String(res), FINAL, "turn must complete after the thinking phase");
+      assert.ok(
+        thinkingSpanMs !== null && thinkingSpanMs >= 600,
+        `thinking phase must survive past stallMs=300 without stalling, got ${thinkingSpanMs}ms`
+      );
+    }
+
+    // --- 2. Plain spinner is busy, not progress: still stalls at STALL_MS ---
+    {
+      const spinnerDoc = () =>
+        docOf([
+          uq(["r0"]),
+          createMockElement({
+            id: "r0",
+            tagName: "model-response",
+            preceding: ["q0"],
+            innerText: "",
+            children: [
+              createMockElement({ id: "mc0", tagName: "message-content", innerText: "" }),
+              createMockElement({ id: "sp0", tagName: "mat-spinner" }),
+            ],
+          }),
+          stopBtnEl(),
+        ]);
+      const st = checkTurnStatus(spinnerDoc(), 0, PREFIX);
+      assert.equal(st.isBusyOrThinking, true, "mat-spinner must count as busy");
+      assert.equal(st.hasActiveThinkingOrTool, false, "mat-spinner must NOT be progress");
+
+      const h = harness();
+      h.state.doc = spinnerDoc();
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, stallMs: 400 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+      const delta = h.state.now - h.state.firstStatusAt;
+      assert.ok(
+        delta >= 0 && delta <= 1000,
+        `spinner-only turn must stall near stallMs=400, got ${delta}ms`
+      );
+      assert.equal(h.state.stopClicked, true, "stopGeneration must run on stall");
+    }
+
+    // --- 3. No stop button (awaitingContent): indicator must NOT extend the stall ---
+    {
+      const st = checkTurnStatus(thinkingDoc({ stop: false }), 0, PREFIX);
+      assert.equal(st.hasStopButton, false);
+      assert.equal(st.hasActiveThinkingOrTool, true);
+
+      const h = harness();
+      h.state.doc = thinkingDoc({ stop: false });
+      h.state.stopVisible = false;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, stallMs: 400 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+      const delta = h.state.now - h.state.firstStatusAt;
+      assert.ok(
+        delta >= 0 && delta <= 1000,
+        `awaitingContent turn must stall near stallMs=400 despite the indicator, got ${delta}ms`
+      );
+    }
+
+    // --- 4. Static thinking-overlay > .thinking-container (no animated layer): stalls ---
+    {
+      const staticDoc = () =>
+        docOf([
+          uq(["p0"]),
+          createMockElement({
+            id: "p0",
+            tagName: "pending-response",
+            preceding: ["q0"],
+            children: [
+              createMockElement({
+                id: "ov0",
+                tagName: "thinking-overlay",
+                children: [
+                  createMockElement({
+                    id: "tc0",
+                    tagName: "div",
+                    innerText: "Thinking…",
+                    attributes: { class: "thinking-container" },
+                  }),
+                ],
+              }),
+            ],
+          }),
+          stopBtnEl(),
+        ]);
+      const st = checkTurnStatus(staticDoc(), 0, PREFIX);
+      assert.equal(
+        st.hasActiveThinkingOrTool,
+        false,
+        "static thinking-container without animated content must not be progress"
+      );
+      assert.equal(st.statusText, "Thinking...", "container text still enters statusText");
+
+      const h = harness();
+      h.state.doc = staticDoc();
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, stallMs: 400 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+    }
+
+    // --- 5. model-thoughts subtree isolation: animated layer inside it is excluded ---
+    {
+      const thoughtsDoc = () =>
+        docOf([
+          uq(["r0"]),
+          createMockElement({
+            id: "r0",
+            tagName: "model-response",
+            preceding: ["q0"],
+            innerText: "Show thinking",
+            children: [
+              createMockElement({
+                id: "mt0",
+                tagName: "model-thoughts",
+                innerText: "",
+                children: [animatedThinking()],
+              }),
+            ],
+          }),
+          stopBtnEl(),
+        ]);
+      const st = checkTurnStatus(thoughtsDoc(), 0, PREFIX);
+      assert.equal(
+        st.hasActiveThinkingOrTool,
+        false,
+        "indicator inside model-thoughts must be excluded"
+      );
+      assert.equal(st.statusText, null, "model-thoughts text must not enter statusText");
+
+      const h = harness();
+      h.state.doc = thoughtsDoc();
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, stallMs: 400 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+    }
+
+    // --- 6. message-content subtree isolation: status phrase inside it is excluded ---
+    {
+      const mcStatusDoc = () =>
+        docOf([
+          uq(["r0"]),
+          createMockElement({
+            id: "r0",
+            tagName: "model-response",
+            preceding: ["q0"],
+            innerText: "",
+            children: [
+              createMockElement({
+                id: "mc0",
+                tagName: "message-content",
+                innerText: "",
+                children: [
+                  createMockElement({
+                    id: "ts0",
+                    tagName: "div",
+                    innerText: "Поиск в интернете",
+                    attributes: { class: "tool-status" },
+                  }),
+                ],
+              }),
+            ],
+          }),
+          stopBtnEl(),
+        ]);
+      const st = checkTurnStatus(mcStatusDoc(), 0, PREFIX);
+      assert.equal(
+        st.hasActiveThinkingOrTool,
+        false,
+        "status phrase inside message-content must be excluded"
+      );
+      assert.equal(st.statusText, null, "message-content text must not enter statusText");
+
+      const h = harness();
+      h.state.doc = mcStatusDoc();
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, stallMs: 400 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+    }
+
+    // --- 7a. Priority: model-response[idx] wins over pending-response ---
+    {
+      const doc = docOf([
+        uq(["r0", "p0"]),
+        createMockElement({
+          id: "r0",
+          tagName: "model-response",
+          preceding: ["q0"],
+          innerText: "answer",
+        }),
+        createMockElement({ id: "p0", tagName: "pending-response", preceding: ["q0"] }),
+      ]);
+      const t = findTurnTarget(doc, 0, PREFIX);
+      assert.equal(t && t.id, "r0", "model-response[idx] must win over pending-response");
+    }
+
+    // --- 7b. Stale pending-response before lastQuery never becomes the target ---
+    {
+      const q1 = createMockElement({
+        id: "q1",
+        tagName: "user-query",
+        innerText: PROMPT,
+        preceding: ["q0", "r0", "p-old"],
+        following: ["r1"],
+      });
+      const base = [
+        createMockElement({
+          id: "q0",
+          tagName: "user-query",
+          innerText: "Old question",
+          following: ["r0", "p-old", "q1", "r1"],
+        }),
+        createMockElement({
+          id: "r0",
+          tagName: "model-response",
+          preceding: ["q0"],
+          following: ["p-old", "q1", "r1"],
+        }),
+        createMockElement({
+          id: "p-old",
+          tagName: "pending-response",
+          preceding: ["q0", "r0"],
+          following: ["q1", "r1"],
+        }),
+        q1,
+      ];
+      assert.equal(
+        findTurnTarget(docOf(base), 1, PREFIX),
+        null,
+        "stale pending-response before lastQuery must not become the target"
+      );
+      const r1 = createMockElement({
+        id: "r1",
+        tagName: "model-response",
+        preceding: ["q0", "r0", "p-old", "q1"],
+      });
+      const withR1 = docOf([...base, r1]);
+      assert.equal(
+        findTurnTarget(withR1, 1, PREFIX) && findTurnTarget(withR1, 1, PREFIX).id,
+        "r1",
+        "old pending-response must not shift the model-response index"
+      );
+    }
+
+    // --- 7c. Turn starts on pending-response, finishes on model-response ---
+    {
+      const h = harness();
+      h.state.doc = thinkingDoc();
+      const FINAL = "Streamed answer from model-response.";
+      const seen = [];
+      h.state.onPoll = (p, status) => {
+        seen.push(status);
+        if (p < 2) return; // two thinking ticks on pending-response
+        if (p === 2) {
+          h.state.doc = streamDoc(FINAL);
+          return;
+        }
+        h.state.doc = streamDoc(FINAL, { stop: false, done: true });
+        h.state.stopVisible = false;
+      };
+      const res = await h.drive({ prompt: PROMPT, isNewChat: false, stallMs: 300 });
+      assert.equal(String(res), FINAL, "text must come from the model-response");
+      assert.equal(
+        seen[0] && seen[0].targetFound,
+        true,
+        "pending-response phase must already report targetFound"
+      );
+      assert.equal(
+        seen[0] && seen[0].hasActiveThinkingOrTool,
+        true,
+        "pending-response phase must report active thinking"
+      );
+    }
+
+    // --- 8a. Explicit stallMs is unclamped — the thinking-high floor must not apply ---
+    {
+      const h = harness();
+      h.state.doc = frozenDoc();
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 300 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+      const delta = h.state.now - h.state.firstStatusAt;
+      assert.ok(
+        delta >= 0 && delta <= 600,
+        `explicit stallMs=300 must hold even for thinking high, got ${delta}ms after first poll`
+      );
+    }
+
+    // --- 8b. Invalid explicit stallMs falls back to env ---
+    {
+      process.env.WEB_GEMINI_STALL_MS = "700";
+      const h = harness();
+      h.state.doc = frozenDoc();
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, stallMs: -1 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+      const delta = h.state.now - h.state.firstStatusAt;
+      assert.ok(
+        delta >= 400 && delta <= 900,
+        `invalid stallMs must fall back to env 700ms, got ${delta}ms after first poll`
+      );
+      delete process.env.WEB_GEMINI_STALL_MS;
+    }
+
+    // --- 8c. thinking: "high" floor: STALL_MS = max(env, 600_000) ---
+    {
+      process.env.WEB_GEMINI_STALL_MS = "500";
+      process.env.WEB_GEMINI_SESSION_CAP_MS = "3600000"; // cap must exceed the 600s floor
+      const h = harness({ advanceMs: 60_000 }); // one fake minute per poll
+      h.state.doc = frozenDoc();
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high" }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+      const delta = h.state.now - h.state.firstStatusAt;
+      assert.ok(
+        delta >= 480_000 && delta <= 660_000,
+        `thinking-high turn must stall near the 600s floor (env=500 ignored), got ${delta}ms after first poll`
+      );
+      delete process.env.WEB_GEMINI_STALL_MS;
+      process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+    }
+
+    // --- 8d. thinking: "high" with env > 600_000: env takes precedence ---
+    {
+      process.env.WEB_GEMINI_STALL_MS = "900000"; // 15 min
+      process.env.WEB_GEMINI_SESSION_CAP_MS = "3600000";
+      const h = harness({ advanceMs: 60_000 });
+      h.state.doc = frozenDoc();
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high" }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+      const delta = h.state.now - h.state.firstStatusAt;
+      assert.ok(
+        delta >= 840_000 && delta <= 960_000,
+        `thinking-high turn must stall near the env 900s value (above 600s floor), got ${delta}ms after first poll`
+      );
+      delete process.env.WEB_GEMINI_STALL_MS;
+      process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+    }
+  } finally {
+    restoreAll();
+  }
 });

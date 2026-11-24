@@ -19,6 +19,7 @@ import {
 import { OrchestratorError, errorJson, toErrorBody } from "./src/errors.js";
 import { parsePolicy, getNodeTimeoutSeconds, type PolicyLoad } from "./src/policy.js";
 import {
+  CoordinatorWorktreeStore,
   DelegationStore,
   JanitorStore,
   MIGRATIONS,
@@ -32,9 +33,15 @@ import {
 } from "./src/janitor-config.js";
 import {
   createJanitor,
+  defaultHasProcessIn,
   type TaskCleanupArgs,
   type TaskCleanupSummary,
 } from "./src/janitor.js";
+import {
+  createCoordinatorWorktrees,
+  environmentShowVerdict,
+  type CoordinatorEnvDto,
+} from "./src/coordinator-worktrees.js";
 import {
   createBbCli,
   runChecked,
@@ -160,6 +167,26 @@ import {
   extractCounters,
   type WorkGraphMode,
 } from "./src/workgraph.js";
+import {
+  buildShadowReport,
+  ensureShadowReconcileStarted,
+  formatShadowReport,
+  shadowObserveDelegate,
+  shadowObserveMerge,
+  shadowObserveRelease,
+  shadowObserveStoreEvent,
+  trackerStatusIsOpen,
+  releaseRefusalCountedByEvent,
+  syncShadowTerminalStatuses,
+  trackerRouteViaCli,
+  trackerStatusViaCli,
+  parseTaskPayload,
+} from "./src/shadow-reconcile.js";
+import {
+  expiredWorkGraphOverrides,
+  parseWorkGraphOverrides,
+  rewriteWorkGraphProjects,
+} from "./src/workgraph-mode.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
  * current selection through `setPendingRole`; `pendingRole` reads it back
@@ -547,6 +574,18 @@ export async function createPlugin(
       experimental_multiline: true,
       default: "",
     },
+    coordinatorWorktrees: {
+      type: "string",
+      label: "Coordinator worktrees",
+      description:
+        "§13.5 (PLUG-392, ADR-0024): `off` (default) — coordinators " +
+        "share the checkout and binding checks never refuse an " +
+        "operation; `on` — owner-only switch after BB env-retention " +
+        "is confirmed: coordinator operations require a registered " +
+        "integration copy. Binding registration and the §16.9 " +
+        "archive-admission ledger run in both modes.",
+      default: "off",
+    },
     gitInstructions: {
       type: "string",
       label: "Working with git",
@@ -665,7 +704,7 @@ export async function createPlugin(
       type: "string",
       label: "Work graph mode per project",
       description:
-        "§32.2 (PLUG-361): JSON mapping of project IDs to work graph mode: {\"<projectId>\": \"off\" | \"shadow\" | \"strict\"}.",
+        "§32.2 (PLUG-361) + §32.5.6 (PLUG-398): JSON mapping of project IDs to work graph mode: {\"<projectId>\": \"off\" | \"shadow\" | \"strict\"} (permanent) or {\"<projectId>\": {\"mode\": \"off\", \"until\": \"<ISO-8601 UTC>\", \"reason\": \"…\"}} (expires automatically; off — at most 24 h).",
       experimental_multiline: true,
       default: "",
     },
@@ -688,8 +727,10 @@ export async function createPlugin(
   });
 
   let currentSettings = await settings.get();
+  // §32.5.6 (PLUG-398): истёкшие переопределения не действуют сразу,
+  // удаление ключа — expireWorkGraphOverrides (такт run-queue).
   const getWorkGraphProjectsMap = (): Record<string, WorkGraphMode> =>
-    parseWorkGraphProjects(currentSettings.workGraphProjects);
+    parseWorkGraphProjects(currentSettings.workGraphProjects, now());
   const getWorkGraphMode = (projectId?: string | null): WorkGraphMode =>
     resolveWorkGraphMode(
       projectId,
@@ -713,6 +754,8 @@ export async function createPlugin(
   type CriticalSetting = (typeof CRITICAL_SETTINGS)[number];
 
   const menuIntents = new Map<CriticalSetting, number>();
+  /** §32.5.6: причина собственной смены настройки для события §32.3 п. 4. */
+  const pendingSettingReasons = new Map<CriticalSetting, string>();
 
   function recordMenuIntent(setting: CriticalSetting, ttlMs: number = 10_000): void {
     menuIntents.set(setting, now() + ttlMs);
@@ -857,6 +900,7 @@ export async function createPlugin(
     }
   }).catch(() => {});
   const janitorStore = new JanitorStore(db);
+  const worktreeStore = new CoordinatorWorktreeStore(db);
   const enqueue = createDelegateQueue();
   const positiveInt = (v: string | undefined, dflt: number): number => {
     const n = Number(v);
@@ -1262,7 +1306,9 @@ export async function createPlugin(
       if (String(prevVal ?? "") !== String(nextVal ?? "")) {
         const source = checkAndConsumeMenuIntent(key);
         const at = now();
-        store.recordSettingChangeEvent(key, prevVal, nextVal, source, at);
+        const reason = source === "menu" ? pendingSettingReasons.get(key) : undefined;
+        pendingSettingReasons.delete(key);
+        store.recordSettingChangeEvent(key, prevVal, nextVal, source, at, reason ? { reason } : undefined);
         if (source === "outside_menu") {
           void createCriticalSettingAlertCard(key, prevVal, nextVal);
         }
@@ -1275,6 +1321,14 @@ export async function createPlugin(
     };
 
     currentSettings = next;
+    // §32.5.6 п. 4: срок off не дольше 24 ч от записи.
+    try {
+      void capOffOverrides().catch((e) =>
+        bb.log.warn(`orchestrator: workGraphProjects cap: ${describeError(e)}`),
+      );
+    } catch {
+      // ещё не инициализировано (смена настроек во время старта)
+    }
     // §18.1 (PLUG-247a): a language change rebuilds the translator and
     // rewrites the installed pre-push (its texts are versioned with the
     // language); everything below re-parses under the new `t`.
@@ -1963,8 +2017,208 @@ export async function createPlugin(
     }
   };
 
+  // ── §32.5 (PLUG-398): наблюдатель-сверка shadow ─────────────────────
+  const getTrackerStatus = trackerStatusViaCli(bbCli);
+  const shadowSyncLastChecked = new Map<string, number>();
+  store.eventObserver = (kind, doc) =>
+    shadowObserveStoreEvent(store, kind, doc, {
+      getMode: getWorkGraphMode,
+      policy: () => policyLoad.policy,
+      now,
+    });
+
+  /** §32.5.1–§32.5.2: приём или следование после успешной ручной раздачи. */
+  const observeShadowDelegate = async (input: {
+    taskKey: string;
+    level: string;
+    kind?: string;
+    noCode?: boolean;
+    delegationId: number;
+    coordinatorThreadId?: string;
+  }): Promise<void> => {
+    try {
+      const row = store.get(input.delegationId);
+      // §32.2 п. 2: очередь → делегирования → трекер
+      const projectId =
+        (await resolveTaskProjectId(store, input.taskKey, { bbCli, log: bb.log })) ??
+        row?.project_id ??
+        null;
+      if (!projectId) return; // task-not-enqueued записан до действия
+      const mode = getWorkGraphMode(projectId);
+      if (mode !== "shadow") return;
+      let attach: { kind?: string; specPaths?: string[] } = {};
+      try {
+        attach = row?.attach ? JSON.parse(row.attach) : {};
+      } catch {}
+      const existing = store.getTask(input.taskKey);
+      const reviewKind =
+        input.kind === "spec_review" ||
+        attach.kind === "spec_review" ||
+        existing?.node === "spec_review"
+          ? ("spec_review" as const)
+          : ("review" as const);
+      const closed =
+        !!existing && (existing.status === "done" || existing.status === "cancelled");
+      const adopting = !existing || closed;
+      // §32.5.4 п. 3: по закрытой записи решает трекер — открыта (доработка)
+      // → переоткрытие, закрыта или неизвестно → `closed-task-action`.
+      let trackerStatus: string | null = null;
+      if (closed) {
+        try {
+          trackerStatus = (await getTrackerStatus(input.taskKey)) ?? null;
+        } catch (e) {
+          bb.log.warn(`orchestrator: shadow observe delegate tracker: ${describeError(e)}`);
+        }
+      }
+      const trackerRoute =
+        !existing || trackerStatusIsOpen(trackerStatus)
+          ? await trackerRouteViaCli(bbCli, input.taskKey)
+          : null;
+      shadowObserveDelegate(store, {
+        taskKey: input.taskKey,
+        projectId,
+        coordinatorThreadId:
+          row?.coordinator_thread_id ?? input.coordinatorThreadId ?? "",
+        level: input.level,
+        reviewKind,
+        noCode: input.noCode,
+        docsOnlyRange: attach.kind === "spec_review" && (attach.specPaths?.length ?? 0) > 0,
+        delegationId: input.delegationId,
+        branch: row?.result_branch ?? null,
+        trackerRoute,
+        trackerStatus,
+        approvalMode: getApprovalMode(),
+        policy: policyLoad.policy,
+        mode,
+        now: now(),
+      });
+    } catch (e) {
+      bb.log.warn(`orchestrator: shadow observe delegate: ${describeError(e)}`);
+    }
+  };
+
+  const observeShadowMerge = async (ref: string, delegationId?: number | null) => {
+    try {
+      const projectId = await resolveTaskProjectId(store, ref, { bbCli, log: bb.log });
+      shadowObserveMerge(store, {
+        taskKey: ref,
+        projectId,
+        delegationId: delegationId ?? null,
+        mode: projectId ? getWorkGraphMode(projectId) : getWorkGraphMode(),
+        policy: policyLoad.policy,
+        now: now(),
+      });
+    } catch (e) {
+      bb.log.warn(`orchestrator: shadow observe merge: ${describeError(e)}`);
+    }
+  };
+
+  /** §32.5.2: merge состоялся — только `merged`/`merged-upstream`. */
+  const mergeLanded = (
+    res: Awaited<ReturnType<typeof mergeDelegation>>,
+  ): res is Extract<typeof res, { mergeStatus: string }> =>
+    "mergeStatus" in res &&
+    (res.mergeStatus === "merged" || res.mergeStatus === "merged-upstream");
+
+  const observeShadowReleaseOutcome = async (
+    taskKey: string,
+    outcome: "auditing" | "refused",
+  ) => {
+    try {
+      const task = store.getTask(taskKey);
+      if (!task) return;
+      shadowObserveRelease(store, {
+        taskKey,
+        outcome,
+        mode: getWorkGraphMode(task.project_id),
+        policy: policyLoad.policy,
+        now: now(),
+      });
+    } catch (e) {
+      bb.log.warn(`orchestrator: shadow observe release: ${describeError(e)}`);
+    }
+  };
+
+  const runShadowSync = (throttled: boolean) =>
+    syncShadowTerminalStatuses(store, {
+      getMode: getWorkGraphMode,
+      getTrackerStatus,
+      now,
+      log: bb.log,
+      ...(throttled
+        ? { minIntervalMs: 60_000, lastChecked: shadowSyncLastChecked }
+        : {}),
+    });
+
+  /** Координатор проекта для сообщений об истечении переопределения. */
+  const projectCoordinatorThread = (projectId: string): string | undefined => {
+    const tasks = store
+      .listAllTasks()
+      .filter((t) => t.project_id === projectId && t.coordinator_thread_id)
+      .sort((a, b) => b.updated_at - a.updated_at);
+    if (tasks[0]) return tasks[0].coordinator_thread_id;
+    return store.latestCoordinatorThreadIdForProject(projectId);
+  };
+
+  /**
+   * §32.5.6 п. 2: истёкшее переопределение удаляется через собственное
+   * меню-намерение (source: menu, reason: override-expired), координатор
+   * проекта получает сообщение с прежним и новым режимом.
+   */
+  let expiringOverrides = false;
+  const expireWorkGraphOverrides = async (): Promise<void> => {
+    if (expiringOverrides) return;
+    const raw = currentSettings.workGraphProjects;
+    const expired = expiredWorkGraphOverrides(raw, now());
+    if (!expired.length) return;
+    expiringOverrides = true;
+    try {
+      const rewritten = rewriteWorkGraphProjects(raw, {
+        remove: expired.map((e) => e.projectId),
+        now: now(),
+      });
+      if (!rewritten) return;
+      pendingSettingReasons.set("workGraphProjects", "override-expired");
+      recordMenuIntent("workGraphProjects");
+      await settings.experimental_set({ workGraphProjects: rewritten.value });
+      currentSettings = { ...currentSettings, workGraphProjects: rewritten.value };
+      for (const e of expired) {
+        const next = getWorkGraphMode(e.projectId);
+        const thread = projectCoordinatorThread(e.projectId);
+        const text =
+          `[orchestrator] Срок переопределения режима графа для проекта ${e.projectId} истёк ` +
+          `(${new Date(e.override.until!).toISOString()}${e.override.reason ? `, причина: ${e.override.reason}` : ""}): ` +
+          `было ${e.override.mode}, стало ${next}.`;
+        bb.log.warn(text);
+        if (thread) pushToThread(thread, text);
+      }
+    } catch (err) {
+      bb.log.warn(`orchestrator: workGraphProjects expiry: ${describeError(err)}`);
+    } finally {
+      expiringOverrides = false;
+    }
+  };
+
+  /** §32.5.6 п. 4: срок `off` дальше 24 ч от записи — обрезка с предупреждением. */
+  const capOffOverrides = async (): Promise<void> => {
+    // §32.5.6 п. 3: невалидный объект — предупреждение, режим наследуется
+    parseWorkGraphOverrides(currentSettings.workGraphProjects, bb.log);
+    const rewritten = rewriteWorkGraphProjects(currentSettings.workGraphProjects, {
+      now: now(),
+    });
+    if (!rewritten || !rewritten.capped.length) return;
+    bb.log.warn(
+      `orchestrator: workGraphProjects: off override for ${rewritten.capped.join(", ")} exceeds 24 h; capped to 24 h`,
+    );
+    pendingSettingReasons.set("workGraphProjects", "off-override-capped");
+    recordMenuIntent("workGraphProjects");
+    await settings.experimental_set({ workGraphProjects: rewritten.value });
+    currentSettings = { ...currentSettings, workGraphProjects: rewritten.value };
+  };
+
   let cachedPumpRepoRoot: string | null = null;
   const pumpRunQueue = async () => {
+    await expireWorkGraphOverrides();
     const projectsMap = getWorkGraphProjectsMap();
     const hasActiveProject = Object.values(projectsMap).some(
       (m) => m === "shadow" || m === "strict",
@@ -2004,6 +2258,9 @@ export async function createPlugin(
       repoRoot,
       cmd,
       bbCli,
+      getTrackerStatus,
+      trackerSyncMinIntervalMs: 60_000,
+      trackerSyncLastChecked: shadowSyncLastChecked,
       resolveProject: (pid: string) => releaseConfig.config ? resolveProject(releaseConfig.config, pid) : null,
       t,
       approvalMode: getApprovalMode() ?? undefined,
@@ -2368,6 +2625,19 @@ export async function createPlugin(
       beat(async () => {
         await watchdog.reconcile();
         await helperWatchdog.reconcile();
+        // §32.5.4 п. 3 (PLUG-398): однократная стартовая метка сверки и
+        // синхронизация существующих записей очереди.
+        await ensureShadowReconcileStarted(store, {
+          getMode: getWorkGraphMode,
+          getTrackerStatus,
+          now,
+          log: bb.log,
+        }).catch((e) =>
+          bb.log.warn(`orchestrator: shadow-reconcile start: ${describeError(e)}`),
+        );
+        await capOffOverrides().catch((e) =>
+          bb.log.warn(`orchestrator: workGraphProjects cap: ${describeError(e)}`),
+        );
         await pumpRelease();
         await pumpRunQueue();
       });
@@ -2380,6 +2650,10 @@ export async function createPlugin(
         beat(async () => {
           await watchdog.reconcile();
           await helperWatchdog.reconcile();
+          // §32.5.4: проход reconcile — синхронизация shadow-очереди
+          await runShadowSync(true).catch((e) =>
+            bb.log.warn(`orchestrator: shadow-sync: ${describeError(e)}`),
+          );
           await pumpRelease();
           await pumpRunQueue();
         });
@@ -2439,8 +2713,70 @@ export async function createPlugin(
     },
     loadConfig: janitorConfig,
     localHostId,
+    worktrees: worktreeStore,
     log: bb.log,
     t,
+  });
+  // §13.5/§16.9 (r34.8, PLUG-392): coordinator worktree bindings —
+  // lazy registration on thread events and the archive-admission
+  // ledger that decides `held`/`remove_pending`/`env-removed`.
+  const coordWorktrees = createCoordinatorWorktrees({
+    store: worktreeStore,
+    threadRole: (id) => store.threadRole(id),
+    cmd,
+    showEnvironment: async (envId) => {
+      // §7/§16.9: «env removed» is a verdict only for the structured
+      // BB answer (exit 1 + error.code environment_not_found); any
+      // other failure — including «bb CLI not found» (exit 127) —
+      // throws so a transient hiccup never reads as «env removed».
+      const res = await bbCli.run([
+        "environment",
+        "show",
+        envId,
+        "--json",
+      ]);
+      const verdict = environmentShowVerdict(res);
+      if (verdict === "ok") {
+        return JSON.parse(res.stdout) as CoordinatorEnvDto;
+      }
+      if (verdict === "gone") {
+        return null;
+      }
+      throw new OrchestratorError(
+        "bb-cli-failed",
+        `bb environment show ${envId} failed (exit ${res.exitCode}): ` +
+          `${res.stderr.trim() || res.stdout.trim() || "no output"}`,
+      );
+    },
+    showThread: async (threadId) => {
+      try {
+        return await runJson(bbCli, ["thread", "show", threadId, "--json"]);
+      } catch {
+        return null;
+      }
+    },
+    listEnvThreads: async (envId) => {
+      try {
+        return await runJson(bbCli, [
+          "thread",
+          "list",
+          "--environment",
+          envId,
+          "--include-archived",
+          "--include-hidden",
+          "--json",
+        ]);
+      } catch {
+        return null;
+      }
+    },
+    // §13.5 п.2: an env serving a delegation is an executor round —
+    // it must never register as a coordinator integration copy. The
+    // index feeds the module's own check (env id, executor thread id
+    // while result_env_id is still NULL, live delegation threads).
+    delegationIndex: () => store.delegationTaskIndex(),
+    hasProcessIn: async (p) => defaultHasProcessIn(p),
+    log: bb.log,
   });
   let janitorBusy = false;
   let lastJanitorRunAt = 0;
@@ -2492,6 +2828,38 @@ export async function createPlugin(
             : Promise.resolve(undefined)
           ).catch((e) =>
             bb.log.warn(`orchestrator janitor: ${describeError(e)}`),
+          ),
+        );
+        // §13.5/§16.9 (PLUG-392): coordinator worktree lifecycle —
+        // lazy binding on activity (`message.dispatched` ships only
+        // `entry.threadId`, the env is resolved inside), archive
+        // admission, and unarchive cancellation. All async — never
+        // the synchronous `message.dispatch` pass.
+        bb.events.on("thread.active", ({ thread }) =>
+          void coordWorktrees.onThreadActive(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+          ),
+        );
+        bb.events.on("message.dispatched", ({ entry }) =>
+          void coordWorktrees
+            .onThreadActive({ id: entry.threadId })
+            .catch((e) =>
+              bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+            ),
+        );
+        bb.events.on("thread.archived", ({ thread }) =>
+          void coordWorktrees.onThreadArchived(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+          ),
+        );
+        bb.events.on("thread.unarchived", ({ thread }) =>
+          void coordWorktrees.onThreadUnarchived(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+          ),
+        );
+        bb.events.on("thread.deleted", ({ thread }) =>
+          void coordWorktrees.onThreadDeleted(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
           ),
         );
       }
@@ -2663,6 +3031,7 @@ export async function createPlugin(
         ctx: {},
         workGraphMode: getWorkGraphMode(taskPid),
         now,
+        policy: policyLoad.policy,
       });
       if (res.task?.coordinator_thread_id) {
         pushToThread(
@@ -2828,6 +3197,15 @@ export async function createPlugin(
           bbCli,
         });
         const res = await delegate({ ...params, threadId: ctx.threadId });
+        // §32.5.1–§32.5.2 (PLUG-398): приём/следование зеркала после раздачи
+        await observeShadowDelegate({
+          taskKey: res.taskKey,
+          level: res.level,
+          kind: params.kind,
+          noCode: params.noCode,
+          delegationId: res.delegationId,
+          coordinatorThreadId: ctx.threadId,
+        });
         return JSON.stringify({
           ...res,
           // §2.3 (PLUG-182): `res.note` carries the reviewByLevel mapping
@@ -2972,30 +3350,42 @@ export async function createPlugin(
       watchdog.markCoordinatorAction(ctx.threadId);
       try {
         let taskKey = params.ref;
+        let mergeDelegationId: number | null = null;
         if (/^\d+$/.test(taskKey)) {
           const row = store.get(Number(taskKey));
           if (row) {
             taskKey = row.task_key;
+            mergeDelegationId = row.id;
             if (row.coordinator_thread_id) {
               watchdog.markCoordinatorAction(row.coordinator_thread_id);
             }
           }
         } else {
           const row = store.latestDoneResultByTask(taskKey);
+          mergeDelegationId = row?.id ?? null;
           if (row?.coordinator_thread_id) {
             watchdog.markCoordinatorAction(row.coordinator_thread_id);
           }
         }
         await assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode, {
           command: "merge",
+          dryRun: params.dryRun === true,
+          delegationId: mergeDelegationId,
           actor: "shadow:coordinator",
           policy: policyLoad.policy,
           log: bb.log,
           bbCli,
         });
-        return JSON.stringify(
-          await mergeDelegation({ ...params, callerThreadId: ctx.threadId }),
-        );
+        const mergeRes = await mergeDelegation({
+          ...params,
+          callerThreadId: ctx.threadId,
+        });
+        // §32.5.2: следование только за состоявшимся merge — conflict и
+        // fix-delegated возвращаются, а не бросаются, и узел не двигают
+        if (mergeLanded(mergeRes)) {
+          await observeShadowMerge(taskKey, mergeRes.delegationId);
+        }
+        return JSON.stringify(mergeRes);
       } catch (e) {
         return JSON.stringify(errorJson(e));
       }
@@ -3379,7 +3769,7 @@ export async function createPlugin(
         name: "enqueue",
         summary: t("cli.helpEnqueueS"),
         usage:
-          "bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|medium|simple|spec|research] [--acceptance <file|text>] [--release-note <text>] [--depends-on <k1,k2>] [--force-reset-branch] [--json]",
+          "bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|high|medium|simple|spec|research] [--acceptance <file|text>] [--release-note <text>] [--depends-on <k1,k2>] [--force-reset-branch] [--json]",
       },
       {
         name: "dequeue",
@@ -3417,6 +3807,12 @@ export async function createPlugin(
         name: "run-queue",
         summary: t("cli.helpRunQueueS"),
         usage: "bb orchestrator run-queue [--once] [--json]",
+      },
+      {
+        name: "shadow-report",
+        summary: t("cli.helpShadowReportS"),
+        usage:
+          "bb orchestrator shadow-report [--project <id>] [--since <iso>] [--json]",
       },
       {
         name: "config",
@@ -3467,7 +3863,8 @@ export async function createPlugin(
           argv[i - 1] !== "--priority" && argv[i - 1] !== "--mode" &&
           argv[i - 1] !== "--acceptance" && argv[i - 1] !== "--release-note" &&
           argv[i - 1] !== "--depends-on" && argv[i - 1] !== "--reason" &&
-          argv[i - 1] !== "--target" && argv[i - 1] !== "--comment",
+          argv[i - 1] !== "--target" && argv[i - 1] !== "--comment" &&
+          argv[i - 1] !== "--project" && argv[i - 1] !== "--since",
       );
       const cmd = positional[0];
 
@@ -3848,6 +4245,15 @@ export async function createPlugin(
             headSha: flag("--head-sha"),
             threadId: ctx.threadId,
           });
+          // §32.5.1–§32.5.2 (PLUG-398): приём/следование зеркала после раздачи
+          await observeShadowDelegate({
+            taskKey: res.taskKey,
+            level: res.level,
+            kind: flag("--kind"),
+            noCode: argv.includes("--no-code") ? true : undefined,
+            delegationId: res.delegationId,
+            coordinatorThreadId: ctx.threadId,
+          });
           return json
             ? jsonOk(res)
             : {
@@ -3990,22 +4396,27 @@ export async function createPlugin(
               t("cli.mergeUsage"),
             );
           }
+          let mergeDelegationId: number | null = null;
           if (/^\d+$/.test(ref)) {
             const row = store.get(Number(ref));
             if (row) {
               ref = row.task_key;
+              mergeDelegationId = row.id;
               if (row.coordinator_thread_id) {
                 watchdog.markCoordinatorAction(row.coordinator_thread_id);
               }
             }
           } else {
             const row = store.latestDoneResultByTask(ref);
+            mergeDelegationId = row?.id ?? null;
             if (row?.coordinator_thread_id) {
               watchdog.markCoordinatorAction(row.coordinator_thread_id);
             }
           }
           await assertGraphAllowsDirectAction(store, ref, getWorkGraphMode, {
             command: "merge",
+            dryRun: argv.includes("--dry-run"),
+            delegationId: mergeDelegationId,
             actor: "shadow:coordinator",
             policy: policyLoad.policy,
             log: bb.log,
@@ -4026,6 +4437,9 @@ export async function createPlugin(
             markMerged: markMergedVal,
             callerThreadId: ctx.threadId,
           });
+          if (mergeLanded(res)) {
+            await observeShadowMerge(ref, res.delegationId);
+          }
           if (json) return jsonOk(res);
           if ("dryRun" in res) {
             return {
@@ -4174,6 +4588,7 @@ export async function createPlugin(
           }
           await assertGraphAllowsDirectAction(store, key, getWorkGraphMode, {
             command: "release",
+            delegationId: store.latestDoneResultByTask(key)?.id ?? null,
             actor: "shadow:coordinator",
             policy: policyLoad.policy,
             log: bb.log,
@@ -4200,17 +4615,33 @@ export async function createPlugin(
           // the release-auditor dispatch inside it is enqueued. A queued
           // release that internally dispatches would deadlock waiting
           // for its own queue slot.
-          const res = await runRelease(
-            {
-              taskKey: key,
-              caller,
-              noDocs: flag("--no-docs"),
-              kb: flag("--kb"),
-              noKb: flag("--no-kb"),
-              forceDropUnmerged: flag("--force-drop-unmerged"),
-            },
-            releaseDeps,
-          );
+          let res: Awaited<ReturnType<typeof runRelease>>;
+          const releaseIdBefore = store.latestReleaseByTask(key)?.id ?? 0;
+          try {
+            res = await runRelease(
+              {
+                taskKey: key,
+                caller,
+                noDocs: flag("--no-docs"),
+                kb: flag("--kb"),
+                noKb: flag("--no-kb"),
+                forceDropUnmerged: flag("--force-drop-unmerged"),
+              },
+              releaseDeps,
+            );
+          } catch (relErr) {
+            // §32.5.2: отказ выкладки — событие конвейера без класса.
+            // Отказ после вставки строки выкладки уже учтён событием
+            // release.failed/rejected (наблюдатель store) — не считаем дважды.
+            if (!releaseRefusalCountedByEvent(store, key, releaseIdBefore)) {
+              await observeShadowReleaseOutcome(key, "refused");
+            }
+            throw relErr;
+          }
+          // published приходит событием release.published (наблюдатель store)
+          if (res.status === "auditing") {
+            await observeShadowReleaseOutcome(key, "auditing");
+          }
           // §2 п.0.2 (r11.9): upstream-выкладка завершается сразу —
           // аудита и «слежу» нет.
           const started =
@@ -4253,6 +4684,10 @@ export async function createPlugin(
 
         if (cmd === "reconcile") {
           const res = await watchdog.reconcile();
+          // §32.5.4: проход reconcile синхронизирует shadow-очередь с трекером
+          await runShadowSync(false).catch((e) =>
+            bb.log.warn(`orchestrator: shadow-sync: ${describeError(e)}`),
+          );
           const upstreamRes = await watchdog.reconcileUpstream();
           return json
             ? jsonOk({ ok: true, ...res, upstream: upstreamRes })
@@ -4679,6 +5114,7 @@ abandoned: ${res.reported
             ctx,
             workGraphMode: getWorkGraphMode(taskProjId),
             now,
+            policy: policyLoad.policy,
           });
           return json
             ? jsonOk(res)
@@ -4712,7 +5148,45 @@ abandoned: ${res.reported
               };
         }
 
+        if (cmd === "shadow-report") {
+          // §32.5.5 (PLUG-398): первым шагом — синхронизация §32.5.4
+          // (пишет только строки shadow:sync), затем отчёт.
+          const sinceRaw = flag("--since");
+          let since: number | undefined;
+          if (sinceRaw !== undefined) {
+            since = Date.parse(sinceRaw);
+            if (!Number.isFinite(since)) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                `shadow-report: --since ожидает дату ISO-8601, получено ${sinceRaw}`,
+              );
+            }
+          }
+          // §32.5.5 п. 1: окно по умолчанию — от метки стартовой сверки;
+          // нет метки — фиксируем её сейчас (с разовой синхронизацией), а не
+          // берём since = 0 с историей до выкладки §32.5.
+          await ensureShadowReconcileStarted(store, {
+            getMode: getWorkGraphMode,
+            getTrackerStatus,
+            now,
+            log: bb.log,
+          });
+          const sync = await runShadowSync(false);
+          const report = buildShadowReport(store, {
+            since,
+            projectId: flag("--project") ?? null,
+            now: now(),
+            getMode: getWorkGraphMode,
+            overrides: parseWorkGraphOverrides(currentSettings.workGraphProjects),
+            synced: sync.synced,
+          });
+          return json
+            ? jsonOk({ ok: true, ...report })
+            : { exitCode: 0, stdout: formatShadowReport(report) };
+        }
+
         if (cmd === "run-queue") {
+          await expireWorkGraphOverrides();
           const res = await runRunQueue({
             store,
             policy: policyLoad.policy,
@@ -4734,6 +5208,7 @@ abandoned: ${res.reported
             getWorkGraphMode: getWorkGraphMode,
             maxActiveTasks: getMaxActiveTasks(),
             repoRoot: ctx.cwd || process.cwd(),
+            getTrackerStatus,
             cmd: cmdRunner,
             bbCli,
             t,
