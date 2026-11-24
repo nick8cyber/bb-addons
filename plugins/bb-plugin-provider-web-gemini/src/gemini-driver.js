@@ -867,9 +867,6 @@ async function stopGeneration(page) {
 }
 
 function findTurnTarget(doc, idx, promptPrefix) {
-  const responses = doc.querySelectorAll('model-response');
-  const target = responses[idx];
-  if (!target) return null;
   const queries = doc.querySelectorAll('user-query');
   if (queries.length === 0) return null;
   const lastQuery = queries[queries.length - 1];
@@ -878,6 +875,15 @@ function findTurnTarget(doc, idx, promptPrefix) {
   if (promptPrefix && !norm(lastQuery.innerText).includes(norm(promptPrefix).slice(0, 40))) {
     return null;
   }
+  const responses = doc.querySelectorAll('model-response');
+  let target = responses[idx] || null;
+  // Early thinking/search phase: <model-response> is not rendered yet — the
+  // last <pending-response> after lastQuery becomes the temporary target.
+  if (!target) {
+    const pending = doc.querySelectorAll('pending-response');
+    target = pending[pending.length - 1] || null;
+  }
+  if (!target) return null;
   const NodeObj = typeof Node !== 'undefined' ? Node : { DOCUMENT_POSITION_FOLLOWING: 4 };
   if (!(lastQuery.compareDocumentPosition(target) & NodeObj.DOCUMENT_POSITION_FOLLOWING)) {
     return null;
@@ -893,6 +899,8 @@ function checkTurnStatus(doc, idx, promptPrefix) {
       isBusyOrThinking: false,
       hasFinishedContent: false,
       hasActionButtons: false,
+      hasActiveThinkingOrTool: false,
+      statusText: null,
       targetTextLength: 0,
       currentText: null,
     };
@@ -1001,12 +1009,73 @@ function checkTurnStatus(doc, idx, promptPrefix) {
     hasActionButtons = target.querySelector(actionSelector) !== null;
   }
 
+  // PLUG-407: active thinking/tool indicators inside the turn target are a
+  // liveness signal while the stop button is visible. Plain busy spinners
+  // (busySelector) stay out of this — they only feed isBusyOrThinking.
+  // message-content and model-thoughts subtrees are strictly excluded.
+  let hasActiveThinkingOrTool = false;
+  let statusText = null;
+  const statusSelector = [
+    'thinking-overlay',
+    '.thinking-container',
+    '.animated-thinking-content',
+    '.tool-status',
+    '[role="status"]',
+    '.status-container',
+    '.gpi-static-text-loader',
+  ].join(', ');
+  const statusPhrases = [
+    'Searching the web',
+    'Ищу в интернете',
+    'Поиск в интернете',
+    'Thinking...',
+    'Думаю...',
+  ];
+  const normStatus = (s) => (s || '').replace(/…/g, '...').replace(/\s+/g, ' ').trim();
+  const parentOf = (el) => (el ? el.parentElement || el.parentNode || el.parent || null : null);
+  const insideContentOrThoughts = (el) => {
+    for (let p = el; p; p = parentOf(p)) {
+      const tag = (p.tagName || '').toLowerCase();
+      if (tag === 'message-content' || tag === 'model-thoughts') return true;
+    }
+    return false;
+  };
+  if (target) {
+    const statusEls = Array.from(target.querySelectorAll(statusSelector)).filter(
+      (el) => !insideContentOrThoughts(el)
+    );
+    const statusTexts = statusEls
+      .map((el) => normStatus(el.innerText))
+      .filter((t) => t.length > 0);
+    statusText = statusTexts.length ? statusTexts.join(' ') : null;
+
+    // Presence counts as progress only before the answer stream starts
+    // (hasFinishedContent === false); afterwards progress is text growth /
+    // domSig changes only.
+    if (!hasFinishedContent) {
+      for (const el of statusEls) {
+        const cls = (el.getAttribute('class') || '').toLowerCase().split(/\s+/);
+        const isAnimated = cls.includes('animated-thinking-content');
+        const isToolStatus = cls.includes('tool-status');
+        if (!isAnimated && !isToolStatus) continue;
+        const text = normStatus(el.innerText);
+        if (!text) continue;
+        if (isAnimated || statusPhrases.some((p) => text.includes(normStatus(p)))) {
+          hasActiveThinkingOrTool = true;
+          break;
+        }
+      }
+    }
+  }
+
   return {
     targetFound: target !== null,
     hasStopButton,
     isBusyOrThinking,
     hasFinishedContent,
     hasActionButtons,
+    hasActiveThinkingOrTool,
+    statusText,
     childCount: target ? target.querySelectorAll('*').length : 0,
     targetTextLength: target ? (target.innerText || '').length : 0,
     currentText,
@@ -1415,8 +1484,18 @@ async function sendPrompt({
     const POLL_INTERVAL_MS = 200;
     const rawSessionCap = Number(process.env.WEB_GEMINI_SESSION_CAP_MS || process.env.ARGON_SESSION_CAP_MS);
     const SESSION_CAP_MS = Number.isFinite(rawSessionCap) && rawSessionCap > 0 ? rawSessionCap : 4 * 3600_000;
-    const rawStallMs = stallMs != null ? Number(stallMs) : Number(process.env.WEB_GEMINI_STALL_MS || process.env.ARGON_STALL_MS);
-    const STALL_MS = Number.isFinite(rawStallMs) && rawStallMs > 0 ? rawStallMs : 120_000;
+    // PLUG-407: a valid explicit stallMs is used unclamped (tests); otherwise
+    // env (or 120s default) with a 10-minute floor for thinking: "high" —
+    // deep research/“Searching the web” phases legitimately show no text growth.
+    const explicitStallMs = stallMs != null ? Number(stallMs) : NaN;
+    let STALL_MS;
+    if (Number.isFinite(explicitStallMs) && explicitStallMs > 0) {
+      STALL_MS = explicitStallMs;
+    } else {
+      const envStall = Number(process.env.WEB_GEMINI_STALL_MS || process.env.ARGON_STALL_MS);
+      const baseStall = Number.isFinite(envStall) && envStall > 0 ? envStall : 120_000;
+      STALL_MS = String(thinking || '').toLowerCase() === 'high' ? Math.max(baseStall, 600_000) : baseStall;
+    }
     const streamStartTime = Date.now();
     let lastProgressTime = streamStartTime;
     let lastDomSignature = null;
@@ -1451,6 +1530,8 @@ async function sendPrompt({
             isBusyOrThinking: false,
             hasFinishedContent: (mc?.innerText || '').trim().length > 0,
             hasActionButtons: false,
+            hasActiveThinkingOrTool: false,
+            statusText: null,
             childCount,
             targetTextLength: (target.innerText || '').length,
             currentText: { src, text: ((mc || target).innerText || '') },
@@ -1515,9 +1596,16 @@ async function sendPrompt({
         hasStopButton,
       };
 
+      // PLUG-407: активный индикатор мышления/инструмента продлевает дедлайн
+      // стола строго пока видна stop-кнопка. Без stop-кнопки (awaitingContent)
+      // или без цели индикатор стол не продлевает.
+      if (hasStopButton && effectiveStatus.hasActiveThinkingOrTool) {
+        hadProgress = true;
+      }
+
       // targetTextLength ловит рост соседних model-thoughts на длинном
       // "Thinking": текст ответа не меняется, но прогресс в DOM идёт.
-      const domSig = `${Boolean(effectiveStatus.hasStopButton)}:${Boolean(effectiveStatus.isBusyOrThinking)}:${Boolean(effectiveStatus.hasFinishedContent)}:${Boolean(effectiveStatus.hasActionButtons)}:${status.childCount ?? 0}:${status.targetTextLength ?? 0}:${currentText?.src ?? ''}`;
+      const domSig = `${Boolean(effectiveStatus.hasStopButton)}:${Boolean(effectiveStatus.isBusyOrThinking)}:${Boolean(effectiveStatus.hasFinishedContent)}:${Boolean(effectiveStatus.hasActionButtons)}:${Boolean(effectiveStatus.hasActiveThinkingOrTool)}:${effectiveStatus.statusText ?? ''}:${status.childCount ?? 0}:${status.targetTextLength ?? 0}:${currentText?.src ?? ''}`;
       if (lastDomSignature === null) {
         lastDomSignature = domSig;
       } else if (domSig !== lastDomSignature) {
