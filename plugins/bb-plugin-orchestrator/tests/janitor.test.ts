@@ -14,7 +14,12 @@ import { join } from "node:path";
 import { makeTempDir } from "./helpers/temp.js";
 import { execFileSync, spawn } from "node:child_process";
 import Database from "better-sqlite3";
-import { DelegationStore, JanitorStore, MIGRATIONS } from "../src/store.js";
+import {
+  CoordinatorWorktreeStore,
+  DelegationStore,
+  JanitorStore,
+  MIGRATIONS,
+} from "../src/store.js";
 import { parseJanitorConfig } from "../src/janitor-config.js";
 import {
   createJanitor,
@@ -201,6 +206,9 @@ function makeWorld(opts: {
   onThreadListCall?: (call: number, page?: { offset?: number }) => void;
   /** Set false to drop the paged SDK seam → CLI `thread list` fallback. */
   sdkList?: boolean;
+  /** §16.9 (PLUG-392): thread_roles rows — `orchestrator` marks a
+   * coordinator thread whose env the janitor must never touch. */
+  roles?: Record<string, string>;
   /** §18.1: the language catalog under test (default — ru). */
   t?: T;
 }) {
@@ -208,7 +216,11 @@ function makeWorld(opts: {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
+  for (const [id, role] of Object.entries(opts.roles ?? {})) {
+    store.setThreadRole(id, role, "hook");
+  }
   const janitor = new JanitorStore(db);
+  const worktrees = new CoordinatorWorktreeStore(db);
   const threads = opts.threads ?? {};
   const interactions = opts.interactions ?? {};
   const archivedCalls: string[] = [];
@@ -333,12 +345,14 @@ function makeWorld(opts: {
     },
     hasProcessIn: opts.hasProcessIn ?? (async () => false),
     localHostId: () => opts.localHostId ?? "",
+    worktrees,
     ...(opts.t ? { t: opts.t } : {}),
   };
   return {
     deps,
     store,
     janitor,
+    worktrees,
     clock,
     // live references — tests can add envs/threads between runs
     envSpecs: opts.envs,
@@ -6456,3 +6470,189 @@ test("§34.2 (ADR-0037): isServiceWorktreePath and evaluateServiceWorktreePrunab
   assert.equal(resActive.reason, "task-active");
 });
 
+
+// ── Coordinator worktrees (§16.9/§7, PLUG-392, ADR-0024) ───────────
+
+test("§16.9: a bound coordinator env is kept «coordinator-live» — merged or not", async () => {
+  const { repo, base } = makeRepo("jan-coord-");
+  const env = addEnv(repo, base, "coord");
+  commitIn(env.path, "w.txt", "feat: coordinator work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  w.worktrees.register(
+    {
+      projectId: env.projectId,
+      coordinatorThreadId: "thr_coord",
+      envId: env.id,
+      worktreePath: env.path,
+      branch: env.branchName,
+    },
+    w.clock.t,
+  );
+  // The copy is merged, clean and idle — a would-be removal candidate.
+  let res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "coordinator-live");
+  w.clock.t += 16 * 60_000;
+  res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(res.removedBranches, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.deepEqual(w.cleanedUp, []);
+  assert.ok(existsSync(env.path));
+  assert.equal(w.janitor.item(env.id)!.reason, "coordinator-live");
+  assert.doesNotThrow(() =>
+    git(repo, ["rev-parse", "--verify", env.branchName]),
+  );
+});
+
+test("§16.9: env with a live orchestrator-role thread is protected without a binding", async () => {
+  const { repo, base } = makeRepo("jan-coord-live-");
+  const env = addEnv(repo, base, "coord");
+  commitIn(env.path, "w.txt", "feat: coordinator work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    roles: { thr_coord: "orchestrator" },
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_coord",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: Date.now() - 60_000,
+          originPluginId: "orchestrator",
+        },
+      ],
+    },
+  });
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.ok(existsSync(env.path));
+  assert.equal(w.janitor.item(env.id)!.reason, "coordinator-live");
+});
+
+test("§16.9/§7: an env BB no longer reports closes the binding — its branch stays protected", async () => {
+  const { repo, base } = makeRepo("jan-coord-gone-");
+  const env = addEnv(repo, base, "coord");
+  commitIn(env.path, "w.txt", "feat: coordinator work");
+  mergeEnv(repo, env);
+  const w = makeWorld({ envs: [env], threads: {} });
+  const binding = w.worktrees.register(
+    {
+      projectId: env.projectId,
+      coordinatorThreadId: "thr_coord",
+      envId: env.id,
+      worktreePath: env.path,
+      branch: env.branchName,
+    },
+    w.clock.t,
+  );
+  // BB retires the env itself — the binding follows it to
+  // `env-removed`, and the merged bb/ branch is still shielded from
+  // the sweep (state ≠ removed).
+  w.envSpecs.length = 0;
+  const res = await w.jan.run();
+  assert.equal(w.worktrees.byId(binding.id)!.state, "env-removed");
+  assert.equal(res.removedBranches, 0);
+  assert.doesNotThrow(() =>
+    git(repo, ["rev-parse", "--verify", env.branchName]),
+  );
+});
+
+test("§16.9: taskCleanup keeps a bound coordinator env and branch (§22 п.5)", async () => {
+  const { repo, base } = makeRepo("jan-coord-task-");
+  const coord = addEnv(repo, base, "coord");
+  commitIn(coord.path, "c.txt", "feat: coordinator copy");
+  const worker = addEnv(repo, base, "worker");
+  commitIn(worker.path, "w.txt", "feat: worker attempt");
+  const workerTip = git(worker.path, ["rev-parse", "HEAD"]);
+  const coordTip = git(coord.path, ["rev-parse", "HEAD"]);
+  commitIn(repo, "final.txt", "feat: final version");
+  git(repo, ["push", "origin", "main"]);
+  const published = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [coord, worker],
+    threads: {
+      [coord.id]: [idle({ t: Date.now() }, coord.id)],
+      [worker.id]: [idle({ t: Date.now() }, worker.id)],
+    },
+  });
+  bindDelegation(w, "PLUG-392", worker, workerTip);
+  // A delegation pointing at the coordinator env must not destroy it.
+  bindDelegation(w, "PLUG-392", coord, coordTip);
+  publishTask(w, "PLUG-392", repo, published);
+  w.worktrees.register(
+    {
+      projectId: coord.projectId,
+      coordinatorThreadId: "thr_coord",
+      envId: coord.id,
+      worktreePath: coord.path,
+      branch: coord.branchName,
+    },
+    w.clock.t,
+  );
+  const res = await w.jan.taskCleanup({
+    taskKey: "PLUG-392",
+    repoPath: worker.path,
+    publishedSha: published,
+    targetBranch: "main",
+  });
+  assert.equal(res.envsRemoved, 1);
+  assert.deepEqual(w.cleanedUp, [worker.id]);
+  assert.ok(res.kept.some((k) => k.id === coord.id && k.reason === "coordinator-live"));
+  assert.ok(existsSync(coord.path));
+  assert.ok(!existsSync(worker.path));
+  assert.doesNotThrow(() =>
+    git(repo, ["rev-parse", "--verify", coord.branchName]),
+  );
+});
+
+test("§16.9 п.1: taskCleanup keeps an env with a live coordinator thread — no binding yet", async () => {
+  const { repo, base } = makeRepo("jan-coord-promoted-");
+  // An executor promoted to coordinator: the env is still the task's
+  // result env (§13.5 п.2), the thread now holds the orchestrator role
+  // and the binding is not registered yet.
+  const coord = addEnv(repo, base, "plug-392-promoted");
+  commitIn(coord.path, "c.txt", "feat: promoted coordinator copy");
+  const coordTip = git(coord.path, ["rev-parse", "HEAD"]);
+  commitIn(repo, "final.txt", "feat: final version");
+  git(repo, ["push", "origin", "main"]);
+  const published = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [coord],
+    roles: { [`thr_${coord.id}`]: "orchestrator" },
+    threads: { [coord.id]: [idle({ t: Date.now() }, coord.id)] },
+  });
+  bindDelegation(w, "PLUG-392", coord, coordTip);
+  publishTask(w, "PLUG-392", repo, published);
+  const res = await w.jan.taskCleanup({
+    taskKey: "PLUG-392",
+    repoPath: coord.path,
+    publishedSha: published,
+    targetBranch: "main",
+  });
+  assert.equal(res.envsRemoved, 0);
+  assert.ok(
+    res.kept.some((k) => k.id === coord.id && k.reason === "coordinator-live"),
+  );
+  assert.ok(
+    res.kept.some(
+      (k) =>
+        k.kind === "branch" &&
+        k.id === coord.branchName &&
+        k.reason === "coordinator-live",
+    ),
+  );
+  assert.deepEqual(w.cleanedUp, []);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.ok(existsSync(coord.path));
+  assert.doesNotThrow(() =>
+    git(repo, ["rev-parse", "--verify", coord.branchName]),
+  );
+});

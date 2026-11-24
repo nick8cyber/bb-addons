@@ -19,6 +19,7 @@ import {
 import { OrchestratorError, errorJson, toErrorBody } from "./src/errors.js";
 import { parsePolicy, getNodeTimeoutSeconds, type PolicyLoad } from "./src/policy.js";
 import {
+  CoordinatorWorktreeStore,
   DelegationStore,
   JanitorStore,
   MIGRATIONS,
@@ -32,9 +33,15 @@ import {
 } from "./src/janitor-config.js";
 import {
   createJanitor,
+  defaultHasProcessIn,
   type TaskCleanupArgs,
   type TaskCleanupSummary,
 } from "./src/janitor.js";
+import {
+  createCoordinatorWorktrees,
+  environmentShowVerdict,
+  type CoordinatorEnvDto,
+} from "./src/coordinator-worktrees.js";
 import {
   createBbCli,
   runChecked,
@@ -567,6 +574,18 @@ export async function createPlugin(
       experimental_multiline: true,
       default: "",
     },
+    coordinatorWorktrees: {
+      type: "string",
+      label: "Coordinator worktrees",
+      description:
+        "§13.5 (PLUG-392, ADR-0024): `off` (default) — coordinators " +
+        "share the checkout and binding checks never refuse an " +
+        "operation; `on` — owner-only switch after BB env-retention " +
+        "is confirmed: coordinator operations require a registered " +
+        "integration copy. Binding registration and the §16.9 " +
+        "archive-admission ledger run in both modes.",
+      default: "off",
+    },
     gitInstructions: {
       type: "string",
       label: "Working with git",
@@ -881,6 +900,7 @@ export async function createPlugin(
     }
   }).catch(() => {});
   const janitorStore = new JanitorStore(db);
+  const worktreeStore = new CoordinatorWorktreeStore(db);
   const enqueue = createDelegateQueue();
   const positiveInt = (v: string | undefined, dflt: number): number => {
     const n = Number(v);
@@ -2693,8 +2713,70 @@ export async function createPlugin(
     },
     loadConfig: janitorConfig,
     localHostId,
+    worktrees: worktreeStore,
     log: bb.log,
     t,
+  });
+  // §13.5/§16.9 (r34.8, PLUG-392): coordinator worktree bindings —
+  // lazy registration on thread events and the archive-admission
+  // ledger that decides `held`/`remove_pending`/`env-removed`.
+  const coordWorktrees = createCoordinatorWorktrees({
+    store: worktreeStore,
+    threadRole: (id) => store.threadRole(id),
+    cmd,
+    showEnvironment: async (envId) => {
+      // §7/§16.9: «env removed» is a verdict only for the structured
+      // BB answer (exit 1 + error.code environment_not_found); any
+      // other failure — including «bb CLI not found» (exit 127) —
+      // throws so a transient hiccup never reads as «env removed».
+      const res = await bbCli.run([
+        "environment",
+        "show",
+        envId,
+        "--json",
+      ]);
+      const verdict = environmentShowVerdict(res);
+      if (verdict === "ok") {
+        return JSON.parse(res.stdout) as CoordinatorEnvDto;
+      }
+      if (verdict === "gone") {
+        return null;
+      }
+      throw new OrchestratorError(
+        "bb-cli-failed",
+        `bb environment show ${envId} failed (exit ${res.exitCode}): ` +
+          `${res.stderr.trim() || res.stdout.trim() || "no output"}`,
+      );
+    },
+    showThread: async (threadId) => {
+      try {
+        return await runJson(bbCli, ["thread", "show", threadId, "--json"]);
+      } catch {
+        return null;
+      }
+    },
+    listEnvThreads: async (envId) => {
+      try {
+        return await runJson(bbCli, [
+          "thread",
+          "list",
+          "--environment",
+          envId,
+          "--include-archived",
+          "--include-hidden",
+          "--json",
+        ]);
+      } catch {
+        return null;
+      }
+    },
+    // §13.5 п.2: an env serving a delegation is an executor round —
+    // it must never register as a coordinator integration copy. The
+    // index feeds the module's own check (env id, executor thread id
+    // while result_env_id is still NULL, live delegation threads).
+    delegationIndex: () => store.delegationTaskIndex(),
+    hasProcessIn: async (p) => defaultHasProcessIn(p),
+    log: bb.log,
   });
   let janitorBusy = false;
   let lastJanitorRunAt = 0;
@@ -2746,6 +2828,38 @@ export async function createPlugin(
             : Promise.resolve(undefined)
           ).catch((e) =>
             bb.log.warn(`orchestrator janitor: ${describeError(e)}`),
+          ),
+        );
+        // §13.5/§16.9 (PLUG-392): coordinator worktree lifecycle —
+        // lazy binding on activity (`message.dispatched` ships only
+        // `entry.threadId`, the env is resolved inside), archive
+        // admission, and unarchive cancellation. All async — never
+        // the synchronous `message.dispatch` pass.
+        bb.events.on("thread.active", ({ thread }) =>
+          void coordWorktrees.onThreadActive(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+          ),
+        );
+        bb.events.on("message.dispatched", ({ entry }) =>
+          void coordWorktrees
+            .onThreadActive({ id: entry.threadId })
+            .catch((e) =>
+              bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+            ),
+        );
+        bb.events.on("thread.archived", ({ thread }) =>
+          void coordWorktrees.onThreadArchived(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+          ),
+        );
+        bb.events.on("thread.unarchived", ({ thread }) =>
+          void coordWorktrees.onThreadUnarchived(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
+          ),
+        );
+        bb.events.on("thread.deleted", ({ thread }) =>
+          void coordWorktrees.onThreadDeleted(thread).catch((e) =>
+            bb.log.warn(`orchestrator worktrees: ${describeError(e)}`),
           ),
         );
       }

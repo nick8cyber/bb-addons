@@ -504,6 +504,39 @@ export const MIGRATIONS: readonly string[] = [
    INSERT INTO task_queue_new SELECT * FROM task_queue;
    DROP TABLE task_queue;
    ALTER TABLE task_queue_new RENAME TO task_queue`,
+  // §7 (r34.8, PLUG-392, ADR-0024): coordinator worktree bindings —
+  // the durable env ↔ coordinator-thread record the §13.5/§16.9
+  // lifecycle protects. One live binding per coordinator in a project
+  // (live = active/archive_pending/held), one owner per env, removed
+  // rows kept for the journal. `decision_generation` + `tip_sha` let a
+  // removal admission be re-checked after a restart.
+  `CREATE TABLE IF NOT EXISTS coordinator_worktrees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    coordinator_thread_id TEXT NOT NULL,
+    env_id TEXT NOT NULL,
+    host_id TEXT,
+    repo_root TEXT,
+    worktree_path TEXT,
+    branch TEXT,
+    base_sha TEXT,
+    state TEXT NOT NULL CHECK (state IN (
+      'active','archive_pending','held','remove_pending','env-removed','removed'
+    )),
+    reason TEXT,
+    tip_sha TEXT,
+    decision_generation INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS coordinator_worktrees_live_idx
+    ON coordinator_worktrees(project_id, coordinator_thread_id)
+    WHERE state IN ('active','archive_pending','held');
+  CREATE UNIQUE INDEX IF NOT EXISTS coordinator_worktrees_env_idx
+    ON coordinator_worktrees(env_id)
+    WHERE state != 'removed';
+  CREATE INDEX IF NOT EXISTS coordinator_worktrees_branch_idx
+    ON coordinator_worktrees(branch)`,
 ];
 
 export type CommandRunStatus =
@@ -5117,4 +5150,288 @@ export class JanitorStore {
       .run(key, value);
   }
 
+}
+
+// ── Coordinator worktrees (§7 r34.8, §13.5/§16.9, PLUG-392) ──────────
+
+export type CoordinatorWorktreeState =
+  | "active"
+  | "archive_pending"
+  | "held"
+  | "remove_pending"
+  | "env-removed"
+  | "removed";
+
+/** §7/§16.9 п.3: closed list of hold codes recorded in `reason`. */
+export const COORDINATOR_HOLD_REASONS = [
+  "coordinator-live",
+  "dirty-worktree",
+  "unpushed-commits",
+  "active-processes",
+  "remote-unavailable",
+  "generation-mismatch",
+  "branch-active",
+  "base-unpublished",
+  "untracked-ignored",
+  "tip-mismatch",
+] as const;
+export type CoordinatorHoldReason = (typeof COORDINATOR_HOLD_REASONS)[number];
+
+/** States that count as the live binding of a coordinator (§7). */
+export const COORDINATOR_LIVE_STATES: readonly CoordinatorWorktreeState[] = [
+  "active",
+  "archive_pending",
+  "held",
+];
+/** States whose env must not be removed by plugin-driven cleanup. */
+export const COORDINATOR_ENV_STATES: readonly CoordinatorWorktreeState[] = [
+  "active",
+  "archive_pending",
+  "held",
+  "remove_pending",
+];
+
+export interface CoordinatorWorktreeRow {
+  id: number;
+  project_id: string;
+  coordinator_thread_id: string;
+  env_id: string;
+  host_id: string | null;
+  repo_root: string | null;
+  worktree_path: string | null;
+  branch: string | null;
+  base_sha: string | null;
+  state: CoordinatorWorktreeState;
+  reason: string | null;
+  tip_sha: string | null;
+  decision_generation: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CoordinatorWorktreeBind {
+  projectId: string;
+  coordinatorThreadId: string;
+  envId: string;
+  hostId?: string | null;
+  repoRoot?: string | null;
+  worktreePath?: string | null;
+  branch?: string | null;
+  baseSha?: string | null;
+  tipSha?: string | null;
+}
+
+/**
+ * §7: the durable coordinator ↔ env binding. `register` is idempotent
+ * for one (project, thread): a live binding on the same env is
+ * reactivated (new decision generation), a binding on a different env
+ * is closed `removed` before the new row is written. A non-removed
+ * binding on the env of ANOTHER thread refuses — one env, one owner.
+ */
+export class CoordinatorWorktreeStore {
+  private readonly db: Database;
+
+  constructor(db: Database) {
+    this.db = db;
+  }
+
+  /** Latest non-removed binding of the thread (any project). */
+  byThread(threadId: string): CoordinatorWorktreeRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees
+         WHERE coordinator_thread_id = ? AND state != 'removed'
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(threadId) as CoordinatorWorktreeRow | undefined;
+  }
+
+  /** The live binding (active/archive_pending/held) of the thread. */
+  liveByThread(threadId: string): CoordinatorWorktreeRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees
+         WHERE coordinator_thread_id = ?
+           AND state IN ('active','archive_pending','held')
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(threadId) as CoordinatorWorktreeRow | undefined;
+  }
+
+  /** The env's non-removed binding, whatever thread owns it. */
+  byEnv(envId: string): CoordinatorWorktreeRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees
+         WHERE env_id = ? AND state != 'removed'
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(envId) as CoordinatorWorktreeRow | undefined;
+  }
+
+  /** §7/§22 п.5: a branch registered anywhere but `removed` is
+   * unconditionally excluded from the `bb/<task>-*` cleanup. */
+  protectedBranches(): Set<string> {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT branch AS b FROM coordinator_worktrees
+         WHERE state != 'removed' AND branch IS NOT NULL`,
+      )
+      .all() as { b: string }[];
+    return new Set(rows.map((r) => r.b));
+  }
+
+  /** Bindings whose env plugin-driven cleanup must skip (§16.9). */
+  envBindings(): CoordinatorWorktreeRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees
+         WHERE state IN ('active','archive_pending','held','remove_pending')
+         ORDER BY id`,
+      )
+      .all() as CoordinatorWorktreeRow[];
+  }
+
+  /** Every non-removed binding — journal scans and reconcile. */
+  bindings(): CoordinatorWorktreeRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees WHERE state != 'removed' ORDER BY id`,
+      )
+      .all() as CoordinatorWorktreeRow[];
+  }
+
+  /**
+   * Register (or reactivate) the binding. Throws `conflict` when the
+   * env already has a non-removed owner — §7 «одна среда, один владелец».
+   */
+  register(bind: CoordinatorWorktreeBind, at: number): CoordinatorWorktreeRow {
+    return this.db.transaction(() => {
+      const prev = this.liveByThread(bind.coordinatorThreadId);
+      if (prev && prev.env_id === bind.envId) {
+        // Same env: refresh the fields and reopen the decision —
+        // the live index keeps this the single live row.
+        this.db
+          .prepare(
+            `UPDATE coordinator_worktrees SET
+               host_id = ?, repo_root = ?, worktree_path = ?, branch = ?,
+               base_sha = ?, tip_sha = ?, state = 'active',
+               reason = 'coordinator-live',
+               decision_generation = decision_generation + 1,
+               updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(
+            bind.hostId ?? prev.host_id,
+            bind.repoRoot ?? prev.repo_root,
+            bind.worktreePath ?? prev.worktree_path,
+            bind.branch ?? prev.branch,
+            bind.baseSha ?? prev.base_sha,
+            bind.tipSha ?? prev.tip_sha,
+            at,
+            prev.id,
+          );
+        return this.byId(prev.id)!;
+      }
+      const envOwner = this.byEnv(bind.envId);
+      if (envOwner && envOwner.coordinator_thread_id !== bind.coordinatorThreadId) {
+        throw new OrchestratorError(
+          "conflict",
+          `env ${bind.envId} is already bound to thread ${envOwner.coordinator_thread_id}`,
+        );
+      }
+      // A stale non-live row of the same thread on this env (env-removed,
+      // remove_pending) blocks the unique env index — close it first.
+      if (envOwner && envOwner.id !== prev?.id) {
+        this.setState(envOwner.id, "removed", null, at);
+      }
+      if (prev) this.setState(prev.id, "removed", null, at);
+      const info = this.db
+        .prepare(
+          `INSERT INTO coordinator_worktrees (
+             project_id, coordinator_thread_id, env_id, host_id,
+             repo_root, worktree_path, branch, base_sha, state, reason,
+             tip_sha, decision_generation, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 'coordinator-live', ?, 1, ?, ?)`,
+        )
+        .run(
+          bind.projectId,
+          bind.coordinatorThreadId,
+          bind.envId,
+          bind.hostId ?? null,
+          bind.repoRoot ?? null,
+          bind.worktreePath ?? null,
+          bind.branch ?? null,
+          bind.baseSha ?? null,
+          bind.tipSha ?? null,
+          at,
+          at,
+        );
+      return this.byId(Number(info.lastInsertRowid))!;
+    })();
+  }
+
+  byId(id: number): CoordinatorWorktreeRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM coordinator_worktrees WHERE id = ?`)
+      .get(id) as CoordinatorWorktreeRow | undefined;
+  }
+
+  setState(
+    id: number,
+    state: CoordinatorWorktreeState,
+    reason: string | null,
+    at: number,
+    tipSha?: string | null,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE coordinator_worktrees SET state = ?, reason = ?,
+           tip_sha = COALESCE(?, tip_sha), updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(state, reason, tipSha ?? null, at, id);
+  }
+
+  /**
+   * §7: a new removal check or an unarchive opens a new decision
+   * generation — a verdict written for an older generation is
+   * discarded (`decide` is a CAS on it).
+   */
+  beginDecision(
+    id: number,
+    state: CoordinatorWorktreeState,
+    at: number,
+  ): number | null {
+    const info = this.db
+      .prepare(
+        `UPDATE coordinator_worktrees SET
+           state = ?, reason = NULL,
+           decision_generation = decision_generation + 1,
+           updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(state, at, id);
+    if (info.changes === 0) return null;
+    return this.byId(id)?.decision_generation ?? null;
+  }
+
+  /** Compare-and-swap the verdict of a decision generation. */
+  decide(
+    id: number,
+    generation: number,
+    state: CoordinatorWorktreeState,
+    reason: string | null,
+    at: number,
+    tipSha?: string | null,
+  ): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE coordinator_worktrees SET state = ?, reason = ?,
+           tip_sha = COALESCE(?, tip_sha), updated_at = ?
+         WHERE id = ? AND decision_generation = ?`,
+      )
+      .run(state, reason, tipSha ?? null, at, id, generation);
+    return info.changes === 1;
+  }
 }

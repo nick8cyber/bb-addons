@@ -562,3 +562,34 @@ test("§32.6 (r34.9, PLUG-400): task_queue rebuild migration preserves rows and 
     .get() as { c: number };
   assert.equal(countAfter.c, oldLevels.length + 1);
 });
+
+test("§7 coordinator_worktrees: schema + live/env uniqueness (PLUG-392)", () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const columns = (db
+    .prepare(`PRAGMA table_info(coordinator_worktrees)`)
+    .all() as { name: string }[]).map((c) => c.name);
+  assert.deepEqual(columns.sort(), [
+    "base_sha",
+    "branch",
+    "coordinator_thread_id",
+    "created_at",
+    "decision_generation",
+    "env_id",
+    "host_id",
+    "id",
+    "project_id",
+    "reason",
+    "repo_root",
+    "state",
+    "tip_sha",
+    "updated_at",
+    "worktree_path",
+  ]);
+  const indexes = (db
+    .prepare(`PRAGMA index_list(coordinator_worktrees)`)
+    .all() as { name: string }[]).map((i) => i.name);
+  assert.ok(indexes.includes("coordinator_worktrees_live_idx"));
+  assert.ok(indexes.includes("coordinator_worktrees_env_idx"));
+  assert.ok(indexes.includes("coordinator_worktrees_branch_idx"));
+});
