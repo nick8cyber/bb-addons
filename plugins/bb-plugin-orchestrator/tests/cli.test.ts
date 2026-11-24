@@ -191,6 +191,254 @@ test("CLI delegate without a calling thread is refused", async () => {
   assert.equal(body.error.code, "no-caller-thread");
 });
 
+test("PLUG-406 r2: CLI worktree create --target must be a non-empty branch name", async () => {
+  const host = await hostWith(
+    {},
+    fakeCli().cli,
+    {
+      threads: {
+        get: async () => ({
+          id: "thr_coord",
+          parentThreadId: null,
+          title: "coordinator",
+          titleFallback: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        }),
+      },
+    },
+  );
+  const res = await host.harness.runCli(
+    ["worktree", "create", "--target", "", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(res.exitCode, 1);
+  const body = JSON.parse(res.stdout) as {
+    ok: boolean;
+    error: { code: string };
+  };
+  assert.equal(body.ok, false);
+  assert.equal(body.error.code, "invalid-arguments");
+});
+
+test("PLUG-406 r2: CLI worktree create --target refuses option-like branch names", async () => {
+  const host = await hostWith(
+    {},
+    fakeCli().cli,
+    {
+      threads: {
+        get: async () => ({
+          id: "thr_coord",
+          parentThreadId: null,
+          title: "coordinator",
+          titleFallback: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        }),
+      },
+    },
+  );
+  const res = await host.harness.runCli(
+    ["worktree", "create", "--target", "-bad-branch", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(res.exitCode, 1);
+  const body = JSON.parse(res.stdout) as {
+    ok: boolean;
+    error: { code: string };
+  };
+  assert.equal(body.ok, false);
+  assert.equal(body.error.code, "invalid-arguments");
+});
+
+test("PLUG-406 r3: CLI worktree create --target without a value is refused", async () => {
+  const spawned: { prompt?: string }[] = [];
+  const host = await hostWith(
+    {},
+    fakeCli().cli,
+    {
+      threads: {
+        get: async () => ({
+          id: "thr_coord",
+          parentThreadId: null,
+          title: "coordinator",
+          titleFallback: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        }),
+        spawn: async (a: { prompt?: string }) => {
+          spawned.push(a);
+          return { id: "thr_new", environmentId: "env_new" };
+        },
+        list: async () => [],
+        update: async () => ({}),
+      },
+    },
+  );
+  const res = await host.harness.runCli(
+    ["worktree", "create", "--target"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(res.exitCode, 1);
+  assert.match(res.stderr ?? "", /invalid-arguments/);
+  assert.equal(spawned.length, 0, "refusal happens before any spawn");
+});
+
+const WORKTREE_FAKE_GIT: CmdRunner = {
+  run: async (file, args) => {
+    const line = args.join(" ");
+    if (line.includes("check-ref-format")) {
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }
+    if (line.includes("fetch")) {
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }
+    if (line.includes("show-toplevel")) {
+      return { exitCode: 0, stdout: "/tmp/bb-cli-wt-fake\n", stderr: "" };
+    }
+    if (line.includes("rev-parse")) {
+      return { exitCode: 0, stdout: "a".repeat(40) + "\n", stderr: "" };
+    }
+    return { exitCode: 0, stdout: "", stderr: "" };
+  },
+};
+
+const coordinatorThreadsGet = {
+  id: "thr_coord",
+  parentThreadId: null,
+  title: "coordinator",
+  titleFallback: null,
+  originPluginId: null,
+  environmentId: null,
+  projectId: "proj_main",
+};
+
+test("PLUG-406 r3: CLI worktree create error details reach the text output and --json", async () => {
+  const host = await hostWith(
+    {},
+    fakeCli((args) => {
+      const key = args.join(" ");
+      if (key === "environment show env_new --json") {
+        // the structured «env removed» answer — the provisioning wait
+        // refuses with env-gone (threadId/envId in the details).
+        return {
+          exitCode: 1,
+          stdout: JSON.stringify({
+            ok: false,
+            error: { code: "environment_not_found" },
+          }),
+          stderr: "",
+        };
+      }
+      return undefined;
+    }).cli,
+    {
+      threads: {
+        get: async () => coordinatorThreadsGet,
+        spawn: async () => ({ id: "thr_new", environmentId: "env_new" }),
+        list: async () => [],
+        update: async () => ({}),
+      },
+      system: { config: async () => ({ primaryHostId: "host_1" }) },
+    },
+    undefined,
+    WORKTREE_FAKE_GIT,
+  );
+  const res = await host.harness.runCli(["worktree", "create"], {
+    threadId: "thr_coord",
+  });
+  assert.equal(res.exitCode, 1);
+  assert.match(res.stderr ?? "", /env-gone/);
+  // the failed round's thread/env ids must reach the TEXT output too —
+  // without --json the caller has no other way to find the thread.
+  assert.match(res.stderr ?? "", /threadId: thr_new/);
+  assert.match(res.stderr ?? "", /envId: env_new/);
+
+  const resJson = await host.harness.runCli(
+    ["worktree", "create", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(resJson.exitCode, 1);
+  const body = JSON.parse(resJson.stdout) as {
+    ok: boolean;
+    error: { code: string; details?: { threadId?: string; envId?: string } };
+  };
+  assert.equal(body.ok, false);
+  assert.equal(body.error.code, "env-gone");
+  assert.equal(body.error.details?.threadId, "thr_new");
+  assert.equal(body.error.details?.envId, "env_new");
+});
+
+test("PLUG-406 r3: CLI worktree create end-to-end spawns the coordinator and writes the orchestrator role", async () => {
+  const dir = makeTempDir("orch-cli-wt-");
+  const spawned: { prompt?: string }[] = [];
+  const host = await hostWith(
+    {},
+    fakeCli((args) => {
+      const key = args.join(" ");
+      if (key === "environment show env_new --json") {
+        return ok(
+          JSON.stringify({
+            id: "env_new",
+            projectId: "proj_1",
+            hostId: "host_1",
+            path: dir,
+            branchName: "bb/coordinator-thr_new",
+            mergeBaseBranch: "origin/main",
+            status: "ready",
+            managed: true,
+            environmentProviderId: "git-worktree",
+            lifecycle: { phase: "active" },
+          }),
+        );
+      }
+      return undefined;
+    }).cli,
+    {
+      threads: {
+        get: async () => coordinatorThreadsGet,
+        spawn: async (a: { prompt?: string }) => {
+          spawned.push(a);
+          return { id: "thr_new", environmentId: "env_new" };
+        },
+        list: async () => [],
+        update: async () => ({}),
+      },
+      system: { config: async () => ({ primaryHostId: "host_1" }) },
+    },
+    undefined,
+    WORKTREE_FAKE_GIT,
+  );
+  const res = await host.harness.runCli(
+    ["worktree", "create", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(res.exitCode, 0, res.stderr || res.stdout);
+  const body = JSON.parse(res.stdout) as {
+    ok: boolean;
+    threadId: string;
+    envId: string;
+    branch: string;
+    baseSha: string;
+    worktreePath: string;
+  };
+  assert.equal(body.ok, true);
+  assert.equal(body.threadId, "thr_new");
+  assert.equal(body.envId, "env_new");
+  assert.equal(body.branch, "bb/coordinator-thr_new");
+  assert.equal(body.baseSha, "a".repeat(40));
+  assert.equal(body.worktreePath, dir);
+  assert.equal(spawned.length, 1, "the coordinator copy was spawned");
+
+  // the spawned coordinator copy must run as the orchestrator — the
+  // CLI writes the manual role right after the successful create.
+  const roleRes = (await host.harness.callRpc("threadRole", {
+    threadId: "thr_new",
+  })) as { role?: string; source?: string | null };
+  assert.equal(roleRes.role, "orchestrator");
+  assert.equal(roleRes.source, "delegate");
+});
+
 test("CLI delegate end-to-end through the fake host", async () => {
   const { cli, calls } = fakeCli();
   const updates: unknown[] = [];

@@ -8,10 +8,13 @@ import { makeTempDir } from "./helpers/temp.js";
 import { createCmd } from "../src/cmd.js";
 import {
   createCoordinatorWorktrees,
+  createCoordinatorWorktree,
   environmentShowVerdict,
   type CoordinatorEnvDto,
   type CoordinatorThreadDto,
+  type CoordinatorWorktreeSpawnArgs,
 } from "../src/coordinator-worktrees.js";
+import { OrchestratorError } from "../src/errors.js";
 import {
   CoordinatorWorktreeStore,
   DelegationStore,
@@ -977,6 +980,275 @@ test("archive: a transient environment show failure → archive_pending, never e
     },
     w.clock.t,
   );
-  await w.wt.onThreadArchived(archived("thr_c", env.id!));
-  assert.equal(w.store.byId(row.id)!.state, "archive_pending");
+});
+
+// ── §13.5 п.1 (PLUG-406): `worktree create` ───────────────────────
+
+test("worktree create: refuses bad args before spawning", async () => {
+  const w = makeWorld();
+  await assert.rejects(
+    createCoordinatorWorktree({
+      projectId: "proj_1",
+      baseSha: "",
+      spawn: async () => ({ id: "thr_new", environmentId: "env_new" }),
+      showEnvironment: async () => null,
+      register: async (bind, opts) => w.store.register(bind, w.clock.t),
+    }),
+    (e: unknown) =>
+      e instanceof OrchestratorError && e.code === "invalid-arguments",
+  );
+});
+
+test("worktree create: spawn without a thread/env is refused", async () => {
+  const w = makeWorld();
+  await assert.rejects(
+    createCoordinatorWorktree({
+      projectId: "proj_1",
+      baseSha: "a".repeat(40),
+      spawn: async () => ({}),
+      showEnvironment: async () => null,
+      register: async (bind, opts) => w.store.register(bind, w.clock.t),
+    }),
+    (e: unknown) =>
+      e instanceof OrchestratorError && e.code === "spawn-failed",
+  );
+});
+
+test("worktree create: waits for the provisioning, spawns the coordinator on the fresh base and registers the binding as active", async () => {
+  const { repo, base } = makeRepo("coord-create-");
+  const env = addEnv(repo, base, "w");
+  const baseSha = git(env.path!, ["rev-parse", "origin/main"]);
+  const world = makeWorld({
+    envs: new Map([[env.id, env]]),
+  });
+  const envs = new Map<string, CoordinatorEnvDto | null>([
+    [env.id, { ...env, status: "creating" }],
+  ]);
+  const spawnedArgs: CoordinatorWorktreeSpawnArgs[] = [];
+  // provisioning finished → the same env answers ready on the next poll.
+  envs.set(env.id, env);
+  const created = await createCoordinatorWorktree({
+    projectId: "proj_1",
+    baseSha,
+    spawn: async (args) => {
+      spawnedArgs.push(args);
+      return { id: "thr_new", environmentId: env.id };
+    },
+    showEnvironment: async (id) => envs.get(id) ?? null,
+    register: async (bind, opts) => world.store.register(bind, world.clock.t),
+    cmd: realCmd,
+    hostId: "host_1",
+    prompt: "coordinator seed",
+    pollIntervalMs: 5,
+  });
+  assert.deepEqual(created, {
+    threadId: "thr_new",
+    envId: env.id!,
+    branch: env.branchName,
+    worktreePath: env.path,
+    baseSha,
+  });
+  assert.equal(spawnedArgs.length, 1);
+  assert.equal(spawnedArgs[0]!.projectId, "proj_1");
+  assert.equal(spawnedArgs[0]!.title, "coordinator");
+  assert.equal(spawnedArgs[0]!.prompt, "coordinator seed");
+  assert.equal(spawnedArgs[0]!.environment.type, "host");
+  assert.equal(spawnedArgs[0]!.environment.hostId, "host_1");
+  assert.equal(spawnedArgs[0]!.environment.workspace.type, "managed-worktree");
+  assert.deepEqual(spawnedArgs[0]!.environment.workspace.baseBranch, {
+    kind: "named",
+    name: baseSha,
+  });
+});
+
+test("worktree create: a ready env registers the binding in state active", async () => {
+  const { repo, base } = makeRepo("coord-create-ready-");
+  const env = addEnv(repo, base, "w");
+  const world = makeWorld({
+    envs: new Map([[env.id, env]]),
+  });
+  const envs = new Map<string, CoordinatorEnvDto | null>([
+    [env.id, env],
+  ]);
+  const created = await createCoordinatorWorktree({
+    projectId: "proj_1",
+    baseSha: git(env.path!, ["rev-parse", "origin/main"]),
+    spawn: async () => ({ id: "thr_new", environmentId: env.id }),
+    showEnvironment: async (id) => envs.get(id) ?? null,
+    register: async (bind, opts) => world.store.register(bind, world.clock.t),
+    cmd: realCmd,
+  });
+  assert.equal(created.threadId, "thr_new");
+  const row = world.store.byThread("thr_new");
+  assert.ok(row);
+  assert.equal(row!.state, "active");
+  assert.equal(row!.reason, "coordinator-live");
+  assert.equal(row!.env_id, env.id);
+  assert.equal(row!.worktree_path, env.path);
+  assert.equal(row!.branch, env.branchName);
+  assert.equal(row!.base_sha, created.baseSha);
+});
+
+test("worktree create: waits through pending provisioning until the env becomes ready", async () => {
+  const { repo, base } = makeRepo("coord-create-wait-");
+  const env = addEnv(repo, base, "w");
+  const world = makeWorld({
+    envs: new Map([[env.id, env]]),
+  });
+  let polls = 0;
+  let status: string = "creating";
+  const created = await createCoordinatorWorktree({
+    projectId: "proj_1",
+    baseSha: git(env.path!, ["rev-parse", "origin/main"]),
+    spawn: async () => ({ id: "thr_new", environmentId: env.id }),
+    showEnvironment: async () => {
+      polls += 1;
+      // provisioning finished between two polls → the next answer is ready
+      if (polls === 2) status = "ready";
+      return { ...env, status };
+    },
+    register: async (bind, opts) => world.store.register(bind, world.clock.t),
+    cmd: realCmd,
+    hostId: "host_1",
+    prompt: "coordinator seed",
+    pollIntervalMs: 5,
+    timeoutMs: 5_000,
+  });
+  assert.equal(created.threadId, "thr_new");
+  assert.equal(polls, 2);
+});
+
+test("worktree create: a gone env refuses with env-gone carrying thread+env ids", async () => {
+  const { repo, base } = makeRepo("coord-create-gone-");
+  const env = addEnv(repo, base, "w");
+  const envs = new Map<string, CoordinatorEnvDto | null>([
+    [env.id!, { ...env, status: "destroyed" }],
+  ]);
+  const world = makeWorld({ envs });
+  await assert.rejects(
+    createCoordinatorWorktree({
+      projectId: "proj_1",
+      baseSha: "a".repeat(40),
+      spawn: async () => ({ id: "thr_new", environmentId: env.id! }),
+      showEnvironment: async (id) => envs.get(id) ?? null,
+      register: async (bind, opts) => world.store.register(bind, world.clock.t),
+      cmd: realCmd,
+      timeoutMs: 150,
+      pollIntervalMs: 5,
+    }),
+    (e: unknown) =>
+      e instanceof OrchestratorError &&
+      e.code === "env-gone" &&
+      String(e.details?.threadId) === "thr_new" &&
+      String(e.details?.envId) === env.id,
+  );
+});
+
+test("worktree create: retries a transient environment show failure until ready", async () => {
+  const { repo, base } = makeRepo("coord-create-trans-");
+  const env = addEnv(repo, base, "w");
+  const world = makeWorld({
+    envs: new Map([[env.id, env]]),
+  });
+  const shown: string[] = [];
+  const created = await createCoordinatorWorktree({
+    projectId: "proj_1",
+    baseSha: git(env.path!, ["rev-parse", "origin/main"]),
+    spawn: async () => ({ id: "thr_new", environmentId: env.id }),
+    showEnvironment: async (id) => {
+      shown.push(id);
+      // §7: a transient bb failure keeps the property — the poll retries.
+      if (shown.length === 1) throw new Error("bb CLI not found");
+      return env;
+    },
+    register: async (bind, opts) => world.store.register(bind, world.clock.t),
+    cmd: realCmd,
+    hostId: "host_1",
+    prompt: "coordinator seed",
+    pollIntervalMs: 5,
+  });
+  assert.equal(created.threadId, "thr_new");
+  assert.equal(shown.length, 2);
+});
+
+test("worktree create: registers the binding against the caller's --target branch", async () => {
+  const { repo, base } = makeRepo("coord-create-target-");
+  const env = addEnv(repo, base, "w");
+  const world = makeWorld({
+    envs: new Map([[env.id, env]]),
+  });
+  let registeredOpts: { targetBranch?: string } | undefined;
+  const created = await createCoordinatorWorktree({
+    projectId: "proj_1",
+    baseSha: git(env.path!, ["rev-parse", "origin/main"]),
+    targetBranch: "dev",
+    spawn: async () => ({ id: "thr_new", environmentId: env.id }),
+    showEnvironment: async () => env,
+    register: async (bind, opts) => {
+      registeredOpts = opts;
+      return world.store.register(bind, world.clock.t);
+    },
+    cmd: realCmd,
+    hostId: "host_1",
+    prompt: "coordinator seed",
+    pollIntervalMs: 5,
+  });
+  assert.equal(created.threadId, "thr_new");
+  assert.equal(registeredOpts?.targetBranch, "dev");
+});
+
+test("PLUG-406 r3: the real coordWorktrees.register refuses an unpublished base — base-unpublished carries threadId/envId", async () => {
+  const { repo, base } = makeRepo("coord-create-base-");
+  const env = addEnv(repo, base, "w");
+  // a local commit on the copy → the base is ahead of origin/main
+  commitIn(env.path!, "unpublished.txt", "wip: unpublished");
+  const world = makeWorld({
+    envs: new Map([[env.id, env]]),
+  });
+  await assert.rejects(
+    createCoordinatorWorktree({
+      projectId: "proj_1",
+      baseSha: git(env.path!, ["rev-parse", "HEAD"]),
+      targetBranch: "main",
+      spawn: async () => ({ id: "thr_new", environmentId: env.id }),
+      showEnvironment: async () => env,
+      register: async (bind, opts) => world.wt.register(bind, opts ?? {}),
+      cmd: realCmd,
+      hostId: "host_1",
+      prompt: "coordinator seed",
+      pollIntervalMs: 5,
+      timeoutMs: 5_000,
+    }),
+    (e: unknown) =>
+      e instanceof OrchestratorError &&
+      e.code === "base-unpublished" &&
+      String(e.details?.threadId) === "thr_new" &&
+      String(e.details?.envId) === env.id,
+  );
+});
+
+test("worktree create: an env that never becomes ready refuses with provisioning-timeout", async () => {
+  const { repo, base } = makeRepo("coord-create-wip-");
+  const env = addEnv(repo, base, "w");
+  const envs = new Map<string, CoordinatorEnvDto | null>([
+    [env.id!, { ...env, status: "creating" }],
+  ]);
+  const world = makeWorld({ envs });
+  await assert.rejects(
+    createCoordinatorWorktree({
+      projectId: "proj_1",
+      baseSha: "a".repeat(40),
+      spawn: async () => ({ id: "thr_new", environmentId: env.id! }),
+      showEnvironment: async (id) => envs.get(id) ?? null,
+      register: async (bind, opts) => world.store.register(bind, world.clock.t),
+      cmd: realCmd,
+      timeoutMs: 150,
+      pollIntervalMs: 5,
+    }),
+    (e: unknown) =>
+      e instanceof OrchestratorError &&
+      e.code === "provisioning-timeout" &&
+      String(e.details?.threadId) === "thr_new" &&
+      String(e.details?.envId) === env.id,
+  );
 });

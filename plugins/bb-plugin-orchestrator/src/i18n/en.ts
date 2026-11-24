@@ -182,6 +182,18 @@ export const EN: Record<string, string> = {
   "del.levelWord": "level {level}",
   "del.spawnRefused": "spawn refused{code}: {reason}",
   "del.spawnNoId": "threads.spawn returned no thread id",
+  "wt.spawnNoThread": "threads.spawn returned no thread id",
+  "wt.spawnNoThreadHint": "the coordinator thread was not created",
+  "wt.baseMissing": "worktree create: no base sha for project {project}",
+  "wt.baseMissingHint":
+    "worktree create: pass --target <branch> or resolve a published origin/<branch>",
+  "wt.spawnMissing": "worktree create: spawn seam is required for project {project}",
+  "wt.envGone":
+    "coordinator thread {threadId} env {envId} is gone before provisioning finished",
+  "wt.envGoneHint": "create the coordinator worktree again",
+  "wt.provisioningTimeout":
+    "coordinator env {envId} of thread {threadId} did not become ready in time",
+  "wt.provisioningTimeoutHint": "the coordinator worktree provisioning did not finish in time",
   "del.baseUnchecked": "base not checked: {reason}",
   "del.baseSkip.no-cmd": "no command runner",
   "del.baseSkip.remote-host": "the target host is not this machine",
@@ -933,6 +945,20 @@ export const EN: Record<string, string> = {
   "cli.unknownJanitorSub": "unknown janitor subcommand \"{sub}\" (run|report)",
   "cli.unknownSub": "unknown subcommand \"{cmd}\"",
   "cli.commandsHint": "commands: delegate, status, show, cancel, merge, helper, role, policy, instructions, reconcile, janitor",
+  "cli.worktreeUsage":
+    "usage: bb orchestrator worktree create [--target <branch>] [--json]",
+  "cli.worktreeCreateOut":
+    "coordinator thread {threadId} created on branch {branch} (env {envId}) at {path}",
+  "cli.worktreeNoThread":
+    "worktree create works only from a bb thread (BB_THREAD_ID is absent)",
+  "cli.worktreeTargetInvalid":
+    "worktree create: --target must be a non-empty branch name without leading dashes",
+  "cli.worktreeNoProject":
+    "worktree create: the calling thread has no bb project bound",
+  "cli.worktreeNoHost":
+    "worktree create: no local bb host is bound to this machine",
+  "cli.helpWorktreeS":
+    "Create a new coordinator thread in a dedicated BB Worktree (§13.5)",
   "app.role": "Role",
   "app.roleNone": "No plugin",
   "app.roleOrchestrator": "Orchestrator",

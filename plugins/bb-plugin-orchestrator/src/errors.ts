@@ -7,12 +7,19 @@
 export class OrchestratorError extends Error {
   readonly code: string;
   readonly hint: string | undefined;
+  readonly details?: Record<string, unknown>;
 
-  constructor(code: string, message: string, hint?: string) {
+  constructor(
+    code: string,
+    message: string,
+    hint?: string,
+    details?: Record<string, unknown>,
+  ) {
     super(message);
     this.name = "OrchestratorError";
     this.code = code;
     this.hint = hint;
+    this.details = details;
   }
 }
 
@@ -20,12 +27,16 @@ export interface ErrorBody {
   code: string;
   message: string;
   hint?: string;
+  /** Structured caller context (e.g. the threadId/envId of a failed
+   * coordinator worktree create) — rides into the `--json` error body. */
+  details?: Record<string, unknown>;
 }
 
 export function toErrorBody(error: unknown): ErrorBody {
   if (error instanceof OrchestratorError) {
     const body: ErrorBody = { code: error.code, message: error.message };
     if (error.hint) body.hint = error.hint;
+    if (error.details) body.details = error.details;
     return body;
   }
   return {
