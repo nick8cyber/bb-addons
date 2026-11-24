@@ -2,7 +2,7 @@
 title: Orchestrator — граф задачи и очередь кодом (Work Graphs)
 status: approved
 updated: 2026-11-23
-revision: 34.8 (r34.8 / PLUG-398 — наблюдатель-сверка shadow §32.5, ADR-0041; r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
+revision: 34.9 (r34.9 — уровень high, §32.6; r34.8 / PLUG-398 — наблюдатель-сверка shadow §32.5, ADR-0041; r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
 ---
 
 # Граф задачи и очередь кодом (Work Graphs)
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS task_queue (
   project_id TEXT NOT NULL,
   coordinator_thread_id TEXT NOT NULL,
   route TEXT NOT NULL CHECK(route IN ('feature', 'fix', 'docs', 'simple', 'research')),
-  level TEXT NOT NULL CHECK(level IN ('complex', 'medium', 'simple', 'spec', 'research', 'architect')),
+  level TEXT NOT NULL CHECK(level IN ('complex', 'high', 'medium', 'simple', 'spec', 'research', 'architect')),
   node TEXT NOT NULL CHECK(node IN (
     'start', 'design', 'spec', 'spec_review', 'owner_gate', 'code', 'checks',
     'review', 'design_check', 'release', 'research'
@@ -585,8 +585,8 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
    - любые раздачи без ключа задачи трекера.
 2. Поля принятой записи:
    - `project_id` — по порядку §32.2 п. 2; `coordinator_thread_id` — тред, выполнивший `delegate`; `priority = 100`; `payload.origin = "shadow-adopt"`, `payload.adopted_delegation_id`;
-   - `route` — из `payload.route` трекера; если его нет — по первой принятой раздаче: уровень `research` → `research`; уровни `complex`/`medium`/`spec`/`architect` → `feature`; уровень `simple` → `simple`; раздача уровня ревью с видом `spec_review` → `docs`, если все пути её диапазона в `docs/` или `*.md` и задача помечена `no_code`, иначе `feature`; ревью кода → по уровню, найденному обратным поиском `reviewByLevel` (`complex`/`medium` → `feature`, `simple` → `simple`), без совпадения → `feature`;
-   - `level` — уровень раздачи; если первая принятая раздача — ревью, `level` берётся обратным поиском по `reviewByLevel` политики (`review` → `complex`, `review-medium` → `medium`, `review-simple` → `simple`), при отсутствии совпадения — `complex`. Значение всегда входит в CHECK §27.1; для `route = feature` допустимы любые уровни из CHECK, включая `spec` и `architect` (уровень описывает первую раздачу, а не весь маршрут);
+   - `route` — из `payload.route` трекера; если его нет — по первой принятой раздаче: уровень `research` → `research`; уровни `complex`/`high`/`medium`/`spec`/`architect` → `feature`; уровень `simple` → `simple`; раздача уровня ревью с видом `spec_review` → `docs`, если все пути её диапазона в `docs/` или `*.md` и задача помечена `no_code`, иначе `feature`; ревью кода → по уровню, найденному обратным поиском `reviewByLevel` (`complex`/`high`/`medium` → `feature`, `simple` → `simple`), без совпадения → `feature`;
+   - `level` — уровень раздачи; если первая принятая раздача — ревью, `level` берётся обратным поиском по `reviewByLevel` политики; если уровню ревью соответствуют несколько исполнительских уровней, берётся старший по порядку `complex` > `high` > `medium` > `simple` (при политике 24.11: `review` → `complex`, `review-medium` → `medium`, `review-simple` → `simple`); при отсутствии совпадения — `complex`. Значение всегда входит в CHECK §27.1; для `route = feature` допустимы любые уровни из CHECK, включая `spec` и `architect` (уровень описывает первую раздачу, а не весь маршрут);
    - `confirmation_mode` — по §29.3; `branch` — фактическая ветка раздачи, для `route = research` — `NULL` (§27.1).
 3. Узел и статус записи сразу выставляются по таблице §32.5.2 для этой раздачи (а не `start/queued`). Принятая задача **никогда не берётся** `run-queue` в `shadow`: конвейер в `shadow` только вычисляет `shadow_eval` (§32.1).
 4. Запись `task_transitions`: `actor = "shadow:adopt"`, `from_node = "none"`, `from_status = "none"`, `to_node`/`to_status` — по п. 3, `reason = "shadow-adopt:<command>"`. Класс вердикта (§32.5.3) приём не получает.
@@ -697,3 +697,11 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 5. **Срок переопределения:** `{ "mode": "off", "until": now+1s }` → до срока `off`, после — наследуемый режим, ключ удалён, событие смены настройки с `reason: 'override-expired'`, сообщение координатору; `until` = now+48h обрезается до 24h.
 6. **Отчёт:** на фикстуре из тестов 1–4 `shadow-report --json` возвращает точные числа по классам и список `skip`.
 7. **`off` молчит:** все сценарии 1–5 в проекте `off` дают 0 строк `task_transitions` и 0 записей очереди (§32.2 п. 5.1).
+
+### 32.6 Уровни исполнения: четыре уровня сложности (24.11, слово владельца)
+
+1. Исполнительские уровни кода: `complex` (редкий, дорогие модели с малыми лимитами), `high`, `medium`, `simple` (постоянные, почти безлимитные модели). Координатор раздаёт большинство задач в `high`/`medium`/`simple`; `complex` — только крупные многофайловые фичи, миграции, большой рефакторинг, поиск причин сложных сбоев. Цепочки моделей задаёт только политика плагина (§2).
+2. `task_queue.level` допускает `high` (§27.1). Существующая база мигрирует пересборкой таблицы с новым CHECK в одной транзакции, данные и индексы сохраняются; миграция идемпотентна.
+3. `enqueue --level` принимает `complex|high|medium|simple|spec|research`; проверки маршрутов (§27.2) для `high` такие же, как для `medium` (в том числе маршрут `docs` разрешён).
+4. Уровень `spec` (писатель спек) обслуживается только сильными моделями; его цепочка — в политике.
+5. Обязательные тесты: миграция базы со строками старого CHECK сохраняет все записи и принимает `level = 'high'`; `enqueue --level high` и приём §32.5.1 раздачи уровня `high` создают запись без ошибки CHECK; обратный поиск при нескольких совпадениях выбирает старший уровень.
