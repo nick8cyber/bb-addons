@@ -2314,3 +2314,145 @@ test("research-пакет: при пустом ответе повторный �
   assert.doesNotMatch(secondPrompt, /envelope/i);
   assert.doesNotMatch(secondPrompt, /Correct the previous reply/i);
 });
+
+test("research-пакет: цитирование ## Additional instructions и ## Preset instructions в Recent comments не перехватывает настоящие разделы (PLUG-404)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-quoted-headings-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const taskText = [
+    "# PLUG-404 · research: цитирование служебных заголовков",
+    "",
+    "## Description",
+    "Основное описание задачи.",
+    "",
+    "## Recent comments",
+    "### user · 2026-11-24",
+    "Вот что было в прошлый раз:",
+    "## Preset instructions",
+    "фейковая инструкция пресета из комментария",
+    "## Additional instructions",
+    "фейковая дополнительная инструкция из комментария",
+    "И это всё было процитировано.",
+    "",
+    "## Preset instructions",
+    "Настоящая инструкция пресета для веб-модели.",
+    "",
+    "## Additional instructions",
+    "задача без кода: не менять файлы",
+    "Настоящий вопрос координатора: сколько звёзд на небе?",
+  ].join("\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+
+  const packageOptions = { limit: 100_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  assert.ok(packed.message.includes("Настоящая инструкция пресета для веб-модели."), "Настоящая Preset instructions должна быть в пакете");
+  assert.ok(packed.message.includes("Настоящий вопрос координатора: сколько звёзд на небе?"), "Настоящая Additional instructions должна быть в пакете");
+  assert.ok(!packed.message.includes("фейковая инструкция пресета из комментария"), "Фейковая Preset instructions из комментария не должна попасть в пакет");
+  assert.ok(!packed.message.includes("фейковая дополнительная инструкция из комментария"), "Фейковая Additional instructions из комментария не должна попасть в пакет");
+  assert.doesNotMatch(packed.message, /Recent comments/);
+});
+
+test("research-режим: пропускает вложения трекера (attachments = []) и не скачивает их (PLUG-404)", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-tracker-skip-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const taskText = [
+    "# PLUG-404 · research: пропуск вложений трекера",
+    "",
+    "## Description",
+    "Исследование без скачивания вложений трекера.",
+    "",
+    "## Attachments",
+    "- test-attachment.md · 01M85QQVY9XWZPR2HK6JAXAVE1",
+    "",
+    "## Additional instructions",
+    "задача без кода: не менять файлы",
+    "Собрать факты из интернета.",
+  ].join("\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+  assert.deepEqual(prep.attachments, [], "В research-режиме attachments должен быть пустым массивом");
+  assert.deepEqual(prep.attachmentOmissions, [], "В research-режиме attachmentOmissions должен быть пустым массивом");
+
+  const nonResearchText = taskText.replace("задача без кода: не менять файлы\n", "");
+  const prepNonResearch = await prepareTask({
+    text: nonResearchText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+  assert.equal(prepNonResearch.research, false);
+  assert.equal(prepNonResearch.attachments.length, 1);
+  assert.equal(prepNonResearch.attachments[0].name, "test-attachment.md");
+
+  const packageOptions = {
+    limit: 100_000,
+    maxTotalBytes: 100_000,
+    spillDir: tmp,
+    ownedFiles: [],
+    signal: new AbortController().signal,
+    maxUploadBytes: 50_000,
+    maxUploadCount: 5,
+    validateUploads: () => ({ files: [] }),
+  };
+
+  const materials = await collectTaskAttachments(prep, [], packageOptions);
+  assert.equal(materials.length, 0);
+
+  const collected = await collectTask(prep, [], materials, packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+  assert.doesNotMatch(packed.message, /test-attachment\.md/);
+  assert.doesNotMatch(packed.message, /01M85QQVY9XWZPR2HK6JAXAVE1/);
+});
+
+test("research-пакет: при запрещённом материале повторный запрос отправляет короткое 'Удали запрещённый к публикации материал...' (PLUG-404)", async (t) => {
+  const repo = setup(t);
+  const app = fixture(t, repo, (request) => {
+    if (request.count === 1) {
+      return { text: "Ответ с секретом: https://user:secret123@example.com/api" };
+    }
+    return { text: "Полный чистый ответ с источниками https://example.com/source 2026-11-24." };
+  }, { settings: { apply: { maxRepairRounds: 2 } } });
+
+  const session = await app.newSession();
+  const taskText = [
+    "# PLUG-404 · research: повторный запрос при запрещённом материале",
+    "",
+    "## Description",
+    "Найти факт в интернете.",
+    "",
+    "## Additional instructions",
+    "задача без кода: не менять файлы",
+  ].join("\n");
+
+  const result = await app.prompt(session, taskText);
+  assert.equal(result.result?.stopReason, "end_turn");
+  assert.equal(app.requests().length, 2);
+  const secondPrompt = app.requests()[1].prompt;
+  assert.match(secondPrompt, /^Удали запрещённый к публикации материал и дай полный ответ с источниками и датами\.$/);
+  assert.doesNotMatch(secondPrompt, /tool/i);
+  assert.doesNotMatch(secondPrompt, /envelope/i);
+  assert.doesNotMatch(secondPrompt, /Correct the previous reply/i);
+});

@@ -2232,8 +2232,11 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 if ((budgets.repairRounds ?? 0) >= maxRepairRounds) throw new TaskTurnError(final.repair);
                 task.ping("request_more");
                 const isLightResearch = context.research && !write;
+                const isProhibited = Boolean(final.prohibited || final.repair === "response contains material prohibited for publication" || final.code === "prohibited-content");
                 const repairMessage = isLightResearch
-                  ? "Дай полный ответ с источниками и датами."
+                  ? (isProhibited
+                      ? "Удали запрещённый к публикации материал и дай полный ответ с источниками и датами."
+                      : "Дай полный ответ с источниками и датами.")
                   : "Correct the previous reply. " + final.repair + ". " +
                     (write ? fileRepairInstruction(context, candidate, final.plan)
                       : "Return the complete publishable final answer without tool calls or file envelopes.\n") + contract;

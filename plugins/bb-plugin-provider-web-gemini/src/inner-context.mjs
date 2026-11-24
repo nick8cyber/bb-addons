@@ -185,27 +185,29 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
   const root = await repoRoot(cwd, signal);
   const pin = savedTurn ? savedTurn.pin : await pinReview(root, refs, thread.environment ?? {}, signal);
   const verdict = savedTurn ? deserializeVerdict(savedTurn.verdict) : parseVerdict(text, system, pin);
-  const pairMatches = [...text.matchAll(/(?:^|\n)## Attachments[ \t]*\r?\n((?:(?!##[ \t])[^\n]*\r?\n)*?)(?=## Recent comments[ \t]*(?:\r?\n|$))/g)];
-  const attachmentRows = pairMatches.length
-    ? pairMatches.at(-1)[1].split(/\r?\n/)
-    : section(text, /^## Attachments[ \t]*$/, { last: true });
-  const attachments = [];
-  const attachmentOmissions = [];
-  for (const line of attachmentRows) {
-    if (!line.startsWith("- ")) continue;
-    const match = TRACKER_ATTACHMENT.exec(line);
-    if (!match) {
-      attachmentOmissions.push({ line, reason: "malformed tracker attachment entry" });
-      continue;
-    }
-    attachments.push({ name: match[1], id: match[2] });
-  }
   const key = /^# ([A-Z][A-Z0-9]{1,9}-\d+) · /m.exec(text)?.[1];
   // PLUG-384: признак на первом ходу или сохранённый в записи сессии —
   // повторные ходы исследовательской сессии остаются лёгкими без маркера.
   const research = !pin && !verdict &&
     (session?.journal?.record?.research === true ||
       additional.some((line) => NO_CODE.test(line)) || RESEARCHER.test(system ?? ""));
+  const attachments = [];
+  const attachmentOmissions = [];
+  if (!research) {
+    const pairMatches = [...text.matchAll(/(?:^|\n)## Attachments[ \t]*\r?\n((?:(?!##[ \t])[^\n]*\r?\n)*?)(?=## Recent comments[ \t]*(?:\r?\n|$))/g)];
+    const attachmentRows = pairMatches.length
+      ? pairMatches.at(-1)[1].split(/\r?\n/)
+      : section(text, /^## Attachments[ \t]*$/, { last: true });
+    for (const line of attachmentRows) {
+      if (!line.startsWith("- ")) continue;
+      const match = TRACKER_ATTACHMENT.exec(line);
+      if (!match) {
+        attachmentOmissions.push({ line, reason: "malformed tracker attachment entry" });
+        continue;
+      }
+      attachments.push({ name: match[1], id: match[2] });
+    }
+  }
   return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions, key, thread: thread.thread, research };
 }
 
@@ -279,7 +281,7 @@ export function checkedAnswer(context, response) {
     if (!source.trim()) return { repair: "empty response" };
   }
   if (context.settings.maskResponse(source) !== source || context.settings.maskResponse(page) !== page) {
-    return { repair: "response contains material prohibited for publication" };
+    return { repair: "response contains material prohibited for publication", prohibited: true };
   }
   if (!context.verdict) return { text: page.trim() ? page : source };
   const line = finalLine(source);
@@ -426,7 +428,7 @@ export async function collectTaskAttachments(context, blocks, options) {
       });
     }
   }
-  if (context.attachments.length) {
+  if (!light && context.attachments?.length) {
     if (uploadCount + new Set(context.attachments.map((item) => item.id)).size > maxUploadCount) {
       throw new Error("mandatory attachments exceed upload count");
     }
@@ -569,20 +571,21 @@ export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) 
 
   const descText = lines.slice(descIdx + 1, firstServiceIdx).join("\n").trim();
 
-  let presetText = "";
-  const presetIdx = lines.findIndex((l, idx) => idx >= firstServiceIdx && l.replace(/[ \t\r]+$/, "") === "## Preset instructions");
-  if (presetIdx !== -1) {
-    const nextIdx = lines.findIndex((l, idx) => idx > presetIdx && isServiceHeading(l));
-    const rawPreset = lines.slice(presetIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
-    presetText = filterServiceLines(rawPreset);
-  }
-
   let addText = "";
-  const addIdx = lines.findIndex((l, idx) => idx >= firstServiceIdx && l.replace(/[ \t\r]+$/, "") === "## Additional instructions");
+  const addIdx = lines.findLastIndex((l, idx) => idx >= firstServiceIdx && l.replace(/[ \t\r]+$/, "") === "## Additional instructions");
   if (addIdx !== -1) {
     const nextIdx = lines.findIndex((l, idx) => idx > addIdx && isServiceHeading(l));
     const rawAdd = lines.slice(addIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
     addText = filterServiceLines(rawAdd);
+  }
+
+  let presetText = "";
+  const presetLimit = addIdx !== -1 ? addIdx : lines.length;
+  const presetIdx = lines.findLastIndex((l, idx) => idx >= firstServiceIdx && idx < presetLimit && l.replace(/[ \t\r]+$/, "") === "## Preset instructions");
+  if (presetIdx !== -1) {
+    const nextIdx = lines.findIndex((l, idx) => idx > presetIdx && isServiceHeading(l));
+    const rawPreset = lines.slice(presetIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
+    presetText = filterServiceLines(rawPreset);
   }
 
   const parts = [
