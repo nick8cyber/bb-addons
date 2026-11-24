@@ -490,3 +490,75 @@ test("migrations 0..54 immutable SHA-256 hash guard (anti-shift, PLUG-283)", () 
     "migration 54 must be attach",
   );
 });
+
+test("§32.6 (r34.9, PLUG-400): task_queue rebuild migration preserves rows and admits level = 'high'", () => {
+  const db = new Database(":memory:");
+  const migIdx = MIGRATIONS.findIndex((m) =>
+    m.includes("task_queue_new") && m.includes("'high'"),
+  );
+  assert.ok(migIdx > 0, "PLUG-400 rebuild migration found");
+  // Run all migrations before the rebuild
+  for (const m of MIGRATIONS.slice(0, migIdx)) db.exec(m);
+
+  // Insert rows with all old valid levels
+  const oldLevels = [
+    "complex",
+    "medium",
+    "simple",
+    "spec",
+    "research",
+    "architect",
+  ];
+  const ins = db.prepare(
+    `INSERT INTO task_queue (
+      task_key, project_id, coordinator_thread_id, route, level, node,
+      status, priority, created_at, updated_at, entered_at
+    ) VALUES (?, 'proj_test', 'thr_coord', 'feature', ?, 'start', 'queued', 100, 1000, 1000, 1000)`,
+  );
+  for (const lvl of oldLevels) {
+    ins.run(`TASK-${lvl.toUpperCase()}`, lvl);
+  }
+
+  // Before migration: level = 'high' fails CHECK constraint
+  assert.throws(
+    () => ins.run("TASK-HIGH", "high"),
+    /CHECK constraint failed/,
+    "old schema must reject high",
+  );
+
+  // Run the rebuild migration
+  db.exec(MIGRATIONS[migIdx]!);
+
+  // All old rows preserved
+  const rows = db
+    .prepare("SELECT task_key, level FROM task_queue ORDER BY task_key")
+    .all() as { task_key: string; level: string }[];
+  assert.equal(rows.length, oldLevels.length);
+  for (const lvl of oldLevels) {
+    const found = rows.find((r) => r.task_key === `TASK-${lvl.toUpperCase()}`);
+    assert.ok(found, `task for level ${lvl} preserved`);
+    assert.equal(found.level, lvl);
+  }
+
+  // After migration: level = 'high' succeeds
+  ins.run("TASK-HIGH", "high");
+  const highRow = db
+    .prepare("SELECT task_key, level FROM task_queue WHERE task_key = 'TASK-HIGH'")
+    .get() as { task_key: string; level: string };
+  assert.ok(highRow);
+  assert.equal(highRow.level, "high");
+
+  // Invalid level still rejected
+  assert.throws(
+    () => ins.run("TASK-BAD", "invalid_level"),
+    /CHECK constraint failed/,
+    "invalid level must still be rejected by CHECK",
+  );
+
+  // Idempotency: running migration a second time succeeds and preserves data
+  db.exec(MIGRATIONS[migIdx]!);
+  const countAfter = db
+    .prepare("SELECT COUNT(*) c FROM task_queue")
+    .get() as { c: number };
+  assert.equal(countAfter.c, oldLevels.length + 1);
+});

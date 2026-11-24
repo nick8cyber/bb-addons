@@ -134,6 +134,7 @@ export function levelRole(level: string, policy?: Policy | null): LevelRole {
 
 const TASK_LEVELS = new Set<TaskLevel>([
   "complex",
+  "high",
   "medium",
   "simple",
   "spec",
@@ -141,13 +142,21 @@ const TASK_LEVELS = new Set<TaskLevel>([
   "architect",
 ]);
 
-/** §32.5.1 п. 2: уровень ревью → уровень исполнения обратным поиском reviewByLevel. */
+const PREFERRED_REVERSE_LEVELS = [
+  "complex",
+  "high",
+  "medium",
+  "simple",
+] as const;
+
+/** §32.5.1 п. 2, §32.6 п. 3: уровень ревью → уровень исполнения обратным поиском reviewByLevel.
+ * При нескольких совпадениях выбирает старший уровень: complex > high > medium > simple. */
 export function reverseReviewLevel(
   reviewLevel: string,
   policy?: Policy | null,
 ): TaskLevel | null {
   const map = policy?.reviewByLevel ?? {};
-  for (const exec of ["complex", "medium", "simple"] as const) {
+  for (const exec of PREFERRED_REVERSE_LEVELS) {
     if (map[exec] === reviewLevel) return exec;
   }
   for (const [exec, rev] of Object.entries(map)) {

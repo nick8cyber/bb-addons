@@ -3655,7 +3655,7 @@ export async function createPlugin(
         name: "enqueue",
         summary: t("cli.helpEnqueueS"),
         usage:
-          "bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|medium|simple|spec|research] [--acceptance <file|text>] [--release-note <text>] [--depends-on <k1,k2>] [--force-reset-branch] [--json]",
+          "bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|high|medium|simple|spec|research] [--acceptance <file|text>] [--release-note <text>] [--depends-on <k1,k2>] [--force-reset-branch] [--json]",
       },
       {
         name: "dequeue",

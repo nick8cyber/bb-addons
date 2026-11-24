@@ -460,6 +460,50 @@ export const MIGRATIONS: readonly string[] = [
   CREATE INDEX IF NOT EXISTS idx_task_spec_contracts_task ON task_spec_contracts(task_key)`,
   // §31.9 (ADR-0032 update): add project_id column to task_spec_contracts
   `ALTER TABLE task_spec_contracts ADD COLUMN project_id TEXT DEFAULT NULL`,
+  // §32.6 (r34.9, PLUG-400): task_queue.level admits 'high' via table rebuild
+  `DROP TABLE IF EXISTS task_queue_new;
+   CREATE TABLE task_queue_new (
+     task_key TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     coordinator_thread_id TEXT NOT NULL,
+     route TEXT NOT NULL CHECK(route IN ('feature', 'fix', 'docs', 'simple', 'research')),
+     level TEXT NOT NULL CHECK(level IN ('complex', 'high', 'medium', 'simple', 'spec', 'research', 'architect')),
+     node TEXT NOT NULL CHECK(node IN (
+       'start', 'design', 'spec', 'spec_review', 'owner_gate', 'code', 'checks',
+       'review', 'design_check', 'release', 'research'
+     )),
+     status TEXT NOT NULL CHECK(status IN (
+       'queued', 'running', 'waiting_approval', 'waiting_release_note',
+       'pr_open', 'blocked', 'stalled', 'deferred', 'done', 'cancelled'
+     )),
+     priority INTEGER NOT NULL DEFAULT 100,
+     depends_on TEXT DEFAULT NULL,
+     confirmation_mode TEXT NOT NULL DEFAULT 'manual' CHECK(confirmation_mode IN ('auto', 'manual')),
+     branch TEXT DEFAULT NULL,
+     interaction_id TEXT DEFAULT NULL,
+     spec_sha TEXT DEFAULT NULL,
+     acceptance_sha TEXT DEFAULT NULL,
+     result_sha TEXT DEFAULT NULL,
+     release_note TEXT DEFAULT NULL,
+     spec_attempts INTEGER NOT NULL DEFAULT 0,
+     spec_review_rounds INTEGER NOT NULL DEFAULT 0,
+     code_attempts INTEGER NOT NULL DEFAULT 0,
+     check_attempts INTEGER NOT NULL DEFAULT 0,
+     code_review_rounds INTEGER NOT NULL DEFAULT 0,
+     design_check_rounds INTEGER NOT NULL DEFAULT 0,
+     release_attempts INTEGER NOT NULL DEFAULT 0,
+     entered_at INTEGER NOT NULL,
+     deadline_at INTEGER DEFAULT NULL,
+     node_alarm_at INTEGER DEFAULT NULL,
+     deferred_by TEXT DEFAULT NULL,
+     deferred_reason TEXT DEFAULT NULL,
+     payload TEXT DEFAULT NULL,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   );
+   INSERT INTO task_queue_new SELECT * FROM task_queue;
+   DROP TABLE task_queue;
+   ALTER TABLE task_queue_new RENAME TO task_queue`,
 ];
 
 export type CommandRunStatus =
@@ -769,6 +813,7 @@ interface SetupError {
 export type TaskRoute = "feature" | "fix" | "docs" | "simple" | "research";
 export type TaskLevel =
   | "complex"
+  | "high"
   | "medium"
   | "simple"
   | "spec"

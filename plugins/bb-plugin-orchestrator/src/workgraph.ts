@@ -1016,6 +1016,7 @@ export async function runEnqueue(
 
   const validLevels = [
     "complex",
+    "high",
     "medium",
     "simple",
     "spec",

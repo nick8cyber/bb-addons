@@ -19,6 +19,7 @@ import {
   buildShadowReport,
   matrixEdges,
   releaseRefusalCountedByEvent,
+  reverseReviewLevel,
   SHADOW_RECONCILE_STARTED_EVENT,
 } from "../src/shadow-reconcile.js";
 import {
@@ -1100,4 +1101,71 @@ test("§32.5.4 п. 2: run-queue проверяет в трекере оцени�
   const t = c.store.getTask(k)!;
   assert.equal(t.status, "done");
   assert.equal(JSON.parse(t.payload ?? "{}").shadow_eval?.would_transition, undefined);
+});
+
+test("§32.6 п. 5: reverseReviewLevel chooses senior level on multiple matches", () => {
+  // complex > high > medium > simple
+  const polAll = {
+    version: 1,
+    reviewByLevel: {
+      complex: "review",
+      high: "review",
+      medium: "review",
+      simple: "review",
+    },
+  };
+  assert.equal(reverseReviewLevel("review", polAll as any), "complex");
+
+  const polHigh = {
+    version: 1,
+    reviewByLevel: {
+      high: "review",
+      medium: "review",
+      simple: "review",
+    },
+  };
+  assert.equal(reverseReviewLevel("review", polHigh as any), "high");
+
+  const polMedium = {
+    version: 1,
+    reviewByLevel: {
+      medium: "review",
+      simple: "review",
+    },
+  };
+  assert.equal(reverseReviewLevel("review", polMedium as any), "medium");
+
+  const polSimple = {
+    version: 1,
+    reviewByLevel: {
+      simple: "review",
+    },
+  };
+  assert.equal(reverseReviewLevel("review", polSimple as any), "simple");
+
+  assert.equal(reverseReviewLevel("unknown-review", polAll as any), null);
+});
+
+test("§32.6 п. 5: adopt §32.5.1 of high level delegation creates task_queue entry without CHECK error", async () => {
+  const policyWithHigh = {
+    ...POLICY,
+    levels: {
+      ...POLICY.levels,
+      high: { chain: ["r"] },
+    },
+    reviewByLevel: {
+      ...POLICY.reviewByLevel,
+      high: "review",
+    },
+  };
+  const c = (await makeHost({ policy: JSON.stringify(policyWithHigh) })) as Ctx;
+  const k = "SMK-45";
+  const id = await delegate(c, k, "high");
+  assert.ok(id > 0);
+  const task = c.store.getTask(k);
+  assert.ok(task, "задача принята в очередь");
+  assert.equal(task.level, "high", "level = high без ошибки CHECK");
+  assert.equal(task.route, "feature");
+  assert.equal(task.node, "code");
+  assert.equal(task.status, "running");
 });
