@@ -6346,10 +6346,10 @@ test("32. browser-groups: no flock on linux fails closed — no in-process degra
 
   const noFlockPath = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "bg374-nopath-")));
   const waitFile = async (f, what) => {
-    for (let i = 0; i < 100 && !fs.existsSync(f); i++) {
+    for (let i = 0; i < 100 && (!fs.existsSync(f) || fs.statSync(f).size === 0); i++) {
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert.ok(fs.existsSync(f), `child did not signal ${what}`);
+    assert.ok(fs.existsSync(f) && fs.statSync(f).size > 0, `child did not signal ${what}`);
   };
   const readyA = path.join(stateDir, "z7-holder-ready");
   const resB = path.join(stateDir, "z7-noflock-result.json");

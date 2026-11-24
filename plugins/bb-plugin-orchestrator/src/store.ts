@@ -460,6 +460,83 @@ export const MIGRATIONS: readonly string[] = [
   CREATE INDEX IF NOT EXISTS idx_task_spec_contracts_task ON task_spec_contracts(task_key)`,
   // §31.9 (ADR-0032 update): add project_id column to task_spec_contracts
   `ALTER TABLE task_spec_contracts ADD COLUMN project_id TEXT DEFAULT NULL`,
+  // §32.6 (r34.9, PLUG-400): task_queue.level admits 'high' via table rebuild
+  `DROP TABLE IF EXISTS task_queue_new;
+   CREATE TABLE task_queue_new (
+     task_key TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     coordinator_thread_id TEXT NOT NULL,
+     route TEXT NOT NULL CHECK(route IN ('feature', 'fix', 'docs', 'simple', 'research')),
+     level TEXT NOT NULL CHECK(level IN ('complex', 'high', 'medium', 'simple', 'spec', 'research', 'architect')),
+     node TEXT NOT NULL CHECK(node IN (
+       'start', 'design', 'spec', 'spec_review', 'owner_gate', 'code', 'checks',
+       'review', 'design_check', 'release', 'research'
+     )),
+     status TEXT NOT NULL CHECK(status IN (
+       'queued', 'running', 'waiting_approval', 'waiting_release_note',
+       'pr_open', 'blocked', 'stalled', 'deferred', 'done', 'cancelled'
+     )),
+     priority INTEGER NOT NULL DEFAULT 100,
+     depends_on TEXT DEFAULT NULL,
+     confirmation_mode TEXT NOT NULL DEFAULT 'manual' CHECK(confirmation_mode IN ('auto', 'manual')),
+     branch TEXT DEFAULT NULL,
+     interaction_id TEXT DEFAULT NULL,
+     spec_sha TEXT DEFAULT NULL,
+     acceptance_sha TEXT DEFAULT NULL,
+     result_sha TEXT DEFAULT NULL,
+     release_note TEXT DEFAULT NULL,
+     spec_attempts INTEGER NOT NULL DEFAULT 0,
+     spec_review_rounds INTEGER NOT NULL DEFAULT 0,
+     code_attempts INTEGER NOT NULL DEFAULT 0,
+     check_attempts INTEGER NOT NULL DEFAULT 0,
+     code_review_rounds INTEGER NOT NULL DEFAULT 0,
+     design_check_rounds INTEGER NOT NULL DEFAULT 0,
+     release_attempts INTEGER NOT NULL DEFAULT 0,
+     entered_at INTEGER NOT NULL,
+     deadline_at INTEGER DEFAULT NULL,
+     node_alarm_at INTEGER DEFAULT NULL,
+     deferred_by TEXT DEFAULT NULL,
+     deferred_reason TEXT DEFAULT NULL,
+     payload TEXT DEFAULT NULL,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   );
+   INSERT INTO task_queue_new SELECT * FROM task_queue;
+   DROP TABLE task_queue;
+   ALTER TABLE task_queue_new RENAME TO task_queue`,
+  // §7 (r34.8, PLUG-392, ADR-0024): coordinator worktree bindings —
+  // the durable env ↔ coordinator-thread record the §13.5/§16.9
+  // lifecycle protects. One live binding per coordinator in a project
+  // (live = active/archive_pending/held), one owner per env, removed
+  // rows kept for the journal. `decision_generation` + `tip_sha` let a
+  // removal admission be re-checked after a restart.
+  `CREATE TABLE IF NOT EXISTS coordinator_worktrees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    coordinator_thread_id TEXT NOT NULL,
+    env_id TEXT NOT NULL,
+    host_id TEXT,
+    repo_root TEXT,
+    worktree_path TEXT,
+    branch TEXT,
+    base_sha TEXT,
+    state TEXT NOT NULL CHECK (state IN (
+      'active','archive_pending','held','remove_pending','env-removed','removed'
+    )),
+    reason TEXT,
+    tip_sha TEXT,
+    decision_generation INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS coordinator_worktrees_live_idx
+    ON coordinator_worktrees(project_id, coordinator_thread_id)
+    WHERE state IN ('active','archive_pending','held');
+  CREATE UNIQUE INDEX IF NOT EXISTS coordinator_worktrees_env_idx
+    ON coordinator_worktrees(env_id)
+    WHERE state != 'removed';
+  CREATE INDEX IF NOT EXISTS coordinator_worktrees_branch_idx
+    ON coordinator_worktrees(branch)`,
 ];
 
 export type CommandRunStatus =
@@ -769,6 +846,7 @@ interface SetupError {
 export type TaskRoute = "feature" | "fix" | "docs" | "simple" | "research";
 export type TaskLevel =
   | "complex"
+  | "high"
   | "medium"
   | "simple"
   | "spec"
@@ -914,6 +992,12 @@ export interface TransitionTaskResult {
  * partial unique index actually sees "plug-1" and "PLUG-1" as one task. */
 export const normalizeTaskKey = (key: string) => key.trim().toUpperCase();
 
+/** §32.5: наблюдатель событий привязан к базе, а не к экземпляру
+ * хранилища — любой DelegationStore над той же базой (сервер, сторож,
+ * тесты) порождает события, видимые сверке shadow. */
+type EventObserver = (kind: string, doc: Record<string, unknown>) => void;
+const EVENT_OBSERVERS = new WeakMap<Database, EventObserver>();
+
 export class DelegationStore {
   private readonly db: Database;
 
@@ -937,8 +1021,37 @@ export class DelegationStore {
     this.nodeTimeoutResolver = resolver;
   }
 
+  /** §32.5 (PLUG-398): наблюдатель-сверка shadow подписан на события
+   * (review.verdict, release.*, pr.merged, delegation.done, delegation.result) — вызывается
+   * в ТОЙ ЖЕ транзакции, что и запись события; исключения глушатся:
+   * сверка никогда не ломает штатный переход. */
+  get eventObserver(): EventObserver | null {
+    return EVENT_OBSERVERS.get(this.db) ?? null;
+  }
+  set eventObserver(fn: EventObserver | null) {
+    if (fn) EVENT_OBSERVERS.set(this.db, fn);
+    else EVENT_OBSERVERS.delete(this.db);
+  }
+
+  /** Вызов наблюдателя §32.5; исключения глушатся. Внутренние сигналы
+   * (`delegation.result`) идут только сюда, в таблицу events не пишутся. */
+  private notifyEventObserver(kind: string, doc: Record<string, unknown>): void {
+    const fn = this.eventObserver;
+    if (!fn) return;
+    try {
+      fn(kind, doc);
+    } catch {
+      // §32.5: сверка shadow не ломает штатный переход
+    }
+  }
+
   constructor(db: Database) {
     this.db = db;
+  }
+
+  /** §32.5.2: одна транзакция на «оценку + следование» зеркала. */
+  inTransaction<R>(fn: () => R): R {
+    return this.db.transaction(fn)();
   }
 
   insert(input: {
@@ -1834,6 +1947,14 @@ export class DelegationStore {
         Date.now(),
         id,
       );
+    // §32.5.1 п. 2: фактическая ветка раздачи известна только здесь —
+    // delegation.done эмитится раньше, до сбора итога круга.
+    if (prev?.task_key) {
+      this.notifyEventObserver("delegation.result", {
+        task: prev.task_key,
+        delegationId: id,
+      });
+    }
   }
 
   /**
@@ -2003,6 +2124,18 @@ export class DelegationStore {
   }
 
   /** §32.3 (PLUG-360): Latest active coordinator thread id for alert routing. */
+  /** §32.5.6: последний координатор проекта (по раздачам). */
+  latestCoordinatorThreadIdForProject(projectId: string): string | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT coordinator_thread_id FROM delegations
+         WHERE project_id = ? AND coordinator_thread_id IS NOT NULL AND coordinator_thread_id != ''
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(projectId) as { coordinator_thread_id: string } | undefined;
+    return row?.coordinator_thread_id;
+  }
+
   latestCoordinatorThreadId(): string | undefined {
     try {
       const task = this.db
@@ -3446,13 +3579,15 @@ export class DelegationStore {
     newValue: unknown,
     source: "menu" | "outside_menu",
     at: number = Date.now(),
+    extra?: { reason?: string },
   ): number {
-    const fields = {
+    const fields: Record<string, unknown> = {
       setting,
       oldValue,
       newValue,
       timestamp: at,
       source,
+      ...(extra?.reason ? { reason: extra.reason } : {}),
     };
     const eventId = this.emitEvent("setting.changed", fields, at);
     try {
@@ -3510,6 +3645,7 @@ export class DelegationStore {
       )
       .run(kind, JSON.stringify(doc), at);
     const eventId = Number(info.lastInsertRowid);
+    this.notifyEventObserver(kind, doc);
     const ctx = this.eventHooksProvider?.();
     if (!ctx?.hooks.length) return eventId;
     for (const h of ctx.hooks) {
@@ -4386,6 +4522,121 @@ export class DelegationStore {
       .all() as TaskQueueRow[];
   }
 
+  /** §32.5.5: строки журнала графа начиная с метки (отчёт сверки). */
+  listTransitionsSince(since: number): TaskTransitionRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM task_transitions WHERE created_at >= ? ORDER BY created_at ASC, id ASC`,
+      )
+      .all(since) as TaskTransitionRow[];
+  }
+
+  /** §32.5.1 (PLUG-398): приём задачи в очередь shadow сразу в фактическом
+   * узле. Нет записи — INSERT; запись закрыта (done/cancelled) — новый
+   * цикл со сбросом счётчиков и артефактов. Строка журнала —
+   * `shadow:adopt` с маркерами `none` (п. 4). Возвращает null, если
+   * открытая запись уже есть (её ведёт следование, не приём). */
+  adoptTask(
+    input: {
+      taskKey: string;
+      projectId: string;
+      coordinatorThreadId: string;
+      route: TaskRoute;
+      level: TaskLevel;
+      node: TaskNode;
+      status: TaskStatus;
+      confirmationMode: ConfirmationMode;
+      branch: string | null;
+      payload: string;
+      command: string;
+      transitionPayload?: string | null;
+      /** §32.5.4 п. 3: `shadow-reopen` при переоткрытии закрытой записи */
+      reasonPrefix?: "shadow-adopt" | "shadow-reopen";
+    },
+    now: number = Date.now(),
+  ): TaskQueueRow | null {
+    return this.db.transaction(() => {
+      const key = normalizeTaskKey(input.taskKey);
+      const existing = this.getTask(key);
+      if (
+        existing &&
+        existing.status !== "done" &&
+        existing.status !== "cancelled"
+      ) {
+        return null;
+      }
+      if (!existing) {
+        this.db
+          .prepare(
+            `INSERT INTO task_queue (
+              task_key, project_id, coordinator_thread_id, route, level,
+              node, status, priority, depends_on, confirmation_mode, branch,
+              release_note, payload, entered_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 100, NULL, ?, ?, NULL, ?, ?, ?, ?)`,
+          )
+          .run(
+            key,
+            input.projectId,
+            input.coordinatorThreadId,
+            input.route,
+            input.level,
+            input.node,
+            input.status,
+            input.confirmationMode,
+            input.branch,
+            input.payload,
+            now,
+            now,
+            now,
+          );
+      } else {
+        this.db
+          .prepare(
+            `UPDATE task_queue SET
+              project_id = ?, coordinator_thread_id = ?, route = ?, level = ?,
+              node = ?, status = ?, priority = 100, depends_on = NULL,
+              confirmation_mode = ?, branch = ?, release_note = NULL, payload = ?,
+              interaction_id = NULL, spec_sha = NULL, acceptance_sha = NULL, result_sha = NULL,
+              spec_attempts = 0, spec_review_rounds = 0, code_attempts = 0, check_attempts = 0,
+              code_review_rounds = 0, design_check_rounds = 0, release_attempts = 0,
+              deadline_at = NULL, node_alarm_at = NULL, deferred_by = NULL, deferred_reason = NULL,
+              entered_at = ?, created_at = ?, updated_at = ?
+            WHERE task_key = ?`,
+          )
+          .run(
+            input.projectId,
+            input.coordinatorThreadId,
+            input.route,
+            input.level,
+            input.node,
+            input.status,
+            input.confirmationMode,
+            input.branch,
+            input.payload,
+            now,
+            now,
+            now,
+            key,
+          );
+      }
+      this.db
+        .prepare(
+          `INSERT INTO task_transitions (
+            task_key, from_node, to_node, from_status, to_status, actor, reason, payload, created_at
+          ) VALUES (?, 'none', ?, 'none', ?, 'shadow:adopt', ?, ?, ?)`,
+        )
+        .run(
+          key,
+          input.node,
+          input.status,
+          `${input.reasonPrefix ?? "shadow-adopt"}:${input.command}`,
+          input.transitionPayload ?? null,
+          now,
+        );
+      return this.getTask(key);
+    })();
+  }
+
   listTransitions(taskKey: string): TaskTransitionRow[] {
     return this.db
       .prepare(
@@ -4439,9 +4690,9 @@ export class DelegationStore {
     reason: string;
     payload?: string | null;
     createdAt?: number;
-  }): void {
+  }): number {
     const key = normalizeTaskKey(input.taskKey);
-    this.db
+    const info = this.db
       .prepare(
         `INSERT INTO task_transitions (
           task_key, from_node, to_node, from_status, to_status, actor, reason, payload, created_at
@@ -4458,6 +4709,7 @@ export class DelegationStore {
         input.payload ?? null,
         input.createdAt ?? Date.now(),
       );
+    return Number(info.lastInsertRowid);
   }
 
   // ── §31.9 (ADR-0032): Task Spec Contracts ─────────────────────────────
@@ -4898,4 +5150,288 @@ export class JanitorStore {
       .run(key, value);
   }
 
+}
+
+// ── Coordinator worktrees (§7 r34.8, §13.5/§16.9, PLUG-392) ──────────
+
+export type CoordinatorWorktreeState =
+  | "active"
+  | "archive_pending"
+  | "held"
+  | "remove_pending"
+  | "env-removed"
+  | "removed";
+
+/** §7/§16.9 п.3: closed list of hold codes recorded in `reason`. */
+export const COORDINATOR_HOLD_REASONS = [
+  "coordinator-live",
+  "dirty-worktree",
+  "unpushed-commits",
+  "active-processes",
+  "remote-unavailable",
+  "generation-mismatch",
+  "branch-active",
+  "base-unpublished",
+  "untracked-ignored",
+  "tip-mismatch",
+] as const;
+export type CoordinatorHoldReason = (typeof COORDINATOR_HOLD_REASONS)[number];
+
+/** States that count as the live binding of a coordinator (§7). */
+export const COORDINATOR_LIVE_STATES: readonly CoordinatorWorktreeState[] = [
+  "active",
+  "archive_pending",
+  "held",
+];
+/** States whose env must not be removed by plugin-driven cleanup. */
+export const COORDINATOR_ENV_STATES: readonly CoordinatorWorktreeState[] = [
+  "active",
+  "archive_pending",
+  "held",
+  "remove_pending",
+];
+
+export interface CoordinatorWorktreeRow {
+  id: number;
+  project_id: string;
+  coordinator_thread_id: string;
+  env_id: string;
+  host_id: string | null;
+  repo_root: string | null;
+  worktree_path: string | null;
+  branch: string | null;
+  base_sha: string | null;
+  state: CoordinatorWorktreeState;
+  reason: string | null;
+  tip_sha: string | null;
+  decision_generation: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CoordinatorWorktreeBind {
+  projectId: string;
+  coordinatorThreadId: string;
+  envId: string;
+  hostId?: string | null;
+  repoRoot?: string | null;
+  worktreePath?: string | null;
+  branch?: string | null;
+  baseSha?: string | null;
+  tipSha?: string | null;
+}
+
+/**
+ * §7: the durable coordinator ↔ env binding. `register` is idempotent
+ * for one (project, thread): a live binding on the same env is
+ * reactivated (new decision generation), a binding on a different env
+ * is closed `removed` before the new row is written. A non-removed
+ * binding on the env of ANOTHER thread refuses — one env, one owner.
+ */
+export class CoordinatorWorktreeStore {
+  private readonly db: Database;
+
+  constructor(db: Database) {
+    this.db = db;
+  }
+
+  /** Latest non-removed binding of the thread (any project). */
+  byThread(threadId: string): CoordinatorWorktreeRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees
+         WHERE coordinator_thread_id = ? AND state != 'removed'
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(threadId) as CoordinatorWorktreeRow | undefined;
+  }
+
+  /** The live binding (active/archive_pending/held) of the thread. */
+  liveByThread(threadId: string): CoordinatorWorktreeRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees
+         WHERE coordinator_thread_id = ?
+           AND state IN ('active','archive_pending','held')
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(threadId) as CoordinatorWorktreeRow | undefined;
+  }
+
+  /** The env's non-removed binding, whatever thread owns it. */
+  byEnv(envId: string): CoordinatorWorktreeRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees
+         WHERE env_id = ? AND state != 'removed'
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(envId) as CoordinatorWorktreeRow | undefined;
+  }
+
+  /** §7/§22 п.5: a branch registered anywhere but `removed` is
+   * unconditionally excluded from the `bb/<task>-*` cleanup. */
+  protectedBranches(): Set<string> {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT branch AS b FROM coordinator_worktrees
+         WHERE state != 'removed' AND branch IS NOT NULL`,
+      )
+      .all() as { b: string }[];
+    return new Set(rows.map((r) => r.b));
+  }
+
+  /** Bindings whose env plugin-driven cleanup must skip (§16.9). */
+  envBindings(): CoordinatorWorktreeRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees
+         WHERE state IN ('active','archive_pending','held','remove_pending')
+         ORDER BY id`,
+      )
+      .all() as CoordinatorWorktreeRow[];
+  }
+
+  /** Every non-removed binding — journal scans and reconcile. */
+  bindings(): CoordinatorWorktreeRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_worktrees WHERE state != 'removed' ORDER BY id`,
+      )
+      .all() as CoordinatorWorktreeRow[];
+  }
+
+  /**
+   * Register (or reactivate) the binding. Throws `conflict` when the
+   * env already has a non-removed owner — §7 «одна среда, один владелец».
+   */
+  register(bind: CoordinatorWorktreeBind, at: number): CoordinatorWorktreeRow {
+    return this.db.transaction(() => {
+      const prev = this.liveByThread(bind.coordinatorThreadId);
+      if (prev && prev.env_id === bind.envId) {
+        // Same env: refresh the fields and reopen the decision —
+        // the live index keeps this the single live row.
+        this.db
+          .prepare(
+            `UPDATE coordinator_worktrees SET
+               host_id = ?, repo_root = ?, worktree_path = ?, branch = ?,
+               base_sha = ?, tip_sha = ?, state = 'active',
+               reason = 'coordinator-live',
+               decision_generation = decision_generation + 1,
+               updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(
+            bind.hostId ?? prev.host_id,
+            bind.repoRoot ?? prev.repo_root,
+            bind.worktreePath ?? prev.worktree_path,
+            bind.branch ?? prev.branch,
+            bind.baseSha ?? prev.base_sha,
+            bind.tipSha ?? prev.tip_sha,
+            at,
+            prev.id,
+          );
+        return this.byId(prev.id)!;
+      }
+      const envOwner = this.byEnv(bind.envId);
+      if (envOwner && envOwner.coordinator_thread_id !== bind.coordinatorThreadId) {
+        throw new OrchestratorError(
+          "conflict",
+          `env ${bind.envId} is already bound to thread ${envOwner.coordinator_thread_id}`,
+        );
+      }
+      // A stale non-live row of the same thread on this env (env-removed,
+      // remove_pending) blocks the unique env index — close it first.
+      if (envOwner && envOwner.id !== prev?.id) {
+        this.setState(envOwner.id, "removed", null, at);
+      }
+      if (prev) this.setState(prev.id, "removed", null, at);
+      const info = this.db
+        .prepare(
+          `INSERT INTO coordinator_worktrees (
+             project_id, coordinator_thread_id, env_id, host_id,
+             repo_root, worktree_path, branch, base_sha, state, reason,
+             tip_sha, decision_generation, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 'coordinator-live', ?, 1, ?, ?)`,
+        )
+        .run(
+          bind.projectId,
+          bind.coordinatorThreadId,
+          bind.envId,
+          bind.hostId ?? null,
+          bind.repoRoot ?? null,
+          bind.worktreePath ?? null,
+          bind.branch ?? null,
+          bind.baseSha ?? null,
+          bind.tipSha ?? null,
+          at,
+          at,
+        );
+      return this.byId(Number(info.lastInsertRowid))!;
+    })();
+  }
+
+  byId(id: number): CoordinatorWorktreeRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM coordinator_worktrees WHERE id = ?`)
+      .get(id) as CoordinatorWorktreeRow | undefined;
+  }
+
+  setState(
+    id: number,
+    state: CoordinatorWorktreeState,
+    reason: string | null,
+    at: number,
+    tipSha?: string | null,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE coordinator_worktrees SET state = ?, reason = ?,
+           tip_sha = COALESCE(?, tip_sha), updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(state, reason, tipSha ?? null, at, id);
+  }
+
+  /**
+   * §7: a new removal check or an unarchive opens a new decision
+   * generation — a verdict written for an older generation is
+   * discarded (`decide` is a CAS on it).
+   */
+  beginDecision(
+    id: number,
+    state: CoordinatorWorktreeState,
+    at: number,
+  ): number | null {
+    const info = this.db
+      .prepare(
+        `UPDATE coordinator_worktrees SET
+           state = ?, reason = NULL,
+           decision_generation = decision_generation + 1,
+           updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(state, at, id);
+    if (info.changes === 0) return null;
+    return this.byId(id)?.decision_generation ?? null;
+  }
+
+  /** Compare-and-swap the verdict of a decision generation. */
+  decide(
+    id: number,
+    generation: number,
+    state: CoordinatorWorktreeState,
+    reason: string | null,
+    at: number,
+    tipSha?: string | null,
+  ): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE coordinator_worktrees SET state = ?, reason = ?,
+           tip_sha = COALESCE(?, tip_sha), updated_at = ?
+         WHERE id = ? AND decision_generation = ?`,
+      )
+      .run(state, reason, tipSha ?? null, at, id, generation);
+    return info.changes === 1;
+  }
 }

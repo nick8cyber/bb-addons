@@ -14,6 +14,8 @@ const EDITOR_SCROLL = "div.overflow-y-auto:has(.ProseMirror)";
 /** Queued-messages panel's own scroll region (host marks it). */
 const QUEUE_SCROLL = "[data-queued-messages-scroll]";
 const QUEUE_FRAME = "[data-queued-messages-scroll-frame]";
+/** Inline editor inside queued messages (message editing mode). */
+const INLINE_EDITOR = "[data-queued-message-inline-editor]";
 /** Every visible queue item is an <li> inside ul.group/queue — message rows,
      inline editors, notices; only the zero-height group dividers are skipped. */
 const QUEUE_ITEM = "ul > li:not([data-queued-message-group-divider])";
@@ -93,12 +95,24 @@ export function enforce(form: Element, win: Window, retry = true): void {
     /* Row text (markdown/async content) grows after mount; watching each row
        and re-measuring once on a timer keeps the clamp from freezing small. */
     rows.forEach((r) => queueObserver?.(r));
+    for (const el of [...grownAncestors.keys()]) {
+      if (!el.isConnected) grownAncestors.delete(el);
+    }
     const frame = queue.closest(QUEUE_FRAME) as HTMLElement | null;
+    const section = (frame ?? queue).closest("section") as HTMLElement | null;
+    const targetSection = section && section !== form ? section : null;
+    const hasInlineEditor =
+      !!queue.querySelector(INLINE_EDITOR) ||
+      !!frame?.querySelector(INLINE_EDITOR) ||
+      !!targetSection?.querySelector(INLINE_EDITOR) ||
+      !!queue.closest(INLINE_EDITOR);
     /* A collapsed panel stays mounted with a zero-height viewport — clamping it
-       would resurrect it; an empty one has nothing to bound. */
-    if (queue.getBoundingClientRect().height === 0 || rows.length === 0) {
+       would resurrect it; an empty one has nothing to bound. An inline editor
+       has all queue caps and section grants removed so the host can reserve space. */
+    if (queue.getBoundingClientRect().height === 0 || rows.length === 0 || hasInlineEditor) {
       for (const el of grownAncestors.keys()) el.style.minHeight = "";
       grownAncestors.clear();
+      if (targetSection?.style.minHeight) targetSection.style.minHeight = "";
       if (queue.style.maxHeight) queue.style.maxHeight = "";
       if (frame?.style.maxHeight) frame.style.maxHeight = "";
     } else {
@@ -149,29 +163,26 @@ export function enforce(form: Element, win: Window, retry = true): void {
       /* Reconcile instead of clear→set: drop ancestors no longer needed,
          rewrite only those whose target changed — no self-mutation churn. */
       const wanted = new Map<HTMLElement, number>();
-      if (delta > 1) {
-        /* Grow ONLY the queue's own section — never the grid ancestor. The
-           host grid stretches free space across ALL auto tracks
-           (align-content: normal → stretch): a grid min-height let the
-           collapsed banner row absorb the surplus, inflating it with dead
-           space and leaving a gap above/below the queue in idle. A section
-           min-height sizes its own track exactly — no surplus anywhere. */
-        const section = (frame ?? queue).closest("section") as HTMLElement | null;
-        if (section && section !== form) {
-          const neededFrame = queueMax + Math.ceil(padY(frame ?? queue));
-          /* Slack = padding + REAL heights of the frame's siblings inside
-             the section (header row, bottom chevron) — measured, so a
-             vanished sibling can't freeze a stale floor. */
-          let slack = padY(section);
-          for (const sib of Array.from(section.children)) {
-            if (sib !== (frame ?? queue)) {
-              slack += (sib as HTMLElement).getBoundingClientRect().height;
-            }
+      /* Grow ONLY the queue's own section — never the grid ancestor. The
+         host grid stretches free space across ALL auto tracks
+         (align-content: normal → stretch): a grid min-height let the
+         collapsed banner row absorb the surplus, inflating it with dead
+         space and leaving a gap above/below the queue in idle. A section
+         min-height sizes its own track exactly — no surplus anywhere. */
+      if (targetSection) {
+        const neededFrame = queueMax + Math.ceil(padY(frame ?? queue));
+        /* Slack = padding + REAL heights of the frame's siblings inside
+           the section (header row, bottom chevron) — measured, so a
+           vanished sibling can't freeze a stale floor. */
+        let slack = padY(targetSection);
+        for (const sib of Array.from(targetSection.children)) {
+          if (sib !== (frame ?? queue)) {
+            slack += (sib as HTMLElement).getBoundingClientRect().height;
           }
-          const want = Math.ceil(neededFrame + slack);
-          if (section.getBoundingClientRect().height < want - 1 || grownAncestors.has(section)) {
-            wanted.set(section, want);
-          }
+        }
+        const want = Math.ceil(neededFrame + slack);
+        if (targetSection.getBoundingClientRect().height < want - 1 || grownAncestors.has(targetSection)) {
+          wanted.set(targetSection, want);
         }
       }
       for (const [el, v] of wanted) {

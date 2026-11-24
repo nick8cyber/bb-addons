@@ -6,9 +6,9 @@ import test from "node:test";
 
 const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
 delete process.env.BB_THREAD_ID;
-import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { execFileSync, execSync } from "node:child_process";
+import fs, { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import path, { join } from "node:path";
 import { makeTempDir } from "./helpers/temp.js";
 import {
   createFakePluginHost,
@@ -5030,4 +5030,754 @@ test("§31.9: resolveRepoIdentity returns undefined on git failure", async () =>
   };
   const res = await resolveRepoIdentity(failingCmd, nonGitDir);
   assert.equal(res, undefined, "resolveRepoIdentity must return undefined when git fails");
+});
+
+test("§31.9 GH-684 Acceptance: global auto+shadow, NO task_queue, two OK reviews on different revisions -> exact second review SHA spawns 1 and saves contract, manual and foreign SHA reject with 0 spawns", async () => {
+  const dir = makeTempDir("orch-gh684-acceptance-");
+  const { run, cmd } = initGitRepo(dir);
+  const repoId = (await resolveRepoIdentity(cmd, dir))!;
+
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 0\n");
+  run(["add", "."]); run(["commit", "-qm", "initial base"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+
+  // Rev 1
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 1\n");
+  run(["commit", "-qam", "docs: spec revision 1"]);
+  const rev1Sha = run(["rev-parse", "HEAD"]).trim();
+
+  // Rev 2 (updated spec based on review comments)
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 2 with fixes\n");
+  run(["commit", "-qam", "docs: spec revision 2"]);
+  const rev2Sha = run(["rev-parse", "HEAD"]).trim();
+
+  // Rev 3 (subsequent update in next round)
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 3 in round 2\n");
+  run(["commit", "-qam", "docs: spec revision 3"]);
+  const rev3Sha = run(["rev-parse", "HEAD"]).trim();
+
+  // Foreign / Unreviewed SHA
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec Rev 4 unreviewed\n");
+  run(["commit", "-qam", "docs: spec revision 4 unreviewed"]);
+  const foreignSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  // Ensure NO row in task_queue for GH-684
+  assert.equal(store.getTask("GH-684"), null);
+  assert.equal(store.getSpecContract("GH-684"), null);
+
+  // Review 1 on rev1Sha (OK, 0 blockers)
+  const del1 = store.insert({
+    taskKey: "GH-684",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-neon",
+    preset: "auditor",
+    provider: "neon",
+    round: 1,
+    continueFrom: rev1Sha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "GH-684",
+      projectId: "proj_gh",
+      repo: repoId,
+      baseSha,
+      headSha: rev1Sha,
+      specPaths: ["docs/specs/GH-684.md"],
+    }),
+  });
+  store.setStatus(del1.id, "running");
+  store.setStatusIf(del1.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  // Review 2 on rev2Sha (OK, 0 blockers)
+  const del2 = store.insert({
+    taskKey: "GH-684",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-neon",
+    preset: "auditor",
+    provider: "neon",
+    round: 2,
+    continueFrom: rev2Sha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "GH-684",
+      projectId: "proj_gh",
+      repo: repoId,
+      baseSha,
+      headSha: rev2Sha,
+      specPaths: ["docs/specs/GH-684.md"],
+    }),
+  });
+  store.setStatus(del2.id, "running");
+  store.setStatusIf(del2.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  // Review 3 on rev3Sha (OK, 0 blockers)
+  const del3 = store.insert({
+    taskKey: "GH-684",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-neon",
+    preset: "auditor",
+    provider: "neon",
+    round: 3,
+    continueFrom: rev3Sha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "GH-684",
+      projectId: "proj_gh",
+      repo: repoId,
+      baseSha,
+      headSha: rev3Sha,
+      specPaths: ["docs/specs/GH-684.md"],
+    }),
+  });
+  store.setStatus(del3.id, "running");
+  store.setStatusIf(del3.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const pol = parsePolicy(POLICY_TEXT);
+
+  let spawnCount = 0;
+  const mockThreads = {
+    spawn: async () => {
+      spawnCount++;
+      return { id: `thr_exec_${spawnCount}` };
+    },
+  };
+  const fakeCli: BbCli = {
+    run: async (args: string[]) => {
+      if (args[0] === "tasks" && args[1] === "preset") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            preset: {
+              providerId: "acp-devin",
+              permissionMode: "full",
+              environmentKind: "host",
+              baseBranch: "main",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "tasks" && args[1] === "show") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            task: { id: "t_gh", key: "GH-684", title: "GH-684 Task" },
+            project: { id: "proj_gh", linkedBbProjectId: "proj_gh_bb" },
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "{}", stderr: "" };
+    },
+  };
+
+  // 1. Foreign / Unreviewed SHA in auto mode -> 0 spawn, rejected with informative error
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "GH-684",
+          level: "complex",
+          from: foreignSha,
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_gh",
+          },
+        },
+        {
+          store,
+          policy: () => pol.policy,
+          loadPolicy: async () => pol,
+          bbCli: fakeCli,
+          threads: mockThreads as any,
+          probes: { roleByThreadId: () => "orchestrator" },
+          primaryHostId: async () => "host_1",
+          cmd,
+          repoRoot: dir,
+          workGraphMode: "shadow",
+          approvalMode: () => "auto",
+        } as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /отсутствует принятое ревью спецификации либо спецификация была изменена после ревью/);
+      return true;
+    },
+  );
+  assert.equal(spawnCount, 0, "No spawn on foreign SHA");
+  assert.equal(store.getSpecContract("GH-684"), null);
+
+  // 2. Manual mode on rev2Sha -> 0 spawn, rejected with owner approval required
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "GH-684",
+          level: "complex",
+          from: rev2Sha,
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_gh",
+          },
+        },
+        {
+          store,
+          policy: () => pol.policy,
+          loadPolicy: async () => pol,
+          bbCli: fakeCli,
+          threads: mockThreads as any,
+          probes: { roleByThreadId: () => "orchestrator" },
+          primaryHostId: async () => "host_1",
+          cmd,
+          repoRoot: dir,
+          workGraphMode: "shadow",
+          approvalMode: () => "manual",
+        } as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      assert.match(err.message, /ожидает одобрения спецификации владельцем \(approvalMode: manual\)/);
+      return true;
+    },
+  );
+  assert.equal(spawnCount, 0, "No spawn in manual mode without owner approval");
+  assert.equal(store.getSpecContract("GH-684"), null);
+
+  // 3. Exact rev2Sha in auto mode -> 1 spawn, contract persisted for rev2Sha
+  const res = await runDelegate(
+    {
+      taskKey: "GH-684",
+      level: "complex",
+      from: rev2Sha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_gh",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: () => "auto",
+    } as any,
+  );
+
+  assert.equal(spawnCount, 1, "Exactly 1 spawn on rev2Sha in auto mode");
+  assert.equal(res.taskKey, "GH-684");
+  const savedContract = store.getSpecContract("GH-684");
+  assert.ok(savedContract, "Contract must be saved in task_spec_contracts");
+  assert.equal(savedContract?.spec_sha, rev2Sha, "Contract must be bound to rev2Sha");
+
+  // Mark round 1 executor done so task is no longer active
+  store.setStatus(res.delegationId, "running");
+  store.setStatusIf(res.delegationId, "running", "done");
+
+  // 4. Stale stored contract in DB (rev2Sha) must NOT block rev3Sha in auto mode: contract rebuilt and updated
+  assert.equal(store.getSpecContract("GH-684")?.spec_sha, rev2Sha);
+  const res3 = await runDelegate(
+    {
+      taskKey: "GH-684",
+      level: "complex",
+      from: rev3Sha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_gh",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: () => "auto",
+    } as any,
+  );
+
+  assert.equal(spawnCount, 2, "Spawns 2nd time on rev3Sha updating stale contract in auto mode");
+  const updatedContract = store.getSpecContract("GH-684");
+  assert.ok(updatedContract, "Contract must still exist");
+  assert.equal(updatedContract?.spec_sha, rev3Sha, "Contract must be updated to rev3Sha");
+
+  // Mark round 2 executor done
+  store.setStatus(res3.delegationId, "running");
+  store.setStatusIf(res3.delegationId, "running", "done");
+
+  // 5. Revoke approval for rev3Sha in task_spec_contracts
+  // Running on the same rev3Sha in auto mode MUST reject (revocation must NOT be bypassed)
+  store.revokeSpecContractApproval("GH-684");
+  assert.equal(store.getSpecContract("GH-684")?.approval_id, null);
+  assert.equal(store.getSpecContract("GH-684")?.spec_sha, null);
+
+  await assert.rejects(
+    async () => {
+      await runDelegate(
+        {
+          taskKey: "GH-684",
+          level: "complex",
+          from: rev3Sha,
+          caller: {
+            threadId: "thr_coord",
+            parentThreadId: null,
+            title: "coordinator",
+            originPluginId: null,
+            projectId: "proj_gh",
+          },
+        },
+        {
+          store,
+          policy: () => pol.policy,
+          loadPolicy: async () => pol,
+          bbCli: fakeCli,
+          threads: mockThreads as any,
+          probes: { roleByThreadId: () => "orchestrator" },
+          primaryHostId: async () => "host_1",
+          cmd,
+          repoRoot: dir,
+          workGraphMode: "shadow",
+          approvalMode: () => "auto",
+        } as any,
+      );
+    },
+    (err: any) => {
+      assert.equal(err.code, "spec-gate-violation");
+      return true;
+    },
+  );
+  assert.equal(spawnCount, 2, "No spawn when contract was revoked for the same revision");
+
+  // 6. When a new revision rev4Sha is committed and reviewed OK, auto mode allows it
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec v4\nApproved changes for v4.");
+  run(["commit", "-qam", "docs: spec revision 4"]);
+  const rev4Sha = run(["rev-parse", "HEAD"]).trim();
+
+  const revDel4 = store.insert({
+    taskKey: "GH-684",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-route",
+    preset: "auditor",
+    provider: "claude-code",
+    continueFrom: rev4Sha,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      baseSha: baseSha,
+      headSha: rev4Sha,
+      specPaths: ["docs/specs/GH-684.md"],
+      repo: repoId,
+      projectId: "proj_gh",
+      taskKey: "GH-684",
+    }),
+  });
+  store.setStatus(revDel4.id, "running");
+  store.setStatusIf(revDel4.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const res4 = await runDelegate(
+    {
+      taskKey: "GH-684",
+      level: "complex",
+      from: rev4Sha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_gh",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: () => "auto",
+    } as any,
+  );
+
+  assert.equal(spawnCount, 3, "Spawns 3rd time on new rev4Sha after revocation of rev3Sha");
+  const contractV4 = store.getSpecContract("GH-684");
+  assert.ok(contractV4);
+  assert.equal(contractV4?.spec_sha, rev4Sha);
+  assert.notEqual(contractV4?.approval_id, null);
+
+  // 7. Test descendant targetSha where only non-spec files changed
+  store.setStatus(res4.delegationId, "running");
+  store.setStatusIf(res4.delegationId, "running", "done");
+
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src/other.ts"), "export const x = 1;\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "code change without touching spec"]);
+  const descendantSha = run(["rev-parse", "HEAD"]).trim();
+
+  const resDescendant = await runDelegate(
+    {
+      taskKey: "GH-684",
+      level: "complex",
+      from: descendantSha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_gh",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: () => "auto",
+    } as any,
+  );
+  assert.equal(spawnCount, 4, "Spawns on descendant targetSha when spec is unchanged");
+
+  // 8. Test short SHA in --from
+  store.setStatus(resDescendant.delegationId, "running");
+  store.setStatusIf(resDescendant.delegationId, "running", "done");
+
+  const shortSha = rev4Sha.slice(0, 7);
+  const resShort = await runDelegate(
+    {
+      taskKey: "GH-684",
+      level: "complex",
+      from: shortSha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_gh",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: () => "auto",
+    } as any,
+  );
+  assert.equal(spawnCount, 5, "Spawns with short SHA in --from");
+
+  // 9. Multiple spec documents in spec review are preserved in specPath and verified
+  store.setStatus(resShort.delegationId, "running");
+  store.setStatusIf(resShort.delegationId, "running", "done");
+
+  writeFileSync(join(dir, "docs/specs/GH-684.md"), "# Spec v5\nMain spec.");
+  writeFileSync(join(dir, "docs/specs/GH-684-aux.md"), "# Aux Spec\nSecondary spec.");
+  run(["add", "docs/specs/GH-684-aux.md"]);
+  run(["commit", "-qam", "docs: add auxiliary spec"]);
+  const rev5Sha = run(["rev-parse", "HEAD"]).trim();
+
+  const revDel5 = store.insert({
+    taskKey: "GH-684",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-route",
+    preset: "auditor",
+    provider: "claude-code",
+    continueFrom: rev5Sha,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      baseSha: descendantSha,
+      headSha: rev5Sha,
+      specPaths: ["docs/specs/GH-684.md", "docs/specs/GH-684-aux.md"],
+      repo: repoId,
+      projectId: "proj_gh",
+      taskKey: "GH-684",
+    }),
+  });
+  store.setStatus(revDel5.id, "running");
+  store.setStatusIf(revDel5.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const res5 = await runDelegate(
+    {
+      taskKey: "GH-684",
+      level: "complex",
+      from: rev5Sha,
+      caller: {
+        threadId: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        originPluginId: null,
+        projectId: "proj_gh",
+      },
+    },
+    {
+      store,
+      policy: () => pol.policy,
+      loadPolicy: async () => pol,
+      bbCli: fakeCli,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: () => "auto",
+    } as any,
+  );
+  assert.equal(spawnCount, 6, "Spawns for rev5Sha with multiple specs");
+  const contractMulti = store.getSpecContract("GH-684");
+  assert.ok(contractMulti?.spec_path?.includes("docs/specs/GH-684.md"), "Must contain main spec");
+  assert.ok(contractMulti?.spec_path?.includes("docs/specs/GH-684-aux.md"), "Must contain auxiliary spec");
+});
+
+test("§31.9 approvalMode forwarding via dispatchToRoute and runRunQueue", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const dir = makeTempDir("orch-dispatch-approval-mode-");
+  const { cmd } = initGitRepo(dir);
+
+  const policy = parsePolicy(POLICY_TEXT).policy;
+  let spawnCount = 0;
+  const mockThreads = {
+    spawn: async () => {
+      spawnCount++;
+      return { id: `thr_spawn_${spawnCount}`, status: "running" };
+    },
+    updatePluginMetadata: async () => ({}),
+    get: async () => ({ status: "running" }),
+    stop: async () => ({}),
+    update: async () => ({}),
+    list: async () => [],
+  };
+
+  const fakeCliInstance = fakeCli().cli;
+
+  // Dispatch a delegation row via dispatchToRoute with approvalMode: "auto"
+  const row = store.insert({
+    taskKey: "FWD-1",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "claude-code",
+  });
+
+  // Since FWD-1 has no spec contract and simple level is mechanical, let's set mechanical basis and approvalId
+  const contract1: SpecContract = {
+    kind: "mechanical",
+    mechanicalBasis: "refactoring without behavior change",
+    approvalId: "appr:proj_gh:FWD-1:base:1000",
+  };
+  store.saveSpecContract({ ...contract1, taskKey: "FWD-1" });
+
+  const dispatchResult = await dispatchToRoute(
+    row,
+    { specBeforeCode: true },
+    {
+      store,
+      policy: () => policy,
+      bbCli: fakeCliInstance,
+      threads: mockThreads as any,
+      probes: { roleByThreadId: () => "orchestrator" },
+      primaryHostId: async () => "host_1",
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      approvalMode: "auto",
+    } as any,
+  );
+
+  assert.equal(dispatchResult.status, "running");
+  assert.equal(spawnCount, 1, "dispatchToRoute passes approvalMode to verifySpecBeforeCodeGate");
+
+  // Verify runRunQueue passes approvalMode to verifySpecBeforeCodeGate
+  store.insertTask({
+    taskKey: "FWD-2",
+    projectId: "proj_gh",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  });
+  const contract2: SpecContract = {
+    kind: "mechanical",
+    mechanicalBasis: "refactoring without behavior change",
+    approvalId: "appr:proj_gh:FWD-2:base:1000",
+    projectId: "proj_gh",
+  };
+  store.saveSpecContract({ ...contract2, taskKey: "FWD-2" });
+
+  const runQueueDispatched: string[] = [];
+  await runRunQueue({
+    store,
+    cmd,
+    repoRoot: dir,
+    mergeBaseBranch: "main",
+    workGraphMode: "strict",
+    policy,
+    approvalMode: "auto",
+    dispatchNode: async (t: any, n: any) => {
+      runQueueDispatched.push(t.task_key);
+      return { ok: true };
+    },
+  } as any);
+
+  assert.ok(runQueueDispatched.includes("FWD-2"), "runRunQueue unblocks FWD-2 with approvalMode: auto");
+});
+
+test("§31.9: revocation bypass prevented when pre-revocation code review exists on different SHA", async () => {
+  const dir = makeTempDir("repro-revoke-");
+  const { run, cmd } = initGitRepo(dir);
+  const repoId = (await resolveRepoIdentity(cmd, dir))!;
+  mkdirSync(join(dir, "docs/specs"), { recursive: true });
+  writeFileSync(join(dir, "docs/specs/RV-1.md"), "# base\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "base"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+  writeFileSync(join(dir, "docs/specs/RV-1.md"), "# spec v1\n");
+  run(["commit", "-qam", "spec v1"]);
+  const specSha = run(["rev-parse", "HEAD"]).trim();
+
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const sr = store.insert({
+    taskKey: "RV-1",
+    projectId: "p",
+    coordinatorThreadId: "c",
+    level: "review",
+    route: "r",
+    preset: "a",
+    provider: "x",
+    round: 1,
+    continueFrom: specSha,
+    explicitRoute: false,
+    noCode: true,
+    attach: JSON.stringify({
+      kind: "spec_review",
+      taskKey: "RV-1",
+      projectId: "p",
+      repo: repoId,
+      baseSha,
+      headSha: specSha,
+      specPaths: ["docs/specs/RV-1.md"],
+    }),
+  });
+  store.setStatus(sr.id, "running");
+  store.setStatusIf(sr.id, "running", "done", {
+    reviewVerdict: { verdict: "OK", blockers: 0 },
+  } as any);
+
+  const gate = () =>
+    verifySpecBeforeCodeGate({
+      taskKey: "RV-1",
+      role: "executor",
+      level: "complex",
+      store,
+      cmd,
+      repoRoot: dir,
+      workGraphMode: "shadow",
+      baseSha: specSha,
+      approvalMode: "auto",
+      project: { id: "p" } as any,
+    });
+  await gate();
+  assert.ok(store.getSpecContract("RV-1")?.approval_id, "approved after spec review");
+
+  // Code review with CHANGES on a different SHA, then task returns to spec -> revoke
+  const cr = store.insert({
+    taskKey: "RV-1",
+    projectId: "p",
+    coordinatorThreadId: "c",
+    level: "review",
+    route: "r",
+    preset: "a",
+    provider: "x",
+    round: 2,
+    continueFrom: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    explicitRoute: false,
+    noCode: true,
+  });
+  store.setStatus(cr.id, "running");
+  store.setStatusIf(cr.id, "running", "done", {
+    reviewVerdict: { verdict: "CHANGES", blockers: 2 },
+  } as any);
+  store.revokeSpecContractApproval("RV-1", Date.now() + 1000);
+  assert.equal(store.getSpecContract("RV-1")?.approval_id, null);
+
+  let rejected = false;
+  try {
+    await gate();
+  } catch (e: any) {
+    rejected = e.code === "spec-gate-violation";
+  }
+  assert.ok(rejected, "gate must reject after revocation (same spec revision, no new review)");
 });

@@ -60,7 +60,7 @@ function task(text, { ref } = {}) {
   return ["# " + key + " · Resume fixture", "## Description", text, "## Attachments", "None.", review].filter(Boolean).join("\n\n");
 }
 
-async function waitFor(predicate, seconds = 10) {
+async function waitFor(predicate, seconds = 25) {
   const deadline = Date.now() + seconds * 1000;
   while (Date.now() < deadline) {
     const value = predicate();

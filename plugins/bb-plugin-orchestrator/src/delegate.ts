@@ -66,6 +66,7 @@ import {
   verifySpecBeforeCodeGate,
   resolveExecutorBaseSha,
   resolvePresetBaseBranch,
+  resolveSpecGateBase,
   resolveTaskSpecContract,
   resolveRepoIdentity,
   verifySpecReviewRange,
@@ -267,6 +268,7 @@ export interface DelegateDeps {
   resolveProject?: (
     projectId: string,
   ) => Promise<ResolvedProject | null> | ResolvedProject | null;
+  approvalMode?: "auto" | "manual" | (() => "auto" | "manual" | null) | null;
 }
 
 /**
@@ -305,6 +307,7 @@ export interface DispatchStepsDeps {
   resolveProject?: (
     projectId: string,
   ) => Promise<ResolvedProject | null> | ResolvedProject | null;
+  approvalMode?: "auto" | "manual" | (() => "auto" | "manual" | null) | null;
 }
 
 export interface DispatchStepsResult {
@@ -722,21 +725,18 @@ export async function runDelegate(
     const proj = effectiveProj && deps.resolveProject
       ? await Promise.resolve(deps.resolveProject(effectiveProj)).catch(() => null)
       : (deps.project ?? null);
-    const presetName = params.preset ?? route.preset;
-    const presetBaseBranch = await resolvePresetBaseBranch(presetName, {
+    // §32.5.7 (PLUG-398): те же входы гейта, что и на пути run-queue
+    const gateBase = await resolveSpecGateBase({
+      cmd: deps.cmd,
+      repoRoot: deps.repoRoot,
+      from: params.from,
+      presetName: params.preset ?? route.preset,
       policy,
-      presetDetails: (policy as any)?.presetDetails,
+      project: proj as any,
     });
-    if (deps.cmd && deps.repoRoot) {
-      try {
-        executorBaseSha = await resolveExecutorBaseSha({
-          cmd: deps.cmd,
-          repoRoot: deps.repoRoot,
-          from: params.from,
-          baseBranch: presetBaseBranch ?? (proj as any)?.baseBranch ?? (policy as any)?.baseBranch,
-        });
-      } catch {}
-    }
+    const presetName = gateBase.presetName;
+    const presetBaseBranch = gateBase.baseBranchName;
+    executorBaseSha = gateBase.baseSha;
     await verifySpecBeforeCodeGate({
       taskKey,
       role,
@@ -751,6 +751,7 @@ export async function runDelegate(
       baseBranchName: presetBaseBranch,
       presetName,
       workGraphMode: mode,
+      approvalMode: deps.approvalMode,
       specBeforeCode: params.specBeforeCode,
       repoRoot: deps.repoRoot,
       task: taskRow ?? undefined,
@@ -1166,6 +1167,7 @@ export async function dispatchToRoute(
         baseBranchName: presetBaseBranch,
         presetName,
         workGraphMode: mode,
+        approvalMode: deps.approvalMode,
         specBeforeCode: opts.specBeforeCode,
         repoRoot: taskRepoRoot,
         task: taskRow,
