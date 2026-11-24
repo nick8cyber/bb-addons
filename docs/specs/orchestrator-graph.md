@@ -1,8 +1,8 @@
 ---
 title: Orchestrator — граф задачи и очередь кодом (Work Graphs)
 status: approved
-updated: 2026-11-23
-revision: 34.10 (r34.10 — действия по закрытым записям §32.5.4 п. 3, одна строка task-not-enqueued; r34.9 — уровень high, §32.6; r34.8 / PLUG-398 — наблюдатель-сверка shadow §32.5, ADR-0041; r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
+updated: 2026-11-24
+revision: 34.10 (r34.10 — действия по закрытым записям §32.5.4 п. 3, одна строка task-not-enqueued; r34.9 / PLUG-400 — уровень high, §32.6; r34.8 / PLUG-398 — наблюдатель-сверка shadow §32.5, ADR-0041; r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
 ---
 
 # Граф задачи и очередь кодом (Work Graphs)
@@ -117,7 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 - **`research` (исследование и сбор данных):**
   - `start → research → done` (уровень `research`, без кода, без ревью, без выкладки).
 
-При постановке задачи `enqueue` параметр `--level` задаёт уровень цепочки для узла реализации кода (`complex`, `medium`, `simple`) либо узла документации (`spec` для маршрута `docs`) или исследования (`research` для маршрута `research`). На маршрутах с кодом (`feature`, `fix`, `simple`) уровень ОБЯЗАН иметь роль `executor`. Попытка указать `--level spec` или `--level architect` для маршрутов с кодом отклоняется с ошибкой `invalid-level: узел code требует уровня с инструментами написания кода (роль executor)`. Узлы `design` и `design_check` ВСЕГДА выполняются ролью `architect` независимо от `--level` задачи.
+При постановке задачи `enqueue` параметр `--level` задаёт уровень цепочки для узла реализации кода (`complex`, `high`, `medium`, `simple`) либо узла документации (`spec` для маршрута `docs`) или исследования (`research` для маршрута `research`). На маршрутах с кодом (`feature`, `fix`, `simple`) уровень ОБЯЗАН иметь роль `executor`. Попытка указать `--level spec` или `--level architect` для маршрутов с кодом отклоняется с ошибкой `invalid-level: узел code требует уровня с инструментами написания кода (роль executor)`. Узлы `design` и `design_check` ВСЕГДА выполняются ролью `architect` независимо от `--level` задачи.
 
 ### 27.3 Тест связи цепочки раздачи (урок 4 аудита)
 
@@ -179,7 +179,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | `feature`, `fix`, `simple`, `docs` | `owner_gate` | Владелец (человек, без `BB_THREAD_ID`) | Отложено владельцем через UI (кнопка `[Отложить]`, Б2) / `defer` | `owner_gate` | `deferred` | Запись `deferred_by = "owner"`. При наличии `BB_THREAD_ID` отказ `permission-denied: owner-only` |
 | `feature`, `fix`, `simple`, `docs` | `owner_gate` | `run-queue` | Таймаут карточки взаимодействия / рестарт сервера | `owner_gate` | `waiting_approval` | Автоматический перевыпуск `PluginInteractionRequest`; постоянный статус в UI без повторных напоминаний (r34.5) |
 | `fix`, `simple` | `code` | Уровень задачи | Сдан коммит кода, но обнаружен выход за рамки маршрута (§31.7, Б3, r34.2) | `design` | `running` | Машинный контроль маршрута (Б3, r34.2): затронуты пути спек, миграций, публичных API или нетто-дифф без тестов превысил лимиты проекта `routeLimits` (по умолчанию >3 файлов, >150 строк). Автоматический перевод задачи на маршрут `feature` (`task.route = 'feature'`, сброс счётчиков), передача архитектору на redesign |
-| `feature`, `fix`, `simple` | `code` | Уровень задачи (`complex`/`medium`/`simple`) | Сдан коммит кода (`done`, чистая копия, `commits > 0`), рамки соблюдены, договор не изменён | `checks` | `running` | Фиксация `result_sha`. Проверка: diff `acceptance_sha..result_sha -- docs/specs/acceptance/<KEY>.md` пуст. Счётчик `check_attempts` не сбрасывается при каждой сдаче (накапливается до порога 3 отказов проверок) |
+| `feature`, `fix`, `simple` | `code` | Уровень задачи (`complex`/`high`/`medium`/`simple`) | Сдан коммит кода (`done`, чистая копия, `commits > 0`), рамки соблюдены, договор не изменён | `checks` | `running` | Фиксация `result_sha`. Проверка: diff `acceptance_sha..result_sha -- docs/specs/acceptance/<KEY>.md` пуст. Счётчик `check_attempts` не сбрасывается при каждой сдаче (накапливается до порога 3 отказов проверок) |
 | `feature`, `fix`, `simple` | `code` | Уровень задачи | Исполнитель изменил `docs/specs/acceptance/<KEY>.md` (§31.5) | `code` | `running` | Отказ захода: `acceptance-contract-tampered`. Инкремент `code_attempts` (при ≥ 3 → `blocked`) |
 | `feature`, `fix`, `simple` | `code` | Уровень задачи | Сдача со статусом done без коммитов (урок 7) | `code` | `running` | Отказ приёмки (если не `no_code`), инкремент `code_attempts` (при ≥ 3 → `blocked`), повтор с требованием коммита |
 | `feature`, `fix`, `simple` | `code` | Уровень задачи | Сбой / таймаут / квота / отмена исполнителя | `code` | `running` (перевыпуск) / `stalled` | Перевыпуск по цепочке уровня задачи; при исчерпании — `stalled` |
@@ -610,7 +610,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | `delegate` уровня `spec` | — | `spec` | `running` |
 | `delegate` уровня `research` | — | `research` | `running` |
 | `delegate` уровня ревью, вид `spec_review` (§31.9) | — | `spec_review` | `running` |
-| `delegate` уровня кода (`complex`/`medium`/`simple`) | — | `code` | `running` |
+| `delegate` уровня с ролью `executor` (`complex`/`high`/`medium`/`simple`) | — | `code` | `running` |
 | `delegate` уровня ревью, вид ревью кода | — | `review` | `running` |
 | `approve <KEY>` (одобрение до кода) | `route` ∈ {`feature`, `fix`, `simple`} и текущий узел ∈ {`start`, `design`, `spec`, `spec_review`} | `code` | `running` |
 | `approve <KEY>` (одобрение до выкладки) | `route = docs` и текущий узел ∈ {`spec`, `spec_review`}; либо `route` ∈ {`feature`, `fix`, `simple`} и текущий узел ∈ {`code`, `checks`, `review`, `design_check`} | `release` | `running` |
@@ -706,6 +706,6 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 
 1. Исполнительские уровни кода: `complex` (редкий, дорогие модели с малыми лимитами), `high`, `medium`, `simple` (постоянные, почти безлимитные модели). Координатор раздаёт большинство задач в `high`/`medium`/`simple`; `complex` — только крупные многофайловые фичи, миграции, большой рефакторинг, поиск причин сложных сбоев. Цепочки моделей задаёт только политика плагина (§2).
 2. `task_queue.level` допускает `high` (§27.1). Существующая база мигрирует пересборкой таблицы с новым CHECK в одной транзакции, данные и индексы сохраняются; миграция идемпотентна.
-3. `enqueue --level` принимает `complex|high|medium|simple|spec|research`; проверки маршрутов (§27.2) для `high` такие же, как для `medium` (в том числе маршрут `docs` разрешён).
+3. `enqueue --level` принимает `complex|high|medium|simple|spec|research`; `architect` остаётся в CHECK и в `validLevels` только для записей узла `design`, через `enqueue --level` не ставится; проверки маршрутов (§27.2) для `high` такие же, как для `medium` (в том числе маршрут `docs` разрешён).
 4. Уровень `spec` (писатель спек) обслуживается только сильными моделями; его цепочка — в политике.
 5. Обязательные тесты: миграция базы со строками старого CHECK сохраняет все записи и принимает `level = 'high'`; `enqueue --level high` и приём §32.5.1 раздачи уровня `high` создают запись без ошибки CHECK; обратный поиск при нескольких совпадениях выбирает старший уровень.
