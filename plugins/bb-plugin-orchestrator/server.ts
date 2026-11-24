@@ -168,6 +168,7 @@ import {
   shadowObserveMerge,
   shadowObserveRelease,
   shadowObserveStoreEvent,
+  releaseRefusalCountedByEvent,
   syncShadowTerminalStatuses,
   trackerRouteViaCli,
   trackerStatusViaCli,
@@ -2078,6 +2079,13 @@ export async function createPlugin(
     }
   };
 
+  /** §32.5.2: merge состоялся — только `merged`/`merged-upstream`. */
+  const mergeLanded = (
+    res: Awaited<ReturnType<typeof mergeDelegation>>,
+  ): res is Extract<typeof res, { mergeStatus: string }> =>
+    "mergeStatus" in res &&
+    (res.mergeStatus === "merged" || res.mergeStatus === "merged-upstream");
+
   const observeShadowReleaseOutcome = async (
     taskKey: string,
     outcome: "auditing" | "refused",
@@ -3239,11 +3247,10 @@ export async function createPlugin(
           ...params,
           callerThreadId: ctx.threadId,
         });
-        if (!params.dryRun) {
-          await observeShadowMerge(
-            taskKey,
-            /^\d+$/.test(params.ref) ? Number(params.ref) : null,
-          );
+        // §32.5.2: следование только за состоявшимся merge — conflict и
+        // fix-delegated возвращаются, а не бросаются, и узел не двигают
+        if (mergeLanded(mergeRes)) {
+          await observeShadowMerge(taskKey, mergeRes.delegationId);
         }
         return JSON.stringify(mergeRes);
       } catch (e) {
@@ -4256,7 +4263,6 @@ export async function createPlugin(
               t("cli.mergeUsage"),
             );
           }
-          const mergeDelegationRef = /^\d+$/.test(ref) ? Number(ref) : null;
           if (/^\d+$/.test(ref)) {
             const row = store.get(Number(ref));
             if (row) {
@@ -4293,8 +4299,8 @@ export async function createPlugin(
             markMerged: markMergedVal,
             callerThreadId: ctx.threadId,
           });
-          if (!argv.includes("--dry-run")) {
-            await observeShadowMerge(ref, mergeDelegationRef);
+          if (mergeLanded(res)) {
+            await observeShadowMerge(ref, res.delegationId);
           }
           if (json) return jsonOk(res);
           if ("dryRun" in res) {
@@ -4471,6 +4477,7 @@ export async function createPlugin(
           // release that internally dispatches would deadlock waiting
           // for its own queue slot.
           let res: Awaited<ReturnType<typeof runRelease>>;
+          const releaseIdBefore = store.latestReleaseByTask(key)?.id ?? 0;
           try {
             res = await runRelease(
               {
@@ -4484,8 +4491,12 @@ export async function createPlugin(
               releaseDeps,
             );
           } catch (relErr) {
-            // §32.5.2: отказ выкладки — событие конвейера без класса
-            await observeShadowReleaseOutcome(key, "refused");
+            // §32.5.2: отказ выкладки — событие конвейера без класса.
+            // Отказ после вставки строки выкладки уже учтён событием
+            // release.failed/rejected (наблюдатель store) — не считаем дважды.
+            if (!releaseRefusalCountedByEvent(store, key, releaseIdBefore)) {
+              await observeShadowReleaseOutcome(key, "refused");
+            }
             throw relErr;
           }
           // published приходит событием release.published (наблюдатель store)

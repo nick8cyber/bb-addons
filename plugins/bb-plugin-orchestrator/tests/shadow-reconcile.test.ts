@@ -7,14 +7,18 @@
 import assert from "node:assert/strict";
 import test, { after, beforeEach } from "node:test";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { createCmd } from "../src/cmd.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
 import { DelegationStore, type TaskTransitionRow } from "../src/store.js";
 import { createPlugin } from "../server.js";
 import { makeTempDir } from "./helpers/temp.js";
 import {
-  shadowObserveMerge,
   buildShadowReport,
   matrixEdges,
+  releaseRefusalCountedByEvent,
 } from "../src/shadow-reconcile.js";
 import {
   parseWorkGraphProjects,
@@ -66,14 +70,30 @@ interface TrackerTask {
   project?: string | null;
 }
 
-function fakeCli(tracker: Map<string, TrackerTask>): { cli: BbCli; calls: string[][] } {
+/** Окружения: id окружения → путь рабочей копии (`environment show`). */
+type EnvPaths = Map<string, string>;
+/** Хук на любой внешний вызов (bb CLI / git) — для регрессий гонок. */
+type CallHook = { fn: (() => void) | null };
+
+function fakeCli(
+  tracker: Map<string, TrackerTask>,
+  envPaths: EnvPaths,
+  hook: CallHook,
+): { cli: BbCli; calls: string[][] } {
   const calls: string[][] = [];
   return {
     calls,
     cli: {
       run: async (args) => {
         calls.push(args);
+        hook.fn?.();
         const key = args.join(" ");
+        if (key.startsWith("environment show")) {
+          const path = envPaths.get(args[2] ?? "");
+          return path
+            ? ok(JSON.stringify({ id: args[2], path, mergeBaseBranch: "main" }))
+            : { exitCode: 1, stdout: "", stderr: "not found" };
+        }
         if (key.startsWith("tasks preset list"))
           return ok(JSON.stringify({ presets: [{ name: "simple", id: "p1" }] }));
         if (key.startsWith("tasks preset show"))
@@ -131,6 +151,8 @@ interface Ctx {
   tracker: Map<string, TrackerTask>;
   sent: { threadId: string; text: string }[];
   clock: { now: number };
+  envPaths: EnvPaths;
+  hook: CallHook;
 }
 
 async function makeHost(
@@ -138,7 +160,10 @@ async function makeHost(
   opts: { clock?: { now: number } } = {},
 ) {
   const tracker = new Map<string, TrackerTask>();
-  const { cli } = fakeCli(tracker);
+  const envPaths: EnvPaths = new Map();
+  const hook: CallHook = { fn: null };
+  const { cli } = fakeCli(tracker, envPaths, hook);
+  const realCmd = createCmd();
   const sent: { threadId: string; text: string }[] = [];
   let spawned = 0;
   const host = createFakePluginHost({
@@ -159,13 +184,17 @@ async function makeHost(
     ],
     sdk: {
       threads: {
-        get: async () => ({
+        get: async (a: { threadId?: string } = {}) => ({
           id: "thr_coord",
           parentThreadId: null,
           title: "coordinator",
           titleFallback: null,
           originPluginId: null,
           projectId: PROJECT,
+          environmentId:
+            (a.threadId ?? "thr_coord") === "thr_coord" && envPaths.has("env_coord")
+              ? "env_coord"
+              : null,
         }),
         spawn: async () => {
           spawned++;
@@ -183,10 +212,17 @@ async function makeHost(
   const clock = opts.clock;
   await createPlugin(host.bb, {
     bbCli: cli,
+    cmd: {
+      ...realCmd,
+      run: (file, args, o) => {
+        hook.fn?.();
+        return realCmd.run(file, args, o);
+      },
+    },
     ...(clock ? { now: () => clock.now } : {}),
   });
   const store = new DelegationStore(host.bb.storage.database());
-  return { host, store, tracker, sent, clock: clock ?? { now: Date.now() } };
+  return { host, store, tracker, sent, clock: clock ?? { now: Date.now() }, envPaths, hook };
 }
 
 async function cli(c: Ctx, argv: string[], threadId: string | null = "thr_coord") {
@@ -233,6 +269,68 @@ function publish(c: Ctx, key: string, action: "push" | "pr" = "push") {
   } as any);
   c.store.updateRelease(rel.id, { status: "published" });
   return rel.id;
+}
+
+function gitR(repo: string, args: string[]): string {
+  return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+}
+
+/**
+ * Настоящие копии для CLI `merge` (§19.7): копия координатора — клон на
+ * ветке `work`, копия исполнителя — связанный worktree на `bb/<key>`.
+ * `conflict: true` — встречная правка того же файла в `work`.
+ */
+function setupMergeCopies(c: Ctx, key: string, opts: { conflict?: boolean } = {}) {
+  const base = makeTempDir("orch-shadow-merge-");
+  const remote = join(base, "remote.git");
+  execFileSync("git", ["init", "-q", "--bare", remote]);
+  const coord = join(base, "coord");
+  execFileSync("git", ["init", "-q", "-b", "main", coord]);
+  gitR(coord, ["config", "user.name", "Agent"]);
+  gitR(coord, ["config", "user.email", "agent@x.io"]);
+  writeFileSync(join(coord, "a.txt"), "one\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-q", "-m", "base"]);
+  gitR(coord, ["remote", "add", "origin", remote]);
+  gitR(coord, ["push", "-q", "-u", "origin", "main"]);
+  gitR(coord, ["checkout", "-q", "-b", "work"]);
+  const exec = join(base, "exec");
+  const branch = `bb/${key.toLowerCase()}`;
+  gitR(coord, ["worktree", "add", "-q", exec, "-b", branch]);
+  if (opts.conflict) {
+    writeFileSync(join(coord, "f.txt"), "coordinator side\n");
+    gitR(coord, ["add", "."]);
+    gitR(coord, ["commit", "-q", "-m", "coord change"]);
+  }
+  writeFileSync(join(exec, "f.txt"), opts.conflict ? "executor side\n" : "feature\n");
+  gitR(exec, ["add", "."]);
+  gitR(exec, ["commit", "-q", "-m", "feat"]);
+  c.envPaths.set("env_coord", coord);
+  c.envPaths.set(`env_exec_${key}`, exec);
+  return { coord, exec, branch, sha: gitR(exec, ["rev-parse", "HEAD"]) };
+}
+
+/** Итог круга исполнителя — штатная запись watchdog (setRoundResult). */
+function recordRound(
+  c: Ctx,
+  id: number,
+  copies: { branch: string; sha: string },
+  key: string,
+) {
+  c.store.setRoundResult(id, {
+    envId: `env_exec_${key}`,
+    branch: copies.branch,
+    sha: copies.sha,
+    commits: 1,
+    dirty: false,
+  });
+}
+
+/** Ручной `merge <KEY>` через CLI плагина. */
+async function mergeCli(c: Ctx, key: string) {
+  const res = await cli(c, ["merge", key]);
+  assert.equal(res.exitCode, 0, `merge ${key}: ${res.stdout} ${res.stderr}`);
+  return res.body;
 }
 
 function followRows(rows: TaskTransitionRow[]) {
@@ -294,16 +392,12 @@ async function featureFlow(c: Ctx, key: string, manual: boolean) {
   if (manual) await approve(c, key);
   const code = await delegate(c, key, "complex");
   finish(c, code);
+  recordRound(c, code, setupMergeCopies(c, key), key);
   const rv = await delegate(c, key, "review");
   finish(c, rv, "OK");
   if (manual) await approve(c, key);
-  shadowObserveMerge(c.store, {
-    taskKey: key,
-    projectId: PROJECT,
-    delegationId: code,
-    mode: "shadow",
-    policy: POLICY as any,
-  });
+  const m = await mergeCli(c, key);
+  assert.equal(m.mergeStatus, "merged", JSON.stringify(m));
   publish(c, key);
 }
 
@@ -377,9 +471,10 @@ test("§32.5.8 2в: feature manual, merge после ревью кода OK бе
   await approve(c, "SMK-5");
   const code = await delegate(c, "SMK-5", "complex");
   finish(c, code);
+  recordRound(c, code, setupMergeCopies(c, "SMK-5"), "SMK-5");
   const rv = await delegate(c, "SMK-5", "review");
   finish(c, rv, "OK");
-  shadowObserveMerge(c.store, { taskKey: "SMK-5", projectId: PROJECT, delegationId: code, mode: "shadow" });
+  await mergeCli(c, "SMK-5");
   const last = followRows(c.store.listTransitions("SMK-5")).at(-1)!;
   assert.equal(last.verdict, "skip");
   assert.equal(last.command, "merge");
@@ -591,12 +686,16 @@ test("§32.5.8 7: проект off — сценарии 1–5 дают 0 стр�
   const c = (await makeHost({ workGraphProjects: JSON.stringify({ [PROJECT]: "off" }), workGraph: "shadow" })) as Ctx;
   const d1 = await delegate(c, "OFF-1", "medium");
   finish(c, d1);
+  recordRound(c, d1, setupMergeCopies(c, "OFF-1"), "OFF-1");
   const sr = await delegate(c, "OFF-1", "review", ["--kind", "spec_review"]);
   finish(c, sr, "OK");
   const rv = await delegate(c, "OFF-1", "review");
   finish(c, rv, "CHANGES");
-  shadowObserveMerge(c.store, { taskKey: "OFF-1", projectId: PROJECT, mode: "off" });
+  const m = await mergeCli(c, "OFF-1");
+  assert.equal(m.mergeStatus, "merged", "merge в off выполняется штатно");
   publish(c, "OFF-1");
+  const rel = await cli(c, ["release", "OFF-1"]);
+  assert.notEqual(rel.exitCode, 0, "выкладка без конфигурации — отказ");
   await delegate(c, "OFF-2", "research");
   c.tracker.set("OFF-1", { status: "done" });
   await cli(c, ["run-queue", "--once"], null);
@@ -625,4 +724,137 @@ test("§32.5.3: граф матрицы §28.1 строится пробами �
   assert.ok(has(a, "design_check", "release"));
   assert.ok(!has(a, "spec_review", "owner_gate"));
   void buildShadowReport;
+});
+
+// ── регрессии ревью PLUG-398 (заход 1) ─────────────────────────────────
+
+test("§32.5.2: merge через CLI с исходом conflict — зеркало не двигается, класса нет", async () => {
+  const c = (await makeHost({ approvalMode: "auto" })) as Ctx;
+  const k = "SMK-30";
+  const code = await delegate(c, k, "complex");
+  finish(c, code);
+  recordRound(c, code, setupMergeCopies(c, k, { conflict: true }), k);
+  const rv = await delegate(c, k, "review");
+  finish(c, rv, "OK");
+  const before = c.store.listTransitions(k).length;
+  const res = await cli(c, ["merge", k, "--no-autofix"]);
+  assert.equal(res.exitCode, 0, res.stdout);
+  assert.equal(res.body.mergeStatus, "conflict", JSON.stringify(res.body));
+  const t = c.store.getTask(k)!;
+  assert.equal(t.node, "review", "несостоявшийся merge не переводит зеркало в release");
+  assert.equal(t.status, "running");
+  assert.equal(c.store.listTransitions(k).length, before, "ни строки следования, ни класса");
+  assert.equal(JSON.parse(t.payload ?? "{}").mirror.dispatched, true);
+});
+
+test("§32.5.1 п. 2: ветка принятой записи — фактическая ветка раздачи из итога круга", async () => {
+  const c = (await makeHost()) as Ctx;
+  const k = "SMK-31";
+  const id = await delegate(c, k, "medium");
+  assert.equal(c.store.getTask(k)!.branch, null, "до итога круга ветка неизвестна");
+  finish(c, id); // delegation.done — итога круга ещё нет
+  assert.equal(c.store.getTask(k)!.branch, null);
+  const copies = setupMergeCopies(c, k);
+  recordRound(c, id, copies, k); // watchdog: collectRoundResult → setRoundResult
+  assert.equal(c.store.getTask(k)!.branch, copies.branch);
+  // ревью не перезаписывает ветку
+  const rv = await delegate(c, k, "review");
+  finish(c, rv, "OK");
+  assert.equal(c.store.getTask(k)!.branch, copies.branch);
+});
+
+test("§32.5.2: отказ выкладки считается один раз — событием после вставки строки, CLI — только до неё", async () => {
+  const c = (await makeHost({ approvalMode: "auto" })) as Ctx;
+  const k = "SMK-32";
+  const code = await delegate(c, k, "complex");
+  finish(c, code);
+  recordRound(c, code, setupMergeCopies(c, k), k);
+  const rv = await delegate(c, k, "review");
+  finish(c, rv, "OK");
+  await mergeCli(c, k);
+  assert.equal(c.store.getTask(k)!.node, "release");
+  // 1) отказ до вставки строки (нет конфигурации выкладки) — путь CLI
+  const before = c.store.latestReleaseByTask(k)?.id ?? 0;
+  const r1 = await cli(c, ["release", k]);
+  assert.notEqual(r1.exitCode, 0);
+  assert.equal(releaseRefusalCountedByEvent(c.store, k, before), false);
+  assert.equal(c.store.getTask(k)!.release_attempts, 1);
+  // 2) отказ после вставки: строка → failed (событие release.failed) —
+  // CLI видит, что отказ уже учтён, и второй раз не считает
+  const idBefore = c.store.latestReleaseByTask(k)?.id ?? 0;
+  const rel = c.store.insertRelease({
+    taskKey: k,
+    projectId: PROJECT,
+    coordinatorThreadId: "thr_coord",
+    repoPath: "/tmp/repo",
+    branch: `bb/${k.toLowerCase()}`,
+    targetAction: "push",
+    targetBranch: "main",
+  } as any);
+  c.store.updateRelease(rel.id, { status: "failed", error: "sync conflict" });
+  assert.equal(c.store.getTask(k)!.release_attempts, 2, "событие release.failed");
+  assert.equal(releaseRefusalCountedByEvent(c.store, k, idBefore), true);
+  const refused = c.store
+    .listTransitions(k)
+    .filter((r) => r.reason === "shadow-release:refused");
+  assert.equal(refused.length, 2);
+});
+
+test("§32.5.1 п. 1: release-audit при неопределённом проекте — полное молчание", async () => {
+  const c = (await makeHost({ workGraph: "shadow" })) as Ctx;
+  c.tracker.set("NOP-1", { project: null });
+  await cli(c, ["delegate", "NOP-1", "--level", "release-audit"]);
+  assert.equal(c.store.getTask("NOP-1"), null);
+  assert.equal(c.store.listTransitions("NOP-1").length, 0, "ни task-not-enqueued, ни shadow:*");
+  // контроль: обычная раздача без проекта — task-not-enqueued (§32.5.1 п. 6)
+  c.tracker.set("NOP-2", { project: null });
+  await cli(c, ["delegate", "NOP-2", "--level", "simple"]);
+  assert.equal(
+    c.store.listTransitions("NOP-2").filter((r) => r.reason === "task-not-enqueued").length,
+    1,
+  );
+});
+
+test("§32.5.4: approve в shadow не открывает закрытую запись", async () => {
+  const c = (await makeHost({ approvalMode: "manual" })) as Ctx;
+  const k = "SMK-33";
+  await delegate(c, k, "spec");
+  c.tracker.set(k, { status: "done" });
+  await cli(c, ["run-queue", "--once"], null);
+  assert.equal(c.store.getTask(k)!.status, "done");
+  const before = c.store.listTransitions(k).length;
+  await cli(c, ["approve", k], null);
+  const t = c.store.getTask(k)!;
+  assert.equal(t.status, "done", "закрытая запись остаётся закрытой");
+  assert.equal(t.node, "spec");
+  assert.equal(
+    c.store.listTransitions(k).filter((r) => r.actor === "shadow:follow").length,
+    0,
+  );
+  assert.equal(c.store.listTransitions(k).length, before);
+});
+
+test("§32.5.2: run-queue пишет shadow_eval поверх свежего payload — следование зеркала за время await не теряется", async () => {
+  const c = (await makeHost({ approvalMode: "auto" })) as Ctx;
+  await delegate(c, "SMK-34", "complex");
+  await delegate(c, "SMK-35", "complex");
+  let fired = false;
+  c.hook.fn = () => {
+    if (fired) return;
+    const a = c.store.getTask("SMK-34");
+    if (!a || !JSON.parse(a.payload ?? "{}").shadow_eval) return;
+    // пока run-queue ждёт гейт по SMK-34, по SMK-35 пришёл итог ревью
+    fired = true;
+    const b = c.store.getTask("SMK-35")!;
+    const p = JSON.parse(b.payload ?? "{}");
+    p.mirror.last_verdict.review = "OK";
+    c.store.updateTask("SMK-35", { payload: JSON.stringify(p) });
+  };
+  const rq = await cli(c, ["run-queue", "--once"], null);
+  c.hook.fn = null;
+  assert.equal(rq.exitCode, 0, rq.stdout);
+  assert.ok(fired, "гейт run-queue ждал внешний вызов между задачами");
+  const p = JSON.parse(c.store.getTask("SMK-35")!.payload ?? "{}");
+  assert.ok(p.shadow_eval, "shadow_eval записан");
+  assert.equal(p.mirror.last_verdict.review, "OK", "свежий payload.mirror не затёрт");
 });

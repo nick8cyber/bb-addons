@@ -944,7 +944,7 @@ export class DelegationStore {
   }
 
   /** §32.5 (PLUG-398): наблюдатель-сверка shadow подписан на события
-   * (review.verdict, release.*, pr.merged, delegation.done) — вызывается
+   * (review.verdict, release.*, pr.merged, delegation.done, delegation.result) — вызывается
    * в ТОЙ ЖЕ транзакции, что и запись события; исключения глушатся:
    * сверка никогда не ломает штатный переход. */
   get eventObserver(): EventObserver | null {
@@ -953,6 +953,18 @@ export class DelegationStore {
   set eventObserver(fn: EventObserver | null) {
     if (fn) EVENT_OBSERVERS.set(this.db, fn);
     else EVENT_OBSERVERS.delete(this.db);
+  }
+
+  /** Вызов наблюдателя §32.5; исключения глушатся. Внутренние сигналы
+   * (`delegation.result`) идут только сюда, в таблицу events не пишутся. */
+  private notifyEventObserver(kind: string, doc: Record<string, unknown>): void {
+    const fn = this.eventObserver;
+    if (!fn) return;
+    try {
+      fn(kind, doc);
+    } catch {
+      // §32.5: сверка shadow не ломает штатный переход
+    }
   }
 
   constructor(db: Database) {
@@ -1857,6 +1869,14 @@ export class DelegationStore {
         Date.now(),
         id,
       );
+    // §32.5.1 п. 2: фактическая ветка раздачи известна только здесь —
+    // delegation.done эмитится раньше, до сбора итога круга.
+    if (prev?.task_key) {
+      this.notifyEventObserver("delegation.result", {
+        task: prev.task_key,
+        delegationId: id,
+      });
+    }
   }
 
   /**
@@ -3547,13 +3567,7 @@ export class DelegationStore {
       )
       .run(kind, JSON.stringify(doc), at);
     const eventId = Number(info.lastInsertRowid);
-    if (this.eventObserver) {
-      try {
-        this.eventObserver(kind, doc);
-      } catch {
-        // §32.5: сверка shadow не ломает штатный переход
-      }
-    }
+    this.notifyEventObserver(kind, doc);
     const ctx = this.eventHooksProvider?.();
     if (!ctx?.hooks.length) return eventId;
     for (const h of ctx.hooks) {

@@ -948,6 +948,25 @@ export function shadowObserveRelease(
 }
 
 /**
+ * §32.5.2: отказ выкладки после вставки строки `releases` уже учтён
+ * событием `release.failed`/`release.rejected` (наблюдатель store) — путь
+ * CLI не должен считать его второй раз. `releaseIdBefore` — id последней
+ * строки выкладки задачи до запуска.
+ */
+export function releaseRefusalCountedByEvent(
+  store: DelegationStore,
+  taskKey: string,
+  releaseIdBefore: number,
+): boolean {
+  const rel = store.latestReleaseByTask(taskKey);
+  return (
+    rel != null &&
+    rel.id > releaseIdBefore &&
+    (rel.status === "failed" || rel.status === "rejected")
+  );
+}
+
+/**
  * События без действия координатора (§32.5.2): итог ревью обновляет
  * `payload.mirror.last_verdict` и счётчики кругов; узел не двигается,
  * класса нет. Сдача исполнителя заполняет фактическую ветку записи.
@@ -1008,11 +1027,14 @@ export function shadowObserveStoreEvent(
     store.updateTask(task.task_key, updates, now);
     return;
   }
-  if (kind === "delegation.done") {
+  if (kind === "delegation.done" || kind === "delegation.result") {
+    // §32.5.1 п. 2: фактическая ветка раздачи. Итог круга (`result_branch`)
+    // пишется после delegation.done — основной сигнал `delegation.result`.
     if (task.branch || task.route === "research") return;
     const delegationId = typeof doc.delegationId === "number" ? doc.delegationId : null;
     const row = delegationId !== null ? store.get(delegationId) : undefined;
-    if (row?.result_branch && levelRole(row.level, policy) === "executor") {
+    const role = row ? levelRole(row.level, policy) : null;
+    if (row?.result_branch && role !== "auditor" && role !== "researcher") {
       store.updateTask(task.task_key, { branch: row.result_branch }, now);
     }
     return;

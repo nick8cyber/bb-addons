@@ -482,6 +482,9 @@ export async function assertGraphAllowsDirectAction(
   if (effectiveMode === "shadow") {
     try {
       const command = action?.command ?? "delegate";
+      // §32.5.1 п. 1: release-audit — полное молчание (0 строк, включая
+      // task-not-enqueued), даже при неопределённом проекте.
+      if (command === "delegate" && action?.level === "release-audit") return;
       if (!store.getTask(key) && (command !== "delegate" || !projectId)) {
         recordTaskNotEnqueued(store, key, command, projectId);
       }
@@ -2119,7 +2122,14 @@ export async function runApprove(
 
   const now = deps.now ? deps.now() : Date.now();
   let approvedTask: TaskQueueRow;
-  if (deps.workGraphMode === "shadow" && task.node !== "owner_gate") {
+  if (
+    deps.workGraphMode === "shadow" &&
+    (task.status === "done" || task.status === "cancelled")
+  ) {
+    // §32.5.4: закрытая запись зеркала не открывается заново — узел и
+    // статус не трогаем, штатное действие (запись одобрения §31.9) ниже.
+    approvedTask = task;
+  } else if (deps.workGraphMode === "shadow" && task.node !== "owner_gate") {
     // §32.5.2 (PLUG-398): зеркало не входит в owner_gate — вид одобрения
     // определяется маршрутом и текущим узлом; узел двигает следование
     // зеркала, штатное действие (запись одобрения §31.9) сохраняется ниже.
@@ -4377,6 +4387,17 @@ export async function runRunQueue(
     finalQueued.some((t) => getTaskMode(t.project_id) === "shadow") ||
     finalActive.some((t) => getTaskMode(t.project_id) === "shadow");
   if (hasShadowTasks && !deps.autoAdvance) {
+    // §32.5.2 (PLUG-398): payload перечитывается в момент записи — между
+    // чтением списка и записью идут await (гейт §31.9), за которые
+    // следование зеркала могло обновить payload.mirror; устаревшая копия
+    // его бы затёрла.
+    const writeShadowEval = (taskKey: string, ev: Record<string, unknown>) => {
+      const fresh = deps.store.getTask(taskKey);
+      if (!fresh) return;
+      deps.store.updateTask(taskKey, {
+        payload: JSON.stringify({ ...parsePayload(fresh.payload), shadow_eval: ev }),
+      });
+    };
     // 1. Evaluate queued tasks: start -> <target_node>
     for (const t of finalQueued) {
       if (getTaskMode(t.project_id) !== "shadow") continue;
@@ -4405,12 +4426,7 @@ export async function runRunQueue(
           current_node: t.node,
           current_status: t.status,
         };
-        deps.store.updateTask(t.task_key, {
-          payload: JSON.stringify({
-            ...payload,
-            shadow_eval: shadowEval,
-          }),
-        });
+        writeShadowEval(t.task_key, shadowEval);
 
         if (res.allowed && res.toNode === "code") {
           try {
@@ -4454,12 +4470,7 @@ export async function runRunQueue(
                 current_node: t.node,
                 current_status: t.status,
               };
-              deps.store.updateTask(t.task_key, {
-                payload: JSON.stringify({
-                  ...payload,
-                  shadow_eval: blockedEval,
-                }),
-              });
+              writeShadowEval(t.task_key, blockedEval);
             }
           }
         }
@@ -4594,12 +4605,7 @@ export async function runRunQueue(
           current_node: t.node,
           current_status: t.status,
         };
-        deps.store.updateTask(t.task_key, {
-          payload: JSON.stringify({
-            ...payload,
-            shadow_eval: shadowEval,
-          }),
-        });
+        writeShadowEval(t.task_key, shadowEval);
 
         if (t.node === "code" || wouldTrans?.to_node === "code") {
           try {
@@ -4643,12 +4649,7 @@ export async function runRunQueue(
                 current_node: t.node,
                 current_status: t.status,
               };
-              deps.store.updateTask(t.task_key, {
-                payload: JSON.stringify({
-                  ...payload,
-                  shadow_eval: blockedEval,
-                }),
-              });
+              writeShadowEval(t.task_key, blockedEval);
             }
           }
         }
