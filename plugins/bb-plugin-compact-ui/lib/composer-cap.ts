@@ -115,6 +115,56 @@ export function enforce(form: Element, win: Window, retry = true): void {
       if (targetSection?.style.minHeight) targetSection.style.minHeight = "";
       if (queue.style.maxHeight) queue.style.maxHeight = "";
       if (frame?.style.maxHeight) frame.style.maxHeight = "";
+      if (hasInlineEditor && queue.getBoundingClientRect().height > 0) {
+        /* The host pins the queue section to an explicit pixel height
+           (expand/collapse transition + stored resize). While an inline
+           editor is mounted a stale pin is dead space the host keeps
+           re-measuring upward (live: 344px → 585px in seconds). Clear the
+           pin only when it exceeds natural content height by a margin —
+           a correct host pin survives, so host and plugin cannot
+           oscillate; the host re-pins a measured value when it next
+           updates. Expanded queue only: a collapsed panel's ~44px pin is
+           its correct height and clearing it would expand the panel. */
+        /* Natural content must come from the <ul> — a scroll container's
+           scrollHeight is max(content, clientHeight), so a pin-stretched
+           scroll would report its own inflated height and the stale pin
+           would confirm itself (the same trap ADR-0019 §7 names for
+           min-height). The ul is plain content and never stretches, but
+           it also does not include the scroll's own padding — the host
+           gives the scroll pt-1 pb-3 = 16px, more than the 8px margin,
+           so padY(queue) must be added or a correct pin reads as stale.
+           No <ul> (or a zero one — not yet rendered): the honest measure
+           is unavailable, so pins stay untouched — fail-open. */
+        const ulH = (queue.firstElementChild as HTMLElement | null)?.scrollHeight || 0;
+        if (ulH > 0) {
+          /* px pins only — parseFloat("100%") reads as 100 and would evict a
+             legitimate percentage/auto height the host set on purpose. */
+          const pinPx = (el: HTMLElement | null | undefined): number => {
+            const v = el?.style.height?.trim() ?? "";
+            return /^\d+(\.\d+)?px$/.test(v) ? parseFloat(v) : -1;
+          };
+          const qContent = ulH + Math.ceil(padY(queue));
+          /* No frame wrapper: the scroll sits in the section directly, so its
+             own padY is already inside qContent — adding padY(queue) again
+             would silently double it and widen the threshold by 16px. */
+          const naturalFrame = frame
+            ? qContent + Math.ceil(padY(frame))
+              + Array.from(frame.children)
+                  .filter((c) => c !== queue)
+                  .reduce((s, c) => s + Math.ceil(c.getBoundingClientRect().height), 0)
+            : qContent;
+          if (pinPx(frame) > naturalFrame + 8) frame!.style.height = "";
+          if (pinPx(queue) > qContent + 8) queue.style.height = "";
+          if (targetSection && pinPx(targetSection) > 0) {
+            let naturalSec = naturalFrame + Math.ceil(padY(targetSection));
+            const self = frame ?? queue;
+            for (const sib of Array.from(targetSection.children)) {
+              if (sib !== self) naturalSec += Math.ceil(sib.getBoundingClientRect().height);
+            }
+            if (pinPx(targetSection) > naturalSec + 8) targetSection.style.height = "";
+          }
+        }
+      }
     } else {
       /* Exact height of the first min(N,3) rows including inter-row gaps —
          measured, not multiplied. The scroll element carries its own vertical
@@ -231,7 +281,7 @@ export function mountComposerCap(
   win: Window = window,
 ): () => void {
   if (signal?.aborted) return () => {};
-  doc.documentElement.dataset.capMounted = "v5";
+  doc.documentElement.dataset.capMounted = "v6";
   const forms = new Set<Element>();
   const track = (form: Element) => {
     if (!forms.has(form)) {

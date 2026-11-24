@@ -41,6 +41,7 @@ function buildDom(opts: { rows: number; rowH?: number; queueH?: number }) {
   card.appendChild(frame);
   card.appendChild(editor);
   document.body.appendChild(card);
+  Object.defineProperty(ul, "scrollHeight", { value: rows * rowH + 4, configurable: true });
   const realQH = queueH ?? rows * rowH + 16 + 4;
   box(scroll, 0, realQH);
   box(frame, 0, realQH);
@@ -163,16 +164,115 @@ describe("enforce: expanded queue shows exactly min(N,3) items", () => {
     expect(section.style.minHeight).toBe("140px");
 
     lis[0].setAttribute("data-queued-message-inline-editor", "");
+    // The host pins the section/frame to an explicit pixel height
+    // (expand transition + stored resize) — stale dead space while editing.
+    // Cleared only when it exceeds natural content (+8): a correct pin stays.
+    Object.defineProperty(scroll, "scrollHeight", { value: 140, configurable: true });
+    section.style.height = "585px";
+    frame.style.height = "300px";
     enforce(card, win);
     expect(scroll.style.maxHeight).toBe("");
     expect(frame.style.maxHeight).toBe("");
     expect(section.style.minHeight).toBe("");
+    expect(section.style.height).toBe("");
+    expect(frame.style.height).toBe("");
+
+    // A correct host pin (<= natural + 8) survives — no oscillation.
+    // buildDom gives the scroll the host padding pt-1 pb-3 = 16px, so the
+    // threshold here exercises padY(queue) being included in natural height.
+    section.style.height = "140px";
+    enforce(card, win);
+    expect(section.style.height).toBe("140px");
+
+    // Pin-stretched scroll: its own scrollHeight reports the inflated
+    // clientHeight, so the stale pin would confirm itself — the natural
+    // height must be read from the <ul> content instead. scrollHeight is
+    // set equal to the pin (clientHeight): an implementation reading the
+    // scroll's own scrollHeight would wrongly keep the pin.
+    Object.defineProperty(scroll, "scrollHeight", { value: 585, configurable: true });
+    box(scroll, 0, 585);
+    Object.defineProperty(scroll.firstElementChild, "scrollHeight", { value: 140, configurable: true });
+    section.style.height = "585px";
+    enforce(card, win);
+    expect(section.style.height).toBe("");
+
+    // If the <ul> itself stretches under the pin (host reserve lives in
+    // content), natural height inflates equally — the pin is kept
+    // (fail-safe: never clear what is not provably stale).
+    Object.defineProperty(scroll.firstElementChild, "scrollHeight", { value: 585, configurable: true });
+    section.style.height = "585px";
+    enforce(card, win);
+    expect(section.style.height).toBe("585px");
+    Object.defineProperty(scroll.firstElementChild, "scrollHeight", { value: 124, configurable: true });
+    Object.defineProperty(scroll, "scrollHeight", { value: 140, configurable: true });
+
+    // Collapsed queue keeps its pin even with the editor mounted —
+    // clearing it would expand the panel.
+    box(scroll, 0, 0);
+    section.style.height = "44px";
+    enforce(card, win);
+    expect(section.style.height).toBe("44px");
+    box(scroll, 0, 103);
 
     lis[0].removeAttribute("data-queued-message-inline-editor");
     enforce(card, win);
     expect(scroll.style.maxHeight).toBe("140px");
     expect(frame.style.maxHeight).toBe("140px");
     expect(section.style.minHeight).toBe("140px");
+  });
+  it("clears only px-format pins and only beyond natural+8 — boundary on scroll, frame, section", () => {
+    const { card, scroll, frame, lis } = buildDom({ rows: 2 });
+    const section = document.createElement("section");
+    card.removeChild(frame);
+    section.appendChild(frame);
+    card.insertBefore(section, card.firstChild);
+    box(scroll, 0, 140);
+    box(frame, 0, 140);
+    box(section, 0, 140);
+    lis[0].setAttribute("data-queued-message-inline-editor", "");
+    // natural heights here: qContent = ul 124 + padY(queue) 16 = 140;
+    // jsdom padY(frame)=padY(section)=0, no siblings → naturalFrame = naturalSec = 140.
+
+    // Non-px values are host-owned (resize/percent layout) — never touched.
+    // Values above the natural+8 threshold so a naive parseFloat would evict them.
+    scroll.style.height = "200%";
+    frame.style.height = "200%";
+    section.style.height = "200%";
+    enforce(card, win);
+    expect(scroll.style.height).toBe("200%");
+    expect(frame.style.height).toBe("200%");
+    expect(section.style.height).toBe("200%");
+
+    // Boundary: pin == natural + 8 survives, pin == natural + 9 is cleared.
+    scroll.style.height = "148px";
+    frame.style.height = "148px";
+    section.style.height = "148px";
+    enforce(card, win);
+    expect(scroll.style.height).toBe("148px");
+    expect(frame.style.height).toBe("148px");
+    expect(section.style.height).toBe("148px");
+    scroll.style.height = "149px";
+    frame.style.height = "149px";
+    section.style.height = "149px";
+    enforce(card, win);
+    expect(scroll.style.height).toBe("");
+    expect(frame.style.height).toBe("");
+    expect(section.style.height).toBe("");
+  });
+  it("without a frame wrapper the scroll padY is counted once, not twice", () => {
+    const { card, scroll, frame, lis } = buildDom({ rows: 2 });
+    card.removeChild(frame);
+    const section = document.createElement("section");
+    section.appendChild(scroll);
+    card.insertBefore(section, card.firstChild);
+    box(scroll, 0, 140);
+    box(section, 0, 140);
+    lis[0].setAttribute("data-queued-message-inline-editor", "");
+    // natural = qContent 140 + padY(section 0) + 0 siblings = 140.
+    // A double padY(queue) would raise the threshold to 164 and keep 149.
+    section.style.height = "149px";
+    enforce(card, win);
+    expect(section.style.height).toBe("");
   });
   it("reconciles grown section grant down to want after large row/editor closes (delta ~ 0)", () => {
     const { card, scroll, frame, lis } = buildDom({ rows: 2 });
