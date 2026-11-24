@@ -3640,9 +3640,20 @@ export async function createPlugin(
   });
   const textFail = (error: unknown) => {
     const body = toErrorBody(error);
+    // §13.5 (PLUG-406, r3): the structured `details` (threadId/envId of a
+    // failed coordinator worktree create) must reach the TEXT output too —
+    // without `--json` the caller has no other way to find the thread.
+    const detailLines = Object.entries(body.details ?? {}).map(
+      ([key, value]) => `${key}: ${String(value)}`,
+    );
+    const details = detailLines.length > 0 ? `\n${detailLines.join("\n")}\n` : "";
     return {
       exitCode: 1,
-      stderr: `${body.code}: ${body.message}${body.hint ? `\nhint: ${body.hint}` : ""}\n`,
+      stderr:
+        `${body.code}: ${body.message}` +
+        details +
+        (body.hint ? `\nhint: ${body.hint}` : "") +
+        "\n",
     };
   };
   const fail = (json: boolean, error: unknown) =>
@@ -4004,20 +4015,32 @@ export async function createPlugin(
             : null;
           const projectId = callerThread?.projectId ?? null;
           const releaseCfg = releaseConfig.config;
+          const targetFlag = flag("--target");
+          const targetFlagPresent = argv.includes("--target");
           const target =
-            flag("--target") ??
-            (projectId && releaseCfg
-              ? resolveProject(releaseCfg, projectId)?.target?.branch
-              : undefined) ??
-            "main";
+            targetFlagPresent && targetFlag === undefined
+              ? undefined
+              : targetFlag ??
+                (projectId && releaseCfg
+                  ? resolveProject(releaseCfg, projectId)?.target?.branch
+                  : undefined) ??
+              "main";
           // §13.5 (PLUG-406, r2): `--target` is a branch NAME — refuse an
           // empty value or anything option-like before it reaches a git
           // refspec; validate the name itself (`git check-ref-format
-          // --branch`) before any spawn/fetch happens.
+          // --branch`) before any spawn/fetch happens. A flag WITHOUT a
+          // value (`worktree create --target`) is a usage error — it must
+          // not silently fall back to the default target.
+          if (targetFlagPresent && targetFlag === undefined) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              t("cli.worktreeTargetInvalid", { target: "" }),
+            );
+          }
           if (!target || target.startsWith("-")) {
             throw new OrchestratorError(
               "invalid-arguments",
-              t("cli.worktreeTargetInvalid", { target }),
+              t("cli.worktreeTargetInvalid", { target: target ?? "" }),
             );
           }
           if (!projectId) {

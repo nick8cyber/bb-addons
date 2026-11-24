@@ -923,16 +923,24 @@ export async function createCoordinatorWorktree(
     );
   } catch (e) {
     // The ids travel with the error — the caller (CLI / `--json`) must be
-    // able to see which thread/env the failed round belonged to.
-    if (e instanceof OrchestratorError) {
-      throw new OrchestratorError(
-        e.code,
-        e.message,
-        e.hint,
-        { threadId, envId },
-      );
-    }
-    throw e;
+    // able to see which thread/env the failed round belonged to. A raw
+    // failure (e.g. a SQLite error in the store) is wrapped into the same
+    // structured error so its `details` survive to the CLI output.
+    const err =
+      e instanceof OrchestratorError
+        ? e
+        : new OrchestratorError(
+            "internal-error",
+            message(e),
+            undefined,
+            { threadId, envId },
+          );
+    throw new OrchestratorError(
+      err.code,
+      err.message,
+      err.hint,
+      { threadId, envId },
+    );
   }
   return {
     threadId,

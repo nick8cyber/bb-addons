@@ -1197,6 +1197,36 @@ test("worktree create: registers the binding against the caller's --target branc
   assert.equal(registeredOpts?.targetBranch, "dev");
 });
 
+test("PLUG-406 r3: the real coordWorktrees.register refuses an unpublished base — base-unpublished carries threadId/envId", async () => {
+  const { repo, base } = makeRepo("coord-create-base-");
+  const env = addEnv(repo, base, "w");
+  // a local commit on the copy → the base is ahead of origin/main
+  commitIn(env.path!, "unpublished.txt", "wip: unpublished");
+  const world = makeWorld({
+    envs: new Map([[env.id, env]]),
+  });
+  await assert.rejects(
+    createCoordinatorWorktree({
+      projectId: "proj_1",
+      baseSha: git(env.path!, ["rev-parse", "HEAD"]),
+      targetBranch: "main",
+      spawn: async () => ({ id: "thr_new", environmentId: env.id }),
+      showEnvironment: async () => env,
+      register: async (bind, opts) => world.wt.register(bind, opts ?? {}),
+      cmd: realCmd,
+      hostId: "host_1",
+      prompt: "coordinator seed",
+      pollIntervalMs: 5,
+      timeoutMs: 5_000,
+    }),
+    (e: unknown) =>
+      e instanceof OrchestratorError &&
+      e.code === "base-unpublished" &&
+      String(e.details?.threadId) === "thr_new" &&
+      String(e.details?.envId) === env.id,
+  );
+});
+
 test("worktree create: an env that never becomes ready refuses with provisioning-timeout", async () => {
   const { repo, base } = makeRepo("coord-create-wip-");
   const env = addEnv(repo, base, "w");
