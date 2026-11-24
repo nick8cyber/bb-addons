@@ -24,6 +24,8 @@ import {
   JanitorStore,
   MIGRATIONS,
   normalizeTaskKey,
+  type CoordinatorWorktreeBind,
+  type CoordinatorWorktreeRow,
   type DelegationRow,
   type TaskQueueRow,
 } from "./src/store.js";
@@ -39,6 +41,7 @@ import {
 } from "./src/janitor.js";
 import {
   createCoordinatorWorktrees,
+  createCoordinatorWorktree,
   environmentShowVerdict,
   type CoordinatorEnvDto,
 } from "./src/coordinator-worktrees.js";
@@ -3834,6 +3837,12 @@ export async function createPlugin(
         summary: t("cli.helpWorkgraphS"),
         usage: "bb orchestrator workgraph <off|shadow|strict> [--json]",
       },
+      {
+        name: "worktree",
+        summary: t("cli.helpWorktreeS"),
+        usage:
+          "bb orchestrator worktree create [--target <branch>] [--json]",
+      },
     ],
     async run(argv, ctx: PluginCliContext) {
       const json = argv.includes("--json");
@@ -3889,6 +3898,7 @@ export async function createPlugin(
             "approve",
             "release-note",
             "run-queue",
+            "worktree",
           ].includes(cmd)
         ) {
           watchdog.markCoordinatorAction(ctx.threadId);
@@ -3967,6 +3977,174 @@ export async function createPlugin(
           return json
             ? jsonOk({ ok: true, workGraph: modeVal })
             : { exitCode: 0, stdout: `workGraph set to ${modeVal}\n` };
+        }
+
+        if (cmd === "worktree") {
+          const sub = positional[1];
+          if (sub !== "create") {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              t("cli.worktreeUsage"),
+            );
+          }
+          if (!ctx.threadId) {
+            throw new OrchestratorError(
+              "no-caller-thread",
+              t("cli.worktreeNoThread"),
+            );
+          }
+          // §13.5 п.1 (PLUG-406): the new coordinator copy is based on
+          // the project's published target — `--target` overrides, else
+          // the release-config target, else `main`.
+          const callerThreadId = ctx.threadId ?? undefined;
+          const callerThread = callerThreadId
+            ? ((await bb.sdk.threads.get({ threadId: callerThreadId })) as {
+                projectId?: string | null;
+              })
+            : null;
+          const projectId = callerThread?.projectId ?? null;
+          const releaseCfg = releaseConfig.config;
+          const target =
+            flag("--target") ??
+            (projectId && releaseCfg
+              ? resolveProject(releaseCfg, projectId)?.target?.branch
+              : undefined) ??
+            "main";
+          // §13.5 (PLUG-406, r2): `--target` is a branch NAME — refuse an
+          // empty value or anything option-like before it reaches a git
+          // refspec; validate the name itself (`git check-ref-format
+          // --branch`) before any spawn/fetch happens.
+          if (!target || target.startsWith("-")) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              t("cli.worktreeTargetInvalid", { target }),
+            );
+          }
+          if (!projectId) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              t("cli.worktreeNoProject"),
+            );
+          }
+          const hostId = String((await localHostId()) ?? "");
+          if (!hostId) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              t("cli.worktreeNoHost"),
+            );
+          }
+          const wtCtx = await resolveWorktreeContext(
+            callerThreadId,
+            projectId ?? undefined,
+            process.cwd(),
+          ).catch(() => null);
+          const repoRoot = wtCtx?.repoRoot;
+          if (!repoRoot) {
+            throw new OrchestratorError(
+              "no-repo",
+              `no-repo: локальный репозиторий проекта не найден для создания worktree`,
+            );
+          }
+          const checkRefRes = await cmdRunner.run("git", [
+            "-C",
+            repoRoot,
+            "check-ref-format",
+            "--branch",
+            target,
+          ]);
+          if (checkRefRes.exitCode !== 0) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              t("cli.worktreeTargetInvalid", { target }),
+            );
+          }
+          const fetchRes = await cmdRunner.run("git", [
+            "-C",
+            repoRoot,
+            "fetch",
+            "origin",
+            "--",
+            target,
+          ]);
+          if (fetchRes.exitCode !== 0) {
+            throw new OrchestratorError(
+              "git-failed",
+              `git fetch origin ${target} failed (exit ${fetchRes.exitCode}): ` +
+                `${fetchRes.stderr.trim() || fetchRes.stdout.trim() || "no output"}`,
+            );
+          }
+          const revRes = await cmdRunner.run("git", [
+            "-C",
+            repoRoot,
+            "rev-parse",
+            "--verify",
+            `origin/${target}`,
+          ]);
+          const baseSha = revRes.stdout.trim();
+          if (revRes.exitCode !== 0 || !baseSha) {
+            throw new OrchestratorError(
+              "git-failed",
+              `git rev-parse origin/${target} failed (exit ${revRes.exitCode})`,
+            );
+          }
+          const res = await createCoordinatorWorktree({
+            projectId: projectId ?? "",
+            baseSha,
+            spawn: async (args) =>
+              (await bb.sdk.threads.spawn(args)) as {
+                id?: string | null;
+                environmentId?: string | null;
+              },
+            showEnvironment: async (envId) => {
+              const showRes = await bbCli.run([
+                "environment",
+                "show",
+                envId,
+                "--json",
+              ]);
+              const verdict = environmentShowVerdict(showRes);
+              if (verdict === "ok") {
+                return JSON.parse(showRes.stdout) as CoordinatorEnvDto;
+              }
+              if (verdict === "gone") return null;
+              throw new OrchestratorError(
+                "bb-cli-failed",
+                `bb environment show ${envId} failed (exit ${showRes.exitCode}): ` +
+                  `${showRes.stderr.trim() || showRes.stdout.trim() || "no output"}`,
+              );
+            },
+            register: async (bind, opts) =>
+              coordWorktrees.register(bind, opts ?? {}),
+            cmd: cmdRunner,
+            hostId,
+            prompt: instructionsText(),
+            targetBranch: target,
+          });
+          // §13.5 (PLUG-406, r2): the spawned coordinator copy must run as
+          // the orchestrator — a freshly spawned BB thread defaults to the
+          // executor role, and only the orchestrator qualifies for the
+          // worktree binding.
+          store.setRoleManual(res.threadId, "orchestrator", "worktree-create");
+          if (json) {
+            return jsonOk({
+              ok: true,
+              threadId: res.threadId,
+              envId: res.envId,
+              branch: res.branch,
+              baseSha: res.baseSha,
+              worktreePath: res.worktreePath,
+            });
+          }
+          return {
+            exitCode: 0,
+            stdout:
+              t("cli.worktreeCreateOut", {
+                threadId: res.threadId,
+                branch: res.branch,
+                envId: res.envId,
+                path: res.worktreePath,
+              }) + "\n",
+          };
         }
 
         if (cmd === "kb") {

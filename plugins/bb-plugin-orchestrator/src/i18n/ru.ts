@@ -183,6 +183,18 @@ export const RU: Record<string, string> = {
   "del.levelWord": "уровень {level}",
   "del.spawnRefused": "spawn refused{code}: {reason}",
   "del.spawnNoId": "threads.spawn returned no thread id",
+  "wt.spawnNoThread": "threads.spawn не вернул id треда",
+  "wt.spawnNoThreadHint": "тред координатора не был создан",
+  "wt.baseMissing": "worktree create: нет sha базы для проекта {project}",
+  "wt.baseMissingHint":
+    "worktree create: укажи --target <ветка> или опубликуй существующий origin/<ветка>",
+  "wt.spawnMissing": "worktree create: seam spawn обязателен для проекта {project}",
+  "wt.envGone":
+    "окружение координатора треда {threadId} ({envId}) исчезло до завершения provisioning",
+  "wt.envGoneHint": "создай координаторский worktree заново",
+  "wt.provisioningTimeout":
+    "окружение координатора {envId} треда {threadId} не стало ready вовремя",
+  "wt.provisioningTimeoutHint": "окружение координатора не подготовилось вовремя",
   "del.baseUnchecked": "база не проверена: {reason}",
   "del.baseSkip.no-cmd": "нет запускателя команд",
   "del.baseSkip.remote-host": "целевая машина — не эта",
@@ -943,6 +955,20 @@ export const RU: Record<string, string> = {
   "cli.unknownJanitorSub": "unknown janitor subcommand \"{sub}\" (run|report)",
   "cli.unknownSub": "unknown subcommand \"{cmd}\"",
   "cli.commandsHint": "commands: delegate, status, show, cancel, merge, helper, role, policy, instructions, reconcile, janitor",
+  "cli.worktreeUsage":
+    "usage: bb orchestrator worktree create [--target <ветка>] [--json]",
+  "cli.worktreeCreateOut":
+    "координатор: тред {threadId} создан в ветке {branch} (env {envId}) по пути {path}",
+  "cli.worktreeNoThread":
+    "команда worktree create работает только из треда bb (BB_THREAD_ID отсутствует)",
+  "cli.worktreeTargetInvalid":
+    "worktree create: --target должен быть непустым именем ветки без ведущих тире",
+  "cli.worktreeNoProject":
+    "worktree create: у треда-вызывающего нет привязанного bb проекта",
+  "cli.worktreeNoHost":
+    "worktree create: локальный bb-хост не привязан к этой машине",
+  "cli.helpWorktreeS":
+    "Новый тред координатора в выделенной BB Worktree (§13.5)",
   "app.role": "Роль",
   "app.roleNone": "Без плагина",
   "app.roleOrchestrator": "Оркестратор",
