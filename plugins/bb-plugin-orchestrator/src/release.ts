@@ -20,10 +20,16 @@ import {
 } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
-import { delimiter, isAbsolute, join, relative } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative } from "node:path";
 import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
+import { runHooksDoctor, HOOK_NAMES } from "./hooks.js";
+import {
+  isLiveCheckoutMigrating,
+  isLiveCheckoutPath,
+  chmodRecursive,
+} from "./live-checkout.js";
 import { verifyReleaseDocumentsGate } from "./spec-gate.js";
 import type { WorkGraphMode } from "./workgraph.js";
 import {
@@ -1515,6 +1521,12 @@ const PRE_COMMIT_MESSAGE_KEYS = [
   "typeThreadId",
   "typeEmail",
   "typeSecret",
+  "targetBranch",
+  "coordinatorNoCode",
+  "coordinatorMixed",
+  "helperNoCommit",
+  "foreignCopy",
+  "architectNoCode",
 ] as const;
 
 const PLUGIN_PRE_COMMIT = join(PLUGIN_HOOKS_DIR, "pre-commit");
@@ -1623,20 +1635,40 @@ export function syncInstalledGateHooks(hooksDir: string, t: T): boolean {
   const a = syncInstalledHook(hooksDir, "pre-push", renderPrePush, t);
   const b = syncInstalledHook(hooksDir, "pre-commit", renderPreCommit, t);
   const c = syncInstalledLeakScan(hooksDir);
-  return a || b || c;
+  let d = false;
+  let e = false;
+  const postCheckoutSrc = join(PLUGIN_HOOKS_DIR, "post-checkout");
+  const postCheckoutDst = join(hooksDir, "post-checkout");
+  if (existsSync(postCheckoutSrc)) {
+    try {
+      const srcBuf = readFileSync(postCheckoutSrc);
+      const dstBuf = existsSync(postCheckoutDst) ? readFileSync(postCheckoutDst) : null;
+      if (!dstBuf || !dstBuf.equals(srcBuf)) {
+        writeFileSync(postCheckoutDst, srcBuf, { mode: 0o755 });
+        chmodSync(postCheckoutDst, 0o755);
+        d = true;
+      }
+    } catch {}
+  }
+  const refTxSrc = join(PLUGIN_HOOKS_DIR, "reference-transaction");
+  const refTxDst = join(hooksDir, "reference-transaction");
+  if (existsSync(refTxSrc)) {
+    try {
+      const srcBuf = readFileSync(refTxSrc);
+      const dstBuf = existsSync(refTxDst) ? readFileSync(refTxDst) : null;
+      if (!dstBuf || !dstBuf.equals(srcBuf)) {
+        writeFileSync(refTxDst, srcBuf, { mode: 0o755 });
+        chmodSync(refTxDst, 0o755);
+        e = true;
+      }
+    } catch {}
+  }
+  return a || b || c || d || e;
 }
 
-/** §17.3 (Б2): standard names the installer covers — shared with
- * `hooks/install.mjs`, which reads the same `hook-names` file. */
-function standardHookNames(): string[] {
-  try {
-    return readFileSync(join(PLUGIN_HOOKS_DIR, "hook-names"), "utf8")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l && !l.startsWith("#"));
-  } catch {
-    return ["pre-push"];
-  }
+/** §17.3 (Б2) & §24.1: standard names the installer covers — 23 standard hooks from HOOK_NAMES. */
+function standardHookNames(): readonly string[] {
+  return HOOK_NAMES;
 }
 
 /** §18.1: true when `installed` is a byte-for-byte `pre-push` rendered
@@ -1983,6 +2015,21 @@ export async function runRelease(
     cfg.config,
   );
   const project = resolveProject(cfg.config!, settingsProject);
+  const commonDirRaw = await git(deps, repo, [
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir",
+  ]).catch(() => "");
+  const repoRoot = commonDirRaw ? dirname(commonDirRaw) : repo;
+  if (
+    isLiveCheckoutMigrating(deps.store, repoRoot) ||
+    isLiveCheckoutMigrating(deps.store, repo)
+  ) {
+    throw new OrchestratorError(
+      "live-checkout-migrating",
+      "live-checkout-migrating: идёт миграция служебной копии live-checkout",
+    );
+  }
   if (project.excluded) {
     throw new OrchestratorError(
       "release-excluded",
@@ -2680,6 +2727,14 @@ async function runReleaseMergedUpstream(
     config,
   );
   const project = resolveProject(config, settingsProject);
+  if (
+    isLiveCheckoutMigrating(deps.store, repo)
+  ) {
+    throw new OrchestratorError(
+      "live-checkout-migrating",
+      "live-checkout-migrating: идёт миграция служебной копии live-checkout",
+    );
+  }
   if (project.excluded) {
     throw new OrchestratorError(
       "release-excluded",
@@ -4374,6 +4429,19 @@ async function publishRelease(
 ): Promise<void> {
   const t = deps.t ?? T_RU;
   const repo = row.repo_path;
+
+  // §24.1 п.1: release перед шагом 6 вызывает doctor и отказывает с hooks-missing, если хуки не стоят.
+  const doctorRes = await runHooksDoctor({
+    hooksDir: deps.hooksDir(),
+    repo,
+    store: deps.store,
+  });
+  if (!doctorRes.ok) {
+    throw new OrchestratorError(
+      "hooks-missing",
+      `hooks-missing: ${doctorRes.message}`,
+    );
+  }
   const headSha = row.head_sha ?? (await git(deps, repo, ["rev-parse", "HEAD"]));
 
   if (row.target_action === "push") {
@@ -5523,108 +5591,135 @@ export async function runPostPublish(
               saveMeta();
             }
           }
-          const fetchRes = await deps.cmd.run(
-            "git",
-            ["-C", co, "fetch", "origin"],
-            { timeoutMs: 180_000 },
-          );
-          // §22.3: инфраструктурный сбой (fetch/ff) — понятная строка,
-          // сырой вывод git — только в журнал плагина.
-          const copyInfraFailed = (
-            cmdline: string,
-            res: { stdout: string; stderr: string },
-          ) => {
-            deps.log?.warn?.(
-              `orchestrator: postPublish ${cmdline} ${row.task_key}: ` +
-                (res.stderr || res.stdout || "").trim().slice(0, 2000),
+          const isLive = isLiveCheckoutPath(co);
+          let liveTokenFile: string | null = null;
+          if (isLive) {
+            const tokenDir = dirname(co);
+            liveTokenFile = join(tokenDir, ".token");
+            mkdirSync(tokenDir, { recursive: true, mode: 0o700 });
+            const tokenVal = randomBytes(24).toString("hex");
+            writeFileSync(
+              liveTokenFile,
+              JSON.stringify({
+                token: tokenVal,
+                expiresAt: Date.now() + 300_000,
+              }),
             );
-            copyErr = t("pp.copyUpdateFailed");
-          };
-          if (fetchRes.exitCode !== 0) {
-            copyInfraFailed("fetch", fetchRes);
-          } else {
-            const origin = `origin/${row.target_branch}`;
-            // (2) целевая ветка разошлась с origin — локальные коммиты,
-            // которых в удалённой цели нет.
-            const ahead = Number(
-              await gitOut(["rev-list", "--count", `${origin}..HEAD`]).catch(
-                () => "",
-              ),
+            process.env.ORCH_LIVE_TOKEN = tokenVal;
+            chmodRecursive(co, true);
+          }
+          try {
+            const fetchRes = await deps.cmd.run(
+              "git",
+              ["-C", co, "fetch", "origin"],
+              { timeoutMs: 180_000 },
             );
-            if (ahead > 0) {
-              copyErr = t("pp.copyDiverged", {
-                n: ahead,
-                target: row.target_branch,
-              });
+            // §22.3: инфраструктурный сбой (fetch/ff) — понятная строка,
+            // сырой вывод git — только в журнал плагина.
+            const copyInfraFailed = (
+              cmdline: string,
+              res: { stdout: string; stderr: string },
+            ) => {
+              deps.log?.warn?.(
+                `orchestrator: postPublish ${cmdline} ${row.task_key}: ` +
+                  (res.stderr || res.stdout || "").trim().slice(0, 2000),
+              );
+              copyErr = t("pp.copyUpdateFailed");
+            };
+            if (fetchRes.exitCode !== 0) {
+              copyInfraFailed("fetch", fetchRes);
             } else {
-              // (3) грязная: правки в отслеживаемых файлах или
-              // неотслеживаемые файлы, пересекающиеся с входящим диффом
-              // `HEAD..origin/<цель>` (прочие untracked не мешают).
-              const trackedDirty = (
-                await gitOut(["status", "--porcelain", "-uno"]).catch(
+              const origin = `origin/${row.target_branch}`;
+              // (2) целевая ветка разошлась с origin — локальные коммиты,
+              // которых в удалённой цели нет.
+              const ahead = Number(
+                await gitOut(["rev-list", "--count", `${origin}..HEAD`]).catch(
                   () => "",
-                )
-              )
-                .split("\n")
-                .filter(Boolean).length;
-              const incoming = new Set(
-                (
-                  await gitOut([
-                    "diff",
-                    "--name-only",
-                    `HEAD..${origin}`,
-                  ]).catch(() => "")
+                ),
+              );
+              if (ahead > 0) {
+                copyErr = t("pp.copyDiverged", {
+                  n: ahead,
+                  target: row.target_branch,
+                });
+              } else {
+                // (3) грязная: правки в отслеживаемых файлах или
+                // неотслеживаемые файлы, пересекающиеся с входящим диффом
+                // `HEAD..origin/<цель>` (прочие untracked не мешают).
+                const trackedDirty = (
+                  await gitOut(["status", "--porcelain", "-uno"]).catch(
+                    () => "",
+                  )
                 )
                   .split("\n")
-                  .filter(Boolean),
-              );
-              const untrackedOverlap = (
-                await gitOut(["status", "--porcelain"]).catch(() => "")
-              )
-                .split("\n")
-                .filter((l) => l.startsWith("?? "))
-                .map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
-                .filter(
-                  (f) =>
-                    incoming.has(f) ||
-                    // `?? foo/` is an untracked DIRECTORY; an untracked
-                    // FILE `foo` also overlaps `foo/bar.ts` — a checked-
-                    // out `foo/bar.ts` cannot coexist with it.
-                    [...incoming].some((p) =>
-                      p.startsWith(f.endsWith("/") ? f : `${f}/`),
-                    ),
-                ).length;
-              const dirtyN = trackedDirty + untrackedOverlap;
-              if (dirtyN > 0) {
-                copyErr = t("pp.copyDirty", { n: dirtyN });
-              } else {
-                const ffRes = await deps.cmd.run(
-                  "git",
-                  ["-C", co, "merge", "--ff-only", origin],
-                  { timeoutMs: 120_000 },
+                  .filter(Boolean).length;
+                const incoming = new Set(
+                  (
+                    await gitOut([
+                      "diff",
+                      "--name-only",
+                      `HEAD..${origin}`,
+                    ]).catch(() => "")
+                  )
+                    .split("\n")
+                    .filter(Boolean),
                 );
-                if (ffRes.exitCode !== 0) {
-                  copyInfraFailed("ff", ffRes);
+                const untrackedOverlap = (
+                  await gitOut(["status", "--porcelain"]).catch(() => "")
+                )
+                  .split("\n")
+                  .filter((l) => l.startsWith("?? "))
+                  .map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
+                  .filter(
+                    (f) =>
+                      incoming.has(f) ||
+                      // `?? foo/` is an untracked DIRECTORY; an untracked
+                      // FILE `foo` also overlaps `foo/bar.ts` — a checked-
+                      // out `foo/bar.ts` cannot coexist with it.
+                      [...incoming].some((p) =>
+                        p.startsWith(f.endsWith("/") ? f : `${f}/`),
+                      ),
+                  ).length;
+                const dirtyN = trackedDirty + untrackedOverlap;
+                if (dirtyN > 0) {
+                  copyErr = t("pp.copyDirty", { n: dirtyN });
                 } else {
-                  copyOk = true;
-                  newHead = await gitOut(["rev-parse", "HEAD"]).catch(
-                    () => "",
+                  const ffRes = await deps.cmd.run(
+                    "git",
+                    ["-C", co, "merge", "--ff-only", origin],
+                    { timeoutMs: 120_000 },
                   );
-                  copyChanged = base
-                    ? (
-                        await gitOut([
-                          "diff",
-                          "--name-only",
-                          `${base}..${newHead}`,
-                        ]).catch(() => "")
-                      )
-                        .split("\n")
-                        .filter(Boolean)
-                    : [];
-                  meta.copy = { head: newHead, changed: copyChanged };
-                  saveMeta();
+                  if (ffRes.exitCode !== 0) {
+                    copyInfraFailed("ff", ffRes);
+                  } else {
+                    copyOk = true;
+                    newHead = await gitOut(["rev-parse", "HEAD"]).catch(
+                      () => "",
+                    );
+                    copyChanged = base
+                      ? (
+                          await gitOut([
+                            "diff",
+                            "--name-only",
+                            `${base}..${newHead}`,
+                          ]).catch(() => "")
+                        )
+                          .split("\n")
+                          .filter(Boolean)
+                      : [];
+                    meta.copy = { head: newHead, changed: copyChanged };
+                    saveMeta();
+                  }
                 }
               }
+            }
+          } finally {
+            if (isLive) {
+              chmodRecursive(co, false);
+              if (liveTokenFile && existsSync(liveTokenFile)) {
+                rmSync(liveTokenFile, { force: true });
+              }
+              delete process.env.ORCH_LIVE_TOKEN;
             }
           }
         }

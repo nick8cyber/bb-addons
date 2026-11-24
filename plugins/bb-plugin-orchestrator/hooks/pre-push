@@ -61,6 +61,23 @@ function localHookPath() {
   if (common.status === 0) {
     candidates.push(join(common.stdout.trim(), "hooks", HOOK_NAME));
   }
+  const chainFile = join(dir, "chain.json");
+  if (existsSync(chainFile)) {
+    try {
+      const c = JSON.parse(readFileSync(chainFile, "utf8"));
+      const cwd = process.cwd();
+      if (c.localHooks) {
+        for (const [r, h] of Object.entries(c.localHooks)) {
+          if (cwd === r || cwd.startsWith(r + "/") || cwd.startsWith(r + "\\")) {
+            candidates.push(join(h, HOOK_NAME));
+          }
+        }
+      }
+      if (c.previousGlobalHooksPath) {
+        candidates.push(join(c.previousGlobalHooksPath, HOOK_NAME));
+      }
+    } catch {}
+  }
   const self = fileURLToPath(import.meta.url);
   for (const c of candidates) {
     if (c === self || !existsSync(c)) continue;

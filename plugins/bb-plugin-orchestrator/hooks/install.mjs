@@ -78,6 +78,42 @@ function pluginHooksDir() {
   }
 }
 const hooksDirArg = flag("--hooks-dir") ?? pluginHooksDir();
+
+const fixLocal = flag("--fix-local");
+if (fixLocal) {
+  const copyPath = resolve(fixLocal);
+  let localHooksPath = "";
+  try {
+    localHooksPath = execFileSync(
+      "git",
+      ["-C", copyPath, "config", "--local", "core.hooksPath"],
+      { encoding: "utf8" },
+    ).trim();
+  } catch {}
+  if (!localHooksPath) {
+    console.log(`копия ${copyPath} не имеет локального core.hooksPath`);
+    process.exit(0);
+  }
+  const targetHooksDir = hooksDirArg
+    ? resolve(hooksDirArg)
+    : resolve(homedir(), ".bb", "git-hooks");
+  mkdirSync(targetHooksDir, { recursive: true, mode: 0o755 });
+  const chainPath = join(targetHooksDir, "chain.json");
+  let chain = {};
+  if (existsSync(chainPath)) {
+    try {
+      chain = JSON.parse(readFileSync(chainPath, "utf8"));
+    } catch {}
+  }
+  chain.localHooks = chain.localHooks ?? {};
+  chain.localHooks[copyPath] = localHooksPath;
+  writeFileSync(chainPath, JSON.stringify(chain, null, 2) + "\n", { mode: 0o644 });
+  try {
+    execFileSync("git", ["-C", copyPath, "config", "--local", "--unset", "core.hooksPath"]);
+  } catch {}
+  console.log(`локальный core.hooksPath для ${copyPath} (${localHooksPath}) перенесён в chain.json и снят`);
+  process.exit(0);
+}
 // §17.3 (ревью PLUG-216 мелко): the hooks dir is required only to
 // INSTALL — `--self-test` falls back to this package's own wrappers and
 // `--dry-run` only prints the inventory.
@@ -194,7 +230,12 @@ if (selfTest) {
   const testHooksDir = join(tmp, "hooks");
   mkdirSync(testHooksDir, { recursive: true });
   const srcDir = dirname(fileURLToPath(import.meta.url));
-  const GATE_HOOKS = new Set(["pre-push", "pre-commit"]);
+  const GATE_HOOKS = new Set([
+    "pre-push",
+    "pre-commit",
+    "post-checkout",
+    "reference-transaction",
+  ]);
   for (const name of HOOK_NAMES) {
     const srcName = GATE_HOOKS.has(name) ? name : "chain";
     const dst = join(testHooksDir, name);
@@ -234,6 +275,12 @@ if (selfTest) {
   for (const kind of kinds) {
     const base = join(tmp, kind.name.replace(/\W+/g, "-"));
     execFileSync("git", ["init", ...(kind.bare ? ["--bare"] : []), base], { stdio: "ignore" });
+    if (!kind.bare) {
+      execFileSync("git", ["-C", base, "config", "user.email", "test@test.local"], { stdio: "ignore" });
+      execFileSync("git", ["-C", base, "config", "user.name", "Test"], { stdio: "ignore" });
+      execFileSync("git", ["-C", base, "checkout", "-B", "selftest-branch"], { stdio: "ignore" });
+      execFileSync("git", ["-C", base, "commit", "--allow-empty", "-m", "init"], { stdio: "ignore" });
+    }
     const repo = kind.mk(base);
     const commonRaw = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
     const common = isAbsolute(commonRaw) ? commonRaw : join(repo, commonRaw);
@@ -245,6 +292,7 @@ if (selfTest) {
       execFileSync("chmod", ["+x", lh]);
       const mark = join(tmp, `mark-${kind.name.replace(/\W+/g, "-")}-${name}`);
       const env = { ...process.env, GIT_DIR: gitDir, ORCH_MARK: mark };
+      delete env.BB_THREAD_ID;
       if (name === "pre-push") {
         writeFileSync(join(testHooksDir, "push-token-selftest.json"),
           JSON.stringify({ token: "t", sha: SHA, branch: "x", expiresAt: Date.now() + 60000 }));
@@ -288,15 +336,21 @@ if (hooksPathNow && resolve(hooksPathNow) !== hooksDir && !force) {
   process.exit(1);
 }
 
+const SPECIALIZED_HOOKS = new Set([
+  "pre-commit",
+  "post-checkout",
+  "pre-push",
+  "reference-transaction",
+]);
+
 // §17.3 (Б2): a global core.hooksPath shadows EVERY hook name — install
-// a wrapper under each: `pre-push` is the orchestrator gate (it chains
-// to the local hook itself), the rest are copies of the `chain`
-// pass-through so repository-local hooks keep firing.
-mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
+// a wrapper under each: specialized hooks for orchestrator gates,
+// the rest are copies of the `chain` pass-through.
+mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
 for (const name of HOOK_NAMES) {
   const src = join(
     HOOKS_SRC,
-    name === "pre-push" || name === "pre-commit" ? name : "chain",
+    SPECIALIZED_HOOKS.has(name) ? name : "chain",
   );
   const dst = join(hooksDir, name);
   copyFileSync(src, dst);
@@ -314,6 +368,18 @@ writeFileSync(
   join(hooksDir, "exclusions"),
   exclusions.map((e) => `${e}\n`).join(""),
 );
+
+const chainPath = join(hooksDir, "chain.json");
+let chain = {};
+if (existsSync(chainPath)) {
+  try {
+    chain = JSON.parse(readFileSync(chainPath, "utf8"));
+  } catch {}
+}
+if (hooksPathNow && resolve(hooksPathNow) !== hooksDir && !chain.previousGlobalHooksPath) {
+  chain.previousGlobalHooksPath = resolve(hooksPathNow);
+}
+writeFileSync(chainPath, JSON.stringify(chain, null, 2) + "\n", { mode: 0o644 });
 
 execFileSync("git", ["config", "--global", "core.hooksPath", hooksDir]);
 console.log(report);

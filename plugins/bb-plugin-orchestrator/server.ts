@@ -141,6 +141,13 @@ import {
   writeLeaksSnapshot,
 } from "./src/release.js";
 import {
+  installHooks,
+  runHooksDoctor,
+} from "./src/hooks.js";
+import {
+  setupLiveCheckout,
+} from "./src/live-checkout.js";
+import {
   projectRepoPath,
   type BbProjectListItem,
 } from "./src/delegate-base.js";
@@ -3758,6 +3765,16 @@ export async function createPlugin(
         usage: "bb orchestrator hooks-dir",
       },
       {
+        name: "hooks",
+        summary: t("cli.helpHooksS"),
+        usage: "bb orchestrator hooks <install|doctor> [--fix-local <path>] [--json]",
+      },
+      {
+        name: "live-checkout",
+        summary: t("cli.helpLiveCheckoutS"),
+        usage: "bb orchestrator live-checkout setup [--repo <path>] [--approved] [--json]",
+      },
+      {
         name: "janitor",
         summary: t("cli.helpJanitorS"),
         usage: "bb orchestrator janitor [run|report] [--dry-run] [--json]",
@@ -4881,6 +4898,64 @@ export async function createPlugin(
 
         if (cmd === "hooks-dir") {
           return { exitCode: 0, stdout: releaseDeps.hooksDir() + "\n" };
+        }
+
+        if (cmd === "hooks") {
+          const sub = positional[1];
+          if (sub === "install") {
+            const fixLocal = flag("--fix-local");
+            const hooksDir = flag("--hooks-dir");
+            const res = await installHooks({
+              fixLocalCopy: fixLocal,
+              hooksDir,
+            });
+            return json
+              ? jsonOk(res)
+              : { exitCode: 0, stdout: res.message + "\n" };
+          }
+          if (sub === "doctor") {
+            const copy = flag("--copy");
+            const repo = flag("--repo") ?? ctx.cwd ?? process.cwd();
+            const hooksDir = flag("--hooks-dir");
+            const res = await runHooksDoctor({
+              copy,
+              repo,
+              hooksDir,
+              store,
+            });
+            return json
+              ? { exitCode: res.code, stdout: JSON.stringify(res, null, 2) + "\n" }
+              : { exitCode: res.code, stdout: res.message + "\n" };
+          }
+          throw new OrchestratorError(
+            "invalid-arguments",
+            "укажи подкоманду: bb orchestrator hooks <install|doctor>",
+          );
+        }
+
+        if (cmd === "live-checkout") {
+          const sub = positional[1];
+          if (sub === "setup") {
+            const repoRoot = flag("--repo") ?? ctx.cwd ?? process.cwd();
+            const approved = argv.includes("--approved");
+            const liveDir = flag("--live-dir");
+            const res = await setupLiveCheckout({
+              repoRoot,
+              approved,
+              liveDir,
+              store,
+              cmd: cmdRunner,
+              bbCli,
+              releaseConfig,
+            });
+            return json
+              ? jsonOk(res)
+              : { exitCode: 0, stdout: res.message + "\n" };
+          }
+          throw new OrchestratorError(
+            "invalid-arguments",
+            "укажи подкоманду: bb orchestrator live-checkout setup",
+          );
         }
 
         if (cmd === "reconcile") {

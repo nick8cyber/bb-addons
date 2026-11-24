@@ -22,6 +22,7 @@ import {
   machineScan,
   runGitleaks,
 } from "../src/scan.js";
+import { setLiveCheckoutMigrating } from "../src/live-checkout.js";
 import { createCommandRunner, type SpawnedCommand } from "../src/commands.js";
 import { acquireCopyLock } from "../src/merge.js";
 import {
@@ -811,6 +812,16 @@ test("release: refuses without release config / level / coordinator", async () =
   await assert.rejects(
     runRelease({ taskKey: "PLUG-1", caller: { ...COORD, threadId: "thr_other", parentThreadId: "p" } }, deps),
     (e: unknown) => (e as OrchestratorError).code === "not-a-coordinator",
+  );
+});
+
+test("§24.1 п.6 (16): release refuses during live checkout migration with live-checkout-migrating", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo);
+  setLiveCheckoutMigrating(store, repo, true);
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "live-checkout-migrating",
   );
 });
 

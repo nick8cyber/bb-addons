@@ -1,28 +1,55 @@
 #!/bin/sh
-# Generic shared-hook wrapper (spec orchestrator §17.3, Б2). The shared
-# `core.hooksPath` shadows EVERY standard hook name, so install.mjs
-# copies this file under each of them — else a repo's local `pre-commit`
-# or `commit-msg` would silently stop firing.
+# Generic shared-hook wrapper (spec orchestrator §17.3, §24.1).
+# The shared `core.hooksPath` shadows EVERY standard hook name, so install
+# copies this file under each of them — else a repo's local hook
+# would silently stop firing.
 #
-# Behaviour: exec the repository's own `$GIT_DIR/hooks/<my name>` with
-# the same arguments — but ONLY when it is executable, exactly like git
-# itself (a non-executable local hook is skipped, not an error; ревью
-# PLUG-210). stdin/stdout/stderr and the exit code pass through. No
-# local hook — exit 0. The orchestrator's own gate lives only in
-# `pre-push`; this wrapper never decides. POSIX sh, not node — this
-# fires on every `git status` (post-index-change), ~45ms of node
-# startup per call was too much (ревью PLUG-210 мелко 10).
+# Behaviour: exec the repository's own `$GIT_DIR/hooks/<my name>` or
+# the hook from `chain.json` (for migrated local hooks or previousGlobalHooksPath)
+# with the same arguments — but ONLY when it is executable.
 name=${0##*/}
 self=$0
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 try=""
 if [ -n "$GIT_DIR" ]; then
   try="$GIT_DIR/hooks/$name"
 fi
 if [ ! -x "$try" ] || [ "$try" -ef "$self" ]; then
-  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
-    || exit 0
-  try="$common/hooks/$name"
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  if [ -n "$common" ]; then
+    try="$common/hooks/$name"
+  fi
+fi
+
+if [ ! -x "$try" ] || [ "$try" -ef "$self" ]; then
+  if [ -f "$dir/chain.json" ]; then
+    resolved=$(node -e '
+      const fs = require("fs");
+      const path = require("path");
+      try {
+        const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        const name = process.argv[2];
+        const cwd = process.cwd();
+        let target = null;
+        if (c.localHooks) {
+          for (const [r, h] of Object.entries(c.localHooks)) {
+            if (cwd === r || cwd.startsWith(r + "/") || cwd.startsWith(r + "\\")) {
+              target = path.join(h, name);
+              break;
+            }
+          }
+        }
+        if (!target && c.previousGlobalHooksPath) {
+          target = path.join(c.previousGlobalHooksPath, name);
+        }
+        if (target) process.stdout.write(target);
+      } catch {}
+    ' "$dir/chain.json" "$name" 2>/dev/null)
+    if [ -n "$resolved" ] && [ -x "$resolved" ] && [ ! "$resolved" -ef "$self" ]; then
+      try="$resolved"
+    fi
+  fi
 fi
 
 [ -x "$try" ] || exit 0
