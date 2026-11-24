@@ -197,9 +197,17 @@ test("2) Тест тишины наблюдателя при off: прямой �
   const transitionsB = store.listTransitions("TASK-B");
   assert.equal(transitionsB.length, 0);
 
-  // In contrast, Task A in shadow mode does record a mirror transition
+  // In contrast, Task A in shadow mode: a delegate is adopted AFTER the
+  // dispatch (§32.5.1) — nothing before it; a manual merge outside the
+  // queue records the service row `task-not-enqueued` (§32.5.1 п. 6).
   await assertGraphAllowsDirectAction(store, "TASK-A", "shadow", {
     command: "delegate",
+    projectsMap,
+    tracker,
+  });
+  assert.equal(store.listTransitions("TASK-A").length, 0);
+  await assertGraphAllowsDirectAction(store, "TASK-A", "shadow", {
+    command: "merge",
     projectsMap,
     tracker,
   });

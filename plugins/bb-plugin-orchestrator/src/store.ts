@@ -914,6 +914,12 @@ export interface TransitionTaskResult {
  * partial unique index actually sees "plug-1" and "PLUG-1" as one task. */
 export const normalizeTaskKey = (key: string) => key.trim().toUpperCase();
 
+/** §32.5: наблюдатель событий привязан к базе, а не к экземпляру
+ * хранилища — любой DelegationStore над той же базой (сервер, сторож,
+ * тесты) порождает события, видимые сверке shadow. */
+type EventObserver = (kind: string, doc: Record<string, unknown>) => void;
+const EVENT_OBSERVERS = new WeakMap<Database, EventObserver>();
+
 export class DelegationStore {
   private readonly db: Database;
 
@@ -937,8 +943,25 @@ export class DelegationStore {
     this.nodeTimeoutResolver = resolver;
   }
 
+  /** §32.5 (PLUG-398): наблюдатель-сверка shadow подписан на события
+   * (review.verdict, release.*, pr.merged, delegation.done) — вызывается
+   * в ТОЙ ЖЕ транзакции, что и запись события; исключения глушатся:
+   * сверка никогда не ломает штатный переход. */
+  get eventObserver(): EventObserver | null {
+    return EVENT_OBSERVERS.get(this.db) ?? null;
+  }
+  set eventObserver(fn: EventObserver | null) {
+    if (fn) EVENT_OBSERVERS.set(this.db, fn);
+    else EVENT_OBSERVERS.delete(this.db);
+  }
+
   constructor(db: Database) {
     this.db = db;
+  }
+
+  /** §32.5.2: одна транзакция на «оценку + следование» зеркала. */
+  inTransaction<R>(fn: () => R): R {
+    return this.db.transaction(fn)();
   }
 
   insert(input: {
@@ -2003,6 +2026,18 @@ export class DelegationStore {
   }
 
   /** §32.3 (PLUG-360): Latest active coordinator thread id for alert routing. */
+  /** §32.5.6: последний координатор проекта (по раздачам). */
+  latestCoordinatorThreadIdForProject(projectId: string): string | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT coordinator_thread_id FROM delegations
+         WHERE project_id = ? AND coordinator_thread_id IS NOT NULL AND coordinator_thread_id != ''
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(projectId) as { coordinator_thread_id: string } | undefined;
+    return row?.coordinator_thread_id;
+  }
+
   latestCoordinatorThreadId(): string | undefined {
     try {
       const task = this.db
@@ -3446,13 +3481,15 @@ export class DelegationStore {
     newValue: unknown,
     source: "menu" | "outside_menu",
     at: number = Date.now(),
+    extra?: { reason?: string },
   ): number {
-    const fields = {
+    const fields: Record<string, unknown> = {
       setting,
       oldValue,
       newValue,
       timestamp: at,
       source,
+      ...(extra?.reason ? { reason: extra.reason } : {}),
     };
     const eventId = this.emitEvent("setting.changed", fields, at);
     try {
@@ -3510,6 +3547,13 @@ export class DelegationStore {
       )
       .run(kind, JSON.stringify(doc), at);
     const eventId = Number(info.lastInsertRowid);
+    if (this.eventObserver) {
+      try {
+        this.eventObserver(kind, doc);
+      } catch {
+        // §32.5: сверка shadow не ломает штатный переход
+      }
+    }
     const ctx = this.eventHooksProvider?.();
     if (!ctx?.hooks.length) return eventId;
     for (const h of ctx.hooks) {
@@ -4386,6 +4430,119 @@ export class DelegationStore {
       .all() as TaskQueueRow[];
   }
 
+  /** §32.5.5: строки журнала графа начиная с метки (отчёт сверки). */
+  listTransitionsSince(since: number): TaskTransitionRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM task_transitions WHERE created_at >= ? ORDER BY created_at ASC, id ASC`,
+      )
+      .all(since) as TaskTransitionRow[];
+  }
+
+  /** §32.5.1 (PLUG-398): приём задачи в очередь shadow сразу в фактическом
+   * узле. Нет записи — INSERT; запись закрыта (done/cancelled) — новый
+   * цикл со сбросом счётчиков и артефактов. Строка журнала —
+   * `shadow:adopt` с маркерами `none` (п. 4). Возвращает null, если
+   * открытая запись уже есть (её ведёт следование, не приём). */
+  adoptTask(
+    input: {
+      taskKey: string;
+      projectId: string;
+      coordinatorThreadId: string;
+      route: TaskRoute;
+      level: TaskLevel;
+      node: TaskNode;
+      status: TaskStatus;
+      confirmationMode: ConfirmationMode;
+      branch: string | null;
+      payload: string;
+      command: string;
+      transitionPayload?: string | null;
+    },
+    now: number = Date.now(),
+  ): TaskQueueRow | null {
+    return this.db.transaction(() => {
+      const key = normalizeTaskKey(input.taskKey);
+      const existing = this.getTask(key);
+      if (
+        existing &&
+        existing.status !== "done" &&
+        existing.status !== "cancelled"
+      ) {
+        return null;
+      }
+      if (!existing) {
+        this.db
+          .prepare(
+            `INSERT INTO task_queue (
+              task_key, project_id, coordinator_thread_id, route, level,
+              node, status, priority, depends_on, confirmation_mode, branch,
+              release_note, payload, entered_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 100, NULL, ?, ?, NULL, ?, ?, ?, ?)`,
+          )
+          .run(
+            key,
+            input.projectId,
+            input.coordinatorThreadId,
+            input.route,
+            input.level,
+            input.node,
+            input.status,
+            input.confirmationMode,
+            input.branch,
+            input.payload,
+            now,
+            now,
+            now,
+          );
+      } else {
+        this.db
+          .prepare(
+            `UPDATE task_queue SET
+              project_id = ?, coordinator_thread_id = ?, route = ?, level = ?,
+              node = ?, status = ?, priority = 100, depends_on = NULL,
+              confirmation_mode = ?, branch = ?, release_note = NULL, payload = ?,
+              interaction_id = NULL, spec_sha = NULL, acceptance_sha = NULL, result_sha = NULL,
+              spec_attempts = 0, spec_review_rounds = 0, code_attempts = 0, check_attempts = 0,
+              code_review_rounds = 0, design_check_rounds = 0, release_attempts = 0,
+              deadline_at = NULL, node_alarm_at = NULL, deferred_by = NULL, deferred_reason = NULL,
+              entered_at = ?, created_at = ?, updated_at = ?
+            WHERE task_key = ?`,
+          )
+          .run(
+            input.projectId,
+            input.coordinatorThreadId,
+            input.route,
+            input.level,
+            input.node,
+            input.status,
+            input.confirmationMode,
+            input.branch,
+            input.payload,
+            now,
+            now,
+            now,
+            key,
+          );
+      }
+      this.db
+        .prepare(
+          `INSERT INTO task_transitions (
+            task_key, from_node, to_node, from_status, to_status, actor, reason, payload, created_at
+          ) VALUES (?, 'none', ?, 'none', ?, 'shadow:adopt', ?, ?, ?)`,
+        )
+        .run(
+          key,
+          input.node,
+          input.status,
+          `shadow-adopt:${input.command}`,
+          input.transitionPayload ?? null,
+          now,
+        );
+      return this.getTask(key);
+    })();
+  }
+
   listTransitions(taskKey: string): TaskTransitionRow[] {
     return this.db
       .prepare(
@@ -4439,9 +4596,9 @@ export class DelegationStore {
     reason: string;
     payload?: string | null;
     createdAt?: number;
-  }): void {
+  }): number {
     const key = normalizeTaskKey(input.taskKey);
-    this.db
+    const info = this.db
       .prepare(
         `INSERT INTO task_transitions (
           task_key, from_node, to_node, from_status, to_status, actor, reason, payload, created_at
@@ -4458,6 +4615,7 @@ export class DelegationStore {
         input.payload ?? null,
         input.createdAt ?? Date.now(),
       );
+    return Number(info.lastInsertRowid);
   }
 
   // ── §31.9 (ADR-0032): Task Spec Contracts ─────────────────────────────
