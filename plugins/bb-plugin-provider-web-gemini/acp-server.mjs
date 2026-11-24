@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import * as webTools from "./src/web-tools.mjs";
-import { checkedAnswer, collectTask, collectTaskAttachments, formatTaskToolResult, loadSettings, packTask, prepareTask, taskInstruction, taskThread, taskTool } from "./src/inner-context.mjs";
+import { checkedAnswer, collectTask, collectTaskAttachments, filterServiceLines, formatTaskToolResult, loadSettings, packTask, prepareTask, SEARCH_DIRECTIVE, taskInstruction, taskThread, taskTool } from "./src/inner-context.mjs";
 import { gatherAgentContext } from "./src/fast-agent.mjs";
 import { collectDiff } from "./src/review-git.mjs";
 import * as journal from "./src/turn-journal.mjs";
@@ -1762,24 +1762,28 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       // spill-файлом, поручение обязано поместиться (§5.2).
       const buildRedelivery = (instruction) => {
         const stored = task.resume.pkg;
+        const isLight = context.research && !write;
         let prior;
         try {
           prior = journal.readExchanges(STATE_DIR, tj.sessKey, tj.turn.turnNo)
-            .map((entry) => context.settings.mask(entry.text)).filter(Boolean).join("\n");
+            .map((entry) => isLight ? context.settings.maskResearch(entry.text, context.key) : context.settings.mask(entry.text))
+            .filter(Boolean).join("\n");
         } catch {
           throw new TaskTurnError("recovery: saved exchange log is missing or corrupt");
         }
         if (task.resume.exact && !prior && Buffer.byteLength(stored.message) <= messageLimit) return stored;
-        const heading = "\n\n=== Продолжение прерванного хода / Resumed turn ===\n";
-        const tail = "=== Поручение / Instruction ===\n" + instruction;
+        const heading = isLight ? "\n\n" : "\n\n=== Продолжение прерванного хода / Resumed turn ===\n";
+        const tail = isLight ? (instruction ? "\n\n" + instruction : "") : ("=== Поручение / Instruction ===\n" + instruction);
         let extraFiles = [];
         let message = stored.message + heading + (prior ? prior + "\n\n" : "") + tail;
         if (Buffer.byteLength(message) > messageLimit) {
           const spill = webTools.writeSpillPackage(UPLOADS_DIR, randomUUID(), stored.message + heading + prior);
           task.ownedFiles.push(spill.pkgPath);
           extraFiles = [spill.pkgPath];
-          message = "Resume the interrupted task: the complete saved package and prior tool results are in the attached " +
-            spill.pkgName + ".\n\n" + tail;
+          message = isLight
+            ? (SEARCH_DIRECTIVE + "\n\nRead the entire task in the attached " + spill.pkgName + "." + (instruction ? "\n\n" + instruction : ""))
+            : ("Resume the interrupted task: the complete saved package and prior tool results are in the attached " +
+              spill.pkgName + ".\n\n" + tail);
         }
         if (Buffer.byteLength(message) > messageLimit) {
           throw new TaskTurnError("recovery: saved instruction does not fit the web textbox limit");
@@ -1822,7 +1826,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             task.packageSha256 = task.resume.pkg.packageSha256;
             slog("task:package-resume", { sessionId, packageSha256: task.packageSha256, turnNo: tj.turn.turnNo });
           } else {
-            packageOptions = { ...taskAttachmentOptions(s, task), limit: messageLimit, reserveBytes: write ? FILE_CAPTURE_MARKER_BYTES : 0 };
+            packageOptions = { ...taskAttachmentOptions(s, task), limit: messageLimit, reserveBytes: write ? FILE_CAPTURE_MARKER_BYTES : 0, isFirstTurn: !s.convId };
             const materials = attachments.materials ?? await collectTaskAttachments(context, attachments.blocks, packageOptions);
             tj.turn.taskSha256 = taskInputSha256(tj.turn.inputBlocksSha256, materials);
             tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
@@ -2121,55 +2125,63 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               slog("driver:done", { sessionId, convId: s.convId || null, streamedAny });
               return res;
             };
-            let toolSeq = 0;
-            const loop = await webTools.runToolLoop({
-              firstMessage: task ? (resumedConv ? [task.resume.instruction, write ? contract : ""].filter(Boolean).join("\n\n") : packed.message)
-                : s.convId ? text : packed.message,
-              send: sendOnce,
-              execute: (call) => task ? taskTool(context, collected, call, toolLimit, task.signal) : webTools.executeTool(call, { cwd: s.cwd }),
-              onToolRound: task ? (_round, forcedFinal) => {
-                if (!forcedFinal) {
-                  budgets.toolRounds = (budgets.toolRounds ?? 0) + 1;
-                  persistJournal();
-                }
-                task.ping("request_more");
-              } : null,
-              ...(task ? {
-                formatResult: (call, result) => {
-                  const formatted = formatTaskToolResult(context, call, result);
-                  recordExchange({ kind: "tool-result", name: call.name, ok: result.ok !== false, text: formatted });
-                  return formatted;
+            let loop;
+            if (task && context.research && !write) {
+              const firstMessage = resumedConv ? [task.resume.instruction, write ? contract : ""].filter(Boolean).join("\n\n") : packed.message;
+              const res = await sendOnce(firstMessage);
+              const raw = typeof res?.rawText === "string" && res.rawText.trim() ? res.rawText : null;
+              loop = { cancelled: false, forcedFinal: false, finalText: String(raw ?? res?.text ?? res ?? ""), rounds: 1, executed: [], lastRes: res };
+            } else {
+              let toolSeq = 0;
+              loop = await webTools.runToolLoop({
+                firstMessage: task ? (resumedConv ? [task.resume.instruction, write ? contract : ""].filter(Boolean).join("\n\n") : packed.message)
+                  : s.convId ? text : packed.message,
+                send: sendOnce,
+                execute: (call) => task ? taskTool(context, collected, call, toolLimit, task.signal) : webTools.executeTool(call, { cwd: s.cwd }),
+                onToolRound: task ? (_round, forcedFinal) => {
+                  if (!forcedFinal) {
+                    budgets.toolRounds = (budgets.toolRounds ?? 0) + 1;
+                    persistJournal();
+                  }
+                  task.ping("request_more");
+                } : null,
+                ...(task ? {
+                  formatResult: (call, result) => {
+                    const formatted = formatTaskToolResult(context, call, result);
+                    recordExchange({ kind: "tool-result", name: call.name, ok: result.ok !== false, text: formatted });
+                    return formatted;
+                  },
+                } : {}),
+                ...(write ? { toolText: (text) => fileEnvelope.isFileToolReply(text) ? text : "" } : {}),
+                onToolStart: (call) => {
+                  const toolCallId = task ? "gemini-read-" + randomUUID() : "argtool-" + (++toolSeq);
+                  upd({
+                    sessionUpdate: "tool_call",
+                    toolCallId,
+                    title: task ? context.settings.mask(webTools.toolTitle(call)) : webTools.toolTitle(call),
+                    kind: webTools.toolKind(call.name),
+                    status: "in_progress",
+                    ...(task ? {} : { rawInput: { name: call.name, args: call.args } }),
+                  });
+                  return toolCallId;
                 },
-              } : {}),
-              ...(write ? { toolText: (text) => fileEnvelope.isFileToolReply(text) ? text : "" } : {}),
-              onToolStart: (call) => {
-                const toolCallId = task ? "gemini-read-" + randomUUID() : "argtool-" + (++toolSeq);
-                upd({
-                  sessionUpdate: "tool_call",
-                  toolCallId,
-                  title: task ? context.settings.mask(webTools.toolTitle(call)) : webTools.toolTitle(call),
-                  kind: webTools.toolKind(call.name),
-                  status: "in_progress",
-                  ...(task ? {} : { rawInput: { name: call.name, args: call.args } }),
-                });
-                return toolCallId;
-              },
-              onToolEnd: (toolCallId, call, r) => {
-                upd({
-                  sessionUpdate: "tool_call_update",
-                  toolCallId,
-                  status: r.ok ? "completed" : "failed",
-                  content: [
-                    {
-                      type: "content",
-                      content: { type: "text", text: String(r.output ?? "").slice(0, 2000) },
-                    },
-                  ],
-                });
-              },
-              maxRounds: Math.max(0, maxToolRounds - (budgets?.toolRounds ?? 0)),
-              isCancelled: () => s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted,
-            });
+                onToolEnd: (toolCallId, call, r) => {
+                  upd({
+                    sessionUpdate: "tool_call_update",
+                    toolCallId,
+                    status: r.ok ? "completed" : "failed",
+                    content: [
+                      {
+                        type: "content",
+                        content: { type: "text", text: String(r.output ?? "").slice(0, 2000) },
+                      },
+                    ],
+                  });
+                },
+                maxRounds: Math.max(0, maxToolRounds - (budgets?.toolRounds ?? 0)),
+                isCancelled: () => s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted,
+              });
+            }
             if (loop.cancelled) {
               const e = new Error("prompt cancelled by user");
               e.code = "ARGON_CANCELLED";
@@ -2219,9 +2231,15 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 if (final.denied) throw new TaskTurnError(final.denied);
                 if ((budgets.repairRounds ?? 0) >= maxRepairRounds) throw new TaskTurnError(final.repair);
                 task.ping("request_more");
-                const repairMessage = "Correct the previous reply. " + final.repair + ". " +
-                  (write ? fileRepairInstruction(context, candidate, final.plan)
-                    : "Return the complete publishable final answer without tool calls or file envelopes.\n") + contract;
+                const isLightResearch = context.research && !write;
+                const isProhibited = Boolean(final.prohibited || final.repair === "response contains material prohibited for publication" || final.code === "prohibited-content");
+                const repairMessage = isLightResearch
+                  ? (isProhibited
+                      ? "Удали запрещённый к публикации материал и дай полный ответ с источниками и датами."
+                      : "Дай полный ответ с источниками и датами.")
+                  : "Correct the previous reply. " + final.repair + ". " +
+                    (write ? fileRepairInstruction(context, candidate, final.plan)
+                      : "Return the complete publishable final answer without tool calls or file envelopes.\n") + contract;
                 budgets.repairRounds = (budgets.repairRounds ?? 0) + 1;
                 persistJournal();
                 recordExchange({ kind: "repair", text: repairMessage });
@@ -2807,9 +2825,12 @@ async function runBoundPrompt(msg, session) {
       // convId восстанавливается только на прежнем backend вне cooldown;
       // иначе ход получает повторную доставку сохранённого пакета в новый чат.
       const useConv = Boolean(plan.turn.convId) && convBackendUsable(plan.turn.backendId);
+      const isLightResearch = context.research && !context.write;
       task.resume = {
         convId: useConv ? turn.convId : null, pkg: plan.pkg, exact: plan.exact,
-        instruction: plan.exact ? "Continue the original task from the saved package." : context.settings.mask(text),
+        instruction: plan.exact
+          ? (isLightResearch ? "Продолжай выполнение задачи." : "Continue the original task from the saved package.")
+          : (isLightResearch ? context.settings.maskResearch(filterServiceLines(text), context.key) : context.settings.mask(text)),
       };
       session.convId = task.resume.convId;
       session.backend = useConv ? BACKENDS.find((b) => b.id === turn.backendId) : null;
