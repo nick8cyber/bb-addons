@@ -105,13 +105,6 @@ async function openDb(dbPath) {
  * worktrees. Executable files only, exactly like git itself. */
 function localHookPath() {
   const candidates = [];
-  if (process.env.GIT_DIR) {
-    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
-  }
-  const common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  if (common.status === 0) {
-    candidates.push(join(common.stdout.trim(), "hooks", HOOK_NAME));
-  }
   const chainFile = join(dir, "chain.json");
   if (existsSync(chainFile)) {
     try {
@@ -128,6 +121,13 @@ function localHookPath() {
         candidates.push(join(c.previousGlobalHooksPath, HOOK_NAME));
       }
     } catch {}
+  }
+  if (process.env.GIT_DIR) {
+    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
+  }
+  const common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (common.status === 0) {
+    candidates.push(join(common.stdout.trim(), "hooks", HOOK_NAME));
   }
   const self = fileURLToPath(import.meta.url);
   for (const c of candidates) {
@@ -181,6 +181,15 @@ try {
 const branchRes = git(["symbolic-ref", "--short", "-q", "HEAD"]);
 const curBranch = branchRes.stdout ? branchRes.stdout.trim() : "";
 const TARGET_BRANCHES = new Set(["main", "master", "dev"]);
+try {
+  const leaksSnapPath = join(commonDir, "orchestrator-leaks.json");
+  if (existsSync(leaksSnapPath)) {
+    const snap = JSON.parse(readFileSync(leaksSnapPath, "utf8"));
+    if (snap?.targetBranch) {
+      TARGET_BRANCHES.add(snap.targetBranch);
+    }
+  }
+} catch {}
 if (TARGET_BRANCHES.has(curBranch)) {
   console.error(msg("targetBranch"));
   process.exit(1);
@@ -323,7 +332,16 @@ if (threadId) {
             } else if (delegation.result_env_id) {
               const resEnv = resolve(delegation.result_env_id);
               const cwdNorm = resolve(cwd);
-              if (cwdNorm !== resEnv && !cwdNorm.startsWith(resEnv + "/") && !cwdNorm.includes(delegation.result_env_id)) {
+              if (cwdNorm !== resEnv && !cwdNorm.startsWith(resEnv + "/")) {
+                console.error(msg("foreignCopy"));
+                db.close();
+                process.exit(1);
+              }
+            } else {
+              const cwdNorm = resolve(cwd);
+              const taskMatch = delegation.task_key && cwdNorm.toLowerCase().includes(delegation.task_key.toLowerCase());
+              const threadMatch = cwdNorm.includes(threadId);
+              if (!taskMatch && !threadMatch) {
                 console.error(msg("foreignCopy"));
                 db.close();
                 process.exit(1);
@@ -334,12 +352,11 @@ if (threadId) {
         db.close();
       }
     }
-  } catch (e) {
-    if (!dbOpened) {
-      console.warn(
-        "Хук читает базу плагина только на чтение; база недоступна — правило (а) и предупреждение.",
-      );
-    }
+  } catch (e) {}
+  if (!dbOpened) {
+    console.warn(
+      "Хук читает базу плагина только на чтение; база недоступна — правило (а) и предупреждение.",
+    );
   }
 }
 

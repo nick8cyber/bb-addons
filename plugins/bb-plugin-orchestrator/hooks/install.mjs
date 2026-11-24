@@ -81,6 +81,17 @@ const hooksDirArg = flag("--hooks-dir") ?? pluginHooksDir();
 
 const fixLocal = flag("--fix-local");
 if (fixLocal) {
+  const confirmed =
+    args.includes("--confirm") ||
+    args.includes("--yes") ||
+    args.includes("-y") ||
+    args.includes("--approved");
+  if (!confirmed) {
+    console.error(
+      "fix-local-needs-confirmation: перенос локального core.hooksPath требует подтверждения владельца (--confirm)",
+    );
+    process.exit(1);
+  }
   const copyPath = resolve(fixLocal);
   let localHooksPath = "";
   try {
@@ -106,10 +117,51 @@ if (fixLocal) {
     } catch {}
   }
   chain.localHooks = chain.localHooks ?? {};
-  chain.localHooks[copyPath] = localHooksPath;
+
+  const absLocalHooks = isAbsolute(localHooksPath) ? localHooksPath : resolve(copyPath, localHooksPath);
+  chain.localHooks[resolve(copyPath)] = absLocalHooks;
+
+  try {
+    const wtOut = execFileSync(
+      "git",
+      ["-C", copyPath, "worktree", "list", "--porcelain"],
+      { encoding: "utf8" },
+    );
+    for (const line of wtOut.split("\n")) {
+      if (line.startsWith("worktree ")) {
+        const wtPath = line.slice("worktree ".length).trim();
+        if (wtPath) {
+          let wtHooks = "";
+          try {
+            wtHooks = execFileSync(
+              "git",
+              ["-C", wtPath, "config", "--local", "core.hooksPath"],
+              { encoding: "utf8" },
+            ).trim();
+          } catch {}
+          if (wtHooks) {
+            chain.localHooks[resolve(wtPath)] = isAbsolute(wtHooks) ? wtHooks : resolve(wtPath, wtHooks);
+          } else {
+            chain.localHooks[resolve(wtPath)] = absLocalHooks;
+          }
+        }
+      }
+    }
+  } catch {}
+
   writeFileSync(chainPath, JSON.stringify(chain, null, 2) + "\n", { mode: 0o644 });
   try {
     execFileSync("git", ["-C", copyPath, "config", "--local", "--unset", "core.hooksPath"]);
+  } catch (err) {
+    console.error(`не удалось снять локальную настройку core.hooksPath для ${copyPath}: ${err.message ?? String(err)}`);
+    process.exit(1);
+  }
+  try {
+    const verify = execFileSync("git", ["-C", copyPath, "config", "--local", "core.hooksPath"], { encoding: "utf8" }).trim();
+    if (verify) {
+      console.error(`локальная настройка core.hooksPath для ${copyPath} осталась после снятия`);
+      process.exit(1);
+    }
   } catch {}
   console.log(`локальный core.hooksPath для ${copyPath} (${localHooksPath}) перенесён в chain.json и снят`);
   process.exit(0);

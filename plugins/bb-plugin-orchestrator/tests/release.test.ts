@@ -1896,8 +1896,13 @@ function installAllWrappers(dir: string) {
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("#"));
   for (const n of names) {
+    const isSpecial =
+      n === "pre-push" ||
+      n === "pre-commit" ||
+      n === "post-checkout" ||
+      n === "reference-transaction";
     cpSync(
-      join(src, n === "pre-push" || n === "pre-commit" ? n : "chain"),
+      join(src, isSpecial ? n : "chain"),
       join(dir, n),
     );
   }

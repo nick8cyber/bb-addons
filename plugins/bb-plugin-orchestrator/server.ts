@@ -4950,10 +4950,43 @@ export async function createPlugin(
               repoRoot,
               approved,
               liveDir,
+              threadId: ctx.threadId,
               store,
               cmd: cmdRunner,
               bbCli,
               releaseConfig,
+              updateReleaseConfigCheckout: async (targetLiveDir: string) => {
+                if (releaseConfig?.config) {
+                  let pid: string | null = null;
+                  try {
+                    pid = await settingsProjectId(
+                      { cmd: cmdRunner, bbCli, localHostId, t: createT("ru") },
+                      repoRoot,
+                      "",
+                      releaseConfig.config,
+                    );
+                  } catch {}
+                  if (!pid && releaseConfig.config.projects) {
+                    for (const [id] of Object.entries(releaseConfig.config.projects)) {
+                      if (id) {
+                        pid = id;
+                        break;
+                      }
+                    }
+                  }
+                  if (pid && releaseConfig.config.projects[pid]) {
+                    const proj = releaseConfig.config.projects[pid]!;
+                    proj.postPublish = proj.postPublish ?? {};
+                    proj.postPublish.checkout = targetLiveDir;
+                  } else if (releaseConfig.config.defaults) {
+                    releaseConfig.config.defaults.postPublish = releaseConfig.config.defaults.postPublish ?? {};
+                    releaseConfig.config.defaults.postPublish.checkout = targetLiveDir;
+                  }
+                  try {
+                    await settings.experimental_set({ release: JSON.stringify(releaseConfig.config, null, 2) });
+                  } catch {}
+                }
+              },
             });
             return json
               ? jsonOk(res)

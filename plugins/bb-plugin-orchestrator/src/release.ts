@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
-import { delimiter, dirname, isAbsolute, join, relative } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
@@ -29,6 +29,7 @@ import {
   isLiveCheckoutMigrating,
   isLiveCheckoutPath,
   chmodRecursive,
+  projectLockPath,
 } from "./live-checkout.js";
 import { verifyReleaseDocumentsGate } from "./spec-gate.js";
 import type { WorkGraphMode } from "./workgraph.js";
@@ -595,6 +596,7 @@ export async function writeLeaksSnapshot(
     allowedEmails: project.allowedEmails,
     hostname: osHostname(),
     excluded: project.excluded,
+    targetBranch: project.target?.branch ?? "main",
     updatedAt: Date.now(),
   };
   writeFileSync(
@@ -5518,10 +5520,13 @@ export async function runPostPublish(
     if (!co || postPublishLocks.has(row.id)) return true;
     // §18.5: флаг «остановлен» — идущий такт новых замков не берёт.
     if (deps.commandRunner?.isStopped?.()) return false;
+    const isLive = isLiveCheckoutPath(co);
     const gitDir = await gitOut(["rev-parse", "--absolute-git-dir"]).catch(
       () => "",
     );
-    const lockPath = join(gitDir || join(co, ".git"), MERGE_LOCK_NAME);
+    const lockPath = isLive
+      ? projectLockPath(co)
+      : join(gitDir || join(co, ".git"), MERGE_LOCK_NAME);
     try {
       const release = await acquireCopyLock(coGit, co, lockPath, {
         owner: deps.instanceId ?? `postPublish:${process.pid}`,
@@ -5533,7 +5538,15 @@ export async function runPostPublish(
         release();
         return false;
       }
-      postPublishLocks.set(row.id, release);
+      const combinedRelease = () => {
+        try {
+          if (isLive) {
+            chmodRecursive(co, false);
+          }
+        } catch {}
+        release();
+      };
+      postPublishLocks.set(row.id, combinedRelease);
       return true;
     } catch (e) {
       // §6 r11: копия занята merge — такт уходит, команды ждут.
@@ -5608,24 +5621,25 @@ export async function runPostPublish(
           }
           const isLive = isLiveCheckoutPath(co);
           let liveTokenFile: string | null = null;
+          let liveProjTokenFile: string | null = null;
           let liveTokenVal: string | null = null;
           if (isLive) {
             const tokenDir = dirname(co);
             liveTokenFile = join(tokenDir, ".token");
+            liveProjTokenFile = join(tokenDir, `.token-${basename(co)}`);
             mkdirSync(tokenDir, { recursive: true, mode: 0o700 });
             liveTokenVal = randomBytes(24).toString("hex");
-            writeFileSync(
-              liveTokenFile,
-              JSON.stringify({
-                token: liveTokenVal,
-                repo: co,
-                expiresAt: Date.now() + 300_000,
-              }),
-            );
+            const tokenPayload = JSON.stringify({
+              token: liveTokenVal,
+              repo: resolve(co),
+              expiresAt: Date.now() + 300_000,
+            });
+            writeFileSync(liveTokenFile, tokenPayload, { mode: 0o600 });
+            writeFileSync(liveProjTokenFile, tokenPayload, { mode: 0o600 });
             chmodRecursive(co, true);
           }
           const liveEnv = liveTokenVal
-            ? { ...process.env, ORCH_LIVE_TOKEN: liveTokenVal }
+            ? { ORCH_LIVE_TOKEN: liveTokenVal }
             : undefined;
           try {
             const fetchRes = await deps.cmd.run(
@@ -5736,7 +5750,14 @@ export async function runPostPublish(
             if (isLive) {
               chmodRecursive(co, false);
               if (liveTokenFile && existsSync(liveTokenFile)) {
-                rmSync(liveTokenFile, { force: true });
+                try {
+                  rmSync(liveTokenFile, { force: true });
+                } catch {}
+              }
+              if (liveProjTokenFile && existsSync(liveProjTokenFile)) {
+                try {
+                  rmSync(liveProjTokenFile, { force: true });
+                } catch {}
               }
             }
           }

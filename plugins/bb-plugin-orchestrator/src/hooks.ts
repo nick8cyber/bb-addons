@@ -145,19 +145,32 @@ export async function installHooks(
       if (common) rootRepo = dirname(common);
     } catch {}
 
-    const absLocalHooks = isAbsolute(localHooksPath) ? localHooksPath : resolve(rootRepo, localHooksPath);
+    const absLocalHooks = isAbsolute(localHooksPath) ? localHooksPath : resolve(copyPath, localHooksPath);
     mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
     const chain = readChainConfig(hooksDir);
     chain.localHooks = chain.localHooks ?? {};
     chain.localHooks[resolve(copyPath)] = absLocalHooks;
-    chain.localHooks[resolve(rootRepo)] = absLocalHooks;
+    if (rootRepo !== copyPath) {
+      chain.localHooks[resolve(rootRepo)] = absLocalHooks;
+    }
 
     try {
-      const wtOut = exec("git", ["-C", rootRepo, "worktree", "list", "--porcelain"]);
+      const wtOut = exec("git", ["-C", copyPath, "worktree", "list", "--porcelain"]);
       for (const line of wtOut.split("\n")) {
         if (line.startsWith("worktree ")) {
           const wtPath = line.slice("worktree ".length).trim();
-          if (wtPath) chain.localHooks[resolve(wtPath)] = absLocalHooks;
+          if (wtPath) {
+            let wtLocalHooks = "";
+            try {
+              wtLocalHooks = exec("git", ["-C", wtPath, "config", "--local", "core.hooksPath"]);
+            } catch {}
+            if (wtLocalHooks) {
+              const absWtHooks = isAbsolute(wtLocalHooks) ? wtLocalHooks : resolve(wtPath, wtLocalHooks);
+              chain.localHooks[resolve(wtPath)] = absWtHooks;
+            } else {
+              chain.localHooks[resolve(wtPath)] = absLocalHooks;
+            }
+          }
         }
       }
     } catch {}
@@ -166,7 +179,24 @@ export async function installHooks(
 
     try {
       exec("git", ["-C", copyPath, "config", "--local", "--unset", "core.hooksPath"]);
-    } catch {}
+    } catch (err: any) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось снять локальную настройку core.hooksPath в ${copyPath}: ${err.message ?? String(err)}`,
+      );
+    }
+
+    try {
+      const verify = exec("git", ["-C", copyPath, "config", "--local", "core.hooksPath"]);
+      if (verify && verify.trim()) {
+        throw new OrchestratorError(
+          "git-failed",
+          `локальная настройка core.hooksPath в ${copyPath} осталась после снятия`,
+        );
+      }
+    } catch (e: any) {
+      if (e instanceof OrchestratorError) throw e;
+    }
 
     return {
       ok: true,
@@ -185,6 +215,8 @@ export async function installHooks(
     if (raw) {
       if (raw.startsWith("~/")) {
         raw = join(homedir(), raw.slice(2));
+      } else if (!isAbsolute(raw)) {
+        raw = resolve(homedir(), raw);
       }
       existingGlobal = resolve(raw);
     }
@@ -341,24 +373,36 @@ export async function runHooksDoctor(
       }
     } catch {}
 
-    // Служебная живая копия — проверяем происхождение из того же origin
-    const repoName = basename(rootRepo);
-    const liveCandidate = join(homedir(), ".bb", "plugin-live", repoName);
-    if (existsSync(liveCandidate)) {
-      let isSameOrigin = false;
-      try {
-        const liveOrigin = exec("git", ["-C", liveCandidate, "remote", "get-url", "origin"]);
-        const repoOrigin = exec("git", ["-C", rootRepo, "remote", "get-url", "origin"]);
-        if (liveOrigin && repoOrigin && liveOrigin === repoOrigin) {
-          isSameOrigin = true;
+    // Служебная живая копия — читаем из принятого postPublish.checkout либо по умолчанию
+    let liveFound = false;
+    if (opts.store?.metaGet) {
+      const configuredLive =
+        opts.store.metaGet(`live-checkout:postPublish:${rootRepo}`) ||
+        opts.store.metaGet(`live-checkout:postPublish:${dirname(repoCommonDir || rootRepo)}`);
+      if (configuredLive && existsSync(configuredLive)) {
+        copiesToCheck.add(resolve(configuredLive));
+        liveFound = true;
+      }
+    }
+    if (!liveFound) {
+      const repoName = basename(rootRepo);
+      const liveCandidate = join(homedir(), ".bb", "plugin-live", repoName);
+      if (existsSync(liveCandidate)) {
+        let isSameOrigin = false;
+        try {
+          const liveOrigin = exec("git", ["-C", liveCandidate, "remote", "get-url", "origin"]);
+          const repoOrigin = exec("git", ["-C", rootRepo, "remote", "get-url", "origin"]);
+          if (liveOrigin && repoOrigin && liveOrigin === repoOrigin) {
+            isSameOrigin = true;
+          }
+        } catch {}
+        if (isSameOrigin) {
+          copiesToCheck.add(resolve(liveCandidate));
         }
-      } catch {}
-      if (isSameOrigin) {
-        copiesToCheck.add(resolve(liveCandidate));
       }
     }
 
-    // Копии координаторов из базы — ТОЛЬКО того же проекта!
+    // Копии координаторов из базы — проверяем принадлежность репозиторию
     if (opts.store) {
       try {
         const list = opts.store.activeCoordinatorWorktrees?.() ?? [];
@@ -369,6 +413,12 @@ export async function runHooksDoctor(
               const wtCommon = exec("git", ["-C", row.worktree_path, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
               if (wtCommon && repoCommonDir && resolve(wtCommon) === repoCommonDir) {
                 isSameRepo = true;
+              } else {
+                const wtOrigin = exec("git", ["-C", row.worktree_path, "remote", "get-url", "origin"]);
+                const repoOrigin = exec("git", ["-C", rootRepo, "remote", "get-url", "origin"]);
+                if (wtOrigin && repoOrigin && wtOrigin === repoOrigin) {
+                  isSameRepo = true;
+                }
               }
             } catch {}
             if (isSameRepo) {
@@ -392,11 +442,15 @@ export async function runHooksDoctor(
     } catch {}
 
     if (localHooksPath) {
+      const detail = `копия ${copy} имеет локальный core.hooksPath=${localHooksPath}; запустите hooks install --fix-local ${copy}`;
       issues.push({
         copy,
         type: "local-hooks-path",
-        detail: `копия ${copy} имеет локальный core.hooksPath=${localHooksPath}; запустите hooks install --fix-local ${copy}`,
+        detail,
       });
+      try {
+        exec("bb", ["thread", "tell", "owner", `[orchestrator doctor] ${detail}`]);
+      } catch {}
       continue;
     }
 

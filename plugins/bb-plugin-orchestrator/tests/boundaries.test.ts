@@ -16,6 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { makeTempDir } from "./helpers/temp.js";
@@ -534,4 +535,14 @@ test("§24.1 п.6 (16): release во время миграции отказыв�
   assert.equal(isLiveCheckoutMigrating(store, repo), true);
   setLiveCheckoutMigrating(store, repo, false);
   assert.equal(isLiveCheckoutMigrating(store, repo), false);
+});
+
+test("тест-страж: глобальный core.hooksPath реальной машины не затронут тестами", () => {
+  let hooksPath = "";
+  try {
+    hooksPath = execFileSync("git", ["config", "--global", "--get", "core.hooksPath"], {
+      encoding: "utf8",
+    }).trim();
+  } catch {}
+  assert.notEqual(hooksPath, join(homedir(), ".bb", "git-hooks"), "тесты не должны устанавливать core.hooksPath на живой машине");
 });

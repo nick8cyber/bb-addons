@@ -6,7 +6,7 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HOOK_NAME = "reference-transaction";
@@ -14,18 +14,6 @@ const dir = dirname(fileURLToPath(import.meta.url));
 
 function chainLocal() {
   const candidates = [];
-  if (process.env.GIT_DIR) {
-    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
-  }
-  try {
-    const common = execFileSync(
-      "git",
-      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { encoding: "utf8" },
-    ).trim();
-    if (common) candidates.push(join(common, "hooks", HOOK_NAME));
-  } catch {}
-
   const chainFile = join(dir, "chain.json");
   if (existsSync(chainFile)) {
     try {
@@ -43,6 +31,18 @@ function chainLocal() {
       }
     } catch {}
   }
+
+  if (process.env.GIT_DIR) {
+    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
+  }
+  try {
+    const common = execFileSync(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { encoding: "utf8" },
+    ).trim();
+    if (common) candidates.push(join(common, "hooks", HOOK_NAME));
+  } catch {}
 
   const self = fileURLToPath(import.meta.url);
   for (const c of candidates) {
@@ -75,7 +75,10 @@ if (state === "prepared") {
 
   if (isLiveCopy) {
     const home = process.env.HOME ?? "/home/ubuntu";
+    const repoBase = basename(cwd);
     const candidates = [
+      join(dirname(cwd), `.token-${repoBase}`),
+      join(home, ".bb", "plugin-live", `.token-${repoBase}`),
       join(dirname(cwd), ".token"),
       join(dirname(gitDir), ".token"),
       join(dirname(dirname(gitDir)), ".token"),
@@ -91,8 +94,8 @@ if (state === "prepared") {
           try {
             const raw = JSON.parse(readFileSync(tokenFile, "utf8"));
             if (raw.token && raw.token === envToken) {
-              const notExpired = !raw.expiresAt || raw.expiresAt > Date.now();
-              const repoMatches = !raw.repo || cwd.startsWith(raw.repo) || raw.repo.startsWith(cwd);
+              const notExpired = typeof raw.expiresAt === "number" && raw.expiresAt > Date.now();
+              const repoMatches = typeof raw.repo === "string" && raw.repo.length > 0 && resolve(raw.repo) === resolve(cwd);
               if (notExpired && repoMatches) {
                 hasToken = true;
                 break;

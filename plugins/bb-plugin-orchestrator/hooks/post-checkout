@@ -55,18 +55,6 @@ async function openDb(dbPath) {
 
 function chainLocal() {
   const candidates = [];
-  if (process.env.GIT_DIR) {
-    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
-  }
-  try {
-    const common = execFileSync(
-      "git",
-      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { encoding: "utf8" },
-    ).trim();
-    if (common) candidates.push(join(common, "hooks", HOOK_NAME));
-  } catch {}
-
   const chainFile = join(dir, "chain.json");
   if (existsSync(chainFile)) {
     try {
@@ -84,6 +72,17 @@ function chainLocal() {
       }
     } catch {}
   }
+  if (process.env.GIT_DIR) {
+    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
+  }
+  try {
+    const common = execFileSync(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { encoding: "utf8" },
+    ).trim();
+    if (common) candidates.push(join(common, "hooks", HOOK_NAME));
+  } catch {}
 
   const self = fileURLToPath(import.meta.url);
   for (const c of candidates) {
@@ -204,19 +203,37 @@ if (threadId && isBranchCheckout) {
             );
           } catch {}
 
-          let notifyTarget = null;
+          const targets = new Set();
           try {
             const h = db.prepare("SELECT caller_thread_id, coordinator_thread_id FROM helpers WHERE thread_id = ?").get(threadId);
-            if (h) notifyTarget = h.caller_thread_id || h.coordinator_thread_id;
-            else {
+            if (h) {
+              if (h.caller_thread_id) targets.add(h.caller_thread_id);
+              if (h.coordinator_thread_id) targets.add(h.coordinator_thread_id);
+            } else {
               const d = db.prepare("SELECT coordinator_thread_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1").get(threadId);
-              if (d) notifyTarget = d.coordinator_thread_id;
+              if (d && d.coordinator_thread_id) targets.add(d.coordinator_thread_id);
             }
           } catch {}
 
-          if (notifyTarget) {
+          const bbDbPath = join(home, ".bb", "bb.db");
+          if (existsSync(bbDbPath)) {
             try {
-              execFileSync("bb", ["thread", "tell", notifyTarget, "--message", msg], { stdio: "ignore" });
+              const bbDb = await openDb(bbDbPath);
+              if (bbDb) {
+                const thr = bbDb.prepare("SELECT parent_thread_id FROM threads WHERE id = ?").get(threadId);
+                if (thr && thr.parent_thread_id) targets.add(thr.parent_thread_id);
+                bbDb.close();
+              }
+            } catch {}
+          }
+
+          if (targets.size === 0) {
+            targets.add(threadId);
+          }
+
+          for (const target of targets) {
+            try {
+              execFileSync("bb", ["thread", "tell", target, msg], { stdio: "ignore" });
             } catch {}
           }
         }
