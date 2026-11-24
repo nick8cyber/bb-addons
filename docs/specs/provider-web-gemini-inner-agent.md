@@ -2,8 +2,8 @@
 title: provider-web-gemini — внутренний агент подготовки контекста и применения ответа
 status: approved
 date: 2026-11-18
-updated: 2026-11-22
-revision: 12 (r12 — фазовая модель дедлайнов r29 в §9: SEND_DEADLINE для негенерационных стадий и бюджета авторетрая, SESSION_CAP как потолок хода, STALL_MS как детект no-progress, GEMINI_MAX_WAIT_MS снят; PLUG-371)
+updated: 2026-11-24
+revision: 13 (r13 — чистый research-пакет §4.6: строка поиска + задача, без протокола инструментов, лимита раундов и служебных разделов BB; PLUG-404)
 tags: [bb, plugins, provider-web-gemini, acp, context]
 ---
 

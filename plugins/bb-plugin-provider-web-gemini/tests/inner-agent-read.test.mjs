@@ -2376,7 +2376,7 @@ test("research-режим: пропускает вложения трекера 
     "Исследование без скачивания вложений трекера.",
     "",
     "## Attachments",
-    "- test-attachment.md · 01M85QQVY9XWZPR2HK6JAXAVE1",
+    "- test-attachment.md · 01M00000000000000000000001",
     "",
     "## Additional instructions",
     "задача без кода: не менять файлы",
@@ -2395,7 +2395,7 @@ test("research-режим: пропускает вложения трекера 
   // Вложения трекера парсятся всегда, так как write на момент prepareTask ещё не известен
   assert.equal(prep.attachments.length, 1);
   assert.equal(prep.attachments[0].name, "test-attachment.md");
-  assert.equal(prep.attachments[0].id, "01M85QQVY9XWZPR2HK6JAXAVE1");
+  assert.equal(prep.attachments[0].id, "01M00000000000000000000001");
   assert.deepEqual(prep.attachmentOmissions, []);
 
   const nonResearchText = taskText.replace("задача без кода: не менять файлы\n", "");
@@ -2429,7 +2429,7 @@ test("research-режим: пропускает вложения трекера 
   assert.deepEqual(collected.omitted.filter((o) => o.source.includes("Tracker attachment")), []);
   const packed = packTask(prep, collected, packageOptions);
   assert.doesNotMatch(packed.message, /test-attachment\.md/);
-  assert.doesNotMatch(packed.message, /01M85QQVY9XWZPR2HK6JAXAVE1/);
+  assert.doesNotMatch(packed.message, /01M00000000000000000000001/);
 
   // Случай research с записью (context.write = { allowedPaths: [] }): вложение парсится и попадает в materials
   const mockCli = join(tmp, "mock-bb.mjs");
@@ -2441,7 +2441,7 @@ test("research-режим: пропускает вложения трекера 
     "    task: { key: args[2] },\n" +
     "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
     "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
-    '    attachments: [{ id: "01M85QQVY9XWZPR2HK6JAXAVE1", fileName: "test-attachment.md" }],\n' +
+    '    attachments: [{ id: "01M00000000000000000000001", fileName: "test-attachment.md" }],\n' +
     "  }));\n" +
     '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
     '  const outIdx = args.indexOf("--out");\n' +
