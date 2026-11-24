@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import * as webTools from "./src/web-tools.mjs";
-import { checkedAnswer, collectTask, collectTaskAttachments, formatTaskToolResult, loadSettings, packTask, prepareTask, taskInstruction, taskThread, taskTool } from "./src/inner-context.mjs";
+import { checkedAnswer, collectTask, collectTaskAttachments, filterServiceLines, formatTaskToolResult, loadSettings, packTask, prepareTask, SEARCH_DIRECTIVE, taskInstruction, taskThread, taskTool } from "./src/inner-context.mjs";
 import { gatherAgentContext } from "./src/fast-agent.mjs";
 import { collectDiff } from "./src/review-git.mjs";
 import * as journal from "./src/turn-journal.mjs";
@@ -1762,24 +1762,28 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       // spill-файлом, поручение обязано поместиться (§5.2).
       const buildRedelivery = (instruction) => {
         const stored = task.resume.pkg;
+        const isLight = context.research && !write;
         let prior;
         try {
           prior = journal.readExchanges(STATE_DIR, tj.sessKey, tj.turn.turnNo)
-            .map((entry) => context.settings.mask(entry.text)).filter(Boolean).join("\n");
+            .map((entry) => isLight ? context.settings.maskResearch(entry.text, context.key) : context.settings.mask(entry.text))
+            .filter(Boolean).join("\n");
         } catch {
           throw new TaskTurnError("recovery: saved exchange log is missing or corrupt");
         }
         if (task.resume.exact && !prior && Buffer.byteLength(stored.message) <= messageLimit) return stored;
-        const heading = "\n\n=== Продолжение прерванного хода / Resumed turn ===\n";
-        const tail = "=== Поручение / Instruction ===\n" + instruction;
+        const heading = isLight ? "\n\n" : "\n\n=== Продолжение прерванного хода / Resumed turn ===\n";
+        const tail = isLight ? (instruction ? "\n\n" + instruction : "") : ("=== Поручение / Instruction ===\n" + instruction);
         let extraFiles = [];
         let message = stored.message + heading + (prior ? prior + "\n\n" : "") + tail;
         if (Buffer.byteLength(message) > messageLimit) {
           const spill = webTools.writeSpillPackage(UPLOADS_DIR, randomUUID(), stored.message + heading + prior);
           task.ownedFiles.push(spill.pkgPath);
           extraFiles = [spill.pkgPath];
-          message = "Resume the interrupted task: the complete saved package and prior tool results are in the attached " +
-            spill.pkgName + ".\n\n" + tail;
+          message = isLight
+            ? (SEARCH_DIRECTIVE + "\n\nRead the entire task in the attached " + spill.pkgName + "." + (instruction ? "\n\n" + instruction : ""))
+            : ("Resume the interrupted task: the complete saved package and prior tool results are in the attached " +
+              spill.pkgName + ".\n\n" + tail);
         }
         if (Buffer.byteLength(message) > messageLimit) {
           throw new TaskTurnError("recovery: saved instruction does not fit the web textbox limit");
@@ -2815,9 +2819,12 @@ async function runBoundPrompt(msg, session) {
       // convId восстанавливается только на прежнем backend вне cooldown;
       // иначе ход получает повторную доставку сохранённого пакета в новый чат.
       const useConv = Boolean(plan.turn.convId) && convBackendUsable(plan.turn.backendId);
+      const isLightResearch = context.research && !context.write;
       task.resume = {
         convId: useConv ? turn.convId : null, pkg: plan.pkg, exact: plan.exact,
-        instruction: plan.exact ? "Continue the original task from the saved package." : context.settings.mask(text),
+        instruction: plan.exact
+          ? (isLightResearch ? "Продолжай выполнение задачи." : "Continue the original task from the saved package.")
+          : (isLightResearch ? context.settings.maskResearch(filterServiceLines(text), context.key) : context.settings.mask(text)),
       };
       session.convId = task.resume.convId;
       session.backend = useConv ? BACKENDS.find((b) => b.id === turn.backendId) : null;

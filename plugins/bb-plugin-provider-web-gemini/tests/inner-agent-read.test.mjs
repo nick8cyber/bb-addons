@@ -1920,58 +1920,8 @@ test("офлайн-тест сборки research-пакета на seed-1938.md
   const tmp = mkdtempSync(join(tmpdir(), "web-gemini-seed-1938-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
 
-  const primarySeedPath = join(process.env.HOME || ("/" + "home/ubuntu"), ".bb/thread-storage", "t" + "hr_6xrjsqv2se/plug404/seed-1938.md");
-  const taskText = existsSync(primarySeedPath) ? readFileSync(primarySeedPath, "utf8") : [
-    "# PLUG-399 · research: рейтинг бесплатных моделей для кодинга (OpenCode Zen, Kilo, OpenRouter, Nous, Radeon, NVIDIA build) по первичным бенчмаркам",
-    "",
-    "## Description",
-    "",
-    "Исследование для политики оркестратора (слово владельца 24.11): отранжировать бесплатные модели по результативности **для кодинга агентом** (правки в репозитории, инструменты, длинный контекст).",
-    "",
-    "## Требования",
-    "- Только первичные и проверяемые источники: официальные лидерборды и репозитории бенчмарков (SWE-bench Verified / Pro, Terminal-Bench 2, LiveCodeBench, Aider Polyglot, SWE-Lancer, BFCL для tool calling), model cards и техотчёты разработчиков, независимые прогоны (Artificial Analysis, LMArena WebDev, OpenRouter rankings по реальному использованию в coding-агентах). Для каждой цифры — ссылка, версия бенчмарка, дата, harness/scaffold.",
-    "- Ничего из головы. Нет данных — пиши «нет данных», не оценивай.",
-    "- Если одна и та же модель доступна у нескольких провайдеров — объедини в одну строку, перечисли провайдеров.",
-    "- Отметь модели-«роутеры» (kilo-auto/free, openrouter/free, big-pickle): бенчмарков у них нет, укажи, что известно о том, куда они маршрутизируют.",
-    "",
-    "## Модели (живые на стенде 24.11)",
-    "**OpenCode Zen (free):** beam-free, big-pickle, deepseek-v4.1-flash-free, flint-40b-free, hy4-flash-free, iceman-free, mimo-v2.6-flash-free, nemotron-3.5-lightning-free, nemotron-3.5-super-vl-free, tidepool-alpha-free.",
-    "**Kilo Gateway (free):** kilo-auto/free, nvidia/nemotron-3.5-lightning, nvidia/nemotron-3-ultra-550b-a55b, nvidia/nemotron-3.5-super-vl, nvidia/nemotron-3-nano-omni-30b-a3b-reasoning, inclusionai/ling-3.2-flash, baidu/ernie-5.5-flash-preview, reflection/beam-free, recursive/flint-v1.0, particle-ai/particle-1, dots-studio/dots-3-note-preview, liquid/lfm-3-1.7b, humansand/ampersand-v0.1, stealth/glyph-cluster.",
-    "**OpenRouter (free):** openrouter/free, google/gemma-4-31b-it, google/gemma-4-26b-a4b-it, nvidia/nemotron-3.5-lightning, nvidia/nemotron-3-ultra-550b-a55b, nvidia/nemotron-3.5-super-vl, nvidia/nemotron-3-nano-omni-30b-a3b-reasoning, inclusionai/ling-3.2-flash, baidu/ernie-5.5-flash-preview, dots-studio/dots-3-note-preview, particle-ai/particle-1, recursive/flint-v1.0, liquid/lfm-3-1.7b.",
-    "**Nous Portal (free):** meituan/longcat-2.5, tencent/hy4-flash, stepfun/step-3.7-flash, upstage/solar-mini4.",
-    "**Radeon Cloud:** DeepSeek-V4-Flash, DeepSeek-V4.1-Flash, GLM-5.3-Flash, Gemma-4-31B-IT, MiMo-V2.6-Flash, Qwen3.8-27B, MiniCPM-V-4.7-35B-A3B, MiniCPM5-2B, Clef, d3, d3-flash.",
-    "**NVIDIA build (NIM free):** moonshotai/kimi-k3.1-pro, mistralai/mistral-large-4-1t-a52b, stepfun-ai/step-5-preview, minimaxai/minimax-m3.1-flash, z-ai/glm-5.3-flash, nvidia/nemotron-3-ultra-550b-a55b, nvidia/nemotron-3.5-super-vl-120b-a12b, nvidia/nemotron-3.5-lightning-30b-a3b, nvidia/nemotron-3.5-bolt-e4b, nvidia/nemotron-3-nano-omni-30b-a3b-reasoning, poolside/laguna-xs-2.1, meta/muse-glimmer-30b, google/gemma-4-31b-it, bigcode/starcoder2-15b.",
-    "",
-    "## Сдача",
-    "1. Таблица: модель · провайдеры · SWE-bench Verified/Pro · Terminal-Bench · LiveCodeBench · Aider · tool calling · контекст · источники (ссылки) · дата.",
-    "2. Общий рейтинг для кодинга агентом (1…N) с объяснением, на каких цифрах он основан; отдельно модели «нет данных».",
-    "3. Рекомендация: топ-5 для уровня medium (обычные фичи) и топ-5 для simple (механика), только из моделей с данными.",
-    "",
-    "## Project context",
-    "",
-    "- Name: BB Plugins",
-    "- Linked bb project: " + "p" + "roj_at84bcu8q7",
-    "",
-    "## Sub-tasks",
-    "",
-    "None.",
-    "",
-    "## Attachments",
-    "",
-    "None.",
-    "",
-    "## Recent comments",
-    "",
-    "None.",
-    "",
-    "## Report-back contract",
-    "",
-    "You are working on task PLUG-399. Use the bb tasks CLI: comment substantive updates (bb tasks comment PLUG-399 --body ...), attach result artifacts, set status when done (bb tasks update PLUG-399 --status in_review) or explain blockage in a comment. Your thread is already attached to the task.",
-    "",
-    "## Additional instructions",
-    "",
-    "задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт",
-  ].join("\n");
+  const fixtureSeedPath = fileURLToPath(new URL("./fixtures/seed-1938.md", import.meta.url));
+  const taskText = readFileSync(fixtureSeedPath, "utf8");
 
   const prep = await prepareTask({
     text: taskText,
@@ -2036,4 +1986,146 @@ test("filterServiceLines: фильтрует закрытый список сл�
 
   const filtered = filterServiceLines(sample);
   assert.equal(filtered, "Сохранить этот текст вопроса.\nИ эту строку тоже.");
+
+  // Проверка замечания 5: /^\s*(?:Работа с git|Git work):/ без i и без пропуска :
+  // Строка без двоеточия или в другом регистре не считается началом блока git.
+  const falseMatches = [
+    "git work is very important",
+    "работа с git без двоеточия",
+    "Git work without colon",
+  ].join("\n");
+  assert.equal(filterServiceLines(falseMatches), falseMatches);
+});
+
+test("research-пакет включает встроенные ACP resource-вложения без маркеров === (PLUG-404 п. 1)", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-resource-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const taskText = [
+    "# PLUG-404 · research: проверка вложений",
+    "",
+    "## Description",
+    "Текст задачи исследования.",
+    "",
+    "## Additional instructions",
+    "задача без кода: файлы репозитория не менять",
+  ].join("\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+
+  const blocks = [
+    { type: "resource", resource: { uri: "memo://notes.txt", text: "Содержимое ресурсного блока ACP." } },
+  ];
+
+  const packageOptions = {
+    limit: 100_000,
+    maxTotalBytes: 100_000,
+    spillDir: tmp,
+    ownedFiles: [],
+    signal: new AbortController().signal,
+    maxUploadBytes: 50_000,
+    maxUploadCount: 5,
+    validateUploads: () => ({ files: [] }),
+  };
+  const materials = await collectTaskAttachments(prep, blocks, packageOptions);
+  const collected = await collectTask(prep, blocks, materials, packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  // Ресурсный блок включён в текст сообщения
+  assert.ok(packed.message.includes("Содержимое ресурсного блока ACP."), "содержимое resource-блока должно быть в сообщении");
+  // Без маркеров ===
+  assert.doesNotMatch(packed.message, /===/);
+  // Первая строка — поисковая директива
+  assert.match(packed.message.split("\n")[0], /^Найди ответ в интернете через поиск Google/);
+});
+
+test("research-пакет при переполнении лимита переливается в файл, сохраняя строку поиска (PLUG-404 п. 3)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-spill-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const taskText = [
+    "# PLUG-404 · research: длинная задача для перелива",
+    "",
+    "## Description",
+    "Очень длинное описание задачи. ".repeat(50),
+    "",
+    "## Additional instructions",
+    "задача без кода: файлы репозитория не менять",
+  ].join("\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+
+  // Задаём маленький лимит сообщения (500 байт), чтобы гарантировать spill
+  const packageOptions = { limit: 500, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  // В сообщении остаётся строка поиска + указатель на приложенный файл без упоминания манифеста
+  assert.match(packed.message.split("\n")[0], /^Найди ответ в интернете через поиск Google/);
+  assert.match(packed.message, /Read the entire task in the attached pkg-[0-9a-f-]+\.md\./);
+  assert.doesNotMatch(packed.message, /manifest/i);
+  assert.equal(packed.files.length, 1);
+  assert.ok(existsSync(packed.files[0]));
+});
+
+test("research-пакет не обрезает Preset/Additional instructions на авторском ## (PLUG-404 п. 4)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-subheading-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const taskText = [
+    "# PLUG-404 · research: сохранение авторских ## подзаголовков",
+    "",
+    "## Description",
+    "Основное описание.",
+    "",
+    "## Preset instructions",
+    "Вводная часть пресета.",
+    "## Авторский подраздел в пресете",
+    "Содержимое авторского подраздела пресета.",
+    "",
+    "## Additional instructions",
+    "задача без кода: файлы репозитория не менять",
+    "Вводная часть дополнительных инструкций.",
+    "## Авторский подраздел в дополнительных",
+    "Содержимое авторского подраздела дополнительных инструкций.",
+    "",
+    "## Report-back contract",
+    "Служебный раздел контракта, который должен быть отсечён.",
+  ].join("\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+
+  const packageOptions = { limit: 100_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  assert.ok(packed.message.includes("## Авторский подраздел в пресете"), "авторский ## подраздел в Preset должен быть сохранён");
+  assert.ok(packed.message.includes("Содержимое авторского подраздела пресета."), "содержимое авторского ## в Preset должно быть сохранено");
+  assert.ok(packed.message.includes("## Авторский подраздел в дополнительных"), "авторский ## подраздел в Additional должен быть сохранён");
+  assert.ok(packed.message.includes("Содержимое авторского подраздела дополнительных инструкций."), "содержимое авторского ## в Additional должно быть сохранено");
+  assert.doesNotMatch(packed.message, /Report-back/);
+  assert.doesNotMatch(packed.message, /Служебный раздел контракта/);
 });

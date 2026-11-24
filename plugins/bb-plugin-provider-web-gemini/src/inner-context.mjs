@@ -36,6 +36,7 @@ export const BB_SERVICE_HEADINGS = [
   "## Report-back contract",
   "## Preset instructions",
   "## Additional instructions",
+  "## Дополнительные инструкции",
 ];
 const bytes = (text) => Buffer.byteLength(text);
 const digest = (text) => createHash("sha256").update(text).digest("hex");
@@ -527,7 +528,7 @@ export function filterServiceLines(text) {
       }
       continue;
     }
-    if (/^\s*(?:Работа с git|Git work):?/i.test(line)) {
+    if (/^\s*(?:Работа с git|Git work):/.test(line)) {
       inGit = true;
       continue;
     }
@@ -553,8 +554,7 @@ export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) 
 
   if (!isBbTemplate) {
     const filtered = filterServiceLines(text);
-    const raw = isFirstTurn ? [SEARCH_DIRECTIVE, filtered].filter(Boolean).join("\n\n") : filtered;
-    return mask(raw);
+    return mask(filtered);
   }
 
   if (!isFirstTurn) {
@@ -572,7 +572,7 @@ export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) 
   let presetText = "";
   const presetIdx = lines.findIndex((l) => /^##\s+Preset instructions[ \t]*$/i.test(l));
   if (presetIdx !== -1) {
-    const nextIdx = lines.findIndex((l, idx) => idx > presetIdx && /^##\s+/.test(l));
+    const nextIdx = lines.findIndex((l, idx) => idx > presetIdx && isServiceHeading(l));
     const rawPreset = lines.slice(presetIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
     presetText = filterServiceLines(rawPreset);
   }
@@ -580,13 +580,12 @@ export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) 
   let addText = "";
   const addIdx = lines.findIndex((l) => /^##\s+(?:Additional instructions|Дополнительные инструкции)[ \t]*$/i.test(l));
   if (addIdx !== -1) {
-    const nextIdx = lines.findIndex((l, idx) => idx > addIdx && /^##\s+/.test(l));
+    const nextIdx = lines.findIndex((l, idx) => idx > addIdx && isServiceHeading(l));
     const rawAdd = lines.slice(addIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
     addText = filterServiceLines(rawAdd);
   }
 
   const parts = [
-    SEARCH_DIRECTIVE,
     firstNonEmpty,
     descText,
     presetText,
@@ -605,13 +604,19 @@ function renderTaskPackage(context, collected, options, supplements, agentOmissi
 
   if (light) {
     const isFirstTurn = options.isFirstTurn !== false;
-    const body = buildCleanResearchPackage(context, { isFirstTurn });
+    const taskBody = buildCleanResearchPackage(context, { isFirstTurn });
+    const extraCore = (collected.core ?? [])
+      .filter(({ entry }) => entry?.source !== "Task text" && entry?.delivery === "package")
+      .map(({ text }) => text);
+    const body = [taskBody, ...extraCore].filter(Boolean).join("\n\n");
+    const header = isFirstTurn ? SEARCH_DIRECTIVE : "";
     const { message, payload, spilledFile } = tools.packFirstMessage({
       maxBytes: limit,
       spillDir,
       spillId: randomUUID(),
       completePackage: {
-        header: "",
+        header,
+        manifest: false,
         render: () => body,
       },
     });

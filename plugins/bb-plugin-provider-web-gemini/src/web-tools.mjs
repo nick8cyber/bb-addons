@@ -1416,7 +1416,10 @@ export function packFirstMessage({
     if (Buffer.byteLength(message) <= maxBytes) return { message, payload };
     payload = render("spill attachment");
     const { pkgName, pkgPath } = writeSpillPackage(spillDir, spillId, payload);
-    message = header ? header + "\n\nRead the entire task and its manifest in the attached " + pkgName + "." : "Read the entire task in the attached " + pkgName + ".";
+    const notice = completePackage.manifest === false
+      ? "Read the entire task in the attached " + pkgName + "."
+      : "Read the entire task and its manifest in the attached " + pkgName + ".";
+    message = header ? header + "\n\n" + notice : notice;
     return { message, payload, spilledFile: pkgPath };
   }
   const seen = new Set();
