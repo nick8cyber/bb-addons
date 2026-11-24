@@ -2129,3 +2129,188 @@ test("research-пакет не обрезает Preset/Additional instructions �
   assert.doesNotMatch(packed.message, /Report-back/);
   assert.doesNotMatch(packed.message, /Служебный раздел контракта/);
 });
+
+test("research-пакет: авторский ## Дополнительные инструкции в Description не отсекает настоящий ## Additional instructions (PLUG-404 п. 1)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-desc-add-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const taskText = [
+    "# PLUG-404 · research: авторские инструкции в Description",
+    "",
+    "## Description",
+    "Основное описание задачи.",
+    "",
+    "## Дополнительные инструкции",
+    "Авторский текст внутри описания, который должен остаться в теле задачи.",
+    "",
+    "## Project context",
+    "- Name: BB Plugins",
+    "",
+    "## Recent comments",
+    "Служебный комментарий.",
+    "",
+    "## Additional instructions",
+    "задача без кода: не менять файлы",
+    "Настоящие инструкции координатора в хвосте пакета.",
+  ].join("\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+
+  const packageOptions = { limit: 100_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  assert.ok(packed.message.includes("## Дополнительные инструкции"), "авторский ## Дополнительные инструкции должен остаться в Description");
+  assert.ok(packed.message.includes("Авторский текст внутри описания"), "текст авторского подраздела должен остаться");
+  assert.ok(packed.message.includes("Настоящие инструкции координатора в хвосте пакета."), "настоящие Additional instructions должны быть в пакете");
+  assert.doesNotMatch(packed.message, /Project context/);
+  assert.doesNotMatch(packed.message, /Recent comments/);
+  assert.doesNotMatch(packed.message, /Служебный комментарий/);
+  assert.doesNotMatch(packed.message, /задача без кода/);
+});
+
+test("research-пакет: URL и @thread в вырезанных разделах Recent comments и Attachments не попадают в пакет и не вызывают чтение тредов (PLUG-404 п. 2)", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-links-leak-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const foreignThreadRef = "@thread:" + "t" + "hr_foreign999#msg=1";
+  const attachThreadRef = "@thread:" + "t" + "hr_attach999#msg=2";
+  const foreignId = "t" + "hr_foreign999";
+  const attachId = "t" + "hr_attach999";
+
+  const taskText = [
+    "# PLUG-404 · research: ссылки в вырезанных разделах",
+    "",
+    "## Description",
+    "Исследовать чистый контекст задачи.",
+    "",
+    "## Attachments",
+    "Ссылка в вложениях: https://github.com/example/repo/issues/456",
+    "Тред во вложениях: " + attachThreadRef,
+    "",
+    "## Recent comments",
+    "Ссылка на внешний PR: https://github.com/example/repo/pull/999",
+    "Ссылка на несуществующий тред: " + foreignThreadRef,
+    "",
+    "## Additional instructions",
+    "задача без кода: не менять файлы",
+    "Исследовать вопрос библиотек.",
+  ].join("\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+
+  const blocks = [
+    { type: "resource", resource: { uri: "memo://embedded.txt", text: "Embedded ACP resource content" } },
+  ];
+
+  const packageOptions = {
+    limit: 100_000,
+    maxTotalBytes: 100_000,
+    spillDir: tmp,
+    ownedFiles: [],
+    signal: new AbortController().signal,
+    maxUploadBytes: 50_000,
+    maxUploadCount: 5,
+    validateUploads: () => ({ files: [] }),
+  };
+
+  const materials = await collectTaskAttachments(prep, blocks, packageOptions);
+  const collected = await collectTask(prep, blocks, materials, packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  assert.doesNotMatch(packed.message, /https:\/\/github\.com\/example\/repo\/pull\/999/);
+  assert.doesNotMatch(packed.message, /https:\/\/github\.com\/example\/repo\/issues\/456/);
+  assert.ok(!packed.message.includes(foreignId));
+  assert.ok(!packed.message.includes(attachId));
+  assert.doesNotMatch(packed.message, /Explicit link/);
+  assert.doesNotMatch(packed.message, /Linked BB material/);
+  assert.ok(packed.message.includes("Embedded ACP resource content"));
+});
+
+test("research-пакет: авторский заголовок в нижнем регистре ## attachments в Description не отсекается (PLUG-404 п. 3)", async (t) => {
+  const { collectTask, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "web-gemini-case-heading-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const taskText = [
+    "# PLUG-404 · research: авторский заголовок в нижнем регистре",
+    "",
+    "## Description",
+    "Описание задачи с авторским подразделом.",
+    "",
+    "## attachments",
+    "Авторский текст списка вложений внутри описания.",
+    "",
+    "## Project context",
+    "- Name: BB Plugins",
+    "",
+    "## Additional instructions",
+    "задача без кода: не менять файлы",
+    "Финальный вопрос исследования.",
+  ].join("\n");
+
+  const prep = await prepareTask({
+    text: taskText,
+    system: null,
+    session: { cwd: tmp },
+    thread: { thread: { id: threadId, projectId }, environment: { path: tmp } },
+    stateDir: tmp,
+  });
+
+  assert.equal(prep.research, true);
+
+  const packageOptions = { limit: 100_000, maxTotalBytes: 100_000, spillDir: tmp, ownedFiles: [] };
+  const collected = await collectTask(prep, [], [], packageOptions);
+  const packed = packTask(prep, collected, packageOptions);
+
+  assert.ok(packed.message.includes("## attachments"), "авторский ## attachments в нижнем регистре должен остаться в Description");
+  assert.ok(packed.message.includes("Авторский текст списка вложений внутри описания."), "содержимое ## attachments должно остаться");
+  assert.ok(packed.message.includes("Финальный вопрос исследования."), "Additional instructions должны остаться");
+  assert.doesNotMatch(packed.message, /Project context/);
+});
+
+test("research-пакет: при пустом ответе повторный запрос отправляет короткое 'Дай полный ответ с источниками и датами' без tool calls (PLUG-404 п. 4)", async (t) => {
+  const repo = setup(t);
+  const app = fixture(t, repo, (request) => {
+    if (request.count === 1) return { text: "" };
+    return { text: "Полный ответ с источниками https://example.com/source 2026-11-24." };
+  }, { settings: { apply: { maxRepairRounds: 2 } } });
+
+  const session = await app.newSession();
+  const taskText = [
+    "# PLUG-404 · research: повторный запрос при пустом ответе",
+    "",
+    "## Description",
+    "Найти факт в интернете.",
+    "",
+    "## Additional instructions",
+    "задача без кода: не менять файлы",
+  ].join("\n");
+
+  const result = await app.prompt(session, taskText);
+  assert.equal(result.result?.stopReason, "end_turn");
+  assert.equal(app.requests().length, 2);
+  const secondPrompt = app.requests()[1].prompt;
+  assert.match(secondPrompt, /^Дай полный ответ с источниками и датами\.$/);
+  assert.doesNotMatch(secondPrompt, /tool/i);
+  assert.doesNotMatch(secondPrompt, /envelope/i);
+  assert.doesNotMatch(secondPrompt, /Correct the previous reply/i);
+});

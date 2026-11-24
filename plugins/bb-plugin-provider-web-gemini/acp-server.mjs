@@ -2231,9 +2231,12 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 if (final.denied) throw new TaskTurnError(final.denied);
                 if ((budgets.repairRounds ?? 0) >= maxRepairRounds) throw new TaskTurnError(final.repair);
                 task.ping("request_more");
-                const repairMessage = "Correct the previous reply. " + final.repair + ". " +
-                  (write ? fileRepairInstruction(context, candidate, final.plan)
-                    : "Return the complete publishable final answer without tool calls or file envelopes.\n") + contract;
+                const isLightResearch = context.research && !write;
+                const repairMessage = isLightResearch
+                  ? "Дай полный ответ с источниками и датами."
+                  : "Correct the previous reply. " + final.repair + ". " +
+                    (write ? fileRepairInstruction(context, candidate, final.plan)
+                      : "Return the complete publishable final answer without tool calls or file envelopes.\n") + contract;
                 budgets.repairRounds = (budgets.repairRounds ?? 0) + 1;
                 persistJournal();
                 recordExchange({ kind: "repair", text: repairMessage });

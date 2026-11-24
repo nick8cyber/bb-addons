@@ -36,7 +36,6 @@ export const BB_SERVICE_HEADINGS = [
   "## Report-back contract",
   "## Preset instructions",
   "## Additional instructions",
-  "## Дополнительные инструкции",
 ];
 const bytes = (text) => Buffer.byteLength(text);
 const digest = (text) => createHash("sha256").update(text).digest("hex");
@@ -478,7 +477,8 @@ export async function collectTask(context, blocks, materials, options) {
     omit("Tracker attachment: " + item.line, item.reason);
   }
 
-  for (const link of explicitLinks(context, blocks)) {
+  const linkSourceText = isLightResearch ? buildCleanResearchPackage(context) : context.text;
+  for (const link of explicitLinks({ ...context, text: linkSourceText }, isLightResearch ? [] : blocks)) {
     signal.throwIfAborted();
     add("Explicit link", link, { at: "task or ACP input", included: "reference" });
     const call = linkCall(link);
@@ -549,7 +549,7 @@ export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) 
   const lines = text.split(/\r?\n/);
   const firstNonEmpty = lines.find((l) => l.trim() !== "");
   const hasTaskHeader = firstNonEmpty ? /^#\s+[A-Z][A-Z0-9]{1,9}-\d+\s+·\s+/.test(firstNonEmpty) : false;
-  const descIdx = lines.findIndex((l) => /^##\s+Description[ \t]*$/i.test(l));
+  const descIdx = lines.findIndex((l) => l.replace(/[ \t\r]+$/, "") === "## Description");
   const isBbTemplate = hasTaskHeader && descIdx !== -1;
 
   if (!isBbTemplate) {
@@ -562,15 +562,15 @@ export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) 
     return mask(filtered);
   }
 
-  const SERVICE_HEADINGS_SET = new Set(BB_SERVICE_HEADINGS.map((h) => h.toLowerCase()));
-  const isServiceHeading = (line) => /^##\s+/.test(line) && SERVICE_HEADINGS_SET.has(line.trim().toLowerCase());
+  const SERVICE_HEADINGS_SET = new Set(BB_SERVICE_HEADINGS);
+  const isServiceHeading = (line) => SERVICE_HEADINGS_SET.has(line.replace(/[ \t\r]+$/, ""));
   let firstServiceIdx = lines.findIndex((l, idx) => idx > descIdx && isServiceHeading(l));
   if (firstServiceIdx === -1) firstServiceIdx = lines.length;
 
   const descText = lines.slice(descIdx + 1, firstServiceIdx).join("\n").trim();
 
   let presetText = "";
-  const presetIdx = lines.findIndex((l) => /^##\s+Preset instructions[ \t]*$/i.test(l));
+  const presetIdx = lines.findIndex((l, idx) => idx >= firstServiceIdx && l.replace(/[ \t\r]+$/, "") === "## Preset instructions");
   if (presetIdx !== -1) {
     const nextIdx = lines.findIndex((l, idx) => idx > presetIdx && isServiceHeading(l));
     const rawPreset = lines.slice(presetIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
@@ -578,7 +578,7 @@ export function buildCleanResearchPackage(context, { isFirstTurn = true } = {}) 
   }
 
   let addText = "";
-  const addIdx = lines.findIndex((l) => /^##\s+(?:Additional instructions|Дополнительные инструкции)[ \t]*$/i.test(l));
+  const addIdx = lines.findIndex((l, idx) => idx >= firstServiceIdx && l.replace(/[ \t\r]+$/, "") === "## Additional instructions");
   if (addIdx !== -1) {
     const nextIdx = lines.findIndex((l, idx) => idx > addIdx && isServiceHeading(l));
     const rawAdd = lines.slice(addIdx + 1, nextIdx === -1 ? undefined : nextIdx).join("\n");
@@ -606,7 +606,7 @@ function renderTaskPackage(context, collected, options, supplements, agentOmissi
     const isFirstTurn = options.isFirstTurn !== false;
     const taskBody = buildCleanResearchPackage(context, { isFirstTurn });
     const extraCore = (collected.core ?? [])
-      .filter(({ entry }) => entry?.source !== "Task text" && entry?.delivery === "package")
+      .filter(({ entry }) => entry?.source === "Embedded resource" && entry?.delivery === "package")
       .map(({ text }) => text);
     const body = [taskBody, ...extraCore].filter(Boolean).join("\n\n");
     const header = isFirstTurn ? SEARCH_DIRECTIVE : "";
