@@ -2,7 +2,7 @@
 title: provider-web-gemini (ранее provider-argon) — ACP-провайдер веб-интерфейса Gemini
 status: approved
 owner: coordinator
-date: 2026-11-22
+date: 2026-11-24
 revision: 33 (r33 — r27: управляемые группы браузера Chrome/Xvfb, маркеры и .lock, реапер сирот, fail-closed flock, PLUG-374; r28: §4.5 каналы сбора генерируемых файлов, отсев телеметрии/RPC, magic-bytes и canvas-fallback, PLUG-376; r29: детект стола генерации no-progress вместо wall-clock дедлайна — фазовый SEND_DEADLINE, SESSION_CAP, STALL_MS и авторетрай стола с ротацией, PLUG-371; r30: §2.3 детект прогресса мышления и поиска Gemini Web, hasActiveThinkingOrTool, PLUG-407; r31: §2.3/§4.2 изоляция спиннеров busySelector от hasActiveThinkingOrTool; r32: §2.3/§4.2 единый контракт findTurnTarget с fallback на pending-response; r33: §2.3 продление стола строго при hasStopButton && hasActiveThinkingOrTool, запрет в awaitingContent, statusText в domSig, ограничение присутствия до hasFinishedContent, PLUG-407)
 tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 ---
