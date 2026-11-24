@@ -422,8 +422,8 @@ export function createCoordinatorWorktrees(deps: CoordinatorWorktreesDeps) {
    * copy-scoped `refs/worktree/*` / `refs/bisect/*` — `rev-list
    * <positions> --not --remotes=origin`. Ancestry-only for now:
    * patch-id equivalence is a later stage, so a squash/rebase-merged
-   * copy conservatively stays `unpushed-commits` — the «kept (squash)»
-   * outcome §16.9 п.2 prescribes anyway.
+   * copy conservatively stays `unpushed-commits` — as §16.9 п.2
+   * prescribes for the current stage.
    */
   const evaluate = async (
     binding: CoordinatorWorktreeRow,
