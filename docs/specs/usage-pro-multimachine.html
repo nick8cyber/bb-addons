@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --ok: var(--chart-1, #3b82f6); --warn: var(--warning, #eab308); --bad: var(--destructive, #ef4444); }
+  .wrap { display: flex; flex-direction: column; gap: 22px; font-family: var(--font-sans); color: var(--foreground); }
+  .row { display: flex; gap: 22px; flex-wrap: wrap; align-items: flex-start; }
+  .cap { font-size: 12px; color: var(--muted-foreground); margin: 0 0 8px; letter-spacing: .02em; }
+  .cap b { color: var(--foreground); font-weight: 600; }
+
+  /* футер сайдбара */
+  .footer { width: 300px; padding: 16px; border-radius: var(--radius); background: var(--surface-recessed, var(--muted)); display: flex; align-items: center; gap: 10px; }
+  .ico { width: 16px; height: 16px; border-radius: 4px; background: var(--muted-foreground); opacity: .5; }
+  .pill { margin-left: auto; display: flex; align-items: center; gap: 8px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px; font-size: 11px; background: var(--background); }
+  .pm { display: flex; align-items: center; gap: 5px; }
+  .pm .lbl { color: var(--muted-foreground); }
+  .mini { width: 26px; height: 5px; border-radius: 3px; background: var(--muted); overflow: hidden; }
+  .mini i { display: block; height: 100%; border-radius: 3px; }
+  .sep { width: 1px; height: 12px; background: var(--border); }
+
+  /* поповер */
+  .pop { width: 320px; padding: 16px; border-radius: var(--radius); background: var(--popover); color: var(--popover-foreground); border: 1px solid var(--border); box-shadow: var(--shadow-lg); display: flex; flex-direction: column; gap: 12px; }
+  .head { display: flex; align-items: center; gap: 8px; }
+  .tabs { display: flex; gap: 4px; }
+  .tab { padding: 4px 9px; border-radius: 6px; font-size: 12px; color: var(--muted-foreground); }
+  .tab.on { background: var(--accent); color: var(--accent-foreground); font-weight: 600; }
+  .src { margin-left: auto; font-size: 12px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; display: flex; gap: 6px; align-items: center; }
+  .src .chev { opacity: .6; }
+  .hint { font-size: 12px; padding: 8px 10px; border-radius: 8px; background: color-mix(in srgb, var(--success, #22c55e) 12%, transparent); color: var(--foreground); }
+  .hint b { color: var(--success, #22c55e); }
+  .list { display: flex; flex-direction: column; gap: 10px; max-height: 360px; overflow: auto; }
+  .mach { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: var(--card); }
+  .mh { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success, #22c55e); }
+  .dot.off { background: var(--muted-foreground); }
+  .role { font-size: 10px; font-weight: 500; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted-foreground); }
+  .plan { margin-left: auto; font-size: 11px; font-weight: 500; color: var(--muted-foreground); }
+  .acct { font-size: 11px; color: var(--muted-foreground); margin-top: -4px; }
+  .win { display: flex; flex-direction: column; gap: 3px; }
+  .wl { display: flex; font-size: 12px; }
+  .wl .pct { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .bar { height: 6px; border-radius: 3px; background: var(--muted); overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 3px; }
+  .reset { font-size: 10.5px; color: var(--subtle-foreground, var(--muted-foreground)); }
+  .state { font-size: 12px; color: var(--muted-foreground); display: flex; gap: 8px; align-items: center; }
+  .btn { margin-left: auto; font-size: 11px; padding: 3px 8px; border-radius: 6px; background: var(--secondary); color: var(--secondary-foreground); }
+  .foot { display: flex; font-size: 10.5px; color: var(--muted-foreground); }
+  .foot span:last-child { margin-left: auto; }
+
+  /* меню источника */
+  .menu { width: 220px; padding: 6px; border-radius: var(--radius); background: var(--popover); border: 1px solid var(--border); box-shadow: var(--shadow-md); font-size: 13px; }
+  .mi { padding: 7px 9px; border-radius: 6px; display: flex; gap: 8px; align-items: center; }
+  .mi.on { background: var(--accent); }
+  .mi .ck { margin-left: auto; opacity: .8; }
+  .mi small { color: var(--muted-foreground); font-size: 11px; }
+  .msep { height: 1px; background: var(--border); margin: 4px 2px; }
+  .notes { font-size: 13px; line-height: 1.5; color: var(--muted-foreground); max-width: 680px; }
+  .notes b { color: var(--foreground); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div>
+    <p class="cap"><b>1. Футер сайдбара (закрыто)</b> — обе машины видны без клика: худшее окно каждой машины</p>
+    <div class="footer">
+      <span class="ico"></span><span class="ico"></span>
+      <div class="pill" title="Лимиты Claude: main / worker">
+        <span class="pm"><span class="lbl">main</span><span class="mini"><i style="width:62%;background:var(--ok)"></i></span>62%</span>
+        <span class="sep"></span>
+        <span class="pm"><span class="lbl">worker</span><span class="mini"><i style="width:18%;background:var(--ok)"></i></span>18%</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <p class="cap"><b>2. Открыто — «Все машины»</b> (по умолчанию, если машин ≥ 2)</p>
+      <div class="pop">
+        <div class="head">
+          <div class="tabs"><span class="tab on">Claude</span></div>
+          <span class="src">🖥 Все машины <span class="chev">▾</span></span>
+        </div>
+        <div class="hint">Свободнее всего: <b>worker</b> — 82% сессии осталось. Тяжёлые треды лучше запускать там.</div>
+        <div class="list">
+          <div class="mach">
+            <div class="mh"><span class="dot"></span>main <span class="role">сервер</span><span class="plan">Team</span></div>
+            <div class="acct">client@company · с IP 109.66.241.88</div>
+            <div class="win"><div class="wl">Сессия (5 ч)<span class="pct">62%</span></div><div class="bar"><i style="width:62%;background:var(--ok)"></i></div><div class="reset">Сброс: Сегодня, 04:28 · через 2ч 15м</div></div>
+            <div class="win"><div class="wl">Неделя<span class="pct">87%</span></div><div class="bar"><i style="width:87%;background:var(--warn)"></i></div><div class="reset">Сброс: 28 нояб., 04:00 · через 3д 2ч</div></div>
+          </div>
+          <div class="mach">
+            <div class="mh"><span class="dot"></span>worker <span class="role">воркер</span><span class="plan">Team</span></div>
+            <div class="acct">second@company · с IP 109.66.241.16</div>
+            <div class="win"><div class="wl">Сессия (5 ч)<span class="pct">18%</span></div><div class="bar"><i style="width:18%;background:var(--ok)"></i></div><div class="reset">Сброс: Сегодня, 03:59 · через 1ч 46м</div></div>
+            <div class="win"><div class="wl">Неделя<span class="pct">31%</span></div><div class="bar"><i style="width:31%;background:var(--ok)"></i></div><div class="reset">Сброс: 28 нояб., 04:00 · через 3д 2ч</div></div>
+          </div>
+        </div>
+        <div class="foot"><span>Обновлено 40 с назад</span><span>↻ Обновить</span></div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:22px">
+      <div>
+        <p class="cap"><b>3. Меню «Usage source»</b> — новый пункт сверху</p>
+        <div class="menu">
+          <div class="mi on">🖥 Все машины <span class="ck">✓</span></div>
+          <div class="msep"></div>
+          <div class="mi"><span class="dot"></span>main <small>сервер</small></div>
+          <div class="mi"><span class="dot"></span>worker</div>
+        </div>
+      </div>
+      <div>
+        <p class="cap"><b>4. Состояния карточки машины</b></p>
+        <div class="pop" style="width:300px;gap:10px">
+          <div class="mach">
+            <div class="mh"><span class="dot"></span>main <span class="role">сервер</span></div>
+            <div class="state">Claude не подключён<span class="btn">Как подключить</span></div>
+          </div>
+          <div class="mach">
+            <div class="mh"><span class="dot off"></span>worker <span class="role">воркер</span><span class="plan">офлайн</span></div>
+            <div class="state">Машина недоступна · данные 12 мин назад</div>
+            <div class="win" style="opacity:.55"><div class="wl">Сессия (5 ч)<span class="pct">18%</span></div><div class="bar"><i style="width:18%;background:var(--ok)"></i></div></div>
+          </div>
+          <div class="mach">
+            <div class="mh"><span class="dot"></span>worker <span class="role">воркер</span><span class="plan">Team</span></div>
+            <div class="win"><div class="wl">Сессия (5 ч)<span class="pct" style="color:var(--bad)">97%</span></div><div class="bar"><i style="width:97%;background:var(--bad)"></i></div><div class="reset">Сброс: Сегодня, 03:59 · через 12м</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <b>Правила:</b> лимиты каждой машины запрашивает сама машина (как сейчас в BB: запрос идёт через её демон), сервер чужие ключи не читает.
+    Цвета — как в Usage Pro: до 80% синий, 80–94% жёлтый, от 95% красный. В футере у каждой машины — самое заполненное окно (сессия или неделя).
+    Одна машина — вид как сейчас, без пункта «Все машины». Табы провайдеров (Codex, Antigravity) остаются; у клиента будет только Claude.
+  </div>
+</div>
+</body>
+</html>
