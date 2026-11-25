@@ -66,6 +66,7 @@ ACP-провайдер «Gemini Web» (`acp-web-gemini`, обратная сов
 Поддерживаются как целевые переменные `WEB_GEMINI_*`, так и прежние `ARGON_*` для полной обратной совместимости:
 - `WEB_GEMINI_FAKE=1` / `ARGON_FAKE=1`: офлайн-режим заглушки для тестов протокола (без запуска Chrome и пула).
 - `WEB_GEMINI_STATE_DIR` / `ARGON_STATE_DIR`: путь к каталогу состояния (по умолчанию `~/.bb/plugins/provider-web-gemini`, фолбэк: `~/.bb/plugins/provider-argon`).
+- `WEB_GEMINI_ORCHESTRATOR_DATA_DIR`: каталог данных оркестратора, используемый для приёма пакета аудита выкладки release-audit/release-<N>-audit.md (спека §4.7 п. 1). Точка входа index.mjs передаёт переменную в acpLaunchSpec.env из bb.server.experimental_dataDir. При её отсутствии поиск переходит к $BB_DATA_DIR/plugins/orchestrator, затем к ~/.bb/plugins/orchestrator.
 - `WEB_GEMINI_POOL_FILE` / `ARGON_POOL_FILE`: путь к файлу пула (по умолчанию `$STATE_DIR/pool.json`).
 - `WEB_GEMINI_BACKENDS` / `ARGON_BACKENDS`: JSON-массив описаний бэкендов в виде строки.
 - `WEB_GEMINI_SEND_DEADLINE_MS` / `ARGON_SEND_DEADLINE_MS`: дедлайн негенерационных фаз хода — collect/delivery/verify/commit и фазовый бюджет авторетрая стола (по умолчанию 1 200 000 мс — 20 минут). На время стадии generation заменяется потолком `WEB_GEMINI_SESSION_CAP_MS`.

@@ -3658,7 +3658,6 @@ test("Точка входа (PLUG-423): index.mjs передаёт WEB_GEMINI_OR
       const derived = reg.deriveProviderOptions({ threadId });
       assert.equal(derived.acpLaunchSpec.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR, "/custom/fictitious/bb-data/plugins/orchestrator");
     }
-    assert.equal(process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR, "/custom/fictitious/bb-data/plugins/orchestrator");
 
     const throwingBb = {
       server: {
@@ -3668,7 +3667,6 @@ test("Точка входа (PLUG-423): index.mjs передаёт WEB_GEMINI_OR
     };
     delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
     assert.doesNotThrow(() => plugin(throwingBb));
-    assert.equal(process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR, undefined);
   } finally {
     if (oldEnv !== undefined) process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = oldEnv;
     else delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
@@ -4021,6 +4019,26 @@ test("Вложения задачи (PLUG-423): отказы обязатель�
     await assert.rejects(
       () => collectTaskAttachments(prepSecrets, [], packageOptions),
       /mandatory audit package is sensitive path: release-207-audit\.md/,
+    );
+
+    // 8. release-audit — симлинк на директорию вне корня данных оркестратора -> отказ
+    const symlinkOrchDir = join(tmp, "symlink-orch");
+    mkdirSync(symlinkOrchDir, { recursive: true });
+    const outsideAuditDir = join(tmp, "outside-audit-dir");
+    mkdirSync(outsideAuditDir, { recursive: true });
+    const outsidePacket = join(outsideAuditDir, "release-208-audit.md");
+    writeFileSync(outsidePacket, "Valid text inside outside dir\n");
+    symlinkSync(outsideAuditDir, join(symlinkOrchDir, "release-audit"));
+    process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = symlinkOrchDir;
+
+    const textSymlinkDir = [
+      "# PLUG-423 · Symlink release-audit directory outside", "## Description", "Desc",
+      "## Additional instructions", `file ${join(symlinkOrchDir, "release-audit", "release-208-audit.md")} — read`,
+    ].join("\n");
+    const prepSymlinkDir = await prepareTask({ text: textSymlinkDir, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    await assert.rejects(
+      () => collectTaskAttachments(prepSymlinkDir, [], packageOptions),
+      /mandatory audit package outside allowed roots: release-208-audit\.md/,
     );
   } finally {
     if (oldEnv !== undefined) process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = oldEnv;

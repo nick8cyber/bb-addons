@@ -37,9 +37,6 @@ export default function plugin(bb) {
   } catch {
     // при исключении переменную не задавать (дальше шаги 2–3)
   }
-  if (orchestratorDataDir) {
-    process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = orchestratorDataDir;
-  }
   const launchEnv = orchestratorDataDir ? { WEB_GEMINI_ORCHESTRATOR_DATA_DIR: orchestratorDataDir } : {};
   for (const [id, displayName, badgeLabel] of [
     ["acp-web-gemini", "Gemini (Web)", "Gemini"],

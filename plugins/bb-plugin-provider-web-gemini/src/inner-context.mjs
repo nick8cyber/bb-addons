@@ -562,7 +562,7 @@ export async function collectTaskAttachments(context, blocks, options) {
       const orchDataDir = resolveOrchestratorDataDir();
       let realAuditDir;
       try {
-        realAuditDir = realpathSync(join(orchDataDir, "release-audit"));
+        realAuditDir = join(realpathSync(orchDataDir), "release-audit");
       } catch {
         realAuditDir = null;
       }
