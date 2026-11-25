@@ -1,246 +1,94 @@
 #!/usr/bin/env node
 /**
  * Shared git post-checkout hook (spec orchestrator §24 п.3).
- * Если BB_THREAD_ID с ролью плагина переключил ветку в копии, которая не его, —
- * строка владельцу и вызвавшему «тред <id> переключил копию <путь> на <ветку>».
+ * A thread with a plugin role (`BB_THREAD_ID`) switched the branch of a
+ * copy that is not its own → one line to the owner and to the caller
+ * «тред <id> переключил копию <путь> на <ветку>». Git cannot forbid a
+ * checkout; the live copy itself is protected by §24.1 п.3.
+ *
+ * Own copy, by real path: executor — the result environment of its
+ * delegation, else its thread's environment; coordinator — its
+ * registered coordinator copies only (the owner's working copy is not
+ * the coordinator's); helper and other roles — the thread's
+ * environment. Unknown own copy → treated as foreign.
+ *
+ * Delivery is the plugin's: `bb orchestrator checkout-notice` resolves
+ * the owner's thread and the callers, deduplicates and reports failed
+ * deliveries. If that call fails the line goes to stderr.
  */
-import { execFileSync, spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HOOK_NAME = "post-checkout";
-const dir = dirname(fileURLToPath(import.meta.url));
+const self = fileURLToPath(import.meta.url);
+const dir = dirname(self);
 
-async function openDb(dbPath) {
-  if (!existsSync(dbPath)) return null;
-  try {
-    const { DatabaseSync } = await import("node:sqlite");
-    const db = new DatabaseSync(dbPath, { readOnly: false });
-    return {
-      prepare(sql) {
-        const stmt = db.prepare(sql);
-        return {
-          get(...args) { return stmt.get(...args); },
-          all(...args) { return stmt.all(...args); },
-          run(...args) { return stmt.run(...args); },
-        };
-      },
-      close() {
-        try { db.close(); } catch {}
-      },
-    };
-  } catch {
-    try {
-      const Database = (await import("better-sqlite3")).default;
-      const db = new Database(dbPath, { readonly: false, timeout: 2000 });
-      return {
-        prepare(sql) {
-          const stmt = db.prepare(sql);
-          return {
-            get(...args) { return stmt.get(...args); },
-            all(...args) { return stmt.all(...args); },
-            run(...args) { return stmt.run(...args); },
-          };
-        },
-        close() {
-          try { db.close(); } catch {}
-        },
-      };
-    } catch {
-      return null;
-    }
-  }
-}
-
-function chainLocal() {
-  const candidates = [];
-  const chainFile = join(dir, "chain.json");
-  if (existsSync(chainFile)) {
-    try {
-      const c = JSON.parse(readFileSync(chainFile, "utf8"));
-      const cwd = process.cwd();
-      if (c.localHooks) {
-        for (const [r, h] of Object.entries(c.localHooks)) {
-          if (cwd === r || cwd.startsWith(r + "/") || cwd.startsWith(r + "\\")) {
-            candidates.push(join(h, HOOK_NAME));
-          }
-        }
-      }
-      if (c.previousGlobalHooksPath) {
-        candidates.push(join(c.previousGlobalHooksPath, HOOK_NAME));
-      }
-    } catch {}
-  }
-  if (process.env.GIT_DIR) {
-    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
-  }
-  try {
-    const common = execFileSync(
-      "git",
-      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { encoding: "utf8" },
-    ).trim();
-    if (common) candidates.push(join(common, "hooks", HOOK_NAME));
-  } catch {}
-
-  const self = fileURLToPath(import.meta.url);
-  for (const c of candidates) {
-    if (c === self || !existsSync(c)) continue;
-    try {
-      accessSync(c, constants.X_OK);
-      const res = spawnSync(c, process.argv.slice(2), {
-        stdio: "inherit",
-      });
-      return res.status ?? 0;
-    } catch {}
-  }
-  return 0;
-}
+let lib = null;
+try {
+  lib = await import("./hook-lib.mjs");
+} catch { /* old or partial install */ }
 
 const threadId = process.env.BB_THREAD_ID;
-const isBranchCheckout = process.argv[4] === "1"; // $3 = 1 branch checkout, 0 file checkout
+const isBranchCheckout = process.argv[4] === "1"; // $3: 1 = branch checkout
 
-if (threadId && isBranchCheckout) {
-  try {
-    const home = process.env.HOME ?? "/home/ubuntu";
-    const dbPath =
-      process.env.ORCHESTRATOR_DB_PATH ??
-      join(home, ".bb", "plugins", "orchestrator", "data.db");
-
-    const db = await openDb(dbPath);
-    if (db) {
-      let role = null;
-      try {
-        const helperRow = db
-          .prepare("SELECT 1 FROM helpers WHERE thread_id = ?")
-          .get(threadId);
-        if (helperRow) {
-          role = "helper";
-        } else {
-          const roleRow = db
-            .prepare("SELECT role FROM thread_roles WHERE thread_id = ?")
-            .get(threadId);
-          if (roleRow && roleRow.role) role = roleRow.role;
-        }
-      } catch {}
-
-      if (role && role !== "none") {
-        const cwd = process.cwd();
-        let isOwnCopy = false;
-
-        if (role === "executor") {
-          let expectedPath = null;
-          const bbDbPath = join(home, ".bb", "bb.db");
-          if (existsSync(bbDbPath)) {
-            try {
-              const bbDb = await openDb(bbDbPath);
-              if (bbDb) {
-                const thrRow = bbDb.prepare("SELECT e.path FROM threads t JOIN environments e ON t.environment_id = e.id WHERE t.id = ?").get(threadId);
-                if (thrRow?.path) expectedPath = resolve(thrRow.path);
-                bbDb.close();
-              }
-            } catch {}
-          }
-          if (expectedPath) {
-            const cwdNorm = resolve(cwd);
-            if (cwdNorm === expectedPath || cwdNorm.startsWith(expectedPath + "/")) {
-              isOwnCopy = true;
-            }
-          } else {
-            try {
-              const del = db
-                .prepare(
-                  "SELECT result_env_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1",
-                )
-                .get(threadId);
-              if (del && del.result_env_id) {
-                const resEnv = resolve(del.result_env_id);
-                const cwdNorm = resolve(cwd);
-                if (cwdNorm === resEnv || cwdNorm.startsWith(resEnv + "/") || cwdNorm.includes(del.result_env_id)) {
-                  isOwnCopy = true;
-                }
-              }
-            } catch {}
-          }
-        } else if (role === "orchestrator") {
-          try {
-            const coord = db
-              .prepare(
-                "SELECT worktree_path FROM coordinator_worktrees WHERE coordinator_thread_id = ? ORDER BY id DESC LIMIT 1",
-              )
-              .get(threadId);
-            if (
-              coord &&
-              coord.worktree_path &&
-              (cwd === coord.worktree_path || cwd.startsWith(coord.worktree_path + "/"))
-            ) {
-              isOwnCopy = true;
-            }
-          } catch {}
-        }
-
-        if (!isOwnCopy) {
-          let newBranch = "";
-          try {
-            newBranch = execFileSync(
-              "git",
-              ["symbolic-ref", "--short", "-q", "HEAD"],
-              { encoding: "utf8" },
-            ).trim();
-          } catch {}
-          newBranch = newBranch || "detached";
-          const msg = `тред ${threadId} переключил копию ${cwd} на ${newBranch}`;
-          console.warn(msg);
-
-          try {
-            db.prepare(
-              "INSERT INTO events (kind, payload, created_at) VALUES (?, ?, ?)",
-            ).run(
-              "checkout.foreign",
-              JSON.stringify({ threadId, cwd, branch: newBranch, message: msg }),
-              Date.now(),
-            );
-          } catch {}
-
-          const targets = new Set();
-          try {
-            const h = db.prepare("SELECT caller_thread_id, coordinator_thread_id FROM helpers WHERE thread_id = ?").get(threadId);
-            if (h) {
-              if (h.caller_thread_id) targets.add(h.caller_thread_id);
-              if (h.coordinator_thread_id) targets.add(h.coordinator_thread_id);
-            } else {
-              const d = db.prepare("SELECT coordinator_thread_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1").get(threadId);
-              if (d && d.coordinator_thread_id) targets.add(d.coordinator_thread_id);
-            }
-          } catch {}
-
-          const bbDbPath = join(home, ".bb", "bb.db");
-          if (existsSync(bbDbPath)) {
-            try {
-              const bbDb = await openDb(bbDbPath);
-              if (bbDb) {
-                const thr = bbDb.prepare("SELECT parent_thread_id FROM threads WHERE id = ?").get(threadId);
-                if (thr && thr.parent_thread_id) targets.add(thr.parent_thread_id);
-                bbDb.close();
-              }
-            } catch {}
-          }
-
-          if (targets.size === 0) {
-            targets.add(threadId);
-          }
-
-          for (const target of targets) {
-            try {
-              execFileSync("bb", ["thread", "tell", target, msg], { stdio: "ignore" });
-            } catch {}
-          }
-        }
-      }
-      db.close();
+async function ownCopies(role, db) {
+  const own = [];
+  if (role === "orchestrator") {
+    for (const r of db.all(
+      "SELECT worktree_path FROM coordinator_worktrees WHERE coordinator_thread_id = ? AND worktree_path IS NOT NULL",
+      threadId,
+    )) {
+      own.push(lib.real(String(r.worktree_path)));
     }
-  } catch {}
+    return own;
+  }
+  let envId = null;
+  if (role === "executor") {
+    const d = db.get(
+      "SELECT result_env_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1",
+      threadId,
+    );
+    envId = d?.result_env_id ?? null;
+  }
+  const envs = await lib.envPaths(threadId, [envId]);
+  const p = (envId && envs.byEnv.get(envId)) || envs.thread;
+  if (p) own.push(p);
+  return own;
 }
 
-process.exit(chainLocal());
+if (lib && threadId && isBranchCheckout) {
+  const { role, error, db } = await lib.readThreadRole(threadId);
+  if (!error && role && role !== "none") {
+    let foreign = true;
+    const paths = lib.repoPaths();
+    const here = paths.top || lib.real(process.cwd());
+    try {
+      const own = await ownCopies(role, db);
+      foreign = !own.some((o) => lib.inside(here, o));
+    } catch {
+      foreign = true;
+    } finally {
+      db?.close();
+    }
+    if (foreign) {
+      const br = spawnSync("git", ["symbolic-ref", "--short", "-q", "HEAD"], {
+        encoding: "utf8",
+      });
+      const branch = (br.status === 0 ? br.stdout.trim() : "") || "detached";
+      const line = `тред ${threadId} переключил копию ${here} на ${branch}`;
+      const res = spawnSync(
+        process.env.BB_CLI ?? "bb",
+        ["orchestrator", "checkout-notice", "--copy", here, "--branch", branch, "--json"],
+        { encoding: "utf8", timeout: 20_000, env: process.env },
+      );
+      if (res.status !== 0) {
+        process.stderr.write(`[orchestrator] ${line} (строка не доставлена: ${(res.stderr || res.error?.message || "").trim().slice(0, 200)})\n`);
+      }
+    }
+  } else if (error) {
+    db?.close();
+  }
+}
+
+process.exit(lib ? lib.runChain(dir, HOOK_NAME, self) : 0);

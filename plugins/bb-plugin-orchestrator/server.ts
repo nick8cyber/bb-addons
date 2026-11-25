@@ -7,7 +7,8 @@
  * the §7 reconcile pass behind `bb orchestrator reconcile`.
  */
 import { z } from "zod";
-import { join as joinPath } from "node:path";
+import { join as joinPath, dirname as dirnamePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { readFileSync, existsSync } from "node:fs";
 import {
@@ -146,7 +147,17 @@ import {
   runHooksDoctor,
 } from "./src/hooks.js";
 import {
-  setupLiveCheckout,
+  requestLiveCheckout,
+  needsApprovalError,
+  getLiveCheckoutRequest,
+  saveLiveCheckoutRequest,
+  listLiveCheckoutRequests,
+  runLiveCheckoutMigration,
+  resumeLiveCheckout,
+  writeLiveRegistry,
+  writeTargetsRegistry,
+  type LiveCheckoutRequest,
+  type MigrationDeps,
 } from "./src/live-checkout.js";
 import {
   projectRepoPath,
@@ -1737,11 +1748,258 @@ export async function createPlugin(
       resolveProject(config, projectId),
     );
   };
+  // PLUG-245 Б2 / §24.1: владелец замков копии postPublish и миграции
+  // live-checkout — этот экземпляр плагина.
+  const orchInstanceId = `orch-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+
+  /** §24.1: строка владельцу — в тред владельца (первый тред с ролью
+   * orchestrator, иначе последний координатор) и в дополнительные треды,
+   * без повторов. true — хотя бы одна доставка; сбой — в журнал. */
+  const notifyOwnerLine = async (
+    line: string,
+    extraThreads: string[] = [],
+  ): Promise<boolean> => {
+    const targets = new Set<string>();
+    const ownerThread = await resolveAlertThreadId().catch(() => undefined);
+    if (ownerThread) targets.add(ownerThread);
+    for (const t2 of extraThreads) if (t2) targets.add(t2);
+    if (!targets.size) {
+      bb.log.warn(`orchestrator: строка владельцу не доставлена (нет треда владельца): ${line}`);
+      return false;
+    }
+    let delivered = false;
+    for (const threadId of targets) {
+      try {
+        await bb.sdk.threads.send({
+          threadId,
+          mode: "queue-if-active",
+          input: [{ type: "text", text: `[orchestrator] ${line}`, mentions: [] }],
+        } as never);
+        delivered = true;
+      } catch (e) {
+        bb.log.warn(`orchestrator: строка в ${threadId} не доставлена: ${describeError(e)}`);
+      }
+    }
+    return delivered;
+  };
+
+  /** §24.1 п.1: принятые `postPublish.checkout` проекта репозитория
+   * (проект по путям из `bb project list`, иначе все проекты). */
+  const liveCheckoutsForRepo = (_repo: string): string[] => {
+    const cfg = releaseConfig.config;
+    if (!cfg) return [];
+    const out = new Set<string>();
+    const ids = new Set<string>(Object.keys(cfg.projects ?? {}));
+    if (cfg.defaults?.postPublish?.checkout) out.add(cfg.defaults.postPublish.checkout);
+    for (const pid of ids) {
+      const co = resolveProject(cfg, pid).postPublish?.checkout;
+      if (co) out.add(co);
+    }
+    return [...out];
+  };
+
+  /** §24.1: реестры для хуков — реальные пути живых копий и целевые
+   * ветки всех проектов (pre-commit видит их и в копии без снимка). */
+  const syncHookRegistries = () => {
+    const cfg = releaseConfig.config;
+    if (!cfg) return;
+    const dir = defaultHooksDir();
+    const branches = new Set<string>();
+    if (cfg.defaults?.target?.branch) branches.add(cfg.defaults.target.branch);
+    for (const pid of Object.keys(cfg.projects ?? {})) {
+      const b = resolveProject(cfg, pid).target?.branch;
+      if (b) branches.add(b);
+    }
+    try {
+      writeTargetsRegistry(dir, [...branches]);
+    } catch (e) {
+      bb.log.warn(`orchestrator: targets.json: ${describeError(e)}`);
+    }
+    try {
+      writeLiveRegistry(dir, liveCheckoutsForRepo(""));
+    } catch (e) {
+      bb.log.warn(`orchestrator: live-copies.json: ${describeError(e)}`);
+    }
+  };
+
+  /** §24.1 п.2 (г): одна подтверждённая запись postPublish.checkout в
+   * сыром JSON настройки release (прочие ключи не трогаются). Проверка —
+   * разбор записанного и чтение настройки обратно; расхождение или сбой
+   * записи — прежнее значение возвращается, ошибка наверх (откат плагинов). */
+  const writeReleaseCheckout = async (projectId: string, liveDir: string) => {
+    const prevRaw = currentSettings.release ?? "";
+    let doc: Record<string, any>;
+    try {
+      doc = prevRaw.trim() ? JSON.parse(prevRaw) : {};
+    } catch (e) {
+      throw new Error(`настройка release не JSON: ${describeError(e)}`);
+    }
+    if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+      throw new Error("настройка release не объект");
+    }
+    doc.projects = doc.projects && typeof doc.projects === "object" ? doc.projects : {};
+    const own = doc.projects[projectId] && typeof doc.projects[projectId] === "object"
+      ? doc.projects[projectId]
+      : {};
+    const basePp = own.postPublish ?? doc.defaults?.postPublish ?? {};
+    own.postPublish = { ...basePp, checkout: liveDir };
+    doc.projects[projectId] = own;
+    const nextRaw = JSON.stringify(doc, null, 2);
+    const parsed = parseReleaseConfig(nextRaw, t);
+    if (
+      parsed.errors.length ||
+      !parsed.config ||
+      resolveProject(parsed.config, projectId).postPublish?.checkout !== liveDir
+    ) {
+      throw new Error(
+        `новая настройка release не проходит проверку: ${parsed.errors.map((e) => e.message).join("; ") || "checkout не применился"}`,
+      );
+    }
+    await settings.experimental_set({ release: nextRaw });
+    const after = (await settings.get()) as { release?: string };
+    if ((after.release ?? "") !== nextRaw) {
+      try {
+        await settings.experimental_set({ release: prevRaw || null });
+      } catch (e) {
+        bb.log.warn(`orchestrator: возврат release: ${describeError(e)}`);
+      }
+      throw new Error("записанная настройка release не совпала при чтении — прежнее значение возвращено");
+    }
+  };
+
+  /** Корень этого экземпляра плагина: ближайший вверх каталог с
+   * package.json bb-plugin-orchestrator (работает и из dist/, и из исходников). */
+  const selfPluginRoot = (): string => {
+    let dir = dirnamePath(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 4; i++) {
+      try {
+        const pkg = JSON.parse(readFileSync(joinPath(dir, "package.json"), "utf8"));
+        if (pkg?.name === "bb-plugin-orchestrator") return dir;
+      } catch {
+        /* нет package.json — выше */
+      }
+      dir = dirnamePath(dir);
+    }
+    return dirnamePath(fileURLToPath(import.meta.url));
+  };
+
+  const migrationDeps = (): MigrationDeps => ({
+    store,
+    instanceId: orchInstanceId,
+    selfPluginId: "orchestrator",
+    selfRoot: selfPluginRoot(),
+    bbCli,
+    writeCheckout: writeReleaseCheckout,
+    notifyOwner: (line, extra) => notifyOwnerLine(line, extra),
+    hooksDir: defaultHooksDir(),
+  });
+
+  /** §24.1 п.2 под §23: решение владельца по заявке (кнопка или CLI). */
+  const decideLiveCheckout = async (
+    req: LiveCheckoutRequest,
+    decision: "approve" | "reject",
+    source: "ui" | "cli",
+  ): Promise<{ ok: boolean; message: string; request: LiveCheckoutRequest }> => {
+    const cur = getLiveCheckoutRequest(store, req.id) ?? req;
+    if (cur.status !== "pending") {
+      return { ok: false, message: `заявка ${cur.id} уже в статусе ${cur.status}`, request: cur };
+    }
+    if (decision === "reject") {
+      const next = { ...cur, status: "rejected" as const, decidedAt: Date.now(), result: `отклонена (${source})` };
+      saveLiveCheckoutRequest(store, next);
+      await notifyOwnerLine(`live-checkout ${cur.id} отклонена владельцем`, cur.requestedBy ? [cur.requestedBy] : []);
+      return { ok: true, message: `заявка ${cur.id} отклонена`, request: next };
+    }
+    const approved = { ...cur, status: "approved" as const, decidedAt: Date.now(), result: `одобрена (${source})` };
+    saveLiveCheckoutRequest(store, approved);
+    const res = await runLiveCheckoutMigration(migrationDeps(), approved);
+    return { ok: res.ok, message: res.message, request: getLiveCheckoutRequest(store, cur.id) ?? approved };
+  };
+
+  /** Карточка владельцу с двумя кнопками + строка (§23 п.2). */
+  const askOwnerLiveCheckout = async (req: LiveCheckoutRequest) => {
+    const line =
+      `заявка live-checkout ${req.id}: перевести живые плагины проекта ${req.projectId} на служебную копию ${req.liveDir} (ветка ${req.targetBranch}); ` +
+      `применить — кнопка или \`bb orchestrator live-checkout approve ${req.id}\`, отклонить — \`… reject ${req.id}\``;
+    await notifyOwnerLine(line, req.requestedBy ? [req.requestedBy] : []);
+    const threadId = await resolveAlertThreadId().catch(() => undefined);
+    if (!threadId) return;
+    try {
+      const result = await bb.ui.requestInput({
+        threadId,
+        rendererId: "orchestrator-live-checkout",
+        title: `Перевести живые плагины проекта ${req.projectId} на ${req.liveDir}?`,
+        payload: { requestId: req.id, projectId: req.projectId, liveDir: req.liveDir, targetBranch: req.targetBranch },
+        timeoutMs: 24 * 3_600_000,
+      });
+      if (result.outcome !== "submitted") return;
+      const v = result.value && typeof result.value === "object" ? (result.value as Record<string, unknown>) : {};
+      const decision = v.action === "approve" ? "approve" : v.action === "reject" ? "reject" : null;
+      if (!decision) return;
+      await decideLiveCheckout(req, decision, "ui").catch((e) =>
+        bb.log.warn(`orchestrator: live-checkout ${req.id}: ${describeError(e)}`),
+      );
+    } catch (e) {
+      bb.log.warn(`orchestrator: карточка live-checkout ${req.id}: ${describeError(e)}`);
+    }
+  };
+
+  /** §24 п.3: строка владельцу и вызвавшему о чужом checkout. */
+  const checkoutNoticeSeen = new Map<string, number>();
+  const checkoutNotice = async (
+    threadId: string,
+    copy: string,
+    branch: string,
+  ): Promise<{ delivered: boolean; line: string; targets: string[]; duplicate?: boolean }> => {
+    const line = `тред ${threadId} переключил копию ${copy} на ${branch}`;
+    const key = `${threadId}|${copy}|${branch}`;
+    const seen = checkoutNoticeSeen.get(key);
+    if (seen !== undefined && Date.now() - seen < 60_000) {
+      return { delivered: true, line, targets: [], duplicate: true };
+    }
+    checkoutNoticeSeen.set(key, Date.now());
+    const callers = new Set<string>();
+    const helper = store.helperByThreadId(threadId);
+    if (helper) {
+      if (helper.caller_thread_id) callers.add(helper.caller_thread_id);
+      if (helper.coordinator_thread_id) callers.add(helper.coordinator_thread_id);
+    }
+    const del = store.byThreadId(threadId);
+    if (del?.coordinator_thread_id) callers.add(del.coordinator_thread_id);
+    try {
+      const thr = await bb.sdk.threads.get({ threadId });
+      if (thr.parentThreadId) callers.add(thr.parentThreadId);
+    } catch {
+      /* тред не найден — вызвавший неизвестен */
+    }
+    callers.delete(threadId);
+    const ownerThread = await resolveAlertThreadId().catch(() => undefined);
+    const targets = [...new Set([...(ownerThread ? [ownerThread] : []), ...callers])].filter(
+      (x) => x !== threadId,
+    );
+    let delivered = false;
+    for (const target of targets) {
+      try {
+        await bb.sdk.threads.send({
+          threadId: target,
+          mode: "queue-if-active",
+          input: [{ type: "text", text: `[orchestrator] ${line}`, mentions: [] }],
+        } as never);
+        delivered = true;
+      } catch (e) {
+        bb.log.warn(`orchestrator: checkout-notice → ${target}: ${describeError(e)}`);
+      }
+    }
+    if (!delivered) bb.log.warn(`orchestrator: checkout-notice не доставлена: ${line}`);
+    return { delivered, line, targets };
+  };
+
   /** §22.1 (ревью): write the leaks snapshot for EVERY configured
    * project on settings load and on every settings save — a fresh
    * worktree scans staged diffs against current rules before any
    * release ever ran. Best-effort throughout. */
   const syncLeaksSnapshots = async () => {
+    syncHookRegistries();
     const config = releaseConfig.config;
     if (!config?.projects || !Object.keys(config.projects).length) return;
     const list = await bbCli.run(["project", "list", "--json"], {
@@ -1871,7 +2129,11 @@ export async function createPlugin(
     commandRetentionDays: () =>
       positiveInt(currentSettings.retentionDays, 30),
     // PLUG-245 Б2: владелец замков копии postPublish — этот экземпляр.
-    instanceId: `orch-${process.pid}-${Math.random().toString(36).slice(2, 10)}`,
+    instanceId: orchInstanceId,
+    // §24.1 п.1: doctor проверяет и служебную живую копию проекта,
+    // строка владельцу о локальном core.hooksPath — фактическому адресату.
+    liveCheckoutsFor: (repo: string) => liveCheckoutsForRepo(repo),
+    notifyOwner: (line: string) => notifyOwnerLine(line),
     // §15 (r33.7) + release §2 п.2: автоочистка копий задачи. Уборщик
     // создаётся ниже — замыкание ленивое: если насос тикнул до
     // присвоения, очистка пропускается до следующего такта.
@@ -1903,6 +2165,11 @@ export async function createPlugin(
   // §22.1 (ревью): the leaks snapshot is refreshed on settings LOAD
   // (here), on every settings save (the onChange handler) and on each
   // delegation — the pre-commit gate never waits for a release.
+  // §24.1 п.2: незавершённая миграция с переводом самого orchestrator —
+  // итог (запись postPublish.checkout или откат) делает новый экземпляр.
+  void Promise.resolve()
+    .then(() => resumeLiveCheckout(migrationDeps()))
+    .catch((e) => bb.log.warn(`orchestrator: live-checkout resume: ${describeError(e)}`));
   void syncLeaksSnapshots().catch((e) =>
     bb.log.warn(`orchestrator: leaks snapshot sync: ${describeError(e)}`),
   );
@@ -3768,12 +4035,17 @@ export async function createPlugin(
       {
         name: "hooks",
         summary: t("cli.helpHooksS"),
-        usage: "bb orchestrator hooks <install|doctor> [--fix-local <path>] [--json]",
+        usage: "bb orchestrator hooks <install [--fix-local <path> --confirm]|doctor [--repo <path>]> [--json]",
       },
       {
         name: "live-checkout",
         summary: t("cli.helpLiveCheckoutS"),
-        usage: "bb orchestrator live-checkout setup [--repo <path>] [--approved] [--json]",
+        usage: "bb orchestrator live-checkout <setup [--repo <path>] [--live-dir <path>]|approve <id>|reject <id>|list> [--json]",
+      },
+      {
+        name: "checkout-notice",
+        summary: t("cli.helpCheckoutNoticeS"),
+        usage: "bb orchestrator checkout-notice --copy <path> --branch <branch> [--json]",
       },
       {
         name: "janitor",
@@ -4903,19 +5175,19 @@ export async function createPlugin(
 
         if (cmd === "hooks") {
           const sub = positional[1];
+          // §23.3 п.1: владелец — терминал без треда агента.
+          const isOwner = !ctx.threadId && !process.env.BB_THREAD_ID;
           if (sub === "install") {
             const fixLocal = flag("--fix-local");
             const hooksDir = flag("--hooks-dir");
-            const confirmed =
-              argv.includes("--confirm") ||
-              argv.includes("--yes") ||
-              argv.includes("-y") ||
-              argv.includes("--approved");
+            const confirmed = argv.includes("--confirm");
             const res = await installHooks({
               fixLocalCopy: fixLocal,
               hooksDir,
               confirmed,
+              owner: isOwner,
             });
+            if (!fixLocal) syncHookRegistries();
             return json
               ? jsonOk(res)
               : { exitCode: 0, stdout: res.message + "\n" };
@@ -4929,6 +5201,8 @@ export async function createPlugin(
               repo,
               hooksDir,
               store,
+              liveCheckouts: liveCheckoutsForRepo(repo),
+              notifyOwner: (line) => notifyOwnerLine(line),
             });
             return json
               ? { exitCode: res.code, stdout: JSON.stringify(res, null, 2) + "\n" }
@@ -4940,61 +5214,87 @@ export async function createPlugin(
           );
         }
 
+        if (cmd === "checkout-notice") {
+          // §24 п.3: вызывает общий хук post-checkout из треда с ролью.
+          const threadId = ctx.threadId ?? process.env.BB_THREAD_ID;
+          const copy = flag("--copy");
+          const branch = flag("--branch");
+          if (!threadId || !copy || !branch) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "checkout-notice: нужны тред (BB_THREAD_ID), --copy и --branch",
+            );
+          }
+          const res = await checkoutNotice(threadId, copy, branch);
+          return json
+            ? jsonOk(res)
+            : { exitCode: res.delivered ? 0 : 1, stdout: res.line + "\n" };
+        }
+
         if (cmd === "live-checkout") {
           const sub = positional[1];
+          const isOwner = !ctx.threadId && !process.env.BB_THREAD_ID;
           if (sub === "setup") {
+            if (argv.includes("--approved")) {
+              throw new OrchestratorError(
+                "live-checkout-needs-approval",
+                "live-checkout-needs-approval: флага --approved нет — одобряет владелец: `bb orchestrator live-checkout approve <id>` или кнопка в карточке",
+              );
+            }
             const repoRoot = flag("--repo") ?? ctx.cwd ?? process.cwd();
-            const approved = argv.includes("--approved");
-            const liveDir = flag("--live-dir");
-            const res = await setupLiveCheckout({
+            const cfg = releaseConfig.config;
+            if (!cfg) {
+              throw new OrchestratorError(
+                "live-checkout-project-unresolved",
+                "live-checkout: нет настроек release — проект не определён",
+              );
+            }
+            // Проект определяется ОДИН раз; ошибка — отказ, без подстановки.
+            const projectId = await settingsProjectId(
+              { cmd: cmdRunner, bbCli, localHostId, t },
               repoRoot,
-              approved,
-              liveDir,
-              threadId: ctx.threadId,
+              ctx.projectId ?? "",
+              cfg,
+            );
+            const targetBranch = resolveProject(cfg, projectId).target.branch;
+            const { request, created } = requestLiveCheckout({
+              repoRoot,
+              projectId,
+              targetBranch,
+              liveDir: flag("--live-dir"),
               store,
-              cmd: cmdRunner,
-              bbCli,
-              releaseConfig,
-              updateReleaseConfigCheckout: async (targetLiveDir: string) => {
-                if (releaseConfig?.config) {
-                  let pid: string | null = null;
-                  try {
-                    pid = await settingsProjectId(
-                      { cmd: cmdRunner, bbCli, localHostId, t: createT("ru") },
-                      repoRoot,
-                      "",
-                      releaseConfig.config,
-                    );
-                  } catch {}
-                  if (!pid && releaseConfig.config.projects) {
-                    for (const [id] of Object.entries(releaseConfig.config.projects)) {
-                      if (id) {
-                        pid = id;
-                        break;
-                      }
-                    }
-                  }
-                  if (pid && releaseConfig.config.projects[pid]) {
-                    const proj = releaseConfig.config.projects[pid]!;
-                    proj.postPublish = proj.postPublish ?? {};
-                    proj.postPublish.checkout = targetLiveDir;
-                  } else if (releaseConfig.config.defaults) {
-                    releaseConfig.config.defaults.postPublish = releaseConfig.config.defaults.postPublish ?? {};
-                    releaseConfig.config.defaults.postPublish.checkout = targetLiveDir;
-                  }
-                  try {
-                    await settings.experimental_set({ release: JSON.stringify(releaseConfig.config, null, 2) });
-                  } catch {}
-                }
-              },
+              threadId: ctx.threadId ?? process.env.BB_THREAD_ID ?? null,
             });
+            if (created) void askOwnerLiveCheckout(request);
+            throw needsApprovalError(request);
+          }
+          if (sub === "approve" || sub === "reject") {
+            if (!isOwner) {
+              throw new OrchestratorError("permission-denied", "owner-only");
+            }
+            const id = positional[2];
+            const req = id ? getLiveCheckoutRequest(store, id) : null;
+            if (!req) {
+              throw new OrchestratorError("invalid-arguments", `заявка live-checkout ${id ?? ""} не найдена`);
+            }
+            const res = await decideLiveCheckout(req, sub === "approve" ? "approve" : "reject", "cli");
+            return json ? jsonOk(res) : { exitCode: 0, stdout: res.message + "\n" };
+          }
+          if (sub === "list") {
+            const list = listLiveCheckoutRequests(store);
             return json
-              ? jsonOk(res)
-              : { exitCode: 0, stdout: res.message + "\n" };
+              ? jsonOk({ requests: list })
+              : {
+                  exitCode: 0,
+                  stdout:
+                    list
+                      .map((r) => `${r.id} ${r.status} ${r.projectId} ${r.targetBranch} ${r.liveDir}${r.result ? ` — ${r.result}` : ""}`)
+                      .join("\n") + "\n",
+                };
           }
           throw new OrchestratorError(
             "invalid-arguments",
-            "укажи подкоманду: bb orchestrator live-checkout setup",
+            "укажи подкоманду: bb orchestrator live-checkout <setup|approve|reject|list>",
           );
         }
 

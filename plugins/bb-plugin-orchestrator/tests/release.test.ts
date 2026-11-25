@@ -1414,6 +1414,43 @@ test("pump: APPROVE → push to target, token consumed, task done", async () => 
   assert.ok(calls.some((c) => c.join(" ").includes("--status done")));
 });
 
+test("§24.1 п.1 (аудит р.3 п.5): шаг 6 с настоящим hooks doctor — без хуков hooks-missing, с установленными — публикация", async () => {
+  const { installHooks } = await import("../src/hooks.js");
+  const prevG = process.env.GIT_CONFIG_GLOBAL;
+  const gcfg = join(makeTempDir("hooks-"), "gitconfig");
+  writeFileSync(gcfg, "[user]\n\tname = T\n\temail = t@example.invalid\n");
+  process.env.GIT_CONFIG_GLOBAL = gcfg;
+  try {
+    // 1) no hooks installed → the real doctor refuses step 6
+    {
+      const { repo } = makeRepo();
+      const { deps, store } = makeDeps(repo, { auditVerdict: '{"verdict":"APPROVE","findings":[]}' });
+      const real = { ...deps, hooksDoctor: undefined };
+      await runRelease({ taskKey: "PLUG-1", caller: COORD }, real);
+      store.setStatus(store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id, "done");
+      const s = await pumpReleases(real);
+      assert.equal(s.failed, 1);
+      assert.match(store.releasesByStatuses(["failed"])[0]!.error ?? "", /hooks-missing/);
+    }
+    // 2) hooks installed into the release hooks dir (isolated global) → published
+    {
+      const { repo, remote } = makeRepo();
+      const { deps, store, tmp } = makeDeps(repo, { auditVerdict: '{"verdict":"APPROVE","findings":[]}' });
+      await installHooks({ hooksDir: tmp });
+      const real = { ...deps, hooksDoctor: undefined };
+      await runRelease({ taskKey: "PLUG-1", caller: COORD }, real);
+      store.setStatus(store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id, "done");
+      const s = await pumpReleases(real);
+      assert.equal(s.published, 1, JSON.stringify(store.releasesByStatuses(["failed"])[0] ?? null));
+      const rel = store.releasesByStatuses(["published"])[0]!;
+      const remoteLog = execFileSync("git", ["--git-dir", remote, "log", "--format=%H", "-1", "main"], { encoding: "utf8" }).trim();
+      assert.equal(remoteLog, rel.head_sha);
+    }
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prevG;
+  }
+});
+
 test("pump: audit chain exhausted → failed + message", async () => {
   const { repo } = makeRepo();
   const { deps, store, sent } = makeDeps(repo);
@@ -1907,6 +1944,7 @@ function installAllWrappers(dir: string) {
     );
   }
   cpSync(join(src, "leak-scan.ts"), join(dir, "leak-scan.ts"));
+  cpSync(join(src, "hook-lib.mjs"), join(dir, "hook-lib.mjs"));
   return names;
 }
 

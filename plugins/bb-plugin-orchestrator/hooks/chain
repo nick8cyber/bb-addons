@@ -1,74 +1,29 @@
-#!/bin/sh
-# Generic shared-hook wrapper (spec orchestrator §17.3, §24.1).
-# The shared `core.hooksPath` shadows EVERY standard hook name, so install
-# copies this file under each of them — else a repo's local hook
-# would silently stop firing.
-#
-# Behaviour: exec the hook from `chain.json` (for migrated local hooks)
-# or the repository's own `$GIT_DIR/hooks/<my name>` or previousGlobalHooksPath
-# with the same arguments — but ONLY when it is executable.
-name=${0##*/}
-self=$0
-dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+#!/usr/bin/env node
+// Generic shared-hook wrapper (spec orchestrator §17.3, §24.1).
+// The shared `core.hooksPath` shadows EVERY standard hook name, so the
+// installer copies this file under each of them — else a repository's
+// local hook would silently stop firing.
+//
+// Behaviour: run the previous hook for my name with the same arguments
+// and stdin — a migrated local `core.hooksPath` of this copy
+// (`chain.json`), then the repository's own `$GIT_DIR/hooks/<name>`,
+// then the previous global `core.hooksPath` — only when it is
+// executable, exactly like git (`hook-lib.mjs`, `chainTarget`).
+import { spawnSync } from "node:child_process";
+import { dirname, basename } from "node:path";
+import { fileURLToPath } from "node:url";
 
-try=""
+const self = fileURLToPath(import.meta.url);
+const dir = dirname(self);
+const name = basename(self);
 
-# 1. First check chain.json localHooks (migrated local hooks have priority!)
-if [ -f "$dir/chain.json" ]; then
-  resolved=$(node -e '
-    const fs = require("fs");
-    const path = require("path");
-    try {
-      const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      const name = process.argv[2];
-      const cwd = process.cwd();
-      let target = null;
-      if (c.localHooks) {
-        for (const [r, h] of Object.entries(c.localHooks)) {
-          if (cwd === r || cwd.startsWith(r + "/") || cwd.startsWith(r + "\\")) {
-            target = path.join(h, name);
-            break;
-          }
-        }
-      }
-      if (target) process.stdout.write(target);
-    } catch {}
-  ' "$dir/chain.json" "$name" 2>/dev/null)
-  if [ -n "$resolved" ] && [ -x "$resolved" ] && [ ! "$resolved" -ef "$self" ]; then
-    try="$resolved"
-  fi
-fi
-
-# 2. Then check repository's own hooks ($GIT_DIR/hooks or common hooks)
-if [ -z "$try" ]; then
-  if [ -n "$GIT_DIR" ] && [ -x "$GIT_DIR/hooks/$name" ] && [ ! "$GIT_DIR/hooks/$name" -ef "$self" ]; then
-    try="$GIT_DIR/hooks/$name"
-  else
-    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-    if [ -n "$common" ] && [ -x "$common/hooks/$name" ] && [ ! "$common/hooks/$name" -ef "$self" ]; then
-      try="$common/hooks/$name"
-    fi
-  fi
-fi
-
-# 3. Finally check previousGlobalHooksPath
-if [ -z "$try" ] && [ -f "$dir/chain.json" ]; then
-  resolvedGlobal=$(node -e '
-    const fs = require("fs");
-    const path = require("path");
-    try {
-      const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      const name = process.argv[2];
-      if (c.previousGlobalHooksPath) {
-        process.stdout.write(path.join(c.previousGlobalHooksPath, name));
-      }
-    } catch {}
-  ' "$dir/chain.json" "$name" 2>/dev/null)
-  if [ -n "$resolvedGlobal" ] && [ -x "$resolvedGlobal" ] && [ ! "$resolvedGlobal" -ef "$self" ]; then
-    try="$resolvedGlobal"
-  fi
-fi
-
-[ -x "$try" ] || exit 0
-[ "$try" -ef "$self" ] && exit 0
-exec "$try" "$@"
+let lib;
+try {
+  lib = await import("./hook-lib.mjs");
+} catch {
+  process.exit(0); // an incomplete install must not wedge git
+}
+const target = lib.chainTarget(dir, name, self);
+if (!target) process.exit(0);
+const res = spawnSync(target, process.argv.slice(2), { stdio: "inherit" });
+process.exit(res.error ? 1 : (res.status ?? 1));

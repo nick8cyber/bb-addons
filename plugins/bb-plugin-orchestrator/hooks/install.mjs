@@ -79,92 +79,15 @@ function pluginHooksDir() {
 }
 const hooksDirArg = flag("--hooks-dir") ?? pluginHooksDir();
 
-const fixLocal = flag("--fix-local");
-if (fixLocal) {
-  const confirmed =
-    args.includes("--confirm") ||
-    args.includes("--yes") ||
-    args.includes("-y") ||
-    args.includes("--approved");
-  if (!confirmed) {
-    console.error(
-      "fix-local-needs-confirmation: перенос локального core.hooksPath требует подтверждения владельца (--confirm)",
-    );
-    process.exit(1);
-  }
-  const copyPath = resolve(fixLocal);
-  let localHooksPath = "";
-  try {
-    localHooksPath = execFileSync(
-      "git",
-      ["-C", copyPath, "config", "--local", "core.hooksPath"],
-      { encoding: "utf8" },
-    ).trim();
-  } catch {}
-  if (!localHooksPath) {
-    console.log(`копия ${copyPath} не имеет локального core.hooksPath`);
-    process.exit(0);
-  }
-  const targetHooksDir = hooksDirArg
-    ? resolve(hooksDirArg)
-    : resolve(homedir(), ".bb", "git-hooks");
-  mkdirSync(targetHooksDir, { recursive: true, mode: 0o755 });
-  const chainPath = join(targetHooksDir, "chain.json");
-  let chain = {};
-  if (existsSync(chainPath)) {
-    try {
-      chain = JSON.parse(readFileSync(chainPath, "utf8"));
-    } catch {}
-  }
-  chain.localHooks = chain.localHooks ?? {};
-
-  const absLocalHooks = isAbsolute(localHooksPath) ? localHooksPath : resolve(copyPath, localHooksPath);
-  chain.localHooks[resolve(copyPath)] = absLocalHooks;
-
-  try {
-    const wtOut = execFileSync(
-      "git",
-      ["-C", copyPath, "worktree", "list", "--porcelain"],
-      { encoding: "utf8" },
-    );
-    for (const line of wtOut.split("\n")) {
-      if (line.startsWith("worktree ")) {
-        const wtPath = line.slice("worktree ".length).trim();
-        if (wtPath) {
-          let wtHooks = "";
-          try {
-            wtHooks = execFileSync(
-              "git",
-              ["-C", wtPath, "config", "--local", "core.hooksPath"],
-              { encoding: "utf8" },
-            ).trim();
-          } catch {}
-          if (wtHooks) {
-            chain.localHooks[resolve(wtPath)] = isAbsolute(wtHooks) ? wtHooks : resolve(wtPath, wtHooks);
-          } else {
-            chain.localHooks[resolve(wtPath)] = absLocalHooks;
-          }
-        }
-      }
-    }
-  } catch {}
-
-  writeFileSync(chainPath, JSON.stringify(chain, null, 2) + "\n", { mode: 0o644 });
-  try {
-    execFileSync("git", ["-C", copyPath, "config", "--local", "--unset", "core.hooksPath"]);
-  } catch (err) {
-    console.error(`не удалось снять локальную настройку core.hooksPath для ${copyPath}: ${err.message ?? String(err)}`);
-    process.exit(1);
-  }
-  try {
-    const verify = execFileSync("git", ["-C", copyPath, "config", "--local", "core.hooksPath"], { encoding: "utf8" }).trim();
-    if (verify) {
-      console.error(`локальная настройка core.hooksPath для ${copyPath} осталась после снятия`);
-      process.exit(1);
-    }
-  } catch {}
-  console.log(`локальный core.hooksPath для ${copyPath} (${localHooksPath}) перенесён в chain.json и снят`);
-  process.exit(0);
+// §24.1 п.1: moving a copy's local core.hooksPath into chain.json is
+// an owner decision — only the plugin command checks the owner and
+// verifies the effective path afterwards (one route, no second copy of
+// the logic here).
+if (flag("--fix-local")) {
+  console.error(
+    "fix-local: используйте `bb orchestrator hooks install --fix-local <копия> --confirm` из терминала владельца",
+  );
+  process.exit(1);
 }
 // §17.3 (ревью PLUG-216 мелко): the hooks dir is required only to
 // INSTALL — `--self-test` falls back to this package's own wrappers and
@@ -306,6 +229,13 @@ if (selfTest) {
       : join(srcDir, "leak-scan.ts"),
     join(testHooksDir, "leak-scan.ts"),
   );
+  // §24.1: every wrapper imports the shared helpers next to it.
+  copyFileSync(
+    hooksDir && existsSync(join(hooksDir, "hook-lib.mjs"))
+      ? join(hooksDir, "hook-lib.mjs")
+      : join(srcDir, "hook-lib.mjs"),
+    join(testHooksDir, "hook-lib.mjs"),
+  );
   const SHA = "a".repeat(40);
   const LINE = `refs/heads/x ${SHA} refs/heads/x ${"0".repeat(40)}\n`;
   const kinds = [
@@ -411,6 +341,8 @@ for (const name of HOOK_NAMES) {
 // §22.1: the shared scanner core `pre-commit` imports — lives next to
 // the hook, not executable and not a hook name.
 copyFileSync(join(HOOKS_SRC, "leak-scan.ts"), join(hooksDir, "leak-scan.ts"));
+// §24.1: shared helpers every hook imports (chain, live copy, roles).
+copyFileSync(join(HOOKS_SRC, "hook-lib.mjs"), join(hooksDir, "hook-lib.mjs"));
 // §17.3 (ревью PLUG-214): `push-to-checkout` is retired — its mere
 // presence disables git's built-in worktree update on
 // receive.denyCurrentBranch=updateInstead. Remove a wrapper an older
@@ -428,8 +360,14 @@ if (existsSync(chainPath)) {
     chain = JSON.parse(readFileSync(chainPath, "utf8"));
   } catch {}
 }
-if (hooksPathNow && resolve(hooksPathNow) !== hooksDir && !chain.previousGlobalHooksPath) {
-  chain.previousGlobalHooksPath = resolve(hooksPathNow);
+// §24.1 п.1: the previous global path is kept as git reads it — an
+// absolute or `~/` path as is, a relative one unresolved (git resolves
+// it from the directory the hook runs in; so does `hook-lib.mjs`).
+const prevAbs = hooksPathNow.startsWith("~/")
+  ? join(homedir(), hooksPathNow.slice(2))
+  : isAbsolute(hooksPathNow) ? resolve(hooksPathNow) : null;
+if (hooksPathNow && prevAbs !== hooksDir && !chain.previousGlobalHooksPath) {
+  chain.previousGlobalHooksPath = prevAbs ?? hooksPathNow;
 }
 writeFileSync(chainPath, JSON.stringify(chain, null, 2) + "\n", { mode: 0o644 });
 

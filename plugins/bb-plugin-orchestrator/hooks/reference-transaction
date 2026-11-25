@@ -1,112 +1,37 @@
 #!/usr/bin/env node
 /**
- * Shared git reference-transaction hook (spec orchestrator §24 п.3).
- * Отклоняет изменение ссылок в служебной живой копии (~/.bb/plugin-live/<repo>),
- * если нет действующего токена postPublish / live-checkout setup.
+ * Shared git reference-transaction hook (spec orchestrator §24.1 п.3).
+ * In state `prepared` it refuses any reference change in the service
+ * live copy unless `ORCH_LIVE_TOKEN` matches the one-shot postPublish
+ * token for exactly this copy (`hook-lib.mjs`: the copy is recognised
+ * by its marker or its real path from the accepted settings, the token
+ * map is keyed by real path and expires). Then it chains to the previous
+ * hook with the same stdin.
  */
-import { execFileSync, spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HOOK_NAME = "reference-transaction";
-const dir = dirname(fileURLToPath(import.meta.url));
+const self = fileURLToPath(import.meta.url);
+const dir = dirname(self);
 
-function chainLocal() {
-  const candidates = [];
-  const chainFile = join(dir, "chain.json");
-  if (existsSync(chainFile)) {
-    try {
-      const c = JSON.parse(readFileSync(chainFile, "utf8"));
-      const cwd = process.cwd();
-      if (c.localHooks) {
-        for (const [r, h] of Object.entries(c.localHooks)) {
-          if (cwd === r || cwd.startsWith(r + "/") || cwd.startsWith(r + "\\")) {
-            candidates.push(join(h, HOOK_NAME));
-          }
-        }
-      }
-      if (c.previousGlobalHooksPath) {
-        candidates.push(join(c.previousGlobalHooksPath, HOOK_NAME));
-      }
-    } catch {}
-  }
+let lib = null;
+try {
+  lib = await import("./hook-lib.mjs");
+} catch { /* old or partial install */ }
 
-  if (process.env.GIT_DIR) {
-    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
-  }
-  try {
-    const common = execFileSync(
-      "git",
-      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { encoding: "utf8" },
-    ).trim();
-    if (common) candidates.push(join(common, "hooks", HOOK_NAME));
-  } catch {}
-
-  const self = fileURLToPath(import.meta.url);
-  for (const c of candidates) {
-    if (c === self || !existsSync(c)) continue;
-    try {
-      accessSync(c, constants.X_OK);
-      const res = spawnSync(c, process.argv.slice(2), {
-        stdio: "inherit",
-      });
-      return res.status ?? 0;
-    } catch {}
-  }
-  return 0;
-}
+let input = "";
+try {
+  input = readFileSync(0, "utf8");
+} catch { /* no stdin */ }
 
 const state = process.argv[2]; // prepared | committed | aborted
-if (state === "prepared") {
-  const cwd = process.cwd();
-  let gitDir = "";
-  try {
-    gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
-      encoding: "utf8",
-    }).trim();
-  } catch {}
-
-  const isLiveCopy =
-    cwd.includes(".bb/plugin-live") ||
-    gitDir.includes(".bb/plugin-live") ||
-    process.env.ORCH_IS_LIVE_COPY === "1";
-
-  if (isLiveCopy) {
-    const home = process.env.HOME ?? "/home/ubuntu";
-    const repoBase = basename(cwd);
-    const candidates = [
-      join(dirname(cwd), `.token-${repoBase}`),
-      join(home, ".bb", "plugin-live", `.token-${repoBase}`),
-      join(dirname(cwd), ".token"),
-      join(dirname(gitDir), ".token"),
-      join(dirname(dirname(gitDir)), ".token"),
-      join(home, ".bb", "plugin-live", ".token"),
-    ];
-
-    let hasToken = false;
-    const envToken = process.env.ORCH_LIVE_TOKEN;
-
-    if (envToken) {
-      for (const tokenFile of candidates) {
-        if (existsSync(tokenFile)) {
-          try {
-            const raw = JSON.parse(readFileSync(tokenFile, "utf8"));
-            if (raw.token && raw.token === envToken) {
-              const notExpired = typeof raw.expiresAt === "number" && raw.expiresAt > Date.now();
-              const repoMatches = typeof raw.repo === "string" && raw.repo.length > 0 && resolve(raw.repo) === resolve(cwd);
-              if (notExpired && repoMatches) {
-                hasToken = true;
-                break;
-              }
-            }
-          } catch {}
-        }
-      }
-    }
-
-    if (!hasToken) {
+if (lib && state === "prepared") {
+  const paths = lib.repoPaths();
+  if (lib.isLiveCopy(dir, paths)) {
+    const key = paths.top || paths.common;
+    if (!lib.liveTokenValid(key)) {
       console.error(
         "отказ: изменение ссылок в служебной живой копии разрешено только postPublish (нет действующего токена)",
       );
@@ -115,4 +40,4 @@ if (state === "prepared") {
   }
 }
 
-process.exit(chainLocal());
+process.exit(lib ? lib.runChain(dir, HOOK_NAME, self, input) : 0);

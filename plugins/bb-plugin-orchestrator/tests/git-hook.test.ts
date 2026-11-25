@@ -18,6 +18,7 @@ import {
 const HOOK_SRC = new URL("../hooks/pre-push", import.meta.url).pathname;
 const PC_SRC = new URL("../hooks/pre-commit", import.meta.url).pathname;
 const SCAN_SRC = new URL("../hooks/leak-scan.ts", import.meta.url).pathname;
+const LIB_SRC = new URL("../hooks/hook-lib.mjs", import.meta.url).pathname;
 const SHA = "a".repeat(40);
 const OTHER = "b".repeat(40);
 
@@ -27,6 +28,7 @@ function makeEnv(withLocalHook = false) {
   const repo = join(base, "repo");
   mkdirSync(hooksDir, { recursive: true });
   cpSync(HOOK_SRC, join(hooksDir, "pre-push"));
+  cpSync(LIB_SRC, join(hooksDir, "hook-lib.mjs"));
   execFileSync("git", ["init", repo]);
   execFileSync("git", ["-C", repo, "config", "user.email", "a@b.c"]);
   execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
@@ -250,6 +252,7 @@ test("Б2/мелко9: installer covers every standard hook name; shared token d
   }
   // §22.1: the shared scanner core lands next to the hooks.
   assert.ok(existsSync(join(gd, "leak-scan.ts")), "leak-scan.ts installed");
+  assert.ok(existsSync(join(gd, "hook-lib.mjs")), "hook-lib.mjs installed");
   assert.match(readFileSync(gcfg, "utf8"), /hookspath/i);
   // the token dir is the SAME dir the installer installs into — the
   // plugin's writePushToken lands where the installed hook scans
@@ -474,6 +477,7 @@ function makePcEnv(withLocalHook = false) {
   mkdirSync(hooksDir, { recursive: true });
   cpSync(PC_SRC, join(hooksDir, "pre-commit"));
   cpSync(SCAN_SRC, join(hooksDir, "leak-scan.ts"));
+  cpSync(LIB_SRC, join(hooksDir, "hook-lib.mjs"));
   execFileSync("git", ["init", repo]);
   execFileSync("git", ["-C", repo, "config", "user.email", "a@b.c"]);
   execFileSync("git", ["-C", repo, "config", "user.name", "T"]);

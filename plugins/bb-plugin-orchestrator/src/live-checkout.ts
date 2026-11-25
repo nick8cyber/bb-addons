@@ -1,27 +1,82 @@
 /**
- * orchestrator §24.1 п.2–3 (PLUG-410): служебная живая копия ~/.bb/plugin-live/<repo>,
- * атомарная миграция live-checkout setup под §23 («всё или ничего») и защита живой копии.
+ * orchestrator §24.1 п.2–3 (PLUG-410): служебная живая копия
+ * ~/.bb/plugin-live/<repo>, миграция `live-checkout setup` под §23
+ * («всё или ничего») и защита живой копии.
+ *
+ * Порядок:
+ *  1. `live-checkout setup` (координатор или владелец) определяет проект
+ *     ОДИН раз и создаёт заявку с параметрами (проект, ветка, копия);
+ *     ответ — отказ `live-checkout-needs-approval` с id заявки, владельцу —
+ *     карточка и строка. Повтор той же заявки новой строки не даёт.
+ *  2. Одобрение — только владелец (кнопка или `live-checkout approve <id>`
+ *     из терминала без BB_THREAD_ID). Применяется ровно сохранённая заявка.
+ *  3. Миграция под замком миграции проекта и замком живой копии (общая
+ *     семантика `acquireCopyLock`, владелец — экземпляр плагина); пока
+ *     идёт публикация шага 6 (метка публикации) — отказ.
+ *  4. Перевод плагинов по одному: статус running, активный источник
+ *     `path:<живая копия>/…`, build-info.json = SHA копии. Сбой — откат
+ *     всех переведённых в обратном порядке, настройка не меняется.
+ *     orchestrator переводится последним: его перезагрузка завершает
+ *     миграцию в новом экземпляре по журналу (`resumeLiveCheckout`).
+ *  5. Только после всех — одна подтверждённая запись `postPublish.checkout`.
  */
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { OrchestratorError } from "./errors.js";
 import type { DelegationStore } from "./store.js";
-import type { CmdRunner } from "./cmd.js";
 import type { BbCli } from "./bb-cli.js";
-import { resolveProject, type ReleaseConfigLoad } from "./release-config.js";
-import { MERGE_LOCK_NAME } from "./merge.js";
+import { acquireCopyLock, type MergeGit } from "./merge.js";
+
+export const LIVE_MARKER = "orchestrator-live.json";
+
+function real(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+function gitOut(args: string[]): string {
+  try {
+    return execFileSync("git", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Канонический корень репозитория: родитель общего каталога git. */
+export function canonicalRepoPath(repo: string): string {
+  const common = gitOut([
+    "-C",
+    resolve(repo),
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir",
+  ]);
+  return real(common ? dirname(common) : repo);
+}
+
+function keyOf(path: string): string {
+  return `${basename(path)}-${createHash("sha1").update(path).digest("hex").slice(0, 12)}`;
+}
 
 export function projectLockDir(): string {
   const dir = join(homedir(), ".bb", "orchestrator-locks");
@@ -29,511 +84,878 @@ export function projectLockDir(): string {
   return dir;
 }
 
-export function projectLockPath(canonicalRoot: string): string {
-  const dir = projectLockDir();
-  const safeName = basename(resolve(canonicalRoot));
-  return join(dir, `${safeName}.lock`);
+/** Замок миграции проекта (держит `live-checkout setup`). */
+export function migrationLockPath(repo: string): string {
+  return join(projectLockDir(), `migrate-${keyOf(canonicalRepoPath(repo))}.lock`);
+}
+
+/** Замок живой копии — один для setup и postPublish (вне её `.git`). */
+export function liveCopyLockPath(liveDir: string): string {
+  return join(projectLockDir(), `live-${keyOf(real(liveDir))}.lock`);
+}
+
+/** Совместимость: замок проекта по корню репозитория. */
+export function projectLockPath(repo: string): string {
+  return migrationLockPath(repo);
 }
 
 export function defaultLiveDir(repoRoot: string): string {
-  const name = basename(resolve(repoRoot));
-  return join(homedir(), ".bb", "plugin-live", name);
+  return join(homedir(), ".bb", "plugin-live", basename(canonicalRepoPath(repoRoot)));
 }
 
-export function isLiveCheckoutPath(p: string): boolean {
-  const norm = resolve(p);
-  const liveBase = join(homedir(), ".bb", "plugin-live");
-  return norm.startsWith(liveBase) || norm.includes(".bb/plugin-live");
+// ── Живая копия: маркер, реестр, токен ─────────────────────────────────
+
+/** Живая копия опознаётся по маркеру в её общем каталоге git (пишет
+ * setup) или по реестру `live-copies.json` в каталоге хуков (пишет
+ * плагин из принятой настройки) — не по подстроке пути. */
+export function isLiveCheckoutPath(p: string, hooksDir?: string): boolean {
+  const common = gitOut(["-C", resolve(p), "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (common && existsSync(join(common, LIVE_MARKER))) return true;
+  if (hooksDir) {
+    try {
+      const list = JSON.parse(readFileSync(join(hooksDir, "live-copies.json"), "utf8"));
+      if (Array.isArray(list)) {
+        const me = real(gitOut(["-C", resolve(p), "rev-parse", "--show-toplevel"]) || p);
+        return list.some((x) => typeof x === "string" && real(x) === me);
+      }
+    } catch {
+      /* нет реестра */
+    }
+  }
+  return false;
 }
 
-function canonicalRepoPath(repo: string): string {
-  let canonical = resolve(repo);
+function writeJsonAtomic(file: string, value: unknown, mode = 0o644): void {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode });
+  renameSync(tmp, file);
+}
+
+/** Реестр живых копий для хуков (реальные пути из принятой настройки). */
+export function writeLiveRegistry(hooksDir: string, paths: string[]): void {
+  if (!existsSync(hooksDir)) return;
+  const list = [...new Set(paths.filter(Boolean).map(real))].sort();
+  writeJsonAtomic(join(hooksDir, "live-copies.json"), list);
+}
+
+/** Целевые ветки всех проектов принятой настройки — для pre-commit. */
+export function writeTargetsRegistry(hooksDir: string, branches: string[]): void {
+  if (!existsSync(hooksDir)) return;
+  const list = [...new Set(branches.filter(Boolean))].sort();
+  writeJsonAtomic(join(hooksDir, "targets.json"), list);
+}
+
+export function liveTokenFile(): string {
+  return join(homedir(), ".bb", "plugin-live", ".token");
+}
+
+function readTokenMap(): Record<string, { token: string; expiresAt: number }> {
   try {
-    const common = execFileSync(
-      "git",
-      ["-C", canonical, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { encoding: "utf8" },
-    ).trim();
-    if (common) canonical = dirname(common);
-  } catch {}
-  return canonical;
+    const m = JSON.parse(readFileSync(liveTokenFile(), "utf8"));
+    return m && typeof m === "object" && !Array.isArray(m) ? m : {};
+  } catch {
+    return {};
+  }
 }
 
+/** Одноразовый токен postPublish для одной копии (§24.1 п.3). */
+export function issueLiveToken(liveDir: string, ttlMs = 600_000): string {
+  const token = randomBytes(24).toString("hex");
+  const map = readTokenMap();
+  const now = Date.now();
+  for (const [k, v] of Object.entries(map)) {
+    if (!v || typeof v.expiresAt !== "number" || v.expiresAt <= now) delete map[k];
+  }
+  map[real(liveDir)] = { token, expiresAt: now + ttlMs };
+  writeJsonAtomic(liveTokenFile(), map, 0o600);
+  return token;
+}
+
+export function revokeLiveToken(liveDir: string, token: string): void {
+  const map = readTokenMap();
+  const k = real(liveDir);
+  if (map[k]?.token !== token) return;
+  delete map[k];
+  if (Object.keys(map).length === 0) {
+    rmSync(liveTokenFile(), { force: true });
+  } else {
+    writeJsonAtomic(liveTokenFile(), map, 0o600);
+  }
+}
+
+/**
+ * Права служебной живой копии (§24.1 п.3): `makeWritable=false` —
+ * каталоги и исполняемые 0555, прочие 0444; `true` — 0755/0644.
+ * Символические ссылки не трогаются. `only` — подкаталог (например,
+ * `.git`), остальное дерево не меняется.
+ */
+export function chmodRecursive(dir: string, makeWritable: boolean): void {
+  if (!existsSync(dir)) return;
+  const walk = (p: string) => {
+    let st;
+    try {
+      st = lstatSync(p);
+    } catch {
+      return;
+    }
+    if (st.isSymbolicLink()) return;
+    if (st.isDirectory()) {
+      if (makeWritable) {
+        try {
+          chmodSync(p, 0o755);
+        } catch {}
+      }
+      let entries: string[] = [];
+      try {
+        entries = readdirSync(p);
+      } catch {}
+      for (const e of entries) walk(join(p, e));
+      if (!makeWritable) {
+        try {
+          chmodSync(p, 0o555);
+        } catch {}
+      }
+      return;
+    }
+    if (st.isFile()) {
+      const exec = (st.mode & 0o111) !== 0;
+      try {
+        chmodSync(p, makeWritable ? (exec ? 0o755 : 0o644) : exec ? 0o555 : 0o444);
+      } catch {}
+    }
+  };
+  walk(dir);
+}
+
+// ── Миграция идёт? ─────────────────────────────────────────────────────
+
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function lockPid(file: string): number | null {
+  try {
+    const pid = Number(readFileSync(file, "utf8").split("\n")[0]);
+    return Number.isInteger(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function migratingMetaKey(repo: string): string {
+  return `live-checkout:migrating:${canonicalRepoPath(repo)}`;
+}
+
+/** Миграция идёт: живой замок миграции проекта или метка в базе с живым pid. */
 export function isLiveCheckoutMigrating(
   store: DelegationStore | null | undefined,
-  repoRoot: string,
+  repo: string,
 ): boolean {
-  if (!store?.metaGet) return false;
-  const directKey = `live-checkout:migrating:${resolve(repoRoot)}`;
-  if (store.metaGet(directKey) === "true") return true;
-  const canonKey = `live-checkout:migrating:${canonicalRepoPath(repoRoot)}`;
-  return store.metaGet(canonKey) === "true";
+  const pid = lockPid(migrationLockPath(repo));
+  if (pid !== null && pidAlive(pid)) return true;
+  const raw = store?.metaGet?.(migratingMetaKey(repo));
+  if (!raw) return false;
+  try {
+    const v = JSON.parse(raw) as { pid?: number };
+    return typeof v.pid === "number" && pidAlive(v.pid);
+  } catch {
+    return raw === "true";
+  }
 }
 
 export function setLiveCheckoutMigrating(
   store: DelegationStore | null | undefined,
-  repoRoot: string,
+  repo: string,
   migrating: boolean,
 ): void {
   if (!store?.metaSet) return;
-  const val = migrating ? "true" : "false";
-  store.metaSet(`live-checkout:migrating:${resolve(repoRoot)}`, val);
-  store.metaSet(`live-checkout:migrating:${canonicalRepoPath(repoRoot)}`, val);
+  store.metaSet(
+    migratingMetaKey(repo),
+    migrating ? JSON.stringify({ pid: process.pid, at: Date.now() }) : "",
+  );
+}
+
+// ── Метка публикации шага 6 ────────────────────────────────────────────
+
+function publishMarkerPrefix(repo: string): string {
+  return `publish-${keyOf(canonicalRepoPath(repo))}-`;
 }
 
 /**
- * Рекурсивное изменение прав доступа служебной живой копии (§24.1 п.3):
- * - При makeWritable=true: каталогам 0o755, исполняемым файлам 0o755, обычным файлам 0o644.
- * - При makeWritable=false: каталогам 0o555, исполняемым файлам 0o555, обычным файлам 0o444.
- * Не следует по символическим ссылкам и сохраняет executable биты.
+ * Шаг 6 release: метка «идёт публикация» ставится ДО проверки миграции,
+ * setup проверяет метки ПОСЛЕ взятия замка миграции — одна из сторон
+ * обязательно видит другую. Возвращает снятие метки.
  */
-export function chmodRecursive(dir: string, makeWritable: boolean): void {
-  if (!existsSync(dir)) return;
-
-  const toggle = (target: string, isDir: boolean) => {
-    try {
-      const st = statSync(target);
-      const isExec = isDir || (st.mode & 0o111) !== 0;
-      const newMode = makeWritable
-        ? isExec
-          ? 0o755
-          : 0o644
-        : isExec
-          ? 0o555
-          : 0o444;
-      chmodSync(target, newMode);
-    } catch {}
-  };
-
-  if (makeWritable) {
-    toggle(dir, true);
+export function beginPublish(
+  store: DelegationStore | null | undefined,
+  repo: string,
+  releaseId: number | string,
+): () => void {
+  const file = join(projectLockDir(), `${publishMarkerPrefix(repo)}${releaseId}.lock`);
+  writeFileSync(file, `${process.pid}\n${new Date().toISOString()}\n`);
+  const done = () => rmSync(file, { force: true });
+  if (isLiveCheckoutMigrating(store, repo)) {
+    done();
+    throw new OrchestratorError(
+      "live-checkout-migrating",
+      "live-checkout-migrating: идёт миграция служебной копии live-checkout",
+    );
   }
+  return done;
+}
 
-  let entries;
+function activePublishes(repo: string): string[] {
+  const dir = projectLockDir();
+  const prefix = publishMarkerPrefix(repo);
+  const out: string[] = [];
+  for (const f of readdirSync(dir)) {
+    if (!f.startsWith(prefix)) continue;
+    const pid = lockPid(join(dir, f));
+    if (pid !== null && pidAlive(pid)) out.push(f);
+    else rmSync(join(dir, f), { force: true });
+  }
+  return out;
+}
+
+// ── Заявка §23 ─────────────────────────────────────────────────────────
+
+export interface LiveCheckoutRequest {
+  id: string;
+  projectId: string;
+  repoRoot: string;
+  canonicalRoot: string;
+  liveDir: string;
+  targetBranch: string;
+  requestedBy: string | null;
+  requestedAt: number;
+  status: "pending" | "approved" | "rejected" | "migrating" | "done" | "failed";
+  decidedAt?: number;
+  result?: string;
+}
+
+const REQ_INDEX = "live-checkout:requests";
+const reqKey = (id: string) => `live-checkout:request:${id}`;
+
+function needStore(store: DelegationStore | null | undefined): DelegationStore {
+  if (!store?.metaGet || !store.metaSet) {
+    throw new OrchestratorError("live-checkout-failed", "нет базы плагина для заявки live-checkout");
+  }
+  return store;
+}
+
+export function getLiveCheckoutRequest(
+  store: DelegationStore | null | undefined,
+  id: string,
+): LiveCheckoutRequest | null {
+  const raw = store?.metaGet?.(reqKey(id));
+  if (!raw) return null;
   try {
-    entries = readdirSync(dir, { withFileTypes: true });
+    return JSON.parse(raw) as LiveCheckoutRequest;
   } catch {
-    if (!makeWritable) toggle(dir, true);
-    return;
+    return null;
   }
+}
 
-  for (const e of entries) {
-    if (e.isSymbolicLink()) continue;
-    const full = join(dir, e.name);
-    try {
-      if (e.isDirectory()) {
-        chmodRecursive(full, makeWritable);
-      } else if (e.isFile()) {
-        toggle(full, false);
-      }
-    } catch {}
+export function saveLiveCheckoutRequest(store: DelegationStore, req: LiveCheckoutRequest): void {
+  store.metaSet(reqKey(req.id), JSON.stringify(req));
+  let ids: string[] = [];
+  try {
+    ids = JSON.parse(store.metaGet(REQ_INDEX) ?? "[]");
+  } catch {}
+  if (!ids.includes(req.id)) {
+    ids.push(req.id);
+    store.metaSet(REQ_INDEX, JSON.stringify(ids.slice(-50)));
   }
+}
 
-  if (!makeWritable) {
-    toggle(dir, true);
-  }
+export function listLiveCheckoutRequests(store: DelegationStore | null | undefined): LiveCheckoutRequest[] {
+  if (!store?.metaGet) return [];
+  let ids: string[] = [];
+  try {
+    ids = JSON.parse(store.metaGet(REQ_INDEX) ?? "[]");
+  } catch {}
+  return ids
+    .map((id) => getLiveCheckoutRequest(store, id))
+    .filter((r): r is LiveCheckoutRequest => r !== null);
 }
 
 export interface SetupLiveCheckoutOptions {
   repoRoot: string;
-  targetBranch?: string;
-  approved?: boolean;
+  /** Проект, определённый вызывающим один раз (резолвер настроек). */
+  projectId: string;
+  /** Целевая ветка этого проекта из принятой настройки. */
+  targetBranch: string;
   liveDir?: string;
-  store?: DelegationStore | null;
-  cmd?: CmdRunner;
-  bbCli?: BbCli;
-  releaseConfig?: ReleaseConfigLoad;
-  pluginsToMigrate?: Array<{
-    id: string;
-    dirName: string;
-    currentSourceDir: string;
-  }>;
-  onSwitchPlugin?: (pluginId: string, newDir: string) => Promise<void>;
-  onBuildPlugins?: (liveDir: string) => Promise<void>;
-  updateReleaseConfigCheckout?: (liveDir: string) => Promise<void>;
-  threadId?: string;
+  store: DelegationStore | null | undefined;
+  threadId?: string | null;
 }
 
-export interface SetupLiveCheckoutResult {
+export interface SetupLiveCheckoutRequestResult {
+  request: LiveCheckoutRequest;
+  created: boolean;
+}
+
+/**
+ * `live-checkout setup` (§24.1 п.2): только заявка. Проект и ветку
+ * определяет вызывающий ОДИН раз; одобрение применит ровно их.
+ * Повтор той же заявки возвращает прежнюю (created=false).
+ */
+export function requestLiveCheckout(opts: SetupLiveCheckoutOptions): SetupLiveCheckoutRequestResult {
+  const store = needStore(opts.store);
+  if (!opts.projectId) {
+    throw new OrchestratorError(
+      "live-checkout-project-unresolved",
+      "live-checkout: проект копии не определён по настройкам release — заявка не создана",
+    );
+  }
+  if (!opts.targetBranch) {
+    throw new OrchestratorError(
+      "live-checkout-project-unresolved",
+      `live-checkout: у проекта ${opts.projectId} нет целевой ветки (target.branch)`,
+    );
+  }
+  const repoRoot = real(opts.repoRoot);
+  const canonicalRoot = canonicalRepoPath(repoRoot);
+  const liveDir = resolve(opts.liveDir ?? defaultLiveDir(repoRoot));
+  if (liveDir === canonicalRoot || liveDir.startsWith(canonicalRoot + "/")) {
+    throw new OrchestratorError(
+      "invalid-arguments",
+      `live-checkout: служебная копия не может лежать внутри рабочей копии (${liveDir})`,
+    );
+  }
+  const same = listLiveCheckoutRequests(store).find(
+    (r) =>
+      (r.status === "pending" || r.status === "migrating" || r.status === "approved") &&
+      r.projectId === opts.projectId &&
+      r.canonicalRoot === canonicalRoot &&
+      r.liveDir === liveDir &&
+      r.targetBranch === opts.targetBranch,
+  );
+  if (same) return { request: same, created: false };
+  const req: LiveCheckoutRequest = {
+    id: `lc-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`,
+    projectId: opts.projectId,
+    repoRoot,
+    canonicalRoot,
+    liveDir,
+    targetBranch: opts.targetBranch,
+    requestedBy: opts.threadId ?? null,
+    requestedAt: Date.now(),
+    status: "pending",
+  };
+  saveLiveCheckoutRequest(store, req);
+  return { request: req, created: true };
+}
+
+export function needsApprovalError(req: LiveCheckoutRequest): OrchestratorError {
+  return new OrchestratorError(
+    "live-checkout-needs-approval",
+    `live-checkout-needs-approval: заявка ${req.id} (проект ${req.projectId}, ветка ${req.targetBranch}, копия ${req.liveDir}) ждёт одобрения владельца по §23 — кнопка в карточке или \`bb orchestrator live-checkout approve ${req.id}\` из терминала владельца`,
+  );
+}
+
+// ── Каталог плагинов BB ────────────────────────────────────────────────
+
+export interface PluginInfo {
+  id: string;
+  rootDir: string;
+  source: string;
+  status: string;
+}
+
+/** Строгий разбор `bb plugin list --json`: `{ plugins: [...] }` с
+ * полями id/rootDir/source/status у каждого; иначе — сбой. */
+export function parsePluginList(stdout: string): PluginInfo[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new OrchestratorError("live-checkout-failed", "bb plugin list вернул некорректный JSON");
+  }
+  const arr =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as { plugins?: unknown }).plugins
+      : undefined;
+  if (!Array.isArray(arr)) {
+    throw new OrchestratorError(
+      "live-checkout-failed",
+      "bb plugin list: неизвестная форма ответа (нет массива plugins)",
+    );
+  }
+  return arr.map((p, i) => {
+    const o = (p ?? {}) as Record<string, unknown>;
+    for (const f of ["id", "rootDir", "source", "status"]) {
+      if (typeof o[f] !== "string" || !o[f]) {
+        throw new OrchestratorError(
+          "live-checkout-failed",
+          `bb plugin list: у записи ${i} нет поля ${f}`,
+        );
+      }
+    }
+    return {
+      id: o.id as string,
+      rootDir: o.rootDir as string,
+      source: o.source as string,
+      status: o.status as string,
+    };
+  });
+}
+
+export interface MigrationDeps {
+  store: DelegationStore;
+  /** Владелец замков — экземпляр плагина (как у postPublish). */
+  instanceId: string;
+  /** id этого плагина — переводится последним. */
+  selfPluginId?: string;
+  /** Корень этого экземпляра плагина (где лежит его dist). */
+  selfRoot?: string;
+  bbCli?: BbCli;
+  listPlugins?: () => Promise<PluginInfo[]>;
+  switchPlugin?: (id: string, dir: string) => Promise<void>;
+  buildPlugin?: (dir: string, liveSha: string) => Promise<void>;
+  /** Одна подтверждённая запись postPublish.checkout; бросает при сбое
+   * записи или проверки (и сама возвращает прежнее значение). */
+  writeCheckout: (projectId: string, liveDir: string) => Promise<void>;
+  notifyOwner: (line: string, extraThreads?: string[]) => Promise<boolean>;
+  hooksDir?: string;
+  /** Сколько ждать статуса running после перевода (мс). */
+  settleMs?: number;
+  pollMs?: number;
+}
+
+export interface MigrationResult {
   ok: boolean;
+  /** true — переведён сам orchestrator, итог допишет новый экземпляр. */
+  pendingSelf?: boolean;
   liveDir: string;
   headSha: string;
   switchedPlugins: string[];
   message: string;
 }
 
-/**
- * bb orchestrator live-checkout setup (§24.1 п.2):
- * Настройка служебной копии для живых плагинов по принципу «всё или ничего»
- * под защитой согласования с владельцем (§23).
- */
-export async function setupLiveCheckout(
-  opts: SetupLiveCheckoutOptions,
-): Promise<SetupLiveCheckoutResult> {
-  const callerThreadId = opts.threadId ?? process.env.BB_THREAD_ID;
-  if (callerThreadId && opts.store) {
-    const role = opts.store.threadRole?.(callerThreadId)?.role;
-    if (role && role !== "none") {
-      throw new OrchestratorError(
-        "live-checkout-needs-approval",
-        "live-checkout-needs-approval: требуется одобрение владельца по §23 (агент не может одобрять миграцию)",
-      );
-    }
-  }
+const INFLIGHT = (canon: string) => `live-checkout:inflight:${canon}`;
 
-  const repoRoot = resolve(opts.repoRoot);
-  const canonicalRoot = canonicalRepoPath(repoRoot);
+interface Inflight {
+  requestId: string;
+  projectId: string;
+  canonicalRoot: string;
+  liveDir: string;
+  liveSha: string;
+  switched: Array<{ id: string; prevDir: string }>;
+  selfId: string;
+  selfPrev: string;
+  selfNew: string;
+  at: number;
+}
 
-  if (!opts.approved) {
-    if (opts.store?.metaSet) {
-      const pendingPayload = {
-        repoRoot,
-        canonicalRoot,
-        liveDir: opts.liveDir ? resolve(opts.liveDir) : defaultLiveDir(repoRoot),
-        requestedAt: Date.now(),
-        requestedBy: callerThreadId ?? "owner",
-      };
-      opts.store.metaSet(`live-checkout:pending:${canonicalRoot}`, JSON.stringify(pendingPayload));
-      opts.store.metaSet(`live-checkout:pending:${repoRoot}`, JSON.stringify(pendingPayload));
-    }
+async function defaultList(deps: MigrationDeps): Promise<PluginInfo[]> {
+  if (deps.listPlugins) return deps.listPlugins();
+  if (!deps.bbCli) throw new OrchestratorError("live-checkout-failed", "нет bb CLI для списка плагинов");
+  const res = await deps.bbCli.run(["plugin", "list", "--json"], { timeoutMs: 60_000 });
+  if (res.exitCode !== 0) {
     throw new OrchestratorError(
-      "live-checkout-needs-approval",
-      "live-checkout-needs-approval: требуется одобрение владельца по §23 для перевода живых плагинов на служебную копию (запрос создан; для применения вызови bb orchestrator live-checkout setup --approved)",
+      "live-checkout-failed",
+      `bb plugin list: ${(res.stderr || res.stdout).trim().slice(0, 300)}`,
     );
   }
+  return parsePluginList(res.stdout);
+}
 
-  let targetBranch = "main";
-  if (opts.targetBranch) {
-    targetBranch = opts.targetBranch;
-  } else if (opts.releaseConfig?.config) {
-    const cfg = opts.releaseConfig.config;
-    let pid: string | null = null;
-    if (cfg.projects) {
-      for (const [id] of Object.entries(cfg.projects)) {
-        if (id) {
-          pid = id;
-          break;
-        }
-      }
+async function defaultSwitch(deps: MigrationDeps, id: string, dir: string): Promise<void> {
+  if (deps.switchPlugin) return deps.switchPlugin(id, dir);
+  if (!deps.bbCli) throw new Error("нет bb CLI для перевода плагина");
+  const res = await deps.bbCli.run(["plugin", "install", dir], { timeoutMs: 600_000 });
+  if (res.exitCode !== 0) {
+    throw new Error(`bb plugin install ${dir}: ${(res.stderr || res.stdout).trim().slice(0, 300)}`);
+  }
+}
+
+function readBuildSha(dir: string): string | null {
+  try {
+    const info = JSON.parse(readFileSync(join(dir, "dist", "build-info.json"), "utf8"));
+    return typeof info.gitSha === "string" ? info.gitSha : null;
+  } catch {
+    return null;
+  }
+}
+
+async function defaultBuild(deps: MigrationDeps, dir: string, liveSha: string): Promise<void> {
+  if (deps.buildPlugin) return deps.buildPlugin(dir, liveSha);
+  const pkgFile = join(dir, "package.json");
+  if (!existsSync(pkgFile)) return;
+  const pkg = JSON.parse(readFileSync(pkgFile, "utf8"));
+  if (!existsSync(join(dir, "node_modules")) && existsSync(join(dir, "package-lock.json"))) {
+    execFileSync("npm", ["ci", "--no-audit", "--no-fund"], { cwd: dir, stdio: "pipe" });
+  }
+  if (pkg.scripts?.build) {
+    execFileSync("npm", ["run", "build"], { cwd: dir, stdio: "pipe" });
+  }
+  // Сборка сделана в живой копии на liveSha: метка сборки — факт этой
+  // сборки. Свою метку (postbuild) с другим SHA не переписываем — это сбой.
+  const sha = readBuildSha(dir);
+  if (sha === null) {
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(
+      join(dir, "dist", "build-info.json"),
+      JSON.stringify({ gitSha: liveSha, builtAt: Date.now(), by: "live-checkout" }, null, 2),
+    );
+  } else if (sha !== liveSha) {
+    throw new Error(`build-info.json в ${dir}: ${sha} ≠ ${liveSha}`);
+  }
+}
+
+/** Ждём: плагин в списке, статус (running, если был running), активный
+ * источник — новая папка, build-info = SHA копии. */
+async function verifySwitched(
+  deps: MigrationDeps,
+  id: string,
+  dir: string,
+  liveSha: string,
+  wasRunning: boolean,
+): Promise<void> {
+  const deadline = Date.now() + (deps.settleMs ?? 60_000);
+  const want = real(dir);
+  for (;;) {
+    const list = await defaultList(deps);
+    const p = list.find((x) => x.id === id);
+    let last = "нет записи в каталоге";
+    if (p) {
+      const srcOk = p.source === `path:${dir}` || p.source === `path:${want}`;
+      const rootOk = real(p.rootDir) === want;
+      const statusOk = wasRunning ? p.status === "running" : true;
+      if (srcOk && rootOk && statusOk) break;
+      last = `статус ${p.status}, источник ${p.source}`;
     }
-    const resolved = pid ? resolveProject(cfg, pid) : null;
-    if (resolved?.target?.branch) {
-      targetBranch = resolved.target.branch;
-    } else if (cfg.defaults?.target?.branch) {
-      targetBranch = cfg.defaults.target.branch;
+    if (Date.now() >= deadline) {
+      throw new Error(`плагин ${id} не поднялся из ${dir} (${last})`);
+    }
+    await new Promise((r) => setTimeout(r, deps.pollMs ?? 1000));
+  }
+  const sha = readBuildSha(dir);
+  if (sha !== liveSha) {
+    throw new Error(`build-info.json плагина ${id}: ${sha ?? "нет"} ≠ ${liveSha}`);
+  }
+}
+
+async function rollback(
+  deps: MigrationDeps,
+  switched: Array<{ id: string; prevDir: string }>,
+): Promise<string[]> {
+  const errors: string[] = [];
+  for (let i = switched.length - 1; i >= 0; i--) {
+    const s = switched[i]!;
+    try {
+      await defaultSwitch(deps, s.id, s.prevDir);
+    } catch (e) {
+      errors.push(`${s.id}: ${(e as Error).message ?? String(e)}`);
     }
   }
+  return errors;
+}
 
-  const liveDir = opts.liveDir ? resolve(opts.liveDir) : defaultLiveDir(repoRoot);
+function rollbackText(errors: string[]): string {
+  return errors.length
+    ? `откат с ошибками: ${errors.join("; ")}`
+    : "все переведённые плагины возвращены на прежние источники";
+}
 
-  // Захватываем общий замок репозитория вне защищённой копии
-  const projLock = projectLockPath(canonicalRoot);
-  const lockDir = dirname(projLock);
-  mkdirSync(lockDir, { recursive: true, mode: 0o700 });
-  let lockAcquired = false;
+const dummyGit: MergeGit = async () => ({ exitCode: 0, stdout: "", stderr: "" });
+
+function finishRequest(
+  store: DelegationStore,
+  req: LiveCheckoutRequest,
+  status: LiveCheckoutRequest["status"],
+  result: string,
+): void {
+  const cur = getLiveCheckoutRequest(store, req.id) ?? req;
+  saveLiveCheckoutRequest(store, { ...cur, status, result, decidedAt: cur.decidedAt ?? Date.now() });
+}
+
+/**
+ * Применение одобренной заявки (§24.1 п.2). Бросает
+ * `live-checkout-failed` с причиной и итогом отката; строка владельцу
+ * уходит в обоих исходах.
+ */
+export async function runLiveCheckoutMigration(
+  deps: MigrationDeps,
+  req: LiveCheckoutRequest,
+): Promise<MigrationResult> {
+  const store = deps.store;
+  if (req.status !== "approved") {
+    throw new OrchestratorError(
+      "live-checkout-needs-approval",
+      `live-checkout-needs-approval: заявка ${req.id} в статусе ${req.status}`,
+    );
+  }
+  const repoRoot = req.canonicalRoot;
+  const liveDir = req.liveDir;
+  const owner = deps.instanceId;
+
+  // Замки: миграция проекта, затем живая копия. Отказ захвата — прерывание.
+  const releaseMigrate = await acquireCopyLock(dummyGit, repoRoot, migrationLockPath(repoRoot), {
+    owner,
+  });
+  let releaseLive: (() => void) | null = null;
+  const switched: Array<{ id: string; prevDir: string }> = [];
+  let token: string | null = null;
+  let selfHandoff = false;
   try {
-    writeFileSync(projLock, `${process.pid}\n${new Date().toISOString()}\n\n\nsetupLiveCheckout\n`, {
-      flag: "wx",
-    });
-    lockAcquired = true;
-  } catch (e: any) {
-    if (e.code === "EEXIST") {
+    setLiveCheckoutMigrating(store, repoRoot, true);
+    const busy = activePublishes(repoRoot);
+    if (busy.length) {
       throw new OrchestratorError(
-        "merge-in-progress",
-        `репозиторий заблокирован другой операцией (замок ${projLock})`,
+        "live-checkout-busy",
+        `live-checkout: идёт публикация release (${busy.length}) — повторите после неё`,
       );
     }
-  }
+    mkdirSync(dirname(liveDir), { recursive: true, mode: 0o700 });
+    releaseLive = await acquireCopyLock(dummyGit, liveDir, liveCopyLockPath(liveDir), { owner });
+    finishRequest(store, req, "migrating", "");
 
-  const switched: Array<{ id: string; prevDir: string }> = [];
-  const parentDir = dirname(liveDir);
-  mkdirSync(parentDir, { recursive: true, mode: 0o700 });
-
-  const liveBase = basename(liveDir);
-  const tokenFile = join(parentDir, `.token-${liveBase}`);
-  const legacyTokenFile = join(parentDir, ".token");
-  const tokenVal = randomBytes(24).toString("hex");
-  const tokenPayload = JSON.stringify({
-    token: tokenVal,
-    repo: resolve(liveDir),
-    expiresAt: Date.now() + 600_000,
-  });
-
-  try {
-    // Блокировка release во время миграции
-    setLiveCheckoutMigrating(opts.store, canonicalRoot, true);
-
-    writeFileSync(tokenFile, tokenPayload, { mode: 0o600 });
-    writeFileSync(legacyTokenFile, tokenPayload, { mode: 0o600 });
-
-    const gitEnv: Record<string, string> = {
-      ...process.env,
-      ORCH_LIVE_TOKEN: tokenVal,
-    };
-    delete gitEnv.GIT_DIR;
-    delete gitEnv.GIT_WORK_TREE;
-    delete gitEnv.GIT_INDEX_FILE;
-
-    // (а) служебная копия ~/.bb/plugin-live/<repo> — отдельный clone на origin/<target>
-    let realOrigin = "";
-    try {
-      realOrigin = execFileSync("git", ["-C", canonicalRoot, "remote", "get-url", "origin"], {
-        encoding: "utf8",
-      }).trim();
-    } catch {}
-    if (!realOrigin) realOrigin = canonicalRoot;
-
+    // (а) служебная копия: clone на origin/<target> либо fetch + ff.
+    const origin = gitOut(["-C", repoRoot, "remote", "get-url", "origin"]) || repoRoot;
+    const env = { ...process.env } as Record<string, string>;
+    delete env.GIT_DIR;
+    delete env.GIT_WORK_TREE;
+    delete env.GIT_INDEX_FILE;
     if (!existsSync(liveDir)) {
-      execFileSync("git", ["clone", "--branch", targetBranch, realOrigin, liveDir], {
-        encoding: "utf8",
+      execFileSync("git", ["clone", "--branch", req.targetBranch, origin, liveDir], {
         stdio: "pipe",
-        env: gitEnv,
+        env,
       });
     } else {
       chmodRecursive(liveDir, true);
-      execFileSync("git", ["-C", liveDir, "fetch", "origin"], {
-        encoding: "utf8",
-        stdio: "pipe",
-        env: gitEnv,
-      });
-      execFileSync("git", ["-C", liveDir, "merge", "--ff-only", `origin/${targetBranch}`], {
-        encoding: "utf8",
-        stdio: "pipe",
-        env: gitEnv,
-      });
-    }
-
-    const liveSha = execFileSync(
-      "git",
-      ["-C", liveDir, "rev-parse", "HEAD"],
-      { encoding: "utf8" },
-    ).trim();
-
-    // (б) сборка плагинов в ней
-    if (opts.onBuildPlugins) {
-      await opts.onBuildPlugins(liveDir);
-    } else {
-      const candidateDirs: string[] = [];
-      const pluginsSub = join(liveDir, "plugins");
-      if (existsSync(pluginsSub)) {
-        for (const e of readdirSync(pluginsSub, { withFileTypes: true })) {
-          if (e.isDirectory() && existsSync(join(pluginsSub, e.name, "package.json"))) {
-            candidateDirs.push(join(pluginsSub, e.name));
-          }
-        }
-      } else if (existsSync(join(liveDir, "package.json"))) {
-        candidateDirs.push(liveDir);
-      }
-
-      for (const pDir of candidateDirs) {
-        const pkg = JSON.parse(readFileSync(join(pDir, "package.json"), "utf8"));
-        if (pkg.scripts?.build) {
-          execFileSync("npm", ["run", "build"], { cwd: pDir, encoding: "utf8", stdio: "pipe", env: gitEnv });
-        }
-        // Проверяем наличие dist и валидного build-info.json (не фабрикуем build-info!)
-        const distDir = join(pDir, "dist");
-        if (existsSync(distDir)) {
-          const infoPath = join(distDir, "build-info.json");
-          if (existsSync(infoPath)) {
-            try {
-              const info = JSON.parse(readFileSync(infoPath, "utf8"));
-              if (info.gitSha && info.gitSha !== liveSha) {
-                throw new Error(`build-info.json в ${distDir} имеет устаревший SHA ${info.gitSha} (ожидался ${liveSha})`);
-              }
-            } catch (err: any) {
-              throw new OrchestratorError("live-checkout-failed", `сбой валидации сборки в ${pDir}: ${err.message ?? String(err)}`);
-            }
-          }
-        }
-      }
-    }
-
-    // (в) перевод источников установленных плагинов по одному с проверкой,
-    // что плагин поднялся и его build-info.json равен SHA служебной копии
-    let plugins = opts.pluginsToMigrate ?? [];
-    if (!opts.pluginsToMigrate && opts.bbCli) {
-      const listRes = await opts.bbCli.run(["plugin", "list", "--json"]);
-      if (listRes.exitCode !== 0) {
+      token = issueLiveToken(liveDir);
+      const tenv = { ...env, ORCH_LIVE_TOKEN: token };
+      execFileSync("git", ["-C", liveDir, "fetch", "origin"], { stdio: "pipe", env: tenv });
+      const br = gitOut(["-C", liveDir, "symbolic-ref", "--short", "-q", "HEAD"]);
+      if (br !== req.targetBranch) {
         throw new OrchestratorError(
           "live-checkout-failed",
-          `не удалось получить список плагинов через bb plugin list: ${listRes.stderr || listRes.stdout}`,
+          `служебная копия ${liveDir} на ветке ${br || "detached"}, ожидалась ${req.targetBranch}`,
         );
       }
-      let parsed: any;
+      execFileSync("git", ["-C", liveDir, "merge", "--ff-only", `origin/${req.targetBranch}`], {
+        stdio: "pipe",
+        env: tenv,
+      });
+    }
+    const liveSha = gitOut(["-C", liveDir, "rev-parse", "HEAD"]);
+    if (!liveSha) throw new OrchestratorError("live-checkout-failed", `нет HEAD в ${liveDir}`);
+
+    // Плагины проекта: источник path: внутри репозитория.
+    const before = await defaultList(deps);
+    const roots = [real(req.repoRoot), repoRoot];
+    const plan = before
+      .filter((p) => p.source.startsWith("path:"))
+      .map((p) => {
+        const root = real(p.rootDir);
+        const base = roots.find((r) => root === r || root.startsWith(r + "/"));
+        return base ? { info: p, root, rel: relative(base, root) } : null;
+      })
+      .filter((x): x is { info: PluginInfo; root: string; rel: string } => x !== null)
+      .filter((x) => real(join(liveDir, x.rel)) !== x.root);
+    const selfId = deps.selfPluginId ?? "orchestrator";
+    plan.sort((a, b) => Number(a.info.id === selfId) - Number(b.info.id === selfId));
+    for (const p of plan) {
+      if (!existsSync(join(liveDir, p.rel, "package.json"))) {
+        throw new OrchestratorError(
+          "live-checkout-failed",
+          `плагина ${p.info.id} нет в служебной копии (${join(liveDir, p.rel)})`,
+        );
+      }
+    }
+
+    // (б) сборка переводимых плагинов в служебной копии.
+    for (const p of plan) {
       try {
-        parsed = JSON.parse(listRes.stdout);
-      } catch {
+        await defaultBuild(deps, join(liveDir, p.rel), liveSha);
+      } catch (e) {
         throw new OrchestratorError(
           "live-checkout-failed",
-          "bb plugin list вернул некорректный JSON",
+          `сборка ${p.info.id}: ${(e as Error).message ?? String(e)}`,
         );
       }
-      const allPlugins = Array.isArray(parsed) ? parsed : parsed.plugins ?? [];
-      plugins = allPlugins
-        .filter((p: any) => {
-          const root = p.rootDir ?? p.dir ?? p.path;
-          if (!root) return false;
-          const rNorm = resolve(root);
-          return rNorm === canonicalRoot || rNorm.startsWith(canonicalRoot + "/");
-        })
-        .map((p: any) => {
-          const root = resolve(p.rootDir ?? p.dir ?? p.path);
-          const rel = relative(canonicalRoot, root);
+    }
+    // Маркер живой копии (до «только чтение»).
+    const common = gitOut(["-C", liveDir, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    writeFileSync(
+      join(common || join(liveDir, ".git"), LIVE_MARKER),
+      JSON.stringify({ projectId: req.projectId, repo: repoRoot, at: Date.now() }) + "\n",
+    );
+
+    // (в) перевод по одному.
+    for (const p of plan) {
+      const newDir = join(liveDir, p.rel);
+      const wasRunning = p.info.status === "running";
+      if (p.info.id === selfId) {
+        const inflight: Inflight = {
+          requestId: req.id,
+          projectId: req.projectId,
+          canonicalRoot: repoRoot,
+          liveDir,
+          liveSha,
+          switched: [...switched],
+          selfId,
+          selfPrev: p.root,
+          selfNew: real(newDir),
+          at: Date.now(),
+        };
+        store.metaSet(INFLIGHT(repoRoot), JSON.stringify(inflight));
+      }
+      try {
+        await defaultSwitch(deps, p.info.id, newDir);
+        switched.push({ id: p.info.id, prevDir: p.root });
+        if (p.info.id === selfId && deps.selfRoot && real(deps.selfRoot) !== real(newDir)) {
+          // Этот экземпляр — прежний orchestrator: итог допишет новый.
+          selfHandoff = true;
           return {
-            id: p.id,
-            dirName: basename(root),
-            currentSourceDir: root,
-            relPath: rel,
+            ok: true,
+            pendingSelf: true,
+            liveDir,
+            headSha: liveSha,
+            switchedPlugins: switched.map((s) => s.id),
+            message: `orchestrator переведён на ${newDir}; запись postPublish.checkout сделает новый экземпляр после проверки`,
           };
-        });
-    }
-
-    for (const plugin of plugins) {
-      const relPath = (plugin as any).relPath ?? join("plugins", plugin.dirName);
-      const newPluginDir = join(liveDir, relPath);
-      let installSucceeded = false;
-      try {
-        if (opts.onSwitchPlugin) {
-          await opts.onSwitchPlugin(plugin.id, newPluginDir);
-          installSucceeded = true;
-        } else if (opts.bbCli) {
-          const swRes = await opts.bbCli.run(["plugin", "install", newPluginDir]);
-          if (swRes.exitCode !== 0) {
-            throw new Error(`bb plugin install ${newPluginDir} failed: ${swRes.stderr || swRes.stdout}`);
-          }
-          installSucceeded = true;
         }
-        switched.push({ id: plugin.id, prevDir: plugin.currentSourceDir });
-
-        // Проверяем build-info.json в целевой сборке
-        const buildInfoPath = join(newPluginDir, "dist", "build-info.json");
-        if (!opts.onSwitchPlugin || existsSync(buildInfoPath)) {
-          let matchesSha = false;
-          if (existsSync(buildInfoPath)) {
-            try {
-              const parsed = JSON.parse(readFileSync(buildInfoPath, "utf8"));
-              if (parsed.gitSha === liveSha) {
-                matchesSha = true;
-              }
-            } catch {}
-          }
-
-          if (!matchesSha) {
-            throw new Error(`build-info.json SHA не совпадает с SHA служебной копии (${liveSha})`);
-          }
+        await verifySwitched(deps, p.info.id, newDir, liveSha, wasRunning);
+      } catch (e) {
+        if (!switched.some((s) => s.id === p.info.id)) {
+          // install мог частично переключить — возвращаем и этот плагин
+          switched.push({ id: p.info.id, prevDir: p.root });
         }
-
-        // Подтверждаем активный источник через BB
-        if (!opts.onSwitchPlugin && opts.bbCli) {
-          const checkRes = await opts.bbCli.run(["plugin", "list", "--json"]);
-          if (checkRes.exitCode === 0) {
-            try {
-              const checkParsed = JSON.parse(checkRes.stdout);
-              const listArr = Array.isArray(checkParsed) ? checkParsed : checkParsed.plugins ?? [];
-              const found = listArr.find((p: any) => p.id === plugin.id);
-              if (found) {
-                const activeRoot = resolve(found.rootDir ?? found.dir ?? found.path ?? "");
-                if (activeRoot !== resolve(newPluginDir)) {
-                  throw new Error(`активный источник плагина ${plugin.id} (${activeRoot}) не переключился на ${newPluginDir}`);
-                }
-              }
-            } catch (err: any) {
-              if (err.message && err.message.includes("не переключился")) throw err;
-            }
-          }
-        }
-      } catch (err: any) {
-        // Если install успел переключить источник текущего плагина, но проверка упала —
-        // текущий плагин тоже включается в откат на прежний источник
-        if (installSucceeded && !switched.some((s) => s.id === plugin.id)) {
-          switched.push({ id: plugin.id, prevDir: plugin.currentSourceDir });
-        }
-        const rollbackErrors: string[] = [];
-        for (let i = switched.length - 1; i >= 0; i--) {
-          const s = switched[i]!;
-          try {
-            if (opts.onSwitchPlugin) {
-              await opts.onSwitchPlugin(s.id, s.prevDir);
-            } else if (opts.bbCli) {
-              const rbRes = await opts.bbCli.run(["plugin", "install", s.prevDir]);
-              if (rbRes.exitCode !== 0) {
-                rollbackErrors.push(`${s.id}: ${rbRes.stderr || rbRes.stdout}`);
-              }
-            }
-          } catch (rbErr: any) {
-            rollbackErrors.push(`${s.id}: ${rbErr.message ?? String(rbErr)}`);
-          }
-        }
-        const rbInfo = rollbackErrors.length > 0 ? ` (ошибки отката: ${rollbackErrors.join("; ")})` : " (все затронутые плагины возвращены на прежние источники)";
+        store.metaSet(INFLIGHT(repoRoot), "");
+        const errs = await rollback(deps, switched);
         throw new OrchestratorError(
           "live-checkout-failed",
-          `сбой перевода плагина ${plugin.id}: ${err.message ?? String(err)}${rbInfo}`,
+          `сбой перевода плагина ${p.info.id}: ${(e as Error).message ?? String(e)}; ${rollbackText(errs)}`,
         );
       }
     }
+    store.metaSet(INFLIGHT(repoRoot), "");
 
-    // (г) только после перевода всех плагинов — смена postPublish.checkout на служебную копию, одной записью
+    // (г) одна подтверждённая запись postPublish.checkout.
     try {
-      if (opts.updateReleaseConfigCheckout) {
-        await opts.updateReleaseConfigCheckout(liveDir);
-      }
-    } catch (err: any) {
-      // Сбой обновления postPublish.checkout — откат всех переведённых плагинов
-      const rollbackErrors: string[] = [];
-      for (let i = switched.length - 1; i >= 0; i--) {
-        const s = switched[i]!;
-        try {
-          if (opts.onSwitchPlugin) {
-            await opts.onSwitchPlugin(s.id, s.prevDir);
-          } else if (opts.bbCli) {
-            const rbRes = await opts.bbCli.run(["plugin", "install", s.prevDir]);
-            if (rbRes.exitCode !== 0) {
-              rollbackErrors.push(`${s.id}: ${rbRes.stderr || rbRes.stdout}`);
-            }
-          }
-        } catch (rbErr: any) {
-          rollbackErrors.push(`${s.id}: ${rbErr.message ?? String(rbErr)}`);
-        }
-      }
-      const rbInfo = rollbackErrors.length > 0 ? ` (ошибки отката: ${rollbackErrors.join("; ")})` : " (все плагины возвращены)";
+      await deps.writeCheckout(req.projectId, liveDir);
+    } catch (e) {
+      const errs = await rollback(deps, switched);
       throw new OrchestratorError(
         "live-checkout-failed",
-        `сбой обновления postPublish.checkout: ${err.message ?? String(err)}${rbInfo}`,
+        `сбой записи postPublish.checkout: ${(e as Error).message ?? String(e)}; ${rollbackText(errs)}`,
       );
     }
-
-    // Превентивная защита служебной живой копии (§24.1 п.3): chmod -R a-w
-    chmodRecursive(liveDir, false);
-
-    return {
-      ok: true,
-      liveDir,
-      headSha: liveSha,
-      switchedPlugins: switched.map((s) => s.id),
-      message: `служебная копия live-checkout успешно настроена в ${liveDir} (${liveSha.slice(0, 7)}), плагины переведены`,
-    };
+    if (deps.hooksDir) {
+      try {
+        writeLiveRegistry(deps.hooksDir, [...readRegistry(deps.hooksDir), liveDir]);
+      } catch {}
+    }
+    const msg = `live-checkout ${req.id}: служебная копия ${liveDir} (${liveSha.slice(0, 7)}), переведены: ${switched.map((s) => s.id).join(", ") || "нет"}; postPublish.checkout проекта ${req.projectId} → ${liveDir}`;
+    finishRequest(store, req, "done", msg);
+    await deps.notifyOwner(msg, req.requestedBy ? [req.requestedBy] : []).catch(() => false);
+    return { ok: true, liveDir, headSha: liveSha, switchedPlugins: switched.map((s) => s.id), message: msg };
+  } catch (e) {
+    const reason = (e as Error).message ?? String(e);
+    finishRequest(store, req, "failed", reason);
+    await deps
+      .notifyOwner(`live-checkout ${req.id} не выполнен: ${reason}; postPublish.checkout не менялся`, req.requestedBy ? [req.requestedBy] : [])
+      .catch(() => false);
+    throw e instanceof OrchestratorError ? e : new OrchestratorError("live-checkout-failed", reason);
   } finally {
-    // Гарантированное снятие прав записи в finally
-    if (existsSync(liveDir)) {
-      try {
-        chmodRecursive(liveDir, false);
-      } catch {}
-    }
-    if (existsSync(tokenFile)) {
-      try {
-        rmSync(tokenFile, { force: true });
-      } catch {}
-    }
-    if (existsSync(legacyTokenFile)) {
-      try {
-        rmSync(legacyTokenFile, { force: true });
-      } catch {}
-    }
-    setLiveCheckoutMigrating(opts.store, canonicalRoot, false);
-    if (lockAcquired) {
-      try {
-        rmSync(projLock, { force: true });
-      } catch {}
+    if (token) revokeLiveToken(liveDir, token);
+    if (existsSync(liveDir)) chmodRecursive(liveDir, false);
+    if (!selfHandoff) setLiveCheckoutMigrating(store, repoRoot, false);
+    releaseLive?.();
+    if (!selfHandoff) releaseMigrate();
+    else {
+      // Замок миграции держится до итога нового экземпляра: его pid тот
+      // же процесс BB, владелец — прежний экземпляр; новый снимает его в
+      // resumeLiveCheckout.
     }
   }
+}
+
+function readRegistry(hooksDir: string): string[] {
+  try {
+    const list = JSON.parse(readFileSync(join(hooksDir, "live-copies.json"), "utf8"));
+    return Array.isArray(list) ? list.filter((x) => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Старт экземпляра: незавершённая миграция с переводом самого
+ * orchestrator. Этот экземпляр загружен из служебной копии и его
+ * build-info = SHA копии → запись postPublish.checkout. Иначе (перевод
+ * не состоялся или истёк срок) — откат остальных и строка владельцу.
+ */
+export async function resumeLiveCheckout(
+  deps: MigrationDeps,
+  opts: { maxAgeMs?: number } = {},
+): Promise<MigrationResult[]> {
+  const store = deps.store;
+  const out: MigrationResult[] = [];
+  for (const req of listLiveCheckoutRequests(store)) {
+    if (req.status !== "migrating") continue;
+    const raw = store.metaGet(INFLIGHT(req.canonicalRoot));
+    if (!raw) continue;
+    let inf: Inflight;
+    try {
+      inf = JSON.parse(raw) as Inflight;
+    } catch {
+      continue;
+    }
+    const selfRoot = deps.selfRoot ? real(deps.selfRoot) : "";
+    const newSelf = inf.selfNew;
+    const switchedAll = [...inf.switched, { id: inf.selfId, prevDir: inf.selfPrev }];
+    const migrateLock = migrationLockPath(inf.canonicalRoot);
+    const done = () => {
+      store.metaSet(INFLIGHT(inf.canonicalRoot), "");
+      setLiveCheckoutMigrating(store, inf.canonicalRoot, false);
+      rmSync(migrateLock, { force: true });
+    };
+    const loadedFromLive = selfRoot !== "" && selfRoot === newSelf;
+    if (loadedFromLive && readBuildSha(selfRoot) === inf.liveSha) {
+      try {
+        await deps.writeCheckout(inf.projectId, inf.liveDir);
+        if (deps.hooksDir) {
+          try {
+            writeLiveRegistry(deps.hooksDir, [...readRegistry(deps.hooksDir), inf.liveDir]);
+          } catch {}
+        }
+        const msg = `live-checkout ${req.id}: переведены ${switchedAll.map((s) => s.id).join(", ")}; postPublish.checkout проекта ${inf.projectId} → ${inf.liveDir} (${inf.liveSha.slice(0, 7)})`;
+        finishRequest(store, req, "done", msg);
+        done();
+        await deps.notifyOwner(msg, req.requestedBy ? [req.requestedBy] : []).catch(() => false);
+        out.push({ ok: true, liveDir: inf.liveDir, headSha: inf.liveSha, switchedPlugins: switchedAll.map((s) => s.id), message: msg });
+      } catch (e) {
+        const errs = await rollback(deps, switchedAll);
+        const reason = `сбой записи postPublish.checkout: ${(e as Error).message ?? String(e)}; ${rollbackText(errs)}`;
+        finishRequest(store, req, "failed", reason);
+        done();
+        await deps.notifyOwner(`live-checkout ${req.id} не выполнен: ${reason}`, req.requestedBy ? [req.requestedBy] : []).catch(() => false);
+        out.push({ ok: false, liveDir: inf.liveDir, headSha: inf.liveSha, switchedPlugins: [], message: reason });
+      }
+      continue;
+    }
+    const age = Date.now() - inf.at;
+    if (loadedFromLive || age > (opts.maxAgeMs ?? 15 * 60_000)) {
+      const errs = await rollback(deps, loadedFromLive ? switchedAll : inf.switched);
+      const reason = loadedFromLive
+        ? `orchestrator поднялся из ${selfRoot}, но build-info ≠ ${inf.liveSha}; ${rollbackText(errs)}`
+        : `перевод orchestrator не завершился за ${Math.round(age / 60000)} мин; ${rollbackText(errs)}`;
+      finishRequest(store, req, "failed", reason);
+      done();
+      await deps.notifyOwner(`live-checkout ${req.id} не выполнен: ${reason}; postPublish.checkout не менялся`, req.requestedBy ? [req.requestedBy] : []).catch(() => false);
+      out.push({ ok: false, liveDir: inf.liveDir, headSha: inf.liveSha, switchedPlugins: [], message: reason });
+    }
+  }
+  return out;
 }

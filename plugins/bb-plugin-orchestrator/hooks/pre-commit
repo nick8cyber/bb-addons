@@ -23,14 +23,9 @@
  * like `pre-push` does. Any infrastructure failure (no git, no
  * scanner module) fails OPEN — a hook must not wedge `git commit`.
  */
-import {
-  accessSync,
-  constants,
-  existsSync,
-  readFileSync,
-} from "node:fs";
+import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HOOK_NAME = "pre-commit";
@@ -38,7 +33,7 @@ const HOOK_NAME = "pre-commit";
 // setting — the plugin rewrites this JSON block on install and whenever
 // the language changes (`renderPreCommit` in release.ts). This file
 // carries the Russian variant; English installs get en texts.
-const MESSAGES = {"finding":"{file}:{line} — {type}: {text}","findingWarn":"{file}:{line} — {type}: {text} (предупреждение)","typeMachine":"путь машины","typeThreadId":"id треда","typeEmail":"почта","typeSecret":"секрет","targetBranch":"в целевую ветку не коммитят, работай в копии задачи","coordinatorNoCode":"координатор код не пишет: delegate","coordinatorMixed":"координатор код не пишет: delegate (пути вне docs: {paths})","helperNoCommit":"помощник не коммитит, итог — текстом вызвавшему","foreignCopy":"коммит вне копии задачи","architectNoCode":"архитектор код не коммитит, итог сдаётся текстом"};
+const MESSAGES = {"finding":"{file}:{line} — {type}: {text}","findingWarn":"{file}:{line} — {type}: {text} (предупреждение)","typeMachine":"путь машины","typeThreadId":"id треда","typeEmail":"почта","typeSecret":"секрет","targetBranch":"в целевую ветку не коммитят, работай в копии задачи","coordinatorNoCode":"координатор код не пишет: delegate","coordinatorMixed":"координатор код не пишет: delegate (пути вне docs: {paths})","helperNoCommit":"помощник не коммитит, итог — текстом вызвавшему","foreignCopy":"коммит вне копии задачи","architectNoCode":"архитектор код не коммитит, итог сдаётся текстом","dbUnavailable":"база плагина недоступна ({error}) — проверена только целевая ветка"};
 function msg(k, p = {}) {
   return String(MESSAGES[k] ?? k).replace(/\{(\w+)\}/g, (m, n) =>
     n in p ? String(p[n]) : m,
@@ -59,96 +54,25 @@ function git(args, opts = {}) {
   });
 }
 
-async function openDb(dbPath) {
-  if (!existsSync(dbPath)) return null;
-  try {
-    const { DatabaseSync } = await import("node:sqlite");
-    const db = new DatabaseSync(dbPath, { readOnly: true });
-    return {
-      prepare(sql) {
-        const stmt = db.prepare(sql);
-        return {
-          get(...args) { return stmt.get(...args); },
-          all(...args) { return stmt.all(...args); },
-          run(...args) { return stmt.run(...args); },
-        };
-      },
-      close() {
-        try { db.close(); } catch {}
-      },
-    };
-  } catch {
-    try {
-      const Database = (await import("better-sqlite3")).default;
-      const db = new Database(dbPath, { readonly: true, timeout: 2000 });
-      return {
-        prepare(sql) {
-          const stmt = db.prepare(sql);
-          return {
-            get(...args) { return stmt.get(...args); },
-            all(...args) { return stmt.all(...args); },
-            run(...args) { return stmt.run(...args); },
-          };
-        },
-        close() {
-          try { db.close(); } catch {}
-        },
-      };
-    } catch {
-      return null;
-    }
-  }
-}
+// Shared helpers (`hook-lib.mjs` next to this file). A missing library
+// fails open for the leak scan and chaining, but §24 rule (а) still
+// applies with the built-in target branches.
+let lib = null;
+try {
+  lib = await import("./hook-lib.mjs");
+} catch { /* old or partial install */ }
 
-/** The repository's own hook (the global core.hooksPath shadows it):
- * `$GIT_DIR/hooks/<name>` — the env var first, then the common dir for
- * worktrees. Executable files only, exactly like git itself. */
-function localHookPath() {
-  const candidates = [];
-  const chainFile = join(dir, "chain.json");
-  if (existsSync(chainFile)) {
-    try {
-      const c = JSON.parse(readFileSync(chainFile, "utf8"));
-      const cwd = process.cwd();
-      if (c.localHooks) {
-        for (const [r, h] of Object.entries(c.localHooks)) {
-          if (cwd === r || cwd.startsWith(r + "/") || cwd.startsWith(r + "\\")) {
-            candidates.push(join(h, HOOK_NAME));
-          }
-        }
-      }
-      if (c.previousGlobalHooksPath) {
-        candidates.push(join(c.previousGlobalHooksPath, HOOK_NAME));
-      }
-    } catch {}
-  }
-  if (process.env.GIT_DIR) {
-    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
-  }
-  const common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  if (common.status === 0) {
-    candidates.push(join(common.stdout.trim(), "hooks", HOOK_NAME));
-  }
-  const self = fileURLToPath(import.meta.url);
-  for (const c of candidates) {
-    if (c === self || !existsSync(c)) continue;
-    try {
-      accessSync(c, constants.X_OK);
-    } catch {
-      continue; // not executable — git would skip it, so do we
-    }
-    return c;
-  }
-  return null;
-}
-
+/** The previous hook (§17.3, §24.1): migrated local core.hooksPath of
+ * this copy, then `$GIT_DIR/hooks/<name>`, then the previous global. */
 function chainLocal() {
-  const local = localHookPath();
+  if (!lib) return 0;
+  const local = lib.chainTarget(dir, HOOK_NAME, fileURLToPath(import.meta.url));
   if (!local) return 0;
   const res = spawnSync(local, process.argv.slice(2), {
     encoding: "utf8",
     stdio: ["pipe", "inherit", "inherit"],
   });
+  if (res.error) return 1;
   return res.status ?? 1;
 }
 
@@ -178,185 +102,105 @@ try {
 } catch { /* no exclusions file — nothing excluded */ }
 
 // ── §24 п.2 (а): Ветка не целевая ──────────────────────────────────────
+// Built-in main/master/dev, this copy's snapshot target and the target
+// of every configured project (`targets.json`, written by the plugin
+// from the accepted settings — a fresh copy without a snapshot is
+// covered too).
 const branchRes = git(["symbolic-ref", "--short", "-q", "HEAD"]);
 const curBranch = branchRes.stdout ? branchRes.stdout.trim() : "";
-const TARGET_BRANCHES = new Set(["main", "master", "dev"]);
-try {
-  const leaksSnapPath = join(commonDir, "orchestrator-leaks.json");
-  if (existsSync(leaksSnapPath)) {
-    const snap = JSON.parse(readFileSync(leaksSnapPath, "utf8"));
-    if (snap?.targetBranch) {
-      TARGET_BRANCHES.add(snap.targetBranch);
-    }
-  }
-} catch {}
-if (TARGET_BRANCHES.has(curBranch)) {
+const TARGET_BRANCHES = lib
+  ? lib.targetBranches(dir, commonDir)
+  : new Set(["main", "master", "dev"]);
+if (curBranch && TARGET_BRANCHES.has(curBranch)) {
   console.error(msg("targetBranch"));
   process.exit(1);
 }
 
 // ── §24 п.2 (б) & §24.1 п.4–5: Роли агентов ──────────────────────────
+// The plugin database is opened read-only. Unavailable or unreadable —
+// a warning and rule (а) only; "no role" is a different, normal state.
 const threadId = process.env.BB_THREAD_ID;
-if (threadId) {
-  let dbOpened = false;
-  try {
-    const home = process.env.HOME ?? "/home/ubuntu";
-    const dbPath =
-      process.env.ORCHESTRATOR_DB_PATH ??
-      join(home, ".bb", "plugins", "orchestrator", "data.db");
-    if (existsSync(dbPath)) {
-      const db = await openDb(dbPath);
-      if (db) {
-        dbOpened = true;
-
-        let role = null;
-        try {
-          const helperRow = db
-            .prepare("SELECT 1 FROM helpers WHERE thread_id = ?")
-            .get(threadId);
-          if (helperRow) {
-            role = "helper";
-          } else {
-            const roleRow = db
-              .prepare("SELECT role FROM thread_roles WHERE thread_id = ?")
-              .get(threadId);
-            if (roleRow && typeof roleRow === "object" && "role" in roleRow) {
-              role = String(roleRow.role);
-            }
-          }
-        } catch {}
-
-        if (role === "orchestrator") {
-          // §24.1 п.4: коммит разрешён, если все изменённые пути лежат в docs/
-          // Проверяем машинный формат с именами путей и обе стороны переименования (-z)
-          const stagedRes = git(["diff", "--cached", "--name-status", "-z"]);
-          const tokens = (stagedRes.stdout ?? "").split("\0").filter((t) => t.length > 0);
-          const stagedPaths = [];
-          for (let i = 0; i < tokens.length; i++) {
-            const status = tokens[i];
-            if (status.startsWith("R") || status.startsWith("C")) {
-              if (i + 1 < tokens.length) stagedPaths.push(tokens[++i]);
-              if (i + 1 < tokens.length) stagedPaths.push(tokens[++i]);
-            } else {
-              if (i + 1 < tokens.length) stagedPaths.push(tokens[++i]);
-            }
-          }
-
-          if (stagedPaths.length > 0) {
-            const nonDocs = stagedPaths.filter((p) => !p.startsWith("docs/"));
-            if (nonDocs.length > 0) {
-              if (nonDocs.length === stagedPaths.length) {
-                console.error(msg("coordinatorNoCode"));
-              } else {
-                console.error(
-                  msg("coordinatorMixed", { paths: [...new Set(nonDocs)].join(", ") }),
-                );
-              }
-              db.close();
-              process.exit(1);
-            }
-          }
-        } else if (role === "helper") {
-          // §24.1 п.5: роль helper не коммитит никогда
-          console.error(msg("helperNoCommit"));
-          db.close();
-          process.exit(1);
-        } else if (
-          role === "auditor" ||
-          role === "researcher" ||
-          role === "release-auditor" ||
-          role === "architect"
-        ) {
-          console.error(msg("architectNoCode"));
-          db.close();
-          process.exit(1);
-        } else if (role === "executor" || !role) {
-          // §24.1 п.5: Корневой executor без записи в delegations: коммитит, если ветка
-          // не целевая и копия не живая и не копия координатора.
-          const cwd = process.cwd();
-          const isLive =
-            cwd.includes(".bb/plugin-live") ||
-            process.env.ORCH_IS_LIVE_COPY === "1";
-          let isCoord = false;
-          try {
-            const coord = db
-              .prepare(
-                "SELECT 1 FROM coordinator_worktrees WHERE worktree_path = ?",
-              )
-              .get(cwd);
-            if (coord) isCoord = true;
-          } catch {}
-
-          if (isLive || isCoord) {
-            console.error(msg("foreignCopy"));
-            db.close();
-            process.exit(1);
-          }
-
-          let delegation = null;
-          try {
-            delegation = db
-              .prepare(
-                "SELECT id, status, task_key, result_env_id, coordinator_thread_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1",
-              )
-              .get(threadId);
-          } catch {}
-
-          if (delegation) {
-            let expectedPath = null;
-            const bbDbPath = join(home, ".bb", "bb.db");
-            if (existsSync(bbDbPath)) {
-              try {
-                const bbDb = await openDb(bbDbPath);
-                if (bbDb) {
-                  if (delegation.result_env_id) {
-                    const envRow = bbDb.prepare("SELECT path FROM environments WHERE id = ?").get(delegation.result_env_id);
-                    if (envRow?.path) expectedPath = resolve(envRow.path);
-                  }
-                  if (!expectedPath) {
-                    const thrRow = bbDb.prepare("SELECT e.path FROM threads t JOIN environments e ON t.environment_id = e.id WHERE t.id = ?").get(threadId);
-                    if (thrRow?.path) expectedPath = resolve(thrRow.path);
-                  }
-                  bbDb.close();
-                }
-              } catch {}
-            }
-
-            if (expectedPath) {
-              const cwdNorm = resolve(cwd);
-              if (cwdNorm !== expectedPath && !cwdNorm.startsWith(expectedPath + "/")) {
-                console.error(msg("foreignCopy"));
-                db.close();
-                process.exit(1);
-              }
-            } else if (delegation.result_env_id) {
-              const resEnv = resolve(delegation.result_env_id);
-              const cwdNorm = resolve(cwd);
-              if (cwdNorm !== resEnv && !cwdNorm.startsWith(resEnv + "/")) {
-                console.error(msg("foreignCopy"));
-                db.close();
-                process.exit(1);
-              }
-            } else {
-              const cwdNorm = resolve(cwd);
-              const taskMatch = delegation.task_key && cwdNorm.toLowerCase().includes(delegation.task_key.toLowerCase());
-              const threadMatch = cwdNorm.includes(threadId);
-              if (!taskMatch && !threadMatch) {
-                console.error(msg("foreignCopy"));
-                db.close();
-                process.exit(1);
-              }
-            }
+if (threadId && !lib) console.warn(msg("dbUnavailable", { error: "hook-lib.mjs" }));
+if (threadId && lib) {
+  const refuse = (key, params) => {
+    console.error(msg(key, params));
+    process.exit(1);
+  };
+  const { role, error, db } = await lib.readThreadRole(threadId);
+  if (error) {
+    console.warn(msg("dbUnavailable", { error }));
+  } else {
+    try {
+      const paths = lib.repoPaths();
+      const here = paths.top || lib.real(process.cwd());
+      if (role === "orchestrator") {
+        // §24.1 п.4: only docs/ — both sides of a rename/copy count.
+        const stagedRes = git(["diff", "--cached", "--name-status", "-z"]);
+        const tokens = (stagedRes.stdout ?? "").split("\0").filter((t) => t.length > 0);
+        const stagedPaths = [];
+        for (let i = 0; i < tokens.length; i++) {
+          const status = tokens[i];
+          if (status.startsWith("R") || status.startsWith("C")) {
+            if (i + 1 < tokens.length) stagedPaths.push(tokens[++i]);
+            if (i + 1 < tokens.length) stagedPaths.push(tokens[++i]);
+          } else if (i + 1 < tokens.length) {
+            stagedPaths.push(tokens[++i]);
           }
         }
-        db.close();
+        const nonDocs = [...new Set(stagedPaths.filter((p) => !p.startsWith("docs/")))];
+        if (nonDocs.length > 0) {
+          if (nonDocs.length === new Set(stagedPaths).size) refuse("coordinatorNoCode");
+          refuse("coordinatorMixed", { paths: nonDocs.join(", ") });
+        }
+      } else if (role === "helper") {
+        refuse("helperNoCommit"); // §24.1 п.5, §19
+      } else if (
+        role === "auditor" ||
+        role === "researcher" ||
+        role === "release-auditor" ||
+        role === "architect"
+      ) {
+        refuse("architectNoCode");
+      } else if (role === "executor") {
+        // Never in the service live copy or a coordinator's copy.
+        if (lib.isLiveCopy(dir, paths)) refuse("foreignCopy");
+        let coordCopies = [];
+        try {
+          coordCopies = db
+            .all("SELECT worktree_path FROM coordinator_worktrees WHERE worktree_path IS NOT NULL")
+            .map((r) => lib.real(String(r.worktree_path)));
+        } catch (e) {
+          console.warn(msg("dbUnavailable", { error: String(e?.message ?? e) }));
+          coordCopies = null;
+        }
+        if (coordCopies && coordCopies.some((c) => lib.inside(here, c))) {
+          refuse("foreignCopy");
+        }
+        let delegation = null;
+        try {
+          delegation = db.get(
+            "SELECT result_env_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1",
+            threadId,
+          );
+        } catch (e) {
+          console.warn(msg("dbUnavailable", { error: String(e?.message ?? e) }));
+        }
+        if (delegation) {
+          // §24 п.2 (б): only in the copy of its own task — the result
+          // environment of the delegation, else the thread's environment,
+          // compared by real path. Unknown path — refusal, never a guess.
+          const envs = await lib.envPaths(threadId, [delegation.result_env_id]);
+          const own =
+            (delegation.result_env_id && envs.byEnv.get(delegation.result_env_id)) ||
+            envs.thread;
+          if (!own || !lib.inside(here, own)) refuse("foreignCopy");
+        }
+        // §24.1 п.5: a root executor (no delegation) commits on a work
+        // branch in any other copy.
       }
+    } finally {
+      db?.close();
     }
-  } catch (e) {}
-  if (!dbOpened) {
-    console.warn(
-      "Хук читает базу плагина только на чтение; база недоступна — правило (а) и предупреждение.",
-    );
   }
 }
 

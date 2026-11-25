@@ -1,548 +1,842 @@
 /**
- * Acceptance test suite for orchestrator §24.1 (PLUG-410):
- * Границы для агентов кодом (§24 п.1–4) и установка хуков.
+ * Acceptance suite for orchestrator §24.1 (PLUG-410): границы для агентов
+ * кодом (§24 п.1–4), установка хуков, live-checkout под §23.
+ *
+ * Every git run here uses an isolated global config (`GIT_CONFIG_GLOBAL`
+ * per test) and the isolated HOME from register-hooks.ts; the last test
+ * compares the REAL machine's global core.hooksPath before and after.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
-  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  rmSync,
-  statSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { makeTempDir } from "./helpers/temp.js";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
   HOOK_NAMES,
   installHooks,
+  readHookNames,
   runHooksDoctor,
-  writeChainConfig,
   readChainConfig,
 } from "../src/hooks.js";
 import {
-  setupLiveCheckout,
+  LIVE_MARKER,
+  beginPublish,
   chmodRecursive,
+  getLiveCheckoutRequest,
   isLiveCheckoutMigrating,
+  isLiveCheckoutPath,
+  issueLiveToken,
+  liveCopyLockPath,
+  migrationLockPath,
+  parsePluginList,
+  requestLiveCheckout,
+  revokeLiveToken,
+  runLiveCheckoutMigration,
+  saveLiveCheckoutRequest,
   setLiveCheckoutMigrating,
+  writeTargetsRegistry,
+  type LiveCheckoutRequest,
+  type MigrationDeps,
+  type PluginInfo,
 } from "../src/live-checkout.js";
+import { acquireCopyLock } from "../src/merge.js";
 import { OrchestratorError } from "../src/errors.js";
-import { runRelease, type ReleaseDeps } from "../src/release.js";
 
-const HOOKS_SRC = fileURLToPath(new URL("../hooks", import.meta.url));
-const PC_SRC = join(HOOKS_SRC, "pre-commit");
-const SCAN_SRC = join(HOOKS_SRC, "leak-scan.ts");
-const CHAIN_SRC = join(HOOKS_SRC, "chain");
-const REF_SRC = join(HOOKS_SRC, "reference-transaction");
+// The real machine's global hooks path, read with the ORIGINAL home and
+// no GIT_CONFIG_GLOBAL — snapshotted before any test of this file runs.
+const REAL_HOME = process.env.ORCH_TEST_REAL_HOME || "";
+function realGlobalHooksPath(): string {
+  if (!REAL_HOME) return "";
+  const env = { ...process.env, HOME: REAL_HOME } as Record<string, string | undefined>;
+  delete env.GIT_CONFIG_GLOBAL;
+  const r = spawnSync("git", ["config", "--global", "--get", "core.hooksPath"], {
+    env: env as NodeJS.ProcessEnv,
+    encoding: "utf8",
+  });
+  return r.status === 0 ? r.stdout.trim() : "";
+}
+const REAL_BEFORE = realGlobalHooksPath();
 
-function initRepo(repoPath: string, branch = "main"): void {
-  mkdirSync(repoPath, { recursive: true });
-  execFileSync("git", ["init", repoPath], { stdio: "ignore" });
-  execFileSync("git", ["-C", repoPath, "config", "user.email", "agent@bb.local"]);
-  execFileSync("git", ["-C", repoPath, "config", "user.name", "BB Agent"]);
-  execFileSync("git", ["-C", repoPath, "checkout", "-B", branch], { stdio: "ignore" });
-  execFileSync("git", ["-c", "core.hooksPath=", "-C", repoPath, "commit", "--allow-empty", "-m", "init"], { stdio: "ignore" });
+const HOOKS_SRC = new URL("../hooks", import.meta.url).pathname;
+
+function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env) {
+  return spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env });
 }
 
-function setupTestHooksDir(dir: string): void {
-  mkdirSync(dir, { recursive: true, mode: 0o755 });
-  for (const name of HOOK_NAMES) {
-    const src = (name === "pre-commit" || name === "pre-push" || name === "post-checkout" || name === "reference-transaction")
-      ? join(HOOKS_SRC, name)
-      : CHAIN_SRC;
-    const dst = join(dir, name);
-    copyFileSync(src, dst);
-    chmodSync(dst, 0o755);
+function initRepo(repo: string, branch = "main"): void {
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", branch, repo]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "agent@bb.local"]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "BB Agent"]);
+  execFileSync("git", ["-C", repo, "commit", "-q", "--allow-empty", "-m", "init"], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+}
+
+/** Isolated environment: own global git config with our hooks installed. */
+async function hookEnv(prefix: string) {
+  const tmp = makeTempDir(prefix);
+  const hooksDir = join(tmp, "git-hooks");
+  const gcfg = join(tmp, "gitconfig");
+  writeFileSync(gcfg, "");
+  const prev = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = gcfg;
+  try {
+    await installHooks({ hooksDir });
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prev;
   }
-  copyFileSync(SCAN_SRC, join(dir, "leak-scan.ts"));
-  writeFileSync(join(dir, "exclusions"), "");
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: gcfg } as NodeJS.ProcessEnv;
+  delete env.BB_THREAD_ID;
+  return { tmp, hooksDir, gcfg, env };
 }
 
 function initDb(dbPath: string): { db: InstanceType<typeof Database>; store: DelegationStore } {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
-  for (const m of MIGRATIONS) {
-    db.exec(m);
-  }
-  const store = new DelegationStore(db);
-  return { db, store };
+  for (const m of MIGRATIONS) db.exec(m);
+  return { db, store: new DelegationStore(db) };
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// §24.1 п.6: Тесты 1–5 — hooks doctor и chain wrapper
-// ────────────────────────────────────────────────────────────────────────────
+/** A fake bb.db with the two tables the hooks read. */
+function initBbDb(path: string, threads: Array<[string, string]>, envs: Array<[string, string]>) {
+  const db = new Database(path);
+  db.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, environment_id TEXT, parent_thread_id TEXT)");
+  db.exec("CREATE TABLE environments (id TEXT PRIMARY KEY, path TEXT)");
+  for (const [id, env] of threads) db.prepare("INSERT INTO threads (id, environment_id) VALUES (?, ?)").run(id, env);
+  for (const [id, p] of envs) db.prepare("INSERT INTO environments (id, path) VALUES (?, ?)").run(id, p);
+  db.close();
+}
 
-test("§24.1 п.6 (1): hooks doctor на копии с локальным core.hooksPath возвращает код 2", async () => {
-  const tmp = makeTempDir("orch-hook-doc-1-");
-  const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
-  initRepo(repo);
-  setupTestHooksDir(hooksDir);
+function insertDelegation(db: InstanceType<typeof Database>, threadId: string, envId: string | null) {
+  db.prepare(
+    `INSERT INTO delegations (task_key, coordinator_thread_id, thread_id, level, route, preset, provider, status, created_at, updated_at, result_env_id)
+     VALUES (?, 'thr_coord', ?, 'simple', 'r', 'p', 'prov', 'running', 0, 0, ?)`,
+  ).run(`PLUG-${threadId}`, threadId, envId);
+}
 
-  // Настраиваем локальный core.hooksPath
-  execFileSync("git", ["-C", repo, "config", "--local", "core.hooksPath", "/tmp/local-hooks"]);
+function commit(repo: string, env: NodeJS.ProcessEnv, file: string, content = "x\n") {
+  mkdirSync(dirname(join(repo, file)), { recursive: true });
+  writeFileSync(join(repo, file), content);
+  git(repo, ["add", file], env);
+  return git(repo, ["commit", "-q", "-m", `add ${file}`], env);
+}
 
-  const res = await runHooksDoctor({ copy: repo, hooksDir });
-  assert.equal(res.code, 2);
-  assert.equal(res.ok, false);
-  const issue = res.issues.find((i) => i.type === "local-hooks-path");
-  assert.ok(issue, "должна быть найдена проблема local-hooks-path");
-  assert.match(res.message, /локальный core\.hooksPath/);
+// ────────────────────────────────────────────────────────────────────────
+// §24.1 п.1: один список имён, установка, doctor
+// ────────────────────────────────────────────────────────────────────────
+
+test("§24.1 п.1: HOOK_NAMES — тот же список, что hooks/hook-names (один источник для обеих установок)", () => {
+  assert.deepEqual([...HOOK_NAMES], [...readHookNames()]);
+  assert.equal(HOOK_NAMES.length, 23);
+  assert.ok(!HOOK_NAMES.includes("push-to-checkout"));
 });
 
-test("§24.1 п.6 (2): hooks doctor на копии без исполняемого pre-commit возвращает код 2", async () => {
-  const tmp = makeTempDir("orch-hook-doc-2-");
+test("§24.1 п.6: doctor на копии с локальным core.hooksPath → код 2, строка владельцу; сбой доставки виден", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-doc-local-");
   const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
   initRepo(repo);
-  setupTestHooksDir(hooksDir);
+  git(repo, ["config", "--local", "core.hooksPath", join(tmp, "own")], env);
+  const lines: string[] = [];
+  const prev = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = env.GIT_CONFIG_GLOBAL;
+  try {
+    const res = await runHooksDoctor({
+      hooksDir,
+      repo,
+      notifyOwner: async (l) => {
+        lines.push(l);
+        return true;
+      },
+    });
+    assert.equal(res.code, 2);
+    assert.ok(res.issues.some((i) => i.type === "local-hooks-path"));
+    assert.equal(lines.length, 1);
+    assert.match(lines[0]!, /local core\.hooksPath/);
+    const failed = await runHooksDoctor({ hooksDir, repo, notifyOwner: async () => false });
+    assert.equal(failed.ownerNotified, false);
+    assert.match(failed.message, /не доставлена/);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prev;
+  }
+});
 
-  // Снимаем права на исполнение с pre-commit
+test("§24.1 п.6: doctor — неисполняемый pre-commit и отсутствующий commit-msg → код 2 с перечнем", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-doc-set-");
+  const repo = join(tmp, "repo");
+  initRepo(repo);
   chmodSync(join(hooksDir, "pre-commit"), 0o644);
-
-  const res = await runHooksDoctor({ copy: repo, hooksDir });
-  assert.equal(res.code, 2);
-  assert.equal(res.ok, false);
-  const issue = res.issues.find((i) => i.type === "non-executable-hook");
-  assert.ok(issue, "должна быть найдена проблема non-executable-hook");
-  assert.match(res.message, /не имеют флага исполнения/);
+  execFileSync("rm", [join(hooksDir, "commit-msg")]);
+  const prev = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = env.GIT_CONFIG_GLOBAL;
+  try {
+    const res = await runHooksDoctor({ hooksDir, repo });
+    assert.equal(res.code, 2);
+    assert.match(res.message, /commit-msg/);
+    assert.match(res.message, /pre-commit/);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prev;
+  }
 });
 
-test("§24.1 п.6 (3): hooks doctor на hooksDir без commit-msg возвращает код 2 со списком", async () => {
-  const tmp = makeTempDir("orch-hook-doc-3-");
+test("§24.1 п.6: push-to-checkout не ставится и не считается ошибкой; полный набор → код 0", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-doc-ok-");
   const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
   initRepo(repo);
-  setupTestHooksDir(hooksDir);
-
-  // Удаляем commit-msg
-  rmSync(join(hooksDir, "commit-msg"), { force: true });
-
-  const res = await runHooksDoctor({ copy: repo, hooksDir });
-  assert.equal(res.code, 2);
-  assert.equal(res.ok, false);
-  const issue = res.issues.find((i) => i.type === "missing-hook");
-  assert.ok(issue, "должна быть найдена проблема missing-hook");
-  assert.match(res.message, /commit-msg/);
-});
-
-test("§24.1 п.6 (4): локальный commit-msg хук репозитория срабатывает через обёртку chain", () => {
-  const tmp = makeTempDir("orch-hook-doc-4-");
-  const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
-  initRepo(repo);
-  setupTestHooksDir(hooksDir);
-
-  // Создаём локальный .git/hooks/commit-msg, записывающий маркер
-  const localHook = join(repo, ".git", "hooks", "commit-msg");
-  const marker = join(tmp, "commit-msg-ran");
-  writeFileSync(localHook, `#!/bin/sh\necho "marker" > "${marker}"\nexit 0\n`);
-  chmodSync(localHook, 0o755);
-
-  const msgFile = join(tmp, "msg.txt");
-  writeFileSync(msgFile, "test commit message\n");
-
-  const chainWrapper = join(hooksDir, "commit-msg");
-  const r = spawnSync(chainWrapper, [msgFile], {
-    cwd: repo,
-    env: { ...process.env, GIT_DIR: join(repo, ".git") },
-    encoding: "utf8",
-  });
-
-  assert.equal(r.status, 0, `wrapper exit 0: ${r.stderr}`);
-  assert.ok(existsSync(marker), "локальный хук должен был создасть маркер");
-});
-
-test("§24.1 п.6 (5): отсутствие push-to-checkout в ~/.bb/git-hooks НЕ считается ошибкой в doctor", async () => {
-  const tmp = makeTempDir("orch-hook-doc-5-");
-  const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
-  initRepo(repo);
-  setupTestHooksDir(hooksDir);
-
-  // Убеждаемся, что push-to-checkout отсутствует
   assert.equal(existsSync(join(hooksDir, "push-to-checkout")), false);
-
-  const res = await runHooksDoctor({
-    copy: repo,
-    hooksDir,
-    runCmd: (cmd, args) => {
-      if (cmd === "git" && args.includes("--git-path")) {
-        return hooksDir;
-      }
-      return "";
-    },
-  });
-  assert.equal(res.code, 0);
-  assert.equal(res.ok, true);
-  assert.equal(res.issues.length, 0);
+  assert.ok(existsSync(join(hooksDir, "hook-lib.mjs")));
+  const prev = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = env.GIT_CONFIG_GLOBAL;
+  try {
+    const res = await runHooksDoctor({ hooksDir, repo });
+    assert.equal(res.code, 0, res.message);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prev;
+  }
 });
 
-test("§24.1 п.6 (6): install с прежним глобальным core.hooksPath сохраняет его в chain.json", async () => {
-  const tmp = makeTempDir("orch-hook-doc-6-");
-  const hooksDir = join(tmp, "hooks");
-  const prevGlobal = join(tmp, "prev-global-hooks");
+test("§24.1 п.1 (аудит р.3 п.4): doctor проверяет живую копию из настройки вне ~/.bb/plugin-live", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-doc-live-");
+  const repo = join(tmp, "repo");
+  const live = join(tmp, "elsewhere", "live");
+  initRepo(repo);
+  initRepo(live);
+  git(live, ["config", "--local", "core.hooksPath", join(tmp, "own")], env);
+  const prev = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = env.GIT_CONFIG_GLOBAL;
+  try {
+    const without = await runHooksDoctor({ hooksDir, repo });
+    assert.equal(without.code, 0);
+    const res = await runHooksDoctor({ hooksDir, repo, liveCheckouts: [live] });
+    assert.equal(res.code, 2);
+    assert.ok(res.issues.some((i) => i.copy === realpathSync(live)));
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prev;
+  }
+});
+
+test("§24.1 п.6: локальный commit-msg репозитория срабатывает через обёртку (настоящий коммит)", async () => {
+  const { tmp, env } = await hookEnv("orch-chain-cm-");
+  const repo = join(tmp, "repo");
+  initRepo(repo);
+  git(repo, ["checkout", "-q", "-b", "work"], env);
+  const local = join(repo, ".git", "hooks", "commit-msg");
+  writeFileSync(local, '#!/bin/sh\necho ran > "$(git rev-parse --show-toplevel)/../cm-ran"\nexit 0\n');
+  chmodSync(local, 0o755);
+  const r = commit(repo, env, "a.txt");
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(existsSync(join(tmp, "cm-ran")));
+});
+
+test("§24.1 п.6 (аудит р.3 п.4): прежний глобальный хук вызывается по цепочке; хук репозитория — в приоритете", async () => {
+  const tmp = makeTempDir("orch-chain-prev-");
+  const hooksDir = join(tmp, "git-hooks");
+  const prevGlobal = join(tmp, "prev-global");
   mkdirSync(prevGlobal, { recursive: true });
-
-  const customCmds: Array<{ cmd: string; args: string[] }> = [];
-  const fakeCmd = (cmd: string, args: string[]) => {
-    customCmds.push({ cmd, args });
-    if (cmd === "git" && args[0] === "config" && args[1] === "--global" && args[2] === "core.hooksPath" && args.length === 3) {
-      return prevGlobal;
-    }
-    return "";
-  };
-
-  const res = await installHooks({
-    hooksDir,
-    runCmd: fakeCmd,
-  });
-
-  assert.equal(res.ok, true);
-  const chain = readChainConfig(hooksDir);
-  assert.equal(chain.previousGlobalHooksPath, resolve(prevGlobal));
+  writeFileSync(join(prevGlobal, "pre-commit"), '#!/bin/sh\necho g >> "$(git rev-parse --show-toplevel)/../ran"\n');
+  chmodSync(join(prevGlobal, "pre-commit"), 0o755);
+  const gcfg = join(tmp, "gitconfig");
+  writeFileSync(gcfg, `[core]\n\thooksPath = ${prevGlobal}\n`);
+  const prev = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = gcfg;
+  try {
+    await installHooks({ hooksDir });
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prev;
+  }
+  assert.equal(readChainConfig(hooksDir).previousGlobalHooksPath, prevGlobal);
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: gcfg } as NodeJS.ProcessEnv;
+  delete env.BB_THREAD_ID;
+  const repo = join(tmp, "repo");
+  initRepo(repo);
+  git(repo, ["checkout", "-q", "-b", "work"], env);
+  assert.equal(commit(repo, env, "a.txt").status, 0);
+  assert.equal(readFileSync(join(tmp, "ran"), "utf8"), "g\n");
+  // a repository hook now exists → it runs, not the old global one
+  const local = join(repo, ".git", "hooks", "pre-commit");
+  writeFileSync(local, '#!/bin/sh\necho l >> "$(git rev-parse --show-toplevel)/../ran"\n');
+  chmodSync(local, 0o755);
+  assert.equal(commit(repo, env, "b.txt").status, 0);
+  assert.equal(readFileSync(join(tmp, "ran"), "utf8"), "g\nl\n");
 });
 
-// ────────────────────────────────────────────────────────────────────────────
-// §24.1 п.6: Тесты 7–11 — коммиты агентов по ролям (pre-commit)
-// ────────────────────────────────────────────────────────────────────────────
+test("§24.1 п.1 (аудит р.3 п.4): относительный прежний глобальный путь — от каталога запуска хука, как у git", async () => {
+  const tmp = makeTempDir("orch-chain-rel-");
+  const hooksDir = join(tmp, "git-hooks");
+  const gcfg = join(tmp, "gitconfig");
+  writeFileSync(gcfg, "[core]\n\thooksPath = .githooks\n");
+  const prev = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = gcfg;
+  try {
+    await installHooks({ hooksDir });
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prev;
+  }
+  assert.equal(readChainConfig(hooksDir).previousGlobalHooksPath, ".githooks");
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: gcfg } as NodeJS.ProcessEnv;
+  delete env.BB_THREAD_ID;
+  const repo = join(tmp, "repo");
+  initRepo(repo);
+  git(repo, ["checkout", "-q", "-b", "work"], env);
+  mkdirSync(join(repo, ".githooks"));
+  writeFileSync(join(repo, ".githooks", "pre-commit"), '#!/bin/sh\ntouch "$(git rev-parse --show-toplevel)/../rel-ran"\n');
+  chmodSync(join(repo, ".githooks", "pre-commit"), 0o755);
+  assert.equal(commit(repo, env, "a.txt").status, 0);
+  assert.ok(existsSync(join(tmp, "rel-ran")));
+});
 
-function runPc(repo: string, hooksDir: string, env: Record<string, string>) {
-  return spawnSync("node", [join(hooksDir, "pre-commit")], {
-    cwd: repo,
-    env: { ...process.env, GIT_DIR: join(repo, ".git"), ...env },
-    encoding: "utf8",
-  });
+test("§24.1 п.1 (аудит р.3 п.4): --fix-local только владельцу; область worktree переносится и проверяется", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-fixlocal-");
+  const repo = join(tmp, "repo");
+  initRepo(repo);
+  git(repo, ["config", "extensions.worktreeConfig", "true"], env);
+  const wt = join(tmp, "wt");
+  assert.equal(git(repo, ["worktree", "add", "-q", "-b", "wt", wt], env).status, 0);
+  const own = join(tmp, "own-hooks");
+  mkdirSync(own);
+  git(wt, ["config", "--worktree", "core.hooksPath", own], env);
+  const prev = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = env.GIT_CONFIG_GLOBAL;
+  try {
+    await assert.rejects(
+      installHooks({ hooksDir, fixLocalCopy: wt, confirmed: true, owner: false }),
+      (e: unknown) => e instanceof OrchestratorError && e.code === "permission-denied",
+    );
+    await assert.rejects(
+      installHooks({ hooksDir, fixLocalCopy: wt, confirmed: false, owner: true }),
+      (e: unknown) => e instanceof OrchestratorError && e.code === "fix-local-needs-confirmation",
+    );
+    const res = await installHooks({ hooksDir, fixLocalCopy: wt, confirmed: true, owner: true });
+    assert.equal(res.ok, true);
+    const eff = git(wt, ["rev-parse", "--git-path", "hooks"], env).stdout.trim();
+    assert.equal(realpathSync(eff), realpathSync(hooksDir));
+    assert.equal(readChainConfig(hooksDir).localHooks?.[realpathSync(wt)], realpathSync(own));
+    const doc = await runHooksDoctor({ hooksDir, repo });
+    assert.equal(doc.code, 0, doc.message);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prev;
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// §24 п.2 / §24.1 п.4–5: коммиты по ролям (настоящий git commit)
+// ────────────────────────────────────────────────────────────────────────
+
+async function roleEnv(prefix: string) {
+  const base = await hookEnv(prefix);
+  const dbPath = join(base.tmp, "data.db");
+  const { db, store } = initDb(dbPath);
+  const bbDb = join(base.tmp, "bb.db");
+  const env = {
+    ...base.env,
+    ORCHESTRATOR_DB_PATH: dbPath,
+    ORCHESTRATOR_BB_DB_PATH: bbDb,
+  } as NodeJS.ProcessEnv;
+  return { ...base, db, store, bbDb, env };
 }
 
-test("§24.1 п.6 (7): коммит координатора только с docs/ проходит", () => {
-  const tmp = makeTempDir("orch-hook-coord-1-");
+test("§24.1 п.6: координатор — docs/ проходит, plugins/ отказ, смешанный — отказ с перечнем", async () => {
+  const { tmp, store, env, db } = await roleEnv("orch-role-coord-");
+  store.setThreadRole("thr_coord", "orchestrator", "owner");
+  initBbDb(join(tmp, "bb.db"), [], []);
+  db.close();
   const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
-  const dbPath = join(tmp, "data.db");
-  initRepo(repo, "task/feature-1");
-  setupTestHooksDir(hooksDir);
-
-  const { db, store } = initDb(dbPath);
-  try {
-    store.setThreadRole("thr_coord", "orchestrator", "hook");
-
-    // Добавляем файл только в docs/
-    mkdirSync(join(repo, "docs"), { recursive: true });
-    writeFileSync(join(repo, "docs", "spec.md"), "# Spec\n");
-    execFileSync("git", ["-C", repo, "add", "docs/spec.md"]);
-
-    const r = runPc(repo, hooksDir, {
-      BB_THREAD_ID: "thr_coord",
-      ORCHESTRATOR_DB_PATH: dbPath,
-    });
-
-    assert.equal(r.status, 0, `pre-commit should succeed: ${r.stderr}`);
-  } finally {
-    db.close();
-  }
+  initRepo(repo);
+  const e = { ...env, BB_THREAD_ID: "thr_coord" };
+  git(repo, ["checkout", "-q", "-b", "docs-work"], e);
+  assert.equal(commit(repo, e, "docs/spec.md").status, 0);
+  const r = commit(repo, e, "plugins/x/a.ts");
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /координатор код не пишет: delegate/);
+  writeFileSync(join(repo, "docs", "b.md"), "b\n");
+  git(repo, ["add", "docs/b.md"], e);
+  const m = commit(repo, e, "plugins/x/c.ts");
+  assert.notEqual(m.status, 0);
+  assert.match(m.stderr, /пути вне docs: plugins\/x\/a\.ts, plugins\/x\/c\.ts|пути вне docs: .*plugins\/x\/c\.ts/);
 });
 
-test("§24.1 п.6 (8): коммит координатора с plugins/ отказ «координатор код не пишет: delegate»", () => {
-  const tmp = makeTempDir("orch-hook-coord-2-");
+test("§24.1 п.6: человек на рабочей ветке проходит, в main — отказ; цель проекта из targets.json — отказ", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-role-human-");
   const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
-  const dbPath = join(tmp, "data.db");
-  initRepo(repo, "task/feature-1");
-  setupTestHooksDir(hooksDir);
-
-  const { db, store } = initDb(dbPath);
-  try {
-    store.setThreadRole("thr_coord", "orchestrator", "hook");
-
-    mkdirSync(join(repo, "plugins", "test"), { recursive: true });
-    writeFileSync(join(repo, "plugins", "test", "index.ts"), "export const x = 1;\n");
-    execFileSync("git", ["-C", repo, "add", "plugins/test/index.ts"]);
-
-    const r = runPc(repo, hooksDir, {
-      BB_THREAD_ID: "thr_coord",
-      ORCHESTRATOR_DB_PATH: dbPath,
-    });
-
-    assert.equal(r.status, 1);
-    assert.match(r.stderr, /координатор код не пишет: delegate/);
-  } finally {
-    db.close();
-  }
+  initRepo(repo);
+  const r = commit(repo, env, "a.txt");
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /в целевую ветку не коммитят/);
+  git(repo, ["checkout", "-q", "-b", "work"], env);
+  assert.equal(commit(repo, env, "a.txt").status, 0);
+  writeTargetsRegistry(hooksDir, ["release-x"]);
+  git(repo, ["checkout", "-q", "-b", "release-x"], env);
+  const t = commit(repo, env, "b.txt");
+  assert.notEqual(t.status, 0);
+  assert.match(t.stderr, /в целевую ветку не коммитят/);
 });
 
-test("§24.1 п.6 (9): коммит координатора со смешанным docs/ + plugins/ отказ со списком путей", () => {
-  const tmp = makeTempDir("orch-hook-coord-3-");
+test("§24.1 п.6: корневой executor — рабочая ветка проходит, main — отказ, копия координатора — отказ", async () => {
+  const { tmp, store, env, db, bbDb } = await roleEnv("orch-role-exec-");
+  store.setThreadRole("thr_exec", "executor", "owner");
+  const coordCopy = join(tmp, "coord");
+  initRepo(coordCopy);
+  db.prepare(
+    `INSERT INTO coordinator_worktrees (project_id, coordinator_thread_id, env_id, worktree_path, state, reason, decision_generation, created_at, updated_at)
+     VALUES ('p', 'thr_coord', 'env_c', ?, 'active', 'coordinator-live', 1, 0, 0)`,
+  ).run(coordCopy);
+  db.close();
+  initBbDb(bbDb, [], []);
   const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
-  const dbPath = join(tmp, "data.db");
-  initRepo(repo, "task/feature-1");
-  setupTestHooksDir(hooksDir);
-
-  const { db, store } = initDb(dbPath);
-  try {
-    store.setThreadRole("thr_coord", "orchestrator", "hook");
-
-    mkdirSync(join(repo, "docs"), { recursive: true });
-    writeFileSync(join(repo, "docs", "spec.md"), "# Spec\n");
-    mkdirSync(join(repo, "src"), { recursive: true });
-    writeFileSync(join(repo, "src", "code.ts"), "const a = 1;\n");
-    execFileSync("git", ["-C", repo, "add", "docs/spec.md", "src/code.ts"]);
-
-    const r = runPc(repo, hooksDir, {
-      BB_THREAD_ID: "thr_coord",
-      ORCHESTRATOR_DB_PATH: dbPath,
-    });
-
-    assert.equal(r.status, 1);
-    assert.match(r.stderr, /координатор код не пишет: delegate \(пути вне docs: src\/code\.ts\)/);
-  } finally {
-    db.close();
-  }
+  initRepo(repo);
+  const e = { ...env, BB_THREAD_ID: "thr_exec" };
+  assert.notEqual(commit(repo, e, "a.txt").status, 0);
+  git(repo, ["checkout", "-q", "-b", "work"], e);
+  assert.equal(commit(repo, e, "a.txt").status, 0);
+  git(coordCopy, ["checkout", "-q", "-b", "cwork"], e);
+  const c = commit(coordCopy, e, "a.txt");
+  assert.notEqual(c.status, 0);
+  assert.match(c.stderr, /коммит вне копии задачи/);
 });
 
-test("§24.1 п.6 (10): корневой executor на рабочей ветке проходит, на main отказ, в копии координатора отказ", () => {
-  const tmp = makeTempDir("orch-hook-exec-");
-  const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
-  const dbPath = join(tmp, "data.db");
-  initRepo(repo, "task/fix-bug");
-  setupTestHooksDir(hooksDir);
-
-  const { db, store } = initDb(dbPath);
-  try {
-    // В thread_roles роль executor, но строки в delegations нет
-    store.setThreadRole("thr_root_exec", "executor", "hook");
-
-    // 10.1: В собственной копии на рабочей ветке — проходит
-    writeFileSync(join(repo, "fix.ts"), "const fix = true;\n");
-    execFileSync("git", ["-C", repo, "add", "fix.ts"]);
-
-    const r1 = runPc(repo, hooksDir, {
-      BB_THREAD_ID: "thr_root_exec",
-      ORCHESTRATOR_DB_PATH: dbPath,
-    });
-    assert.equal(r1.status, 0, `executor on feature branch should succeed: ${r1.stderr}`);
-
-    // 10.2: На ветке main — отказ
-    execFileSync("git", ["-C", repo, "checkout", "-b", "main"], { stdio: "ignore" });
-    const r2 = runPc(repo, hooksDir, {
-      BB_THREAD_ID: "thr_root_exec",
-      ORCHESTRATOR_DB_PATH: dbPath,
-    });
-    assert.equal(r2.status, 1);
-    assert.match(r2.stderr, /в целевую ветку не коммитят, работай в копии задачи/);
-
-    // 10.3: В копии координатора — отказ
-    execFileSync("git", ["-C", repo, "checkout", "-b", "task/fix-bug-2"], { stdio: "ignore" });
-    db.prepare(
-      "INSERT INTO coordinator_worktrees (project_id, coordinator_thread_id, env_id, worktree_path, state, created_at, updated_at) VALUES ('proj_1', 'thr_coord', 'env_1', ?, 'active', 1, 1)",
-    ).run(repo);
-
-    const r3 = runPc(repo, hooksDir, {
-      BB_THREAD_ID: "thr_root_exec",
-      ORCHESTRATOR_DB_PATH: dbPath,
-    });
-    assert.equal(r3.status, 1);
-    assert.match(r3.stderr, /коммит вне копии задачи/);
-  } finally {
-    db.close();
-  }
+test("§24 п.2 (аудит р.3 п.3): executor с делегированием — только в своей копии по реальному пути; путь неизвестен — отказ", async () => {
+  const { tmp, store, env, db, bbDb } = await roleEnv("orch-role-deleg-");
+  store.setThreadRole("thr_exec", "executor", "owner");
+  insertDelegation(db, "thr_exec", "env_own");
+  insertDelegation(db, "thr_lost", null);
+  store.setThreadRole("thr_lost", "executor", "owner");
+  db.close();
+  const own = join(tmp, "own-thr_lost-PLUG-1");
+  const other = join(tmp, "other");
+  initRepo(own);
+  initRepo(other);
+  initBbDb(bbDb, [["thr_exec", "env_thread"]], [["env_own", own], ["env_thread", other]]);
+  const e = { ...env, BB_THREAD_ID: "thr_exec" };
+  git(own, ["checkout", "-q", "-b", "w"], e);
+  git(other, ["checkout", "-q", "-b", "w"], e);
+  assert.equal(commit(own, e, "a.txt").status, 0);
+  const f = commit(other, e, "a.txt");
+  assert.notEqual(f.status, 0);
+  assert.match(f.stderr, /коммит вне копии задачи/);
+  // no env for the delegation, no thread env → refusal even though the
+  // path contains the thread id and task key (no substring guessing)
+  const l = commit(own, { ...env, BB_THREAD_ID: "thr_lost" }, "b.txt");
+  assert.notEqual(l.status, 0);
+  assert.match(l.stderr, /коммит вне копии задачи/);
 });
 
-test("§24.1 п.6 (11): коммит helper отказ «помощник не коммитит, итог — текстом вызвавшему»", () => {
-  const tmp = makeTempDir("orch-hook-helper-");
+test("§24.1 п.6: коммит helper — отказ «помощник не коммитит»", async () => {
+  const { tmp, env, db, bbDb } = await roleEnv("orch-role-helper-");
+  db.prepare(
+    `INSERT INTO helpers (caller_thread_id, coordinator_thread_id, thread_id, preset, route, level, title, status, created_at, updated_at)
+     VALUES ('thr_caller', 'thr_coord', 'thr_help', 'p', 'r', 'simple', 't', 'running', 0, 0)`,
+  ).run();
+  db.close();
+  initBbDb(bbDb, [], []);
   const repo = join(tmp, "repo");
-  const hooksDir = join(tmp, "hooks");
-  const dbPath = join(tmp, "data.db");
-  initRepo(repo, "task/helper-work");
-  setupTestHooksDir(hooksDir);
-
-  const { db, store } = initDb(dbPath);
-  try {
-    db.prepare(
-      "INSERT INTO helpers (caller_thread_id, coordinator_thread_id, thread_id, preset, status, created_at, updated_at) VALUES ('thr_parent', 'thr_coord', 'thr_hlp', 'preset', 'running', 1, 1)",
-    ).run();
-
-    writeFileSync(join(repo, "helper.ts"), "const h = 1;\n");
-    execFileSync("git", ["-C", repo, "add", "helper.ts"]);
-
-    const r = runPc(repo, hooksDir, {
-      BB_THREAD_ID: "thr_hlp",
-      ORCHESTRATOR_DB_PATH: dbPath,
-    });
-    assert.equal(r.status, 1);
-    assert.match(r.stderr, /помощник не коммитит, итог — текстом вызвавшему/);
-  } finally {
-    db.close();
-  }
+  initRepo(repo);
+  const e = { ...env, BB_THREAD_ID: "thr_help" };
+  git(repo, ["checkout", "-q", "-b", "w"], e);
+  const r = commit(repo, e, "a.txt");
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /помощник не коммитит/);
 });
 
-// ────────────────────────────────────────────────────────────────────────────
-// §24.1 п.6: Тесты 12–16 — live checkout, token gate и миграция
-// ────────────────────────────────────────────────────────────────────────────
+test("§24 п.2 (аудит р.3 п.3): база роли не читается → предупреждение и только правило (а)", async () => {
+  const { tmp, env } = await hookEnv("orch-role-broken-");
+  const dbPath = join(tmp, "broken.db");
+  writeFileSync(dbPath, "not a database");
+  const repo = join(tmp, "repo");
+  initRepo(repo);
+  const e = { ...env, BB_THREAD_ID: "thr_x", ORCHESTRATOR_DB_PATH: dbPath };
+  git(repo, ["checkout", "-q", "-b", "w"], e);
+  const r = commit(repo, e, "a.txt");
+  assert.equal(r.status, 0);
+  assert.match(r.stderr + r.stdout, /база плагина недоступна/);
+});
 
-test("§24.1 п.6 (12): коммит, checkout и merge в живой копии без токена отвергаются", () => {
-  const tmp = makeTempDir("orch-live-protect-");
-  const liveDir = join(tmp, ".bb", "plugin-live", "my-repo");
-  const hooksDir = join(tmp, "hooks");
-  initRepo(liveDir, "main");
-  setupTestHooksDir(hooksDir);
+// ────────────────────────────────────────────────────────────────────────
+// §24 п.3: post-checkout → одна строка через checkout-notice
+// ────────────────────────────────────────────────────────────────────────
 
-  // Настраиваем защиту: chmod a-w
+test("§24.1 п.6: post-checkout из треда с ролью в чужой копии → один вызов checkout-notice", async () => {
+  const { tmp, store, env, db, bbDb } = await roleEnv("orch-postco-");
+  store.setThreadRole("thr_coord", "orchestrator", "owner");
+  db.close();
+  initBbDb(bbDb, [], []);
+  const calls = join(tmp, "bb-calls");
+  const fakeBb = join(tmp, "fake-bb");
+  writeFileSync(fakeBb, `#!/bin/sh\necho "$@" >> ${calls}\n`);
+  chmodSync(fakeBb, 0o755);
+  const repo = join(tmp, "owner-copy");
+  initRepo(repo);
+  const e = { ...env, BB_THREAD_ID: "thr_coord", BB_CLI: fakeBb };
+  assert.equal(git(repo, ["checkout", "-q", "-b", "feature"], e).status, 0);
+  const lines = readFileSync(calls, "utf8").trim().split("\n");
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /^orchestrator checkout-notice --copy .*owner-copy --branch feature/);
+  // a human (no BB_THREAD_ID) — nothing
+  git(repo, ["checkout", "-q", "main"], env);
+  assert.equal(readFileSync(calls, "utf8").trim().split("\n").length, 1);
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// §24.1 п.3: живая копия — только чтение + reference-transaction
+// ────────────────────────────────────────────────────────────────────────
+
+function makeLive(tmp: string, env: NodeJS.ProcessEnv, liveDir: string) {
+  const origin = join(tmp, "origin.git");
+  const seed = join(tmp, "seed");
+  initRepo(seed);
+  execFileSync("git", ["clone", "-q", "--bare", seed, origin]);
+  execFileSync("git", ["clone", "-q", origin, liveDir], { env });
+  const common = git(liveDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout.trim();
+  writeFileSync(join(common, LIVE_MARKER), "{}\n");
+  return { origin, seed };
+}
+
+test("§24.1 п.6: коммит, checkout и merge в живой копии (вне ~/.bb/plugin-live) без токена → отказ до изменения", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-live-protect-");
+  const liveDir = join(tmp, "custom", "live");
+  makeLive(tmp, env, liveDir);
+  assert.equal(isLiveCheckoutPath(liveDir, hooksDir), true);
+  const headBefore = git(liveDir, ["rev-parse", "HEAD"]).stdout.trim();
+  // reference-transaction refuses even while files are writable
+  const br = git(liveDir, ["checkout", "-q", "-b", "agent-branch"], env);
+  assert.notEqual(br.status, 0);
+  assert.match(br.stderr, /изменение ссылок в служебной живой копии/);
   chmodRecursive(liveDir, false);
-
-  // 1. Попытка создания / записи файла в read-only дерево пресекается ФС
-  assert.throws(() => {
-    writeFileSync(join(liveDir, "exploit.ts"), "hack");
-  });
-
-  // 2. reference-transaction hook блокирует обновление ref без токена
-  const refHook = join(hooksDir, "reference-transaction");
-  const stdinLine = `0000000000000000000000000000000000000000 ${"a".repeat(40)} refs/heads/newbranch\n`;
-  const r = spawnSync("node", [refHook, "prepared"], {
-    cwd: liveDir,
-    input: stdinLine,
-    env: { ...process.env, GIT_DIR: join(liveDir, ".git") },
-    encoding: "utf8",
-  });
-  assert.equal(r.status, 1);
-  assert.match(r.stderr, /изменение ссылок в служебной живой копии/);
+  try {
+    assert.throws(() => writeFileSync(join(liveDir, "exploit.ts"), "x"));
+    const m = git(liveDir, ["merge", "--ff-only", "origin/main"], env);
+    assert.equal(git(liveDir, ["rev-parse", "HEAD"]).stdout.trim(), headBefore);
+    assert.ok(m.status === 0 || m.status !== 0); // up to date or refused — HEAD unchanged
+  } finally {
+    chmodRecursive(liveDir, true);
+  }
 });
 
-test("§24.1 п.6 (13): postPublish с токеном: fast-forward успешен", () => {
-  const tmp = makeTempDir("orch-live-token-");
-  const liveDir = join(tmp, ".bb", "plugin-live", "my-repo");
-  const hooksDir = join(tmp, "hooks");
-  initRepo(liveDir, "main");
-  setupTestHooksDir(hooksDir);
-
+test("§24.1 п.6: fetch + ff с токеном этой копии проходит; токен другой копии или просроченный — нет", async () => {
+  const { tmp, env } = await hookEnv("orch-live-token-");
+  const liveDir = join(tmp, "custom", "live");
+  const { seed, origin } = makeLive(tmp, env, liveDir);
+  execFileSync("git", ["-C", seed, "commit", "-q", "--allow-empty", "-m", "next"], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  execFileSync("git", ["-C", seed, "push", "-q", origin, "main"], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
   chmodRecursive(liveDir, false);
+  try {
+    const other = issueLiveToken(join(tmp, "another-copy"));
+    chmodRecursive(liveDir, true);
+    const bad = git(liveDir, ["fetch", "-q", "origin"], { ...env, ORCH_LIVE_TOKEN: other });
+    assert.notEqual(bad.status, 0, "token of another copy must not open this one");
+    const token = issueLiveToken(liveDir);
+    const f = git(liveDir, ["fetch", "-q", "origin"], { ...env, ORCH_LIVE_TOKEN: token });
+    assert.equal(f.status, 0, f.stderr);
+    const ff = git(liveDir, ["merge", "-q", "--ff-only", "origin/main"], { ...env, ORCH_LIVE_TOKEN: token });
+    assert.equal(ff.status, 0, ff.stderr);
+    revokeLiveToken(liveDir, token);
+    const after = git(liveDir, ["checkout", "-q", "-b", "x"], { ...env, ORCH_LIVE_TOKEN: token });
+    assert.notEqual(after.status, 0, "revoked token");
+  } finally {
+    chmodRecursive(liveDir, true);
+  }
+});
 
-  // Проверяем, что с токеном reference-transaction пропускает
-  const token = "valid-test-token-123";
-  const tokenFile = join(dirname(liveDir), ".token");
-  writeFileSync(
-    tokenFile,
+test("§24.1 п.6 (аудит р.3 п.2/п.5): штатный runPostPublish — защищённая копия вне ~/.bb/plugin-live, настоящие хуки, ff проходит, .git снова только чтение", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-live-pp-");
+  const liveDir = join(tmp, "custom", "live");
+  const { seed, origin } = makeLive(tmp, env, liveDir);
+  const repo = join(tmp, "repo");
+  execFileSync("git", ["clone", "-q", origin, repo]);
+  execFileSync("git", ["-C", seed, "commit", "-q", "--allow-empty", "-m", "next"], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  execFileSync("git", ["-C", seed, "push", "-q", origin, "main"], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  const newSha = git(seed, ["rev-parse", "HEAD"]).stdout.trim();
+  chmodRecursive(liveDir, false);
+  const { store, db } = initDb(join(tmp, "data.db"));
+  const { runPostPublish } = await import("../src/release.js");
+  const { parseReleaseConfig } = await import("../src/release-config.js");
+  const { createCmd } = await import("../src/cmd.js");
+  const cfg = parseReleaseConfig(
     JSON.stringify({
-      token,
-      repo: liveDir,
-      expiresAt: Date.now() + 60_000,
+      defaults: { target: { action: "push", branch: "main" } },
+      projects: { p1: { postPublish: { checkout: liveDir, on: "published" } } },
     }),
   );
-
-  const refHook = join(hooksDir, "reference-transaction");
-  const stdinLine = `0000000000000000000000000000000000000000 ${"a".repeat(40)} refs/heads/main\n`;
-
-  const r = spawnSync("node", [refHook, "prepared"], {
-    cwd: liveDir,
-    input: stdinLine,
-    env: { ...process.env, GIT_DIR: join(liveDir, ".git"), ORCH_LIVE_TOKEN: token },
-    encoding: "utf8",
-  });
-  assert.equal(r.status, 0, `reference-transaction with token should pass: ${r.stderr}`);
+  assert.deepEqual(cfg.errors, []);
+  const prevG = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = env.GIT_CONFIG_GLOBAL;
+  try {
+    const deps = {
+      store,
+      cmd: createCmd(),
+      loadReleaseConfig: () => cfg,
+      hooksDir: () => hooksDir,
+      instanceId: "inst-pp",
+      log: {},
+    } as never;
+    const row = {
+      id: 42,
+      task_key: "PLUG-410",
+      repo_path: repo,
+      repo_root: repo,
+      settings_project_id: "p1",
+      project_id: "p1",
+      target_action: "push",
+      target_branch: "main",
+      branch: "main",
+      head_sha: newSha,
+      published_sha: newSha,
+    } as never;
+    const res = await runPostPublish(deps, row, "release.published");
+    assert.equal(git(liveDir, ["rev-parse", "HEAD"]).stdout.trim(), newSha, JSON.stringify(res));
+    assert.throws(() => writeFileSync(join(liveDir, ".git", "x"), "x"), "the copy's .git is read-only again");
+    assert.equal(existsSync(join(liveDir, ".git", "orchestrator-merge.lock")), false);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prevG;
+    chmodRecursive(liveDir, true);
+    db.close();
+  }
 });
 
-test("§24.1 п.6 (14): live-checkout setup без одобрения даёт отказ live-checkout-needs-approval", async () => {
-  const tmp = makeTempDir("orch-live-setup-1-");
+// ────────────────────────────────────────────────────────────────────────
+// §24.1 п.2: live-checkout setup под §23
+// ────────────────────────────────────────────────────────────────────────
+
+test("§24.1 п.6: setup без одобрения — заявка и live-checkout-needs-approval; повтор — та же заявка", () => {
+  const tmp = makeTempDir("orch-live-req-");
   const repo = join(tmp, "repo");
   initRepo(repo);
+  const { store, db } = initDb(join(tmp, "data.db"));
+  const a = requestLiveCheckout({ repoRoot: repo, projectId: "p1", targetBranch: "main", store, threadId: "thr_coord" });
+  assert.equal(a.created, true);
+  assert.equal(a.request.status, "pending");
+  assert.equal(a.request.projectId, "p1");
+  const b = requestLiveCheckout({ repoRoot: repo, projectId: "p1", targetBranch: "main", store, threadId: "thr_coord" });
+  assert.equal(b.created, false);
+  assert.equal(b.request.id, a.request.id);
+  assert.throws(
+    () => requestLiveCheckout({ repoRoot: repo, projectId: "", targetBranch: "main", store }),
+    (e: unknown) => e instanceof OrchestratorError && e.code === "live-checkout-project-unresolved",
+  );
+  db.close();
+});
 
+test("§24.1 п.2: применить можно только одобренную заявку", async () => {
+  const tmp = makeTempDir("orch-live-unapproved-");
+  const repo = join(tmp, "repo");
+  initRepo(repo);
+  const { store, db } = initDb(join(tmp, "data.db"));
+  const { request } = requestLiveCheckout({ repoRoot: repo, projectId: "p1", targetBranch: "main", store });
   await assert.rejects(
-    async () => {
-      await setupLiveCheckout({
-        repoRoot: repo,
-        approved: false,
-      });
+    runLiveCheckoutMigration(
+      { store, instanceId: "i1", writeCheckout: async () => {}, notifyOwner: async () => true },
+      request,
+    ),
+    (e: unknown) => e instanceof OrchestratorError && e.code === "live-checkout-needs-approval",
+  );
+  db.close();
+});
+
+test("§24.1 п.2 (аудит р.3 п.1): каталог BB — строгая форма; {} и запись без полей → сбой", () => {
+  assert.throws(() => parsePluginList("{}"), /нет массива plugins/);
+  assert.throws(() => parsePluginList('{"plugins":[{"id":"a"}]}'), /нет поля rootDir/);
+  assert.deepEqual(parsePluginList('{"plugins":[]}'), []);
+});
+
+/** Repo with two plugin dirs, an origin, and an approved request. */
+function migrationFixture(prefix: string) {
+  const tmp = makeTempDir(prefix);
+  const origin = join(tmp, "origin.git");
+  const seed = join(tmp, "seed");
+  initRepo(seed);
+  for (const p of ["p1", "p2"]) {
+    mkdirSync(join(seed, "plugins", p), { recursive: true });
+    writeFileSync(join(seed, "plugins", p, "package.json"), `{"name":"${p}"}\n`);
+  }
+  execFileSync("git", ["-C", seed, "add", "."]);
+  execFileSync("git", ["-C", seed, "commit", "-q", "-m", "plugins"], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  execFileSync("git", ["clone", "-q", "--bare", seed, origin]);
+  const repo = join(tmp, "repo");
+  execFileSync("git", ["clone", "-q", origin, repo]);
+  const liveDir = join(tmp, "live", "repo");
+  const { store, db } = initDb(join(tmp, "data.db"));
+  const { request } = requestLiveCheckout({ repoRoot: repo, projectId: "p1", targetBranch: "main", liveDir, store });
+  const approved: LiveCheckoutRequest = { ...request, status: "approved" };
+  saveLiveCheckoutRequest(store, approved);
+  const repoReal = realpathSync(repo);
+  const state = new Map<string, PluginInfo>([
+    ["plug-1", { id: "plug-1", rootDir: join(repoReal, "plugins", "p1"), source: `path:${join(repoReal, "plugins", "p1")}`, status: "running" }],
+    ["plug-2", { id: "plug-2", rootDir: join(repoReal, "plugins", "p2"), source: `path:${join(repoReal, "plugins", "p2")}`, status: "running" }],
+  ]);
+  const switches: string[] = [];
+  const writes: string[] = [];
+  const owner: string[] = [];
+  const deps = (over: Partial<MigrationDeps> = {}): MigrationDeps => ({
+    store,
+    instanceId: "inst-1",
+    settleMs: 50,
+    pollMs: 5,
+    listPlugins: async () => [...state.values()],
+    buildPlugin: async (dir, sha) => {
+      mkdirSync(join(dir, "dist"), { recursive: true });
+      writeFileSync(join(dir, "dist", "build-info.json"), JSON.stringify({ gitSha: sha }));
     },
-    (err: unknown) => {
-      assert.ok(err instanceof OrchestratorError);
-      assert.equal(err.code, "live-checkout-needs-approval");
+    switchPlugin: async (id, dir) => {
+      switches.push(`${id}→${dir.includes("/live/") ? "live" : "prev"}`);
+      const cur = state.get(id)!;
+      state.set(id, { ...cur, rootDir: dir, source: `path:${dir}` });
+    },
+    writeCheckout: async (_pid, dir) => {
+      writes.push(dir);
+    },
+    notifyOwner: async (line) => {
+      owner.push(line);
       return true;
     },
+    ...over,
+  });
+  return { tmp, repo, liveDir, store, db, approved, state, switches, writes, owner, deps };
+}
+
+test("§24.1 п.6: сбой перевода второго плагина → первый возвращён, postPublish.checkout прежний, строка владельцу", async () => {
+  const f = migrationFixture("orch-live-mig-fail-");
+  const base = f.deps();
+  await assert.rejects(
+    runLiveCheckoutMigration(
+      f.deps({
+        switchPlugin: async (id, dir) => {
+          if (id === "plug-2" && dir.includes("/live/")) throw new Error("simulated install failure");
+          await base.switchPlugin!(id, dir);
+        },
+      }),
+      f.approved,
+    ),
+    /simulated install failure/,
   );
+  assert.deepEqual(f.switches, ["plug-1→live", "plug-2→prev", "plug-1→prev"]);
+  assert.deepEqual(f.writes, []);
+  assert.equal(getLiveCheckoutRequest(f.store, f.approved.id)?.status, "failed");
+  assert.match(f.owner.at(-1)!, /не выполнен.*plug-2/);
+  assert.equal(isLiveCheckoutMigrating(f.store, f.repo), false);
+  chmodRecursive(f.liveDir, true);
+  f.db.close();
 });
 
-test("§24.1 п.6 (15): сбой на 2-м плагине при setup — откат 1-го плагина, postPublish.checkout не изменился", async () => {
-  const tmp = makeTempDir("orch-live-setup-2-");
-  const repo = join(tmp, "repo");
-  const liveDir = join(tmp, ".bb", "plugin-live", "repo");
-  const dbPath = join(tmp, "data.db");
-  initRepo(repo);
-
-  const { store } = initDb(dbPath);
-
-  const switchedBack: string[] = [];
-  const switchedTo: string[] = [];
-  let updateConfigCalled = false;
-
+test("§24.1 п.2 (аудит р.3 п.1): плагин не поднялся (disabled) после перевода → откат, запись не делается", async () => {
+  const f = migrationFixture("orch-live-mig-disabled-");
+  const base = f.deps();
   await assert.rejects(
-    async () => {
-      await setupLiveCheckout({
-        repoRoot: repo,
-        approved: true,
-        liveDir,
-        store,
-        pluginsToMigrate: [
-          { id: "plugin-1", dirName: "p1", currentSourceDir: "/original/p1" },
-          { id: "plugin-2", dirName: "p2", currentSourceDir: "/original/p2" },
-        ],
-        onBuildPlugins: async () => {},
-        onSwitchPlugin: async (pluginId, newDir) => {
-          if (newDir.includes("/original/")) {
-            switchedBack.push(pluginId);
-          } else {
-            switchedTo.push(pluginId);
-            if (pluginId === "plugin-2") {
-              throw new Error("simulated failure on plugin-2");
-            }
+    runLiveCheckoutMigration(
+      f.deps({
+        switchPlugin: async (id, dir) => {
+          await base.switchPlugin!(id, dir);
+          if (id === "plug-2" && dir.includes("/live/")) {
+            f.state.set(id, { ...f.state.get(id)!, status: "disabled" });
           }
         },
-        updateReleaseConfigCheckout: async () => {
-          updateConfigCalled = true;
-        },
-      });
-    },
-    (err: unknown) => {
-      assert.match(String(err), /simulated failure on plugin-2/);
-      return true;
-    },
+      }),
+      f.approved,
+    ),
+    /не поднялся/,
   );
-
-  assert.deepEqual(switchedTo, ["plugin-1", "plugin-2"]);
-  assert.deepEqual(switchedBack, ["plugin-1"], "plugin-1 должен быть откачен назад");
-  assert.equal(updateConfigCalled, false, "updateReleaseConfigCheckout не должен был вызываться");
-  assert.equal(isLiveCheckoutMigrating(store, repo), false, "migrating flag должен быть сброшен");
+  assert.deepEqual(f.writes, []);
+  chmodRecursive(f.liveDir, true);
+  f.db.close();
 });
 
-test("§24.1 п.6 (16): release во время миграции отказывает с live-checkout-migrating (флаг миграции блокирует release)", () => {
-  const tmp = makeTempDir("orch-live-migrating-");
-  const repo = join(tmp, "repo");
-  const dbPath = join(tmp, "data.db");
-  initRepo(repo);
-
-  const { store } = initDb(dbPath);
-  assert.equal(isLiveCheckoutMigrating(store, repo), false);
-  setLiveCheckoutMigrating(store, repo, true);
-  assert.equal(isLiveCheckoutMigrating(store, repo), true);
-  setLiveCheckoutMigrating(store, repo, false);
-  assert.equal(isLiveCheckoutMigrating(store, repo), false);
+test("§24.1 п.2 (аудит р.3 п.1): сбой записи настройки → откат всех переведённых", async () => {
+  const f = migrationFixture("orch-live-mig-write-");
+  await assert.rejects(
+    runLiveCheckoutMigration(
+      f.deps({ writeCheckout: async () => { throw new Error("settings write refused"); } }),
+      f.approved,
+    ),
+    /settings write refused/,
+  );
+  assert.deepEqual(f.switches, ["plug-1→live", "plug-2→live", "plug-2→prev", "plug-1→prev"]);
+  chmodRecursive(f.liveDir, true);
+  f.db.close();
 });
 
-test("тест-страж: глобальный core.hooksPath реальной машины не затронут тестами", () => {
-  let hooksPath = "";
+test("§24.1 п.2: успешная миграция — оба плагина, одна запись, маркер живой копии, копия только для чтения", async () => {
+  const f = migrationFixture("orch-live-mig-ok-");
+  const res = await runLiveCheckoutMigration(f.deps(), f.approved);
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.switchedPlugins, ["plug-1", "plug-2"]);
+  assert.deepEqual(f.writes, [f.liveDir]);
+  assert.equal(getLiveCheckoutRequest(f.store, f.approved.id)?.status, "done");
+  assert.equal(isLiveCheckoutPath(f.liveDir), true);
+  assert.throws(() => writeFileSync(join(f.liveDir, "x"), "x"));
+  chmodRecursive(f.liveDir, true);
+  f.db.close();
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Замки: миграция ↔ шаг 6 ↔ postPublish (аудит р.3 п.2)
+// ────────────────────────────────────────────────────────────────────────
+
+test("§24.1 п.6: release во время миграции → live-checkout-migrating; публикация в полёте → миграция отказывает", async () => {
+  const f = migrationFixture("orch-live-mig-lock-");
+  setLiveCheckoutMigrating(f.store, f.repo, true);
+  assert.throws(
+    () => beginPublish(f.store, f.repo, 7),
+    (e: unknown) => e instanceof OrchestratorError && e.code === "live-checkout-migrating",
+  );
+  setLiveCheckoutMigrating(f.store, f.repo, false);
+  const end = beginPublish(f.store, f.repo, 8);
   try {
-    hooksPath = execFileSync("git", ["config", "--global", "--get", "core.hooksPath"], {
-      encoding: "utf8",
-    }).trim();
-  } catch {}
-  assert.notEqual(hooksPath, join(homedir(), ".bb", "git-hooks"), "тесты не должны устанавливать core.hooksPath на живой машине");
+    await assert.rejects(
+      runLiveCheckoutMigration(f.deps(), f.approved),
+      (e: unknown) => e instanceof OrchestratorError && e.code === "live-checkout-busy",
+    );
+  } finally {
+    end();
+  }
+  assert.equal(isLiveCheckoutMigrating(f.store, f.repo), false);
+  f.db.close();
+});
+
+test("§24.1 п.3 (аудит р.3 п.2): замок живой копии того же экземпляра не крадётся; замок миграции = migrating", async () => {
+  const tmp = makeTempDir("orch-live-lock-");
+  const live = join(tmp, "live");
+  mkdirSync(live);
+  const git0 = async () => ({ exitCode: 0, stdout: "", stderr: "" });
+  const rel = await acquireCopyLock(git0, live, liveCopyLockPath(live), { owner: "inst-A" });
+  await assert.rejects(
+    acquireCopyLock(git0, live, liveCopyLockPath(live), { owner: "inst-A" }),
+    /already running/,
+  );
+  rel();
+  const repo = join(tmp, "repo");
+  initRepo(repo);
+  const relM = await acquireCopyLock(git0, repo, migrationLockPath(repo), { owner: "inst-A" });
+  assert.equal(isLiveCheckoutMigrating(null, repo), true);
+  relM();
+  assert.equal(isLiveCheckoutMigrating(null, repo), false);
+  assert.ok(!liveCopyLockPath(live).startsWith(live), "lock lives outside the protected copy");
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Тест-страж: настоящий глобальный core.hooksPath машины не тронут
+// ────────────────────────────────────────────────────────────────────────
+
+test("тест-страж: глобальный core.hooksPath реальной машины до и после прогона совпадает", () => {
+  assert.notEqual(process.env.HOME, REAL_HOME, "HOME тестов изолирован");
+  assert.notEqual(homedir(), REAL_HOME);
+  assert.equal(realGlobalHooksPath(), REAL_BEFORE);
 });

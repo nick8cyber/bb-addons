@@ -565,6 +565,7 @@ export const EN: Record<string, string> = {
   "hookPc.helperNoCommit": "helper never commits, report outcome as text to caller",
   "hookPc.foreignCopy": "commit outside task worktree",
   "hookPc.architectNoCode": "architect does not commit code, report outcome as text",
+  "hookPc.dbUnavailable": "plugin database unavailable ({error}) — only the target branch was checked",
   "status.moreErrs": " (+{n} more)",
   "status.fixSetting": "fix `{name}`",
   "status.reloadHint": " — then `bb plugin reload orchestrator`",
@@ -1119,5 +1120,6 @@ export const EN: Record<string, string> = {
   "cli.helpSetS": "Set orchestrator setting (owner-only)",
   "cli.helpWorkgraphS": "Set orchestrator workGraph mode (owner-only)",
   "cli.helpHooksS": "Install and check git hooks",
-  "cli.helpLiveCheckoutS": "Setup live checkout for plugins",
+  "cli.helpLiveCheckoutS": "Live checkout for plugins: setup files a request, the owner approves or rejects it",
+  "cli.helpCheckoutNoticeS": "Line to the owner and the caller when a role thread switched a foreign copy (called by the shared post-checkout hook)",
 };

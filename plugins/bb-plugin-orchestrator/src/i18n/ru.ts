@@ -563,6 +563,7 @@ export const RU: Record<string, string> = {
   "hookPc.helperNoCommit": "помощник не коммитит, итог — текстом вызвавшему",
   "hookPc.foreignCopy": "коммит вне копии задачи",
   "hookPc.architectNoCode": "архитектор код не коммитит, итог сдаётся текстом",
+  "hookPc.dbUnavailable": "база плагина недоступна ({error}) — проверена только целевая ветка",
   "status.moreErrs": " (+{n} ещё)",
   "status.fixSetting": "исправьте `{name}`",
   "status.reloadHint": " — затем `bb plugin reload orchestrator`",
@@ -1131,5 +1132,6 @@ export const RU: Record<string, string> = {
   "cli.helpSetS": "Установка настройки оркестратора (только владелец)",
   "cli.helpWorkgraphS": "Переключение режима графа workGraph (только владелец)",
   "cli.helpHooksS": "Установка и диагностика git-хуков",
-  "cli.helpLiveCheckoutS": "Настройка служебной копии для живых плагинов",
+  "cli.helpLiveCheckoutS": "Служебная копия для живых плагинов: setup — заявка, approve/reject — решение владельца",
+  "cli.helpCheckoutNoticeS": "Строка владельцу и вызвавшему о переключении чужой копии (вызывает общий хук post-checkout)",
 };

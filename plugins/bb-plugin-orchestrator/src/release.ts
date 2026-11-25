@@ -29,7 +29,10 @@ import {
   isLiveCheckoutMigrating,
   isLiveCheckoutPath,
   chmodRecursive,
-  projectLockPath,
+  liveCopyLockPath,
+  beginPublish,
+  issueLiveToken,
+  revokeLiveToken,
 } from "./live-checkout.js";
 import { verifyReleaseDocumentsGate } from "./spec-gate.js";
 import type { WorkGraphMode } from "./workgraph.js";
@@ -246,6 +249,11 @@ export interface ReleaseDeps {
   workGraphMode?: WorkGraphMode | ((projectId?: string) => WorkGraphMode);
   /** §24.1: проверка наличия хуков перед шагом 6. */
   hooksDoctor?: (opts: DoctorOptions) => Promise<DoctorResult>;
+  /** §24.1 п.1: служебные живые копии проекта репозитория из принятой
+   * настройки (`postPublish.checkout`) — doctor проверяет и их. */
+  liveCheckoutsFor?: (repo: string) => string[];
+  /** §24.1 п.1: строка владельцу (doctor: локальный core.hooksPath). */
+  notifyOwner?: (line: string) => Promise<boolean>;
   log?: {
     info?(m: string): void;
     warn?(m: string): void;
@@ -1531,6 +1539,7 @@ const PRE_COMMIT_MESSAGE_KEYS = [
   "helperNoCommit",
   "foreignCopy",
   "architectNoCode",
+  "dbUnavailable",
 ] as const;
 
 const PLUGIN_PRE_COMMIT = join(PLUGIN_HOOKS_DIR, "pre-commit");
@@ -1611,10 +1620,18 @@ export function syncInstalledPrePush(hooksDir: string, t: T): boolean {
  * fails open. No installed `pre-commit` → nothing to sync. Returns
  * true when the file moved. */
 export function syncInstalledLeakScan(hooksDir: string): boolean {
+  return syncInstalledSupportFile(hooksDir, "leak-scan.ts");
+}
+
+/** §22.1 / §24.1: a module the installed hooks import from their own
+ * directory (`leak-scan.ts`, `hook-lib.mjs`) follows a plugin update
+ * atomically. No installed `pre-commit` → nothing installed, nothing
+ * to sync. Returns true when the file moved. */
+export function syncInstalledSupportFile(hooksDir: string, name: string): boolean {
   const preCommit = join(hooksDir, "pre-commit");
   if (!existsSync(preCommit)) return false;
-  const path = join(hooksDir, "leak-scan.ts");
-  const current = readFileSync(join(PLUGIN_HOOKS_DIR, "leak-scan.ts"));
+  const path = join(hooksDir, name);
+  const current = readFileSync(join(PLUGIN_HOOKS_DIR, name));
   try {
     if (readFileSync(path).equals(current)) return false;
   } catch {
@@ -1639,6 +1656,7 @@ export function syncInstalledGateHooks(hooksDir: string, t: T): boolean {
   const a = syncInstalledHook(hooksDir, "pre-push", renderPrePush, t);
   const b = syncInstalledHook(hooksDir, "pre-commit", renderPreCommit, t);
   const c = syncInstalledLeakScan(hooksDir);
+  const lib = syncInstalledSupportFile(hooksDir, "hook-lib.mjs");
   let d = false;
   let e = false;
   const postCheckoutSrc = join(PLUGIN_HOOKS_DIR, "post-checkout");
@@ -1667,7 +1685,7 @@ export function syncInstalledGateHooks(hooksDir: string, t: T): boolean {
       }
     } catch {}
   }
-  return a || b || c || d || e;
+  return a || b || c || lib || d || e;
 }
 
 /** §17.3 (Б2) & §24.1: standard names the installer covers — 23 standard hooks from HOOK_NAMES. */
@@ -1767,24 +1785,26 @@ export function assertInstalledHookFresh(deps: ReleaseDeps): void {
   // fails open). It is not language-versioned, so with `pre-commit`
   // installed the scanner is synced in place; a failed sync (or a stale
   // file without the gate) stays part of the freshness report.
-  const scanName = "leak-scan.ts";
-  const scanFresh = () => {
-    try {
-      return readFileSync(join(dir, scanName)).equals(
-        readFileSync(join(PLUGIN_HOOKS_DIR, scanName)),
-      );
-    } catch {
-      return false;
+  // §24.1: the same for `hook-lib.mjs`, which every hook imports.
+  for (const scanName of ["leak-scan.ts", "hook-lib.mjs"]) {
+    const scanFresh = () => {
+      try {
+        return readFileSync(join(dir, scanName)).equals(
+          readFileSync(join(PLUGIN_HOOKS_DIR, scanName)),
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (!scanFresh() && existsSync(join(dir, "pre-commit"))) {
+      try {
+        syncInstalledSupportFile(dir, scanName);
+      } catch {
+        // stays stale below
+      }
     }
-  };
-  if (!scanFresh() && existsSync(join(dir, "pre-commit"))) {
-    try {
-      syncInstalledLeakScan(dir);
-    } catch {
-      // stays stale below
-    }
+    if (!scanFresh() && present > 0) stale.push(scanName);
   }
-  if (!scanFresh() && present > 0) stale.push(scanName);
   // §17.3 (ревью PLUG-214): `push-to-checkout` is retired — a leftover
   // wrapper still disables git's built-in worktree update on
   // updateInstead pushes. Its presence alone is a stale install.
@@ -4437,21 +4457,33 @@ async function publishRelease(
   row: ReleaseRow,
   s: PumpSummary,
 ): Promise<void> {
-  const t = deps.t ?? T_RU;
   const repo = row.repo_path;
 
-  // §24.1 п.1: release перед шагом 6 проверяет отсутствие миграции и вызывает doctor
-  if (isLiveCheckoutMigrating(deps.store, repo)) {
-    throw new OrchestratorError(
-      "live-checkout-migrating",
-      "live-checkout-migrating: идёт миграция служебной копии live-checkout",
-    );
+  // §24.1 п.1–2: метка публикации ставится ДО проверки миграции
+  // (setup проверяет метки после своего замка — одна из сторон видит
+  // другую), держится до конца шага 6; затем doctor по всем копиям.
+  const endPublish = beginPublish(deps.store, repo, row.id);
+  try {
+    await publishReleaseLocked(deps, row, s, repo);
+  } finally {
+    endPublish();
   }
+}
+
+async function publishReleaseLocked(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+  s: PumpSummary,
+  repo: string,
+): Promise<void> {
+  const t = deps.t ?? T_RU;
   const doctorFn = deps.hooksDoctor ?? runHooksDoctor;
   const doctorRes = await doctorFn({
     hooksDir: deps.hooksDir(),
     repo,
     store: deps.store,
+    liveCheckouts: deps.liveCheckoutsFor?.(repo) ?? [],
+    ...(deps.notifyOwner ? { notifyOwner: deps.notifyOwner } : {}),
   });
   if (!doctorRes.ok) {
     throw new OrchestratorError(
@@ -5520,12 +5552,18 @@ export async function runPostPublish(
     if (!co || postPublishLocks.has(row.id)) return true;
     // §18.5: флаг «остановлен» — идущий такт новых замков не берёт.
     if (deps.commandRunner?.isStopped?.()) return false;
-    const isLive = isLiveCheckoutPath(co);
+    // §24.1 п.2–3: живая копия опознаётся по маркеру/реестру (любой
+    // путь, не только ~/.bb/plugin-live); её замок — вне защищённой
+    // .git, общий с live-checkout setup; пока идёт миграция — ждём.
+    const isLive = isLiveCheckoutPath(co, deps.hooksDir());
+    if (isLive && isLiveCheckoutMigrating(deps.store, row.repo_path)) {
+      return false;
+    }
     const gitDir = await gitOut(["rev-parse", "--absolute-git-dir"]).catch(
       () => "",
     );
     const lockPath = isLive
-      ? projectLockPath(co)
+      ? liveCopyLockPath(co)
       : join(gitDir || join(co, ".git"), MERGE_LOCK_NAME);
     try {
       const release = await acquireCopyLock(coGit, co, lockPath, {
@@ -5538,6 +5576,8 @@ export async function runPostPublish(
         release();
         return false;
       }
+      // Конец postPublish (все команды с cwd: checkout отработали) —
+      // живая копия целиком снова «только чтение».
       const combinedRelease = () => {
         try {
           if (isLive) {
@@ -5619,23 +5659,11 @@ export async function runPostPublish(
               saveMeta();
             }
           }
-          const isLive = isLiveCheckoutPath(co);
-          let liveTokenFile: string | null = null;
-          let liveProjTokenFile: string | null = null;
+          const isLive = isLiveCheckoutPath(co, deps.hooksDir());
           let liveTokenVal: string | null = null;
           if (isLive) {
-            const tokenDir = dirname(co);
-            liveTokenFile = join(tokenDir, ".token");
-            liveProjTokenFile = join(tokenDir, `.token-${basename(co)}`);
-            mkdirSync(tokenDir, { recursive: true, mode: 0o700 });
-            liveTokenVal = randomBytes(24).toString("hex");
-            const tokenPayload = JSON.stringify({
-              token: liveTokenVal,
-              repo: resolve(co),
-              expiresAt: Date.now() + 300_000,
-            });
-            writeFileSync(liveTokenFile, tokenPayload, { mode: 0o600 });
-            writeFileSync(liveProjTokenFile, tokenPayload, { mode: 0o600 });
+            // §24.1 п.3: одноразовый токен этой копии + временная запись.
+            liveTokenVal = issueLiveToken(co, 300_000);
             chmodRecursive(co, true);
           }
           const liveEnv = liveTokenVal
@@ -5748,17 +5776,16 @@ export async function runPostPublish(
             }
           } finally {
             if (isLive) {
-              chmodRecursive(co, false);
-              if (liveTokenFile && existsSync(liveTokenFile)) {
-                try {
-                  rmSync(liveTokenFile, { force: true });
-                } catch {}
-              }
-              if (liveProjTokenFile && existsSync(liveProjTokenFile)) {
-                try {
-                  rmSync(liveProjTokenFile, { force: true });
-                } catch {}
-              }
+              // Ссылки и объекты — снова «только чтение» сразу после ff;
+              // рабочее дерево остаётся записываемым для команд с
+              // cwd: checkout (сборка) до конца postPublish (§24.1 п.3).
+              if (liveTokenVal) revokeLiveToken(co, liveTokenVal);
+              const coCommon = await gitOut([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+              ]).catch(() => "");
+              chmodRecursive(coCommon || join(co, ".git"), false);
             }
           }
         }

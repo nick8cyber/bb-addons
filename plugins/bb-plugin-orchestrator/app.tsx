@@ -840,6 +840,57 @@ function CriticalSettingsAlertCard(props: PluginPendingInteractionProps) {
   );
 }
 
+/** §24.1 п.2 под §23: заявка live-checkout — применить или отклонить. */
+function LiveCheckoutApprovalCard(props: PluginPendingInteractionProps) {
+  const { interaction, submit } = props;
+  const payload = (interaction.payload || {}) as Record<string, unknown>;
+  const [busy, setBusy] = useState<string | null>(null);
+  const act = async (action: "approve" | "reject") => {
+    setBusy(action);
+    try {
+      await submit({ action });
+    } catch {
+      setBusy(null);
+    }
+  };
+  const btn = {
+    background: "rgba(128,128,128,.2)",
+    color: "inherit",
+    border: "1px solid rgba(128,128,128,.4)",
+    borderRadius: 4,
+    padding: "4px 10px",
+    cursor: "pointer",
+  } as const;
+  return (
+    <div
+      style={{
+        border: "1px solid rgba(234, 179, 8, 0.4)",
+        borderRadius: 8,
+        padding: 12,
+        margin: "8px 0",
+        background: "rgba(234, 179, 8, 0.05)",
+      }}
+    >
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>
+        {interaction.title ||
+          `Перевести живые плагины на ${String(payload.liveDir ?? "")}?`}
+      </div>
+      <div style={{ fontSize: 12, opacity: 0.8 }}>
+        заявка {String(payload.requestId ?? "")} · проект {String(payload.projectId ?? "")} · ветка{" "}
+        {String(payload.targetBranch ?? "")}
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <button type="button" disabled={busy !== null} onClick={() => act("approve")} style={btn}>
+          {busy === "approve" ? "..." : "Применить"}
+        </button>
+        <button type="button" disabled={busy !== null} onClick={() => act("reject")} style={btn}>
+          {busy === "reject" ? "..." : "Отклонить"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.composer.customize({
     id: "orchestrator-role",
@@ -857,5 +908,10 @@ export default definePluginApp((app) => {
   app.slots.pendingInteraction({
     id: "orchestrator-settings-alert",
     component: CriticalSettingsAlertCard,
+  });
+
+  app.slots.pendingInteraction({
+    id: "orchestrator-live-checkout",
+    component: LiveCheckoutApprovalCard,
   });
 });
