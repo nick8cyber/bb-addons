@@ -58,6 +58,10 @@ async function ownCopies(role, db) {
 }
 
 if (lib && threadId && isBranchCheckout) {
+  const paths = lib.repoPaths();
+  if (lib.isExcluded(dir, paths.top, paths.common)) {
+    process.exit(lib.runChain(dir, HOOK_NAME, self));
+  }
   const { role, error, db } = await lib.readThreadRole(threadId);
   if (!error && role && role !== "none") {
     let foreign = true;

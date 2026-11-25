@@ -77,21 +77,19 @@ function refuse(msg) {
   process.exit(1);
 }
 
-// ── Exclusions: service repositories with their own push flow. ────────
+// ── Exclusions: service repositories with their own push flow (§24.4).
 const repoTop = git(["rev-parse", "--show-toplevel"]);
-if (repoTop.status === 0) {
-  const repo = repoTop.stdout.trim();
-  let excluded = false;
-  try {
-    for (const line of readFileSync(exclusionsFile, "utf8").split("\n")) {
-      const e = line.trim();
-      if (!e || e.startsWith("#")) continue;
-      if (e.endsWith("/")) {
-        if (repo.startsWith(e)) { excluded = true; break; }
-      } else if (repo === e) { excluded = true; break; }
-    }
-  } catch { /* no exclusions file — nothing excluded */ }
-  if (excluded) process.exit(chainLocal());
+const common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+const topDir = repoTop.status === 0 && repoTop.stdout ? repoTop.stdout.trim() : "";
+const commonDir = common.status === 0 && common.stdout ? common.stdout.trim() : "";
+let hookLib = null;
+try {
+  hookLib = await import("./hook-lib.mjs");
+} catch {}
+if (hookLib && (topDir || commonDir)) {
+  if (hookLib.isExcluded(dir, topDir, commonDir)) {
+    process.exit(chainLocal());
+  }
 }
 
 // ── Ref lines from stdin: <local ref> <local sha> <remote ref> <remote sha>.

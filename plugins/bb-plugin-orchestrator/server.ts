@@ -145,6 +145,8 @@ import {
   defaultHooksDir,
   installHooks,
   runHooksDoctor,
+  collectProjectsRegistry,
+  writeJsonAtomic,
 } from "./src/hooks.js";
 import {
   requestLiveCheckout,
@@ -1823,6 +1825,31 @@ export async function createPlugin(
     } catch (e) {
       bb.log.warn(`orchestrator: live-copies.json: ${describeError(e)}`);
     }
+    // §24.4: асинхронный сбор реестра projects.json при загрузке и смене настроек
+    syncProjectsRegistry().catch((e) => {
+      bb.log.warn(`orchestrator: projects.json: ${describeError(e)}`);
+    });
+  };
+
+  /** §24.4: асинхронный сбор реестра projects.json. */
+  const syncProjectsRegistry = async () => {
+    const cfg = releaseConfig.config;
+    if (!cfg) return;
+    const dir = defaultHooksDir();
+    const res = await collectProjectsRegistry(cfg, {
+      bbCli,
+      localHostId,
+      asyncGit: async (repo, args) => {
+        const r = await cmd.run("git", ["-C", repo, ...args], { timeoutMs: 30_000 });
+        return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr };
+      },
+    });
+    if (!res.ok) {
+      const msg = res.failures.map((f) => `${f.project}: ${f.reason}`).join("; ");
+      bb.log.warn(`orchestrator: projects.json: ${msg}`);
+      return;
+    }
+    writeJsonAtomic(join(dir, "projects.json"), res.registry);
   };
 
   /** §24.1 п.2 (г): одна подтверждённая запись postPublish.checkout в
@@ -5184,11 +5211,20 @@ export async function createPlugin(
             const fixLocal = flag("--fix-local");
             const hooksDir = flag("--hooks-dir");
             const confirmed = argv.includes("--confirm");
+            const exclude = flags("--exclude");
             const res = await installHooks({
               fixLocalCopy: fixLocal,
               hooksDir,
               confirmed,
               owner: isOwner,
+              exclude,
+              releaseConfig: releaseConfig.config,
+              bbCli,
+              localHostId,
+              asyncGit: async (repo, args) => {
+                const r = await cmd.run("git", ["-C", repo, ...args], { timeoutMs: 30_000 });
+                return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr };
+              },
             });
             if (!fixLocal) syncHookRegistries();
             return json

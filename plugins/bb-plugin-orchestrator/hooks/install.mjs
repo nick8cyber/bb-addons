@@ -33,10 +33,12 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  renameSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { covers } from "./hook-lib.mjs";
 
 const HOOKS_SRC = dirname(fileURLToPath(import.meta.url));
 /** Standard hook names this installer covers — single source shared
@@ -103,7 +105,12 @@ if (!hooksDirArg && !selfTest && !dryRun) {
 }
 const hooksDir = hooksDirArg ? resolve(hooksDirArg) : null;
 const reposRoot = resolve(flag("--repos-root") ?? homedir());
-const extraExcludes = multi("--exclude").map((p) => resolve(p));
+const extraExcludes = multi("--exclude");
+const normalizedExcludes = extraExcludes.map((p) => {
+  const hasSlash = p.endsWith("/");
+  const abs = resolve(p);
+  return hasSlash ? (abs.endsWith("/") ? abs : abs + "/") : abs;
+});
 
 const SKIP = new Set([
   "node_modules", ".cache", ".local", ".npm", ".cargo", ".rustup",
@@ -166,7 +173,7 @@ for (const repo of repos) {
   (hasLocal ? withLocalHooks : plain).push(repo);
 }
 
-const exclusions = [...new Set(extraExcludes)];
+const exclusions = [...new Set(normalizedExcludes)];
 
 const report = [
   `hooks dir:      ${hooksDir ?? "(не определён — для установки передайте --hooks-dir)"}`,
@@ -318,6 +325,47 @@ if (hooksPathNow && resolve(hooksPathNow) !== hooksDir && !force) {
   process.exit(1);
 }
 
+// §24.4 п.5: проверка --exclude по projects.json и live-copies.json ДО любой записи
+if (hooksDir) {
+  const projFile = join(hooksDir, "projects.json");
+  let projectsList = null;
+  if (!existsSync(projFile)) {
+    if (normalizedExcludes.length > 0) {
+      console.warn("проверка покрытия проектов пропущена — нет реестра; запусти bb orchestrator hooks install");
+    }
+  } else {
+    try {
+      projectsList = JSON.parse(readFileSync(projFile, "utf8"));
+    } catch {}
+  }
+
+  const liveFile = join(hooksDir, "live-copies.json");
+  let liveList = null;
+  if (existsSync(liveFile)) {
+    try {
+      liveList = JSON.parse(readFileSync(liveFile, "utf8"));
+    } catch {}
+  }
+
+  if (projectsList || liveList) {
+    const targets = [];
+    for (const p of projectsList ?? []) targets.push(dirname(p));
+    for (const l of liveList ?? []) targets.push(l);
+    const coversList = [];
+    for (const entry of normalizedExcludes) {
+      for (const t of targets) {
+        if (covers(entry, t)) {
+          coversList.push(`${entry} → ${t}`);
+        }
+      }
+    }
+    if (coversList.length > 0) {
+      console.error(`exclusion-covers-project: ${coversList.join(", ")}`);
+      process.exit(1);
+    }
+  }
+}
+
 const SPECIALIZED_HOOKS = new Set([
   "pre-commit",
   "post-checkout",
@@ -348,10 +396,30 @@ copyFileSync(join(HOOKS_SRC, "hook-lib.mjs"), join(hooksDir, "hook-lib.mjs"));
 // receive.denyCurrentBranch=updateInstead. Remove a wrapper an older
 // install wrote under that name.
 rmSync(join(hooksDir, "push-to-checkout"), { force: true });
-writeFileSync(
-  join(hooksDir, "exclusions"),
-  exclusions.map((e) => `${e}\n`).join(""),
-);
+// §24.4 п.5: слияние вместо перезаписи exclusions
+const exclusionsPath = join(hooksDir, "exclusions");
+let existingContent = existsSync(exclusionsPath) ? readFileSync(exclusionsPath, "utf8") : "";
+let newContent = existingContent;
+if (normalizedExcludes.length > 0) {
+  const existingLines = existingContent.split("\n");
+  const existingSet = new Set(existingLines.map((l) => l.trim()).filter(Boolean));
+  const toAppend = [];
+  for (const entry of normalizedExcludes) {
+    if (!existingSet.has(entry)) {
+      toAppend.push(entry);
+      existingSet.add(entry);
+    }
+  }
+  if (toAppend.length > 0) {
+    if (newContent && !newContent.endsWith("\n")) newContent += "\n";
+    newContent += toAppend.join("\n") + "\n";
+  }
+}
+if (!existsSync(exclusionsPath) || normalizedExcludes.length > 0) {
+  const tmp = `${exclusionsPath}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  writeFileSync(tmp, newContent);
+  renameSync(tmp, exclusionsPath);
+}
 
 const chainPath = join(hooksDir, "chain.json");
 let chain = {};

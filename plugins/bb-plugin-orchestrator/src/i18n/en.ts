@@ -560,6 +560,7 @@ export const EN: Record<string, string> = {
   "hookPc.typeEmail": "email",
   "hookPc.typeSecret": "secret",
   "hookPc.targetBranch": "cannot commit to target branch, work in a task worktree",
+  "hookPc.projectsRegistryMissing": "projects registry not found — target branch refusal relies only on settings snapshot; run bb orchestrator hooks install",
   "hookPc.coordinatorNoCode": "coordinator does not write code: delegate",
   "hookPc.coordinatorMixed": "coordinator does not write code: delegate (paths outside docs: {paths})",
   "hookPc.helperNoCommit": "helper never commits, report outcome as text to caller",

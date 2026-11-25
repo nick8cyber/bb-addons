@@ -416,6 +416,7 @@ test("§24.1 п.6: человек на рабочей ветке проходи�
   const { tmp, hooksDir, env } = await hookEnv("orch-role-human-");
   const repo = join(tmp, "repo");
   initRepo(repo);
+  writeFileSync(join(hooksDir, "projects.json"), JSON.stringify([realpathSync(join(repo, ".git"))]));
   const r = commit(repo, env, "a.txt");
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /в целевую ветку не коммитят/);
@@ -429,7 +430,7 @@ test("§24.1 п.6: человек на рабочей ветке проходи�
 });
 
 test("§24.1 п.6: корневой executor — рабочая ветка проходит, main — отказ, копия координатора — отказ", async () => {
-  const { tmp, store, env, db, bbDb } = await roleEnv("orch-role-exec-");
+  const { tmp, store, env, db, bbDb, hooksDir } = await roleEnv("orch-role-exec-");
   store.setThreadRole("thr_exec", "executor", "owner");
   const coordCopy = join(tmp, "coord");
   initRepo(coordCopy);
@@ -441,6 +442,7 @@ test("§24.1 п.6: корневой executor — рабочая ветка пр�
   initBbDb(bbDb, [], []);
   const repo = join(tmp, "repo");
   initRepo(repo);
+  writeFileSync(join(hooksDir, "projects.json"), JSON.stringify([realpathSync(join(repo, ".git"))]));
   const e = { ...env, BB_THREAD_ID: "thr_exec" };
   assert.notEqual(commit(repo, e, "a.txt").status, 0);
   git(repo, ["checkout", "-q", "-b", "work"], e);

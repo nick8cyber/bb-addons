@@ -558,6 +558,7 @@ export const RU: Record<string, string> = {
   "hookPc.typeEmail": "почта",
   "hookPc.typeSecret": "секрет",
   "hookPc.targetBranch": "в целевую ветку не коммитят, работай в копии задачи",
+  "hookPc.projectsRegistryMissing": "реестр проектов не найден — запрет целевой ветки только по слепку настроек; запусти bb orchestrator hooks install",
   "hookPc.coordinatorNoCode": "координатор код не пишет: delegate",
   "hookPc.coordinatorMixed": "координатор код не пишет: delegate (пути вне docs: {paths})",
   "hookPc.helperNoCommit": "помощник не коммитит, итог — текстом вызвавшему",

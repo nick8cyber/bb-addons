@@ -1540,6 +1540,7 @@ const PRE_COMMIT_MESSAGE_KEYS = [
   "foreignCopy",
   "architectNoCode",
   "dbUnavailable",
+  "projectsRegistryMissing",
 ] as const;
 
 const PLUGIN_PRE_COMMIT = join(PLUGIN_HOOKS_DIR, "pre-commit");

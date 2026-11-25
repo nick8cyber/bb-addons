@@ -29,13 +29,15 @@ try {
 const state = process.argv[2]; // prepared | committed | aborted
 if (lib && state === "prepared") {
   const paths = lib.repoPaths();
-  if (lib.isLiveCopy(dir, paths)) {
-    const key = paths.top || paths.common;
-    if (!lib.liveTokenValid(key)) {
-      console.error(
-        "отказ: изменение ссылок в служебной живой копии разрешено только postPublish (нет действующего токена)",
-      );
-      process.exit(1);
+  if (!lib.isExcluded(dir, paths.top, paths.common)) {
+    if (lib.isLiveCopy(dir, paths)) {
+      const key = paths.top || paths.common;
+      if (!lib.liveTokenValid(key)) {
+        console.error(
+          "отказ: изменение ссылок в служебной живой копии разрешено только postPublish (нет действующего токена)",
+        );
+        process.exit(1);
+      }
     }
   }
 }

@@ -33,7 +33,7 @@ const HOOK_NAME = "pre-commit";
 // setting — the plugin rewrites this JSON block on install and whenever
 // the language changes (`renderPreCommit` in release.ts). This file
 // carries the Russian variant; English installs get en texts.
-const MESSAGES = {"finding":"{file}:{line} — {type}: {text}","findingWarn":"{file}:{line} — {type}: {text} (предупреждение)","typeMachine":"путь машины","typeThreadId":"id треда","typeEmail":"почта","typeSecret":"секрет","targetBranch":"в целевую ветку не коммитят, работай в копии задачи","coordinatorNoCode":"координатор код не пишет: delegate","coordinatorMixed":"координатор код не пишет: delegate (пути вне docs: {paths})","helperNoCommit":"помощник не коммитит, итог — текстом вызвавшему","foreignCopy":"коммит вне копии задачи","architectNoCode":"архитектор код не коммитит, итог сдаётся текстом","dbUnavailable":"база плагина недоступна ({error}) — проверена только целевая ветка"};
+const MESSAGES = {"finding":"{file}:{line} — {type}: {text}","findingWarn":"{file}:{line} — {type}: {text} (предупреждение)","typeMachine":"путь машины","typeThreadId":"id треда","typeEmail":"почта","typeSecret":"секрет","targetBranch":"в целевую ветку не коммитят, работай в копии задачи","coordinatorNoCode":"координатор код не пишет: delegate","coordinatorMixed":"координатор код не пишет: delegate (пути вне docs: {paths})","helperNoCommit":"помощник не коммитит, итог — текстом вызвавшему","foreignCopy":"коммит вне копии задачи","architectNoCode":"архитектор код не коммитит, итог сдаётся текстом","dbUnavailable":"база плагина недоступна ({error}) — проверена только целевая ветка","projectsRegistryMissing":"реестр проектов не найден — запрет целевой ветки только по слепку настроек; запусти bb orchestrator hooks install"};
 function msg(k, p = {}) {
   return String(MESSAGES[k] ?? k).replace(/\{(\w+)\}/g, (m, n) =>
     n in p ? String(p[n]) : m,
@@ -76,44 +76,40 @@ function chainLocal() {
   return res.status ?? 1;
 }
 
-// ── Exclusions: service repositories (same file as `pre-push`). ──────
-// In a linked worktree `--show-toplevel` names the WORKTREE, not the
-// repository root — `dirname(<common dir>)` is the main copy's path
-// (spec §22.1). An exclusion naming either path skips the leak scan.
+// ── §24.4: Новый порядок проверок pre-commit (PLUG-421) ──────────────
+// 1. Корень копии и общий каталог git: любой сбой — chainLocal().
 const repoTop = git(["rev-parse", "--show-toplevel"]);
-if (repoTop.status !== 0) process.exit(chainLocal());
+if (repoTop.status !== 0 || !repoTop.stdout) process.exit(chainLocal());
 const common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-if (common.status !== 0) process.exit(chainLocal());
+if (common.status !== 0 || !common.stdout) process.exit(chainLocal());
+const topDir = repoTop.stdout.trim();
 const commonDir = common.stdout.trim();
-const repoRoots = new Set([repoTop.stdout.trim(), dirname(commonDir)]);
-let excluded = false;
-try {
-  for (const line of readFileSync(exclusionsFile, "utf8").split("\n")) {
-    const e = line.trim();
-    if (!e || e.startsWith("#")) continue;
-    for (const repo of repoRoots) {
-      if (e.endsWith("/") ? repo.startsWith(e) : repo === e) {
-        excluded = true;
-        break;
-      }
-    }
-    if (excluded) break;
-  }
-} catch { /* no exclusions file — nothing excluded */ }
 
-// ── §24 п.2 (а): Ветка не целевая ──────────────────────────────────────
-// Built-in main/master/dev, this copy's snapshot target and the target
-// of every configured project (`targets.json`, written by the plugin
-// from the accepted settings — a fresh copy without a snapshot is
-// covered too).
-const branchRes = git(["symbolic-ref", "--short", "-q", "HEAD"]);
-const curBranch = branchRes.stdout ? branchRes.stdout.trim() : "";
-const TARGET_BRANCHES = lib
-  ? lib.targetBranches(dir, commonDir)
-  : new Set(["main", "master", "dev"]);
-if (curBranch && TARGET_BRANCHES.has(curBranch)) {
-  console.error(msg("targetBranch"));
-  process.exit(1);
+// 2. Признак управляемого репозитория (только чтение, без строк в stderr).
+const { managed, registryMissing } = lib
+  ? lib.isManaged(dir, commonDir)
+  : { managed: false, registryMissing: true };
+
+// 3. Exclusions: совпадение — немедленный выход 0 (chainLocal), без проверок ниже.
+if (lib && lib.isExcluded(dir, topDir, commonDir)) {
+  process.exit(chainLocal());
+}
+
+// 4. Правило (а) — только если репозиторий управляемый.
+// Здесь же, и только здесь, предупреждение projectsRegistryMissing.
+if (registryMissing) {
+  process.stderr.write(`[orchestrator] ${msg("projectsRegistryMissing")}\n`);
+}
+if (managed) {
+  const branchRes = git(["symbolic-ref", "--short", "-q", "HEAD"]);
+  const curBranch = branchRes.stdout ? branchRes.stdout.trim() : "";
+  const TARGET_BRANCHES = lib
+    ? lib.targetBranches(dir, commonDir)
+    : new Set(["main", "master", "dev"]);
+  if (curBranch && TARGET_BRANCHES.has(curBranch)) {
+    console.error(msg("targetBranch"));
+    process.exit(1);
+  }
 }
 
 // ── §24 п.2 (б) & §24.1 п.4–5: Роли агентов ──────────────────────────
@@ -204,8 +200,6 @@ if (threadId && lib) {
   }
 }
 
-// Если репозиторий исключён из проверки утечек, пропускаем только проверку утечек
-if (excluded) process.exit(chainLocal());
 
 // ── The project's `leaks` settings — the plugin's snapshot in the
 // COMMON git dir, so every worktree (coordinator's and executors'

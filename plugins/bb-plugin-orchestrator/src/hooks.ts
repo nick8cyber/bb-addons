@@ -20,10 +20,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
 import type { DelegationStore } from "./store.js";
+import type { BbProjectListItem } from "./delegate-base.js";
 
 const PLUGIN_HOOKS_SRC = fileURLToPath(new URL("../hooks", import.meta.url));
 
@@ -121,6 +122,12 @@ export interface InstallHooksOptions {
   owner?: boolean;
   hooksSrcDir?: string;
   runCmd?: RunCmd;
+  exclude?: string[];
+  releaseConfig?: any;
+  bbCli?: { run: (args: string[], opts?: { timeoutMs?: number }) => Promise<{ exitCode: number; stdout: string; stderr: string }> };
+  localHostId?: () => Promise<string | null>;
+  asyncGit?: (repo: string, args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  projectsList?: BbProjectListItem[];
 }
 
 export interface InstallHooksResult {
@@ -129,6 +136,179 @@ export interface InstallHooksResult {
   message: string;
   fixedLocalCopy?: string;
   moved?: Array<{ copy: string; scope: string; value: string }>;
+  projectsRegistry?: string[];
+}
+
+/**
+ * Check if exclusion entry covers a target root path (§24.4 п.4–5).
+ * Raw entry is compared as written and after realpath (preserving trailing /).
+ * Trailing / is directory prefix match; without trailing / is exact match.
+ */
+export function covers(entry: string, target: string): boolean {
+  if (!entry || !target) return false;
+  const raw = entry.trim();
+  if (!raw || raw.startsWith("#")) return false;
+  const variants = [raw];
+  const hasSlash = raw.endsWith("/");
+  const toResolve = hasSlash ? raw.slice(0, -1) : raw;
+  try {
+    const resolved = realpathSync(toResolve);
+    const norm = hasSlash ? (resolved.endsWith("/") ? resolved : resolved + "/") : resolved;
+    if (norm !== raw) variants.push(norm);
+  } catch {}
+  for (const v of variants) {
+    if (v.endsWith("/")) {
+      if (target.startsWith(v) || (v.length > 1 && target === v.slice(0, -1))) return true;
+    } else {
+      if (target === v) return true;
+    }
+  }
+  return false;
+}
+
+export function writeJsonAtomic(file: string, value: unknown, mode = 0o644): void {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode });
+  renameSync(tmp, file);
+}
+
+function writeContentAtomic(file: string, content: string, mode = 0o644): void {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  writeFileSync(tmp, content, { mode });
+  renameSync(tmp, file);
+}
+
+export function mainPathOf(p: BbProjectListItem, localHost: string): string | null {
+  for (const s of p.sources ?? []) {
+    if (s.type !== "local_path" || !s.path || s.isDefault !== true) continue;
+    if (s.hostId && s.hostId !== localHost) continue;
+    return s.path;
+  }
+  return null;
+}
+
+export interface CollectProjectsDeps {
+  bbCli?: { run: (args: string[], opts?: { timeoutMs?: number }) => Promise<{ exitCode: number; stdout: string; stderr: string }> };
+  localHostId?: () => Promise<string | null>;
+  runCmd?: RunCmd;
+  asyncGit?: (repo: string, args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  projectsList?: BbProjectListItem[];
+}
+
+export interface CollectProjectsResult {
+  ok: boolean;
+  registry: string[];
+  failures: Array<{ project: string; reason: string }>;
+}
+
+/**
+ * Сбор реестра projects.json (§24.4 п.2).
+ * local_path -> git rev-parse --git-common-dir -> realpath.
+ */
+export async function collectProjectsRegistry(
+  releaseConfig: any,
+  deps: CollectProjectsDeps = {},
+): Promise<CollectProjectsResult> {
+  if (!releaseConfig || !releaseConfig.projects || Object.keys(releaseConfig.projects).length === 0) {
+    return { ok: true, registry: [], failures: [] };
+  }
+
+  const failures: Array<{ project: string; reason: string }> = [];
+  const localHost = deps.localHostId ? String((await deps.localHostId()) ?? "") : "";
+
+  let bbProjects: BbProjectListItem[] = [];
+  if (deps.projectsList) {
+    bbProjects = deps.projectsList;
+  } else if (deps.bbCli) {
+    try {
+      const res = await deps.bbCli.run(["project", "list", "--json"], { timeoutMs: 30_000 });
+      if (res.exitCode !== 0) {
+        return {
+          ok: false,
+          registry: [],
+          failures: [{ project: "*", reason: `bb project list завершился с кодом ${res.exitCode}: ${res.stderr}` }],
+        };
+      }
+      const parsed = JSON.parse(res.stdout);
+      if (!Array.isArray(parsed)) {
+        return {
+          ok: false,
+          registry: [],
+          failures: [{ project: "*", reason: "bb project list вернул не массив" }],
+        };
+      }
+      bbProjects = parsed as BbProjectListItem[];
+    } catch (e) {
+      return {
+        ok: false,
+        registry: [],
+        failures: [{ project: "*", reason: `сбой bb project list: ${(e as Error).message ?? String(e)}` }],
+      };
+    }
+  } else {
+    try {
+      const exec = deps.runCmd ?? defaultExec;
+      const raw = exec(process.env.BB_CLI ?? "bb", ["project", "list", "--json"]);
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        return {
+          ok: false,
+          registry: [],
+          failures: [{ project: "*", reason: "bb project list вернул не массив" }],
+        };
+      }
+      bbProjects = parsed as BbProjectListItem[];
+    } catch (e) {
+      return {
+        ok: false,
+        registry: [],
+        failures: [{ project: "*", reason: `сбой bb project list: ${(e as Error).message ?? String(e)}` }],
+      };
+    }
+  }
+
+  const registry: string[] = [];
+  for (const [pid, pcfg] of Object.entries(releaseConfig.projects)) {
+    if (pcfg && (pcfg as any).excluded === true) {
+      continue;
+    }
+    const item = bbProjects.find((p) => p.id === pid || (p as any).name === pid);
+    const mainPath = item ? mainPathOf(item, localHost) : null;
+    if (!mainPath || !existsSync(mainPath)) {
+      continue;
+    }
+
+    try {
+      let commonRaw = "";
+      if (deps.asyncGit) {
+        const r = await deps.asyncGit(mainPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        if (r.exitCode !== 0) {
+          failures.push({ project: pid, reason: `${mainPath} — не git-репозиторий` });
+          continue;
+        }
+        commonRaw = r.stdout.trim();
+      } else {
+        const exec = deps.runCmd ?? defaultExec;
+        commonRaw = exec("git", ["-C", mainPath, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+      }
+      if (!commonRaw) {
+        failures.push({ project: pid, reason: `${mainPath} — не git-репозиторий` });
+        continue;
+      }
+      const commonReal = realpathSync(commonRaw);
+      registry.push(commonReal);
+    } catch (err) {
+      failures.push({ project: pid, reason: `${mainPath} — не git-репозиторий` });
+    }
+  }
+
+  if (failures.length > 0) {
+    return { ok: false, registry: [], failures };
+  }
+
+  return { ok: true, registry: [...new Set(registry)].sort(), failures: [] };
 }
 
 /** Значения core.hooksPath копии по областям (`--show-scope`). */
@@ -324,9 +504,103 @@ export async function installHooks(
 
   if (opts.fixLocalCopy) return fixLocal(opts, hooksDir, exec);
 
+  // 1. Сбор и запись projects.json (п.2; сбой — projects-registry-failed, ничего не записано).
+  let projRegistry: string[] | undefined;
+  if (opts.releaseConfig !== undefined || opts.projectsList !== undefined) {
+    const projRes = await collectProjectsRegistry(opts.releaseConfig, {
+      bbCli: opts.bbCli,
+      localHostId: opts.localHostId,
+      runCmd: exec,
+      asyncGit: opts.asyncGit,
+      projectsList: opts.projectsList,
+    });
+    if (!projRes.ok) {
+      throw new OrchestratorError(
+        "projects-registry-failed",
+        `projects-registry-failed: ${projRes.failures.map((f) => `${f.project}: ${f.reason}`).join("; ")}`,
+      );
+    }
+    mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
+    writeJsonAtomic(join(hooksDir, "projects.json"), projRes.registry);
+    projRegistry = projRes.registry;
+  } else if (!existsSync(join(hooksDir, "projects.json"))) {
+    mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
+    writeJsonAtomic(join(hooksDir, "projects.json"), []);
+    projRegistry = [];
+  } else {
+    try {
+      const p = JSON.parse(readFileSync(join(hooksDir, "projects.json"), "utf8"));
+      if (Array.isArray(p)) projRegistry = p;
+    } catch {}
+  }
+
+  // 2. Проверка новых --exclude по свежему реестру и live-copies.json
+  // (сбой — exclusion-covers-project, ничего не записано, кроме реестра шага 1).
+  const normalizedExcludes = (opts.exclude ?? []).map((arg) => {
+    const hasSlash = arg.endsWith("/");
+    const abs = resolve(arg);
+    return hasSlash ? (abs.endsWith("/") ? abs : abs + "/") : abs;
+  });
+
+  if (normalizedExcludes.length > 0) {
+    const targets: string[] = [];
+    for (const p of projRegistry ?? []) targets.push(dirname(p));
+    const liveFile = join(hooksDir, "live-copies.json");
+    if (existsSync(liveFile)) {
+      try {
+        const liveList = JSON.parse(readFileSync(liveFile, "utf8"));
+        if (Array.isArray(liveList)) {
+          for (const l of liveList) targets.push(l);
+        }
+      } catch {}
+    }
+
+    const coversList: string[] = [];
+    for (const entry of normalizedExcludes) {
+      for (const t of targets) {
+        if (covers(entry, t)) {
+          coversList.push(`${entry} → ${t}`);
+        }
+      }
+    }
+    if (coversList.length > 0) {
+      throw new OrchestratorError(
+        "exclusion-covers-project",
+        `exclusion-covers-project: ${coversList.join(", ")}`,
+      );
+    }
+  }
+
   mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
 
-  // 1. Прежний глобальный core.hooksPath — как его читает git.
+  // 3. Слияние и запись exclusions.
+  const exclusionsFile = join(hooksDir, "exclusions");
+  let existingContent = "";
+  if (existsSync(exclusionsFile)) {
+    existingContent = readFileSync(exclusionsFile, "utf8");
+  }
+  let newContent = existingContent;
+  if (normalizedExcludes.length > 0) {
+    const existingLines = existingContent.split("\n");
+    const existingSet = new Set(existingLines.map((l) => l.trim()).filter(Boolean));
+    const toAppend: string[] = [];
+    for (const entry of normalizedExcludes) {
+      if (!existingSet.has(entry)) {
+        toAppend.push(entry);
+        existingSet.add(entry);
+      }
+    }
+    if (toAppend.length > 0) {
+      if (newContent && !newContent.endsWith("\n")) newContent += "\n";
+      newContent += toAppend.join("\n") + "\n";
+    }
+  }
+  if (!existsSync(exclusionsFile) || normalizedExcludes.length > 0) {
+    writeContentAtomic(exclusionsFile, newContent);
+  }
+
+  // 4. Файлы хуков и core.hooksPath
+  // Прежний глобальный core.hooksPath — как его читает git.
   const raw = tryExec(exec, "git", ["config", "--global", "core.hooksPath"]);
   const chain = readChainConfig(hooksDir);
   if (raw) {
@@ -342,7 +616,6 @@ export async function installHooks(
   }
   writeChainConfig(hooksDir, chain);
 
-  // 2. Файл на каждое имя из HOOK_NAMES + общие модули.
   const names = readHookNames(hooksSrc);
   for (const name of names) {
     const special = (SPECIALIZED_HOOK_NAMES as readonly string[]).includes(name);
@@ -356,12 +629,9 @@ export async function installHooks(
   for (const f of HOOK_SUPPORT_FILES) {
     copyFileSync(join(hooksSrc, f), join(hooksDir, f));
   }
-  const exclusions = join(hooksDir, "exclusions");
-  if (!existsSync(exclusions)) writeFileSync(exclusions, "");
   // push-to-checkout НЕ входит в HOOK_NAMES (§17.3) — убираем старую обёртку.
   rmSync(join(hooksDir, "push-to-checkout"), { force: true });
 
-  // 3. Глобальный core.hooksPath и проверка записи.
   exec("git", ["config", "--global", "core.hooksPath", hooksDir]);
   const after = tryExec(exec, "git", ["config", "--global", "core.hooksPath"]);
   if (opts.runCmd === undefined && realPath(after || "/nonexistent") !== realPath(hooksDir)) {
@@ -375,6 +645,7 @@ export async function installHooks(
     ok: true,
     hooksDir,
     message: `хуки оркестратора установлены в ${hooksDir} (${names.length} хуков)`,
+    projectsRegistry: projRegistry,
   };
 }
 
@@ -397,7 +668,9 @@ export interface DoctorIssue {
     | "local-hooks-path"
     | "effective-path-mismatch"
     | "missing-hook"
-    | "non-executable-hook";
+    | "non-executable-hook"
+    | "missing-projects-registry"
+    | "exclusion-covers-project";
   detail: string;
 }
 
@@ -451,6 +724,69 @@ export async function runHooksDoctor(
       type: "non-executable-hook",
       detail: `хуки в ${hooksDir} не исполняемые (+x): ${nonExec.join(", ")}`,
     });
+  }
+
+  // 1b. Реестр projects.json (§24.4 п.2).
+  const projFile = join(hooksDir, "projects.json");
+  let projectsList: string[] | null = null;
+  if (!existsSync(projFile)) {
+    issues.push({
+      type: "missing-projects-registry",
+      detail: `реестр проектов не найден: ${projFile}; запусти bb orchestrator hooks install`,
+    });
+  } else {
+    try {
+      const parsed = JSON.parse(readFileSync(projFile, "utf8"));
+      if (Array.isArray(parsed)) {
+        projectsList = parsed;
+      } else {
+        issues.push({
+          type: "missing-projects-registry",
+          detail: `реестр проектов ${projFile} повреждён; запусти bb orchestrator hooks install`,
+        });
+      }
+    } catch {
+      issues.push({
+        type: "missing-projects-registry",
+        detail: `реестр проектов ${projFile} не читается; запусти bb orchestrator hooks install`,
+      });
+    }
+  }
+
+  // 1c. Проверка exclusions на покрытие проектов (§24.4 п.5).
+  const exclusionsFile = join(hooksDir, "exclusions");
+  if (existsSync(exclusionsFile)) {
+    let liveList: string[] = [];
+    const liveFile = join(hooksDir, "live-copies.json");
+    if (existsSync(liveFile)) {
+      try {
+        const p = JSON.parse(readFileSync(liveFile, "utf8"));
+        if (Array.isArray(p)) liveList = p;
+      } catch {}
+    }
+    const targets: string[] = [];
+    if (projectsList) {
+      for (const p of projectsList) targets.push(dirname(p));
+    }
+    for (const l of liveList) targets.push(l);
+
+    const lines = readFileSync(exclusionsFile, "utf8").split("\n");
+    const covered: string[] = [];
+    for (const line of lines) {
+      const raw = line.trim();
+      if (!raw || raw.startsWith("#")) continue;
+      for (const t of targets) {
+        if (covers(raw, t)) {
+          covered.push(`${raw} → ${t}`);
+        }
+      }
+    }
+    if (covered.length > 0) {
+      issues.push({
+        type: "exclusion-covers-project",
+        detail: `запись exclusions покрывает управляемый проект: ${covered.join(", ")}`,
+      });
+    }
   }
 
   // 2. Копии.

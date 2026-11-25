@@ -1,10 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, chmodSync, realpathSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { makeTempDir } from "./helpers/temp.js";
 import { writePushToken } from "../src/release.js";
+import { DelegationStore, MIGRATIONS } from "../src/store.js";
+import {
+  HOOK_NAMES,
+  SPECIALIZED_HOOK_NAMES,
+  HOOK_SUPPORT_FILES,
+  installHooks,
+  runHooksDoctor,
+  collectProjectsRegistry,
+} from "../src/hooks.js";
 import {
   IP_VERSION_LIKE,
   LEAK_GHP_SECRET,
@@ -745,4 +755,530 @@ test("§4 r11.1: реальная почта в файле фикстур — о
   const r = runPreCommit(repo, hooksDir);
   assert.equal(r.status, 1);
   assert.match(r.stderr, /leak-samples\.ts:1 — почта: /);
+});
+
+// ── §24.4 (PLUG-421): Область запрета целевой ветки и полные исключения ──
+
+async function setupHooksEnv(prefix: string, opts?: { exclusions?: string; projects?: string[] }) {
+  const base = makeTempDir(prefix);
+  const hooksDir = join(base, "hooks");
+  const gcfg = join(base, "gitconfig");
+  writeFileSync(gcfg, "");
+  const prevGcfg = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = gcfg;
+  try {
+    await installHooks({ hooksDir });
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prevGcfg;
+  }
+  if (opts?.exclusions !== undefined) {
+    writeFileSync(join(hooksDir, "exclusions"), opts.exclusions);
+  }
+  if (opts?.projects !== undefined) {
+    writeFileSync(join(hooksDir, "projects.json"), JSON.stringify(opts.projects));
+  }
+  const dbPath = join(base, "data.db");
+  const db = new Database(dbPath);
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const bbDb = join(base, "bb.db");
+  const bdb = new Database(bbDb);
+  bdb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, environment_id TEXT, parent_thread_id TEXT)");
+  bdb.exec("CREATE TABLE environments (id TEXT PRIMARY KEY, path TEXT)");
+  bdb.close();
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: gcfg,
+    ORCHESTRATOR_DB_PATH: dbPath,
+    ORCHESTRATOR_BB_DB_PATH: bbDb,
+  };
+  delete env.BB_THREAD_ID;
+
+  return { base, hooksDir, gcfg, db, store, env };
+}
+
+function initTestRepo(repo: string, branch = "main") {
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", branch, repo]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "Test User"]);
+}
+
+function doCommit(repo: string, env: NodeJS.ProcessEnv, file = "a.txt", content = "hello\n") {
+  mkdirSync(join(repo, file, ".."), { recursive: true });
+  writeFileSync(join(repo, file), content);
+  spawnSync("git", ["-C", repo, "add", file], { env, encoding: "utf8" });
+  return spawnSync("git", ["-C", repo, "commit", "-m", `add ${file}`], { env, encoding: "utf8" });
+}
+
+test("§24.4 (6.1): коммит в /tmp проходит при установленных хуках (с /tmp/ и без /tmp/ в exclusions)", async () => {
+  // Вариант А: с /tmp/ в exclusions
+  {
+    const { base, env, store } = await setupHooksEnv("test-6-1a-", { exclusions: "/tmp/\n" });
+    const repo = join(base, "repo-a");
+    initTestRepo(repo, "main");
+    const r1 = doCommit(repo, env, "file.txt", "content\n");
+    assert.equal(r1.status, 0, `commit with /tmp/ in exclusions failed: ${r1.stderr}`);
+
+    // Тот же репо с BB_THREAD_ID роли executor без делегирования
+    store.setThreadRole("thr_exec_a", "executor", "owner");
+    const r2 = doCommit(repo, { ...env, BB_THREAD_ID: "thr_exec_a" }, "file2.txt", "content2\n");
+    assert.equal(r2.status, 0, `executor commit with /tmp/ failed: ${r2.stderr}`);
+  }
+
+  // Вариант Б: без /tmp/ в exclusions
+  {
+    const { base, env, store } = await setupHooksEnv("test-6-1b-", { exclusions: "" });
+    const repo = join(base, "repo-b");
+    initTestRepo(repo, "main");
+    const r1 = doCommit(repo, env, "file.txt", "content\n");
+    assert.equal(r1.status, 0, `commit without /tmp/ in exclusions failed: ${r1.stderr}`);
+
+    // Тот же репо с BB_THREAD_ID роли executor без делегирования
+    store.setThreadRole("thr_exec_b", "executor", "owner");
+    const r2 = doCommit(repo, { ...env, BB_THREAD_ID: "thr_exec_b" }, "file2.txt", "content2\n");
+    assert.equal(r2.status, 0, `executor commit without /tmp/ failed: ${r2.stderr}`);
+  }
+});
+
+test("§24.4 (6.2): неуправляемый репозиторий вне exclusions на main — коммит проходит, утечки ловятся", async () => {
+  const { base, env } = await setupHooksEnv("test-6-2-", { exclusions: "" });
+  const repo = join(base, "repo");
+  initTestRepo(repo, "main");
+  // Чистый коммит проходит
+  const ok = doCommit(repo, env, "clean.txt", "ok\n");
+  assert.equal(ok.status, 0, `clean commit failed: ${ok.stderr}`);
+
+  // thr_... в добавленной строке — отказ
+  const leak = doCommit(repo, env, "leak.txt", `const t = "${LEAK_THREAD_ID}";\n`);
+  assert.equal(leak.status, 1);
+  assert.match(leak.stderr, /id треда/);
+});
+
+test("§24.4 (6.3): основная копия проекта из projects.json на main — отказ; worktree на main — отказ, на рабочей ветке — проходит", async () => {
+  const { base, hooksDir, env } = await setupHooksEnv("test-6-3-", { exclusions: "" });
+  const repo = join(base, "repo");
+  initTestRepo(repo, "main");
+  writeFileSync(join(hooksDir, "projects.json"), JSON.stringify([realpathSync(join(repo, ".git"))]));
+
+  // Основная копия на main — отказ
+  const rMain = doCommit(repo, env, "a.txt");
+  assert.equal(rMain.status, 1);
+  assert.match(rMain.stderr, /в целевую ветку не коммитят/);
+
+  // Сделаем начальный коммит в рабочей ветке, чтобы можно было создать worktree
+  execFileSync("git", ["-C", repo, "checkout", "-q", "-b", "work"]);
+  assert.equal(doCommit(repo, env, "init.txt").status, 0);
+  execFileSync("git", ["-C", repo, "branch", "main", "work"]);
+
+  // Worktree на рабочей ветке — проходит
+  const wtWork = join(base, "wt-work");
+  execFileSync("git", ["-C", repo, "worktree", "add", wtWork, "-b", "feature"]);
+  assert.equal(doCommit(wtWork, env, "wt.txt").status, 0);
+
+  // Worktree на main — отказ
+  const wtMain = join(base, "wt-main");
+  execFileSync("git", ["-C", repo, "worktree", "add", wtMain, "main"]);
+  const rWtMain = doCommit(wtMain, env, "wt-main.txt");
+  assert.equal(rWtMain.status, 1);
+  assert.match(rWtMain.stderr, /в целевую ветку не коммитят/);
+});
+
+test("§24.4 (6.4): репозиторий со слепком orchestrator-leaks.json без excluded на main — отказ", async () => {
+  const { base, env } = await setupHooksEnv("test-6-4-", { exclusions: "" });
+  const repo = join(base, "repo");
+  initTestRepo(repo, "main");
+  writeFileSync(
+    join(repo, ".git", "orchestrator-leaks.json"),
+    JSON.stringify({ version: 1, threadIds: true }),
+  );
+  const r = doCommit(repo, env, "a.txt");
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /в целевую ветку не коммитят/);
+});
+
+test("§24.4 (6.5): проект с excluded: true не входит в projects.json, коммит на main проходит, install --exclude добавляет путь, doctor не считает ошибкой", async () => {
+  const { base, hooksDir, env } = await setupHooksEnv("test-6-5-", { exclusions: "" });
+  const repo = join(base, "repo");
+  initTestRepo(repo, "main");
+
+  // Слепок со снапшотом excluded: true
+  writeFileSync(
+    join(repo, ".git", "orchestrator-leaks.json"),
+    JSON.stringify({ version: 1, excluded: true }),
+  );
+  const r = doCommit(repo, env, "a.txt");
+  assert.equal(r.status, 0, `excluded project commit on main failed: ${r.stderr}`);
+
+  // hooks install с --exclude
+  const prevGcfg = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = join(base, "gitconfig");
+  try {
+    const res = await installHooks({
+      hooksDir,
+      exclude: [repo],
+      releaseConfig: {
+        projects: {
+          proj_ex: { excluded: true },
+        },
+      },
+      projectsList: [
+        { id: "proj_ex", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+      ],
+    });
+    assert.equal(res.ok, true);
+
+    // doctor не считает эту запись пересечением
+    const doc = await runHooksDoctor({ hooksDir, repo });
+    assert.equal(doc.ok, true);
+    assert.equal(doc.issues.some((i) => i.type === "exclusion-covers-project"), false);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prevGcfg;
+  }
+
+  // Запись добавлена в exclusions
+  const exclContent = readFileSync(join(hooksDir, "exclusions"), "utf8");
+  assert.ok(exclContent.includes(repo));
+});
+
+test("§24.4 (6.6): нет projects.json, exclusions содержит <tmp>/excluded/: управляемый по слепку — отказ, прочий — предупреждение, в excluded — без предупреждения", async () => {
+  const { base, hooksDir, env } = await setupHooksEnv("test-6-6-");
+  try {
+    const { rmSync } = await import("node:fs");
+    rmSync(join(hooksDir, "projects.json"));
+  } catch {}
+
+  const exclPrefix = join(base, "excluded") + "/";
+  writeFileSync(join(hooksDir, "exclusions"), exclPrefix);
+
+  // 1. Управляемый по слепку (в <tmp>/managed/repo) -> отказ
+  const managedRepo = join(base, "managed", "repo");
+  initTestRepo(managedRepo, "main");
+  writeFileSync(
+    join(managedRepo, ".git", "orchestrator-leaks.json"),
+    JSON.stringify({ version: 1, threadIds: true }),
+  );
+  const rManaged = doCommit(managedRepo, env, "a.txt");
+  assert.equal(rManaged.status, 1);
+  assert.match(rManaged.stderr, /в целевую ветку не коммитят/);
+
+  // 2. Прочий на main вне <tmp>/excluded/ -> проходит с предупреждением projectsRegistryMissing
+  const otherRepo = join(base, "other", "repo");
+  initTestRepo(otherRepo, "main");
+  const rOther = doCommit(otherRepo, env, "b.txt");
+  assert.equal(rOther.status, 0);
+  assert.match(rOther.stderr, /реестр проектов не найден — запрет целевой ветки только по слепку настроек/);
+
+  // 3. Неуправляемый репозиторий в <tmp>/excluded/ -> проходит без предупреждения
+  const exclRepo = join(base, "excluded", "repo");
+  initTestRepo(exclRepo, "main");
+  const rExcl = doCommit(exclRepo, env, "c.txt");
+  assert.equal(rExcl.status, 0);
+  assert.ok(!rExcl.stderr.includes("реестр проектов не найден"));
+});
+
+test("§24.4 (6.7): репозиторий под /tmp/ с ролью orchestrator и файлом вне docs/ — проходит", async () => {
+  const { base, env, store } = await setupHooksEnv("test-6-7-", { exclusions: "/tmp/\n" });
+  store.setThreadRole("thr_coord_7", "orchestrator", "owner");
+  const repo = join(base, "repo");
+  initTestRepo(repo, "main");
+  execFileSync("git", ["-C", repo, "checkout", "-q", "-b", "feature"]);
+  const e = { ...env, BB_THREAD_ID: "thr_coord_7" };
+  const r = doCommit(repo, e, "src/code.ts", "console.log('code');\n");
+  assert.equal(r.status, 0, `ordinarily forbidden coordinator commit passed under exclusions: ${r.stderr}`);
+});
+
+test("§24.4 (6.8): worktree управляемого репозитория под исключённым префиксом — проверки pre-commit и pre-push действуют", async () => {
+  const { base, hooksDir, env, store } = await setupHooksEnv("test-6-8-");
+  const managedRepo = join(base, "managed", "repo");
+  initTestRepo(managedRepo, "main");
+  writeFileSync(join(hooksDir, "projects.json"), JSON.stringify([realpathSync(join(managedRepo, ".git"))]));
+
+  const exclPrefix = join(base, "excluded") + "/";
+  writeFileSync(join(hooksDir, "exclusions"), exclPrefix);
+
+  // Подготовим коммит на рабочей ветке в managedRepo
+  execFileSync("git", ["-C", managedRepo, "checkout", "-q", "-b", "work"]);
+  assert.equal(doCommit(managedRepo, env, "init.txt").status, 0);
+  execFileSync("git", ["-C", managedRepo, "branch", "main", "work"]);
+
+  // Создадим worktree под исключённым префиксом: <tmp>/excluded/wt
+  const wt = join(base, "excluded", "wt");
+  execFileSync("git", ["-C", managedRepo, "worktree", "add", wt, "-b", "wt-branch"]);
+
+  // pre-commit в worktree:
+  // 1) с ролью orchestrator коммит файла вне docs/ -> отказ
+  store.setThreadRole("thr_coord_8", "orchestrator", "owner");
+  const rCoord = doCommit(wt, { ...env, BB_THREAD_ID: "thr_coord_8" }, "src/app.ts");
+  assert.equal(rCoord.status, 1);
+  assert.match(rCoord.stderr, /координатор код не пишет/);
+
+  // 2) на main без роли -> отказ правила (а)
+  execFileSync("git", ["-C", wt, "checkout", "-q", "main"]);
+  const rMain = doCommit(wt, env, "main.txt");
+  assert.equal(rMain.status, 1);
+  assert.match(rMain.stderr, /в целевую ветку не коммитят/);
+
+  // 3) на рабочей ветке без роли -> проходит
+  execFileSync("git", ["-C", wt, "checkout", "-q", "wt-branch"]);
+  const rWork = doCommit(wt, env, "work.txt");
+  assert.equal(rWork.status, 0);
+
+  // pre-push:
+  const remote = join(base, "managed", "remote.git");
+  execFileSync("git", ["init", "--bare", remote]);
+  execFileSync("git", ["-C", wt, "remote", "add", "origin", remote]);
+
+  // push рабочей ветки из worktree без маркера release -> отказ
+  const pushWt = spawnSync("git", ["-C", wt, "push", "origin", "wt-branch"], { env, encoding: "utf8" });
+  assert.equal(pushWt.status, 1);
+  assert.match(pushWt.stderr, /выкладка только через `bb orchestrator release`/);
+
+  // тот же push из неуправляемого репозитория в <tmp>/excluded/ -> проходит
+  const unmanagedRepo = join(base, "excluded", "unmanaged");
+  initTestRepo(unmanagedRepo, "main");
+  execFileSync("git", ["-C", unmanagedRepo, "checkout", "-q", "-b", "u-work"]);
+  assert.equal(doCommit(unmanagedRepo, env, "u.txt").status, 0);
+  const uRemote = join(base, "managed", "u-remote.git");
+  execFileSync("git", ["init", "--bare", uRemote]);
+  execFileSync("git", ["-C", unmanagedRepo, "remote", "add", "origin", uRemote]);
+  const pushUnm = spawnSync("git", ["-C", unmanagedRepo, "push", "origin", "u-work"], { env, encoding: "utf8" });
+  assert.equal(pushUnm.status, 0, `unmanaged push should pass: ${pushUnm.stderr}`);
+});
+
+test("§24.4 (6.9): post-checkout и reference-transaction в исключённом репозитории вызывают только локальный хук", async () => {
+  const { base, hooksDir, env, store } = await setupHooksEnv("test-6-9-", { exclusions: "/tmp/\n" });
+  store.setThreadRole("thr_coord_9", "orchestrator", "owner");
+  const repo = join(base, "repo");
+  initTestRepo(repo, "main");
+  assert.equal(doCommit(repo, env, "init.txt").status, 0);
+
+  // Локальный post-checkout
+  const localCo = join(repo, ".git", "hooks", "post-checkout");
+  writeFileSync(localCo, "#!/bin/sh\necho LOCAL_CO > \"${GIT_DIR:-.git}/../local-co-ran\"\nexit 0\n");
+  chmodSync(localCo, 0o755);
+
+  // post-checkout: переключение ветки с ролью orchestrator в чужой копии не даёт ошибок и строк
+  const co = spawnSync("git", ["-C", repo, "checkout", "-q", "-b", "branch-9"], {
+    env: { ...env, BB_THREAD_ID: "thr_coord_9" },
+    encoding: "utf8",
+  });
+  assert.equal(co.status, 0);
+  assert.equal(existsSync(join(repo, "local-co-ran")), true);
+
+  // reference-transaction: создаём маркер живой копии
+  writeFileSync(join(repo, ".git", ".bb-live-checkout"), "");
+  const refTx = spawnSync("node", [join(hooksDir, "reference-transaction"), "prepared"], {
+    cwd: repo,
+    input: "ref lines\n",
+    env,
+    encoding: "utf8",
+  });
+  assert.equal(refTx.status, 0);
+  assert.ok(!refTx.stderr.includes("отказ: изменение ссылок"));
+});
+
+test("§24.4 (6.10): запись через символьную ссылку сопоставляется после realpath", async () => {
+  const { base, hooksDir, env, store } = await setupHooksEnv("test-6-10-");
+  store.setThreadRole("thr_coord_10", "orchestrator", "owner");
+
+  const realDir = join(base, "real");
+  mkdirSync(realDir, { recursive: true });
+  const linkDir = join(base, "link");
+  symlinkSync(realDir, linkDir);
+
+  // Неуправляемый репозиторий в real/repo
+  const repo = join(realDir, "repo");
+  initTestRepo(repo, "main");
+  execFileSync("git", ["-C", repo, "checkout", "-q", "-b", "work"]);
+
+  // В exclusions теста только <tmp>/link/
+  writeFileSync(join(hooksDir, "exclusions"), `${linkDir}/\n`);
+
+  const e = { ...env, BB_THREAD_ID: "thr_coord_10" };
+  const rPass = doCommit(repo, e, "src/a.ts");
+  assert.equal(rPass.status, 0, `symlink exclusion matched after realpath: ${rPass.stderr}`);
+
+  // Без этой записи — отказ «координатор код не пишет»
+  writeFileSync(join(hooksDir, "exclusions"), "");
+  const rFail = doCommit(repo, e, "src/b.ts");
+  assert.equal(rFail.status, 1);
+  assert.match(rFail.stderr, /координатор код не пишет/);
+});
+
+test("§24.4 (6.11): установка не стирает существующие исключения (байт-в-байт без --exclude, слияние с --exclude)", async () => {
+  const { base, hooksDir } = await setupHooksEnv("test-6-11-");
+  const origContent = "# Service exclusions\n/tmp/\n/home/ubuntu/kb/\n";
+  writeFileSync(join(hooksDir, "exclusions"), origContent);
+
+  const prevGcfg = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = join(base, "gitconfig");
+  try {
+    // hooks install без --exclude -> файл байт-в-байт прежний
+    await installHooks({ hooksDir });
+    assert.equal(readFileSync(join(hooksDir, "exclusions"), "utf8"), origContent);
+
+    // --exclude <X>/ -> прежние строки на месте и в том же порядке, <X>/ дописан
+    const extra = join(base, "extra") + "/";
+    await installHooks({ hooksDir, exclude: [extra] });
+    const content2 = readFileSync(join(hooksDir, "exclusions"), "utf8");
+    assert.equal(content2, origContent + extra + "\n");
+
+    // Повтор с тем же <X>/ дубля не даёт
+    await installHooks({ hooksDir, exclude: [extra] });
+    assert.equal(readFileSync(join(hooksDir, "exclusions"), "utf8"), content2);
+
+    // То же для install.mjs
+    const extra2 = join(base, "extra2") + "/";
+    const resMjs = spawnSync("node", ["hooks/install.mjs", "--hooks-dir", hooksDir, "--exclude", extra2], {
+      cwd: PLUGIN_DIR,
+      env: { ...process.env, GIT_CONFIG_GLOBAL: join(base, "gitconfig") },
+      encoding: "utf8",
+    });
+    assert.equal(resMjs.status, 0, resMjs.stderr);
+    const content3 = readFileSync(join(hooksDir, "exclusions"), "utf8");
+    assert.equal(content3, content2 + extra2 + "\n");
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prevGcfg;
+  }
+});
+
+test("§24.4 (6.12): exclusion-covers-project при попытке исключить управляемый проект; doctor код 2", async () => {
+  const { base, hooksDir } = await setupHooksEnv("test-6-12-");
+  const managedRepo = join(base, "managed", "repo");
+  initTestRepo(managedRepo, "main");
+  writeFileSync(join(hooksDir, "exclusions"), "");
+
+  const prevGcfg = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = join(base, "gitconfig");
+  try {
+    // hooks install с exclude, покрывающим managedRepo
+    await assert.rejects(
+      async () => {
+        await installHooks({
+          hooksDir,
+          exclude: [join(base, "managed") + "/"],
+          releaseConfig: {
+            projects: {
+              proj_m: { checks: [] },
+            },
+          },
+          projectsList: [
+            { id: "proj_m", sources: [{ type: "local_path", path: managedRepo, isDefault: true }] },
+          ],
+        });
+      },
+      (err: any) => {
+        assert.equal(err.code, "exclusion-covers-project");
+        return true;
+      },
+    );
+    assert.equal(readFileSync(join(hooksDir, "exclusions"), "utf8"), "");
+
+    // install.mjs с уже записанным projects.json
+    writeFileSync(join(hooksDir, "projects.json"), JSON.stringify([realpathSync(join(managedRepo, ".git"))]));
+    const resMjs = spawnSync("node", ["hooks/install.mjs", "--hooks-dir", hooksDir, "--exclude", join(base, "managed") + "/"], {
+      cwd: PLUGIN_DIR,
+      env: { ...process.env, GIT_CONFIG_GLOBAL: join(base, "gitconfig") },
+      encoding: "utf8",
+    });
+    assert.equal(resMjs.status, 1);
+    assert.match(resMjs.stderr, /exclusion-covers-project/);
+    assert.equal(readFileSync(join(hooksDir, "exclusions"), "utf8"), "");
+
+    // Запись, уже лежащая в exclusions -> doctor код 2
+    writeFileSync(join(hooksDir, "exclusions"), join(base, "managed") + "/\n");
+    const doc = await runHooksDoctor({ hooksDir, repo: managedRepo });
+    assert.equal(doc.ok, false);
+    assert.equal(doc.code, 2);
+    assert.ok(doc.issues.some((i) => i.type === "exclusion-covers-project"));
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prevGcfg;
+  }
+});
+
+test("§24.4 (6.14): сбор реестра projects.json (local_path missing, broken git, async sync)", async () => {
+  const base = makeTempDir("test-6-14-");
+  const repo1 = join(base, "repo1");
+  initTestRepo(repo1, "main");
+
+  // (а) Настройка с двумя проектами: у одного repo, у другого пути нет
+  const resA = await collectProjectsRegistry(
+    {
+      projects: {
+        p1: { checks: [] },
+        p2: { checks: [] },
+      },
+    },
+    {
+      projectsList: [
+        { id: "p1", sources: [{ type: "local_path", path: repo1, isDefault: true }] },
+        { id: "p2", sources: [{ type: "local_path", path: join(base, "nonexistent"), isDefault: true }] },
+      ],
+    },
+  );
+  assert.equal(resA.ok, true);
+  assert.deepEqual(resA.registry, [realpathSync(join(repo1, ".git"))]);
+
+  // Запуск из worktree того же репозитория даёт ту же запись
+  const wt1 = join(base, "repo1-wt");
+  execFileSync("git", ["-C", repo1, "commit", "-q", "--allow-empty", "-m", "init"]);
+  execFileSync("git", ["-C", repo1, "worktree", "add", wt1, "-b", "wt1-branch"]);
+  const resWt = await collectProjectsRegistry(
+    { projects: { p1: { checks: [] } } },
+    {
+      projectsList: [
+        { id: "p1", sources: [{ type: "local_path", path: wt1, isDefault: true }] },
+      ],
+    },
+  );
+  assert.equal(resWt.ok, true);
+  assert.deepEqual(resWt.registry, [realpathSync(join(repo1, ".git"))]);
+
+  // (б) local_path существует, но не git-репозиторий -> projects-registry-failed
+  const notRepo = join(base, "not-repo");
+  mkdirSync(notRepo);
+  const hooksDir = join(base, "hooks");
+  await assert.rejects(
+    async () => {
+      await installHooks({
+        hooksDir,
+        releaseConfig: {
+          projects: {
+            p_bad: { checks: [] },
+          },
+        },
+        projectsList: [
+          { id: "p_bad", sources: [{ type: "local_path", path: notRepo, isDefault: true }] },
+        ],
+      });
+    },
+    (err: any) => {
+      assert.equal(err.code, "projects-registry-failed");
+      assert.match(err.message, /p_bad/);
+      return true;
+    },
+  );
+  // В hooksDir ничего не записано
+  assert.equal(existsSync(hooksDir), false);
+
+  // (в) Асинхронный сбор: ошибка логгируется в warn, прежний файл на месте
+  const hooksDir2 = join(base, "hooks2");
+  mkdirSync(hooksDir2);
+  writeFileSync(join(hooksDir2, "projects.json"), JSON.stringify(["old-entry"]));
+  const warnings: string[] = [];
+  const fakeLog = { warn: (msg: string) => warnings.push(msg) };
+  // Симуляция фонового сбора
+  const resBad = await collectProjectsRegistry(
+    { projects: { p_bad: {} } },
+    {
+      projectsList: [{ id: "p_bad", sources: [{ type: "local_path", path: notRepo, isDefault: true }] }],
+    },
+  );
+  if (!resBad.ok) {
+    fakeLog.warn(`orchestrator: projects.json: ${resBad.failures.map(f => `${f.project}: ${f.reason}`).join("; ")}`);
+  }
+  assert.ok(warnings.some(w => w.includes("p_bad")));
+  assert.equal(readFileSync(join(hooksDir2, "projects.json"), "utf8"), JSON.stringify(["old-entry"]));
 });

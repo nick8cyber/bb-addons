@@ -293,3 +293,113 @@ export async function envPaths(threadId, envIds) {
 export function inside(p, root) {
   return Boolean(p && root && (p === root || p.startsWith(root + "/")));
 }
+
+/**
+ * Check if exclusion entry covers a target root path (§24.4 п.4–5).
+ * Raw entry is compared as written and after realpath (preserving trailing /).
+ * Trailing / is directory prefix match; without trailing / is exact match.
+ */
+export function covers(entry, target) {
+  if (!entry || !target) return false;
+  const raw = entry.trim();
+  if (!raw || raw.startsWith("#")) return false;
+  const variants = [raw];
+  const hasSlash = raw.endsWith("/");
+  const toResolve = hasSlash ? raw.slice(0, -1) : raw;
+  try {
+    const resolved = realpathSync(toResolve);
+    const norm = hasSlash ? (resolved.endsWith("/") ? resolved : resolved + "/") : resolved;
+    if (norm !== raw) variants.push(norm);
+  } catch {}
+  for (const v of variants) {
+    if (v.endsWith("/")) {
+      if (target.startsWith(v) || (v.length > 1 && target === v.slice(0, -1))) return true;
+    } else {
+      if (target === v) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Managed repository check (§24.4 п.2).
+ * Returns { managed: boolean, registryMissing: boolean }.
+ * Managed if any of:
+ * 1) real path of commonDir is in `projects.json` in hooksDir;
+ * 2) orchestrator-leaks.json snapshot in commonDir without "excluded": true;
+ * 3) .bb-live-checkout marker in commonDir (isLiveCopy).
+ * registryMissing is true only if projects.json does not exist or is unreadable.
+ */
+export function isManaged(hooksDir, commonDir) {
+  let registryMissing = false;
+  let projectsList = null;
+  const projFile = join(hooksDir, "projects.json");
+  if (!existsSync(projFile)) {
+    registryMissing = true;
+  } else {
+    try {
+      const parsed = JSON.parse(readFileSync(projFile, "utf8"));
+      if (Array.isArray(parsed)) {
+        projectsList = parsed;
+      } else {
+        registryMissing = true;
+      }
+    } catch {
+      registryMissing = true;
+    }
+  }
+
+  let managed = false;
+  if (commonDir) {
+    const realCommon = real(commonDir);
+    if (projectsList && projectsList.some((p) => real(p) === realCommon)) {
+      managed = true;
+    }
+    if (!managed) {
+      const snap = readJson(join(commonDir, "orchestrator-leaks.json"));
+      if (snap && typeof snap === "object" && snap.excluded !== true) {
+        managed = true;
+      }
+    }
+    if (!managed && existsSync(join(commonDir, LIVE_MARKER))) {
+      managed = true;
+    }
+  }
+
+  return { managed, registryMissing };
+}
+
+/**
+ * Exclusions check for git hooks (§24.4 п.3–4).
+ * Returns boolean.
+ * Roots compared:
+ * - for managed repository: ONLY dirname(commonDir) (main copy root);
+ * - for unmanaged: top and dirname(commonDir).
+ * Entries from exclusions: matched as written AND after realpath (preserving trailing /).
+ */
+export function isExcluded(hooksDir, top, commonDir) {
+  const { managed } = isManaged(hooksDir, commonDir);
+  const roots = [];
+  if (managed) {
+    if (commonDir) roots.push(dirname(commonDir));
+  } else {
+    if (top) roots.push(top);
+    if (commonDir) roots.push(dirname(commonDir));
+  }
+  if (roots.length === 0) return false;
+
+  const exclusionsFile = join(hooksDir, "exclusions");
+  let content;
+  try {
+    content = readFileSync(exclusionsFile, "utf8");
+  } catch {
+    return false;
+  }
+
+  for (const line of content.split("\n")) {
+    const raw = line.trim();
+    if (!raw || raw.startsWith("#")) continue;
+    if (roots.some((r) => covers(raw, r))) return true;
+  }
+  return false;
+}
