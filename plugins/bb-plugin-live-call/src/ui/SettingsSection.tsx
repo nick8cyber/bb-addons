@@ -5,6 +5,11 @@
  */
 import { useCallback, useEffect, useState } from "react";
 
+import {
+  setCallButtonFooter,
+  setCallButtonNav,
+  useCallButtonPlacement,
+} from "./button-placement.js";
 import { callEngine } from "./engine.js";
 import { Icon } from "./icons.js";
 import { publishProjects } from "./project-events.js";
@@ -31,6 +36,13 @@ export function SettingsSection() {
   const [busyProjectId, setBusyProjectId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [probe, setProbe] = useState<{ running: boolean; result?: ProbeResult; error?: string }>({ running: false });
+  // §2: хук с подпиской на storage; setter'ы принимают boolean прямо, без
+  // замыкания на текущее значение и без расхождения соседних тумблеров.
+  const {
+    placement: { footer: footerButton, nav: navButton },
+    setFooter: setFooterButton,
+    setNav: setNavButton,
+  } = useCallButtonPlacement();
 
   const refresh = useCallback(async () => {
     try {
@@ -119,6 +131,14 @@ export function SettingsSection() {
             <span className="lc-sub">нет</span>
           )}
         </Row>
+        <Row label="Кнопка звонка">
+          <PlacementToggles
+            footer={footerButton}
+            nav={navButton}
+            onFooter={setFooterButton}
+            onNav={setNavButton}
+          />
+        </Row>
         <Row label="Горячие клавиши">
           <span className="lc-sub">
             <kbd>⌘/Ctrl ⇧ L</kbd> позвонить или завершить · <kbd>⌘/Ctrl ⇧ K</kbd> сменить режим. Переназначить — в палитре команд.
@@ -151,6 +171,67 @@ export function SettingsSection() {
       )}
       {probe.error && <p className="lc-bad">Проверка не удалась: {probe.error}</p>}
     </div>
+  );
+}
+
+/**
+ * §2–3.4 спеки live-call-button-placement: где показывать кнопку звонка.
+ * Два независимых тумблера; регистрации слотов одноразовые, поэтому подсказка
+ * «Применяется после перезагрузки страницы» стоит под контролами всегда.
+ */
+export function PlacementToggles({
+  footer,
+  nav,
+  onFooter,
+  onNav,
+}: {
+  footer: boolean;
+  nav: boolean;
+  onFooter: (value: boolean) => void;
+  onNav: (value: boolean) => void;
+}) {
+  return (
+    <div className="lc-placement" data-testid="call-button-placement">
+      <Toggle
+        id="call-button-footer"
+        label="Кнопка звонка в нижнем сайдбаре"
+        checked={footer}
+        onChange={onFooter}
+        hint="Иконка трубки рядом с лимитами и «…» в футере сайдбара"
+      />
+      <Toggle
+        id="call-button-nav"
+        label="Кнопка звонка в левой панели"
+        checked={nav}
+        onChange={onNav}
+        hint="Иконка в левой панели навигации; открывает страницу звонка"
+      />
+      <p className="lc-sub lc-placement__hint">Применяется после перезагрузки страницы</p>
+      {!footer && !nav && (
+        <p className="lc-sub">Кнопок не будет — звонок остаётся по ⌘/Ctrl ⇧ L и в палитре команд.</p>
+      )}
+    </div>
+  );
+}
+
+function Toggle({
+  id,
+  label,
+  checked,
+  onChange,
+  hint,
+}: {
+  id: string;
+  label: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  hint: string;
+}) {
+  return (
+    <label className="lc-toggle" htmlFor={id} title={hint}>
+      <input id={id} type="checkbox" role="switch" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span>{label}</span>
+    </label>
   );
 }
 
