@@ -1005,7 +1005,8 @@ function checkTurnStatus(doc, idx, promptPrefix) {
         } catch {
           hostOk = false;
         }
-        const hasDl = Boolean(a.getAttribute && a.getAttribute('download'));
+        // download="" (empty value) still marks a file link — same as collectGeneratedFiles.
+        const hasDl = a.hasAttribute ? a.hasAttribute('download') : Boolean(a.getAttribute && a.getAttribute('download') !== null);
         const label = ((a.getAttribute ? a.getAttribute('aria-label') : '') || '') + ' ' + (a.innerText || '');
         const fileExt = /\.(pdf|pptx?|xlsx?|docx?|csv|tsv|md|txt|zip|json|png|jpe?g|gif|svg|webp|mp3|wav|mp4|html?|ics|epub)(?:$|[?#])/i;
         if (hostOk && (hasDl || /download|скачать|export|экспорт/i.test(label) || fileExt.test(href))) {
@@ -1017,7 +1018,7 @@ function checkTurnStatus(doc, idx, promptPrefix) {
         const fileBtns = target ? Array.from(target.querySelectorAll('button, [role="button"]')) : [];
         for (const b of fileBtns) {
           const label = ((b.getAttribute ? b.getAttribute('aria-label') : '') || '') + ' ' + (b.innerText || '');
-          const hasDl = Boolean(b.getAttribute && b.getAttribute('download'));
+          const hasDl = b.hasAttribute ? b.hasAttribute('download') : Boolean(b.getAttribute && b.getAttribute('download') !== null);
           if (hasDl || /download|скачать|export|экспорт/i.test(label)) {
             hasGeneratedFile = true;
             break;
@@ -1554,6 +1555,11 @@ async function sendPrompt({
     // button is visible (the turn then waits for the stop press, the session cap or
     // a finished answer instead of declaring a stall).
     let highWindowStart = null;
+    // PLUG-413: whether the last poll that found the target reported finished
+    // content (text / image / generated file, §4.2). Used after the target is lost:
+    // the answer counts as captured only from real content, never from raw
+    // pending-response chrome ("Searching the web…", "Show thinking…").
+    let lastHadFinishedContent = false;
 
     while (Date.now() - streamStartTime < SESSION_CAP_MS) {
       await throwIfCancelled();
@@ -1613,13 +1619,20 @@ async function sendPrompt({
       // stop button is visible the turn may not be stalled (author-driven); the
       // window starts at the first poll without a stop button and without an answer
       // and is not extended by spinner / isGenerating / domSig progress signals.
+      // PLUG-413: "answer" = hasFinishedContent (§4.2) or text captured from
+      // message-content. Raw pending-response text (src 'raw': "Searching the
+      // web…", "Show thinking…") is not an answer and does not reset the window.
+      const answered = () =>
+        Boolean(
+          (status && status.targetFound ? status.hasFinishedContent : lastHadFinishedContent) ||
+            (lastSrc === 'mc' && lastText && lastText.length > 0)
+        );
       const highStalled = () => {
         if (hasStopButton) {
           highWindowStart = null;
           return false;
         }
-        const answered = Boolean(status && status.hasFinishedContent) || Boolean(lastText && lastText.length);
-        if (answered) {
+        if (answered()) {
           highWindowStart = null;
           return false;
         }
@@ -1639,14 +1652,19 @@ async function sendPrompt({
           e.code = 'WEB_GEMINI_STALLED';
           throw e;
         }
-        // Answer already captured — losing the target afterwards is a completion
-        // with the captured content, not a stall (PLUG-411 / PLUG-413 §2.3).
-        if (lastText && lastText.length) {
+        // §2.3 п.2 (thinking: high): target lost AFTER a captured answer and with
+        // no stop button — completion with the captured content, not a stall.
+        // With the stop button visible the generation is still running (a brief
+        // target loss during a DOM re-render) — keep polling, never truncate.
+        // low/medium keep the previous behaviour (keep polling until the target
+        // returns, a stall or the cap).
+        if (isHighThinking && !hasStopButton && answered()) {
           break;
         }
         continue;
       }
 
+      lastHadFinishedContent = Boolean(status.hasFinishedContent);
       let hadProgress = false;
       const currentText = status.currentText;
       if (currentText !== null && currentText.text.length) {
