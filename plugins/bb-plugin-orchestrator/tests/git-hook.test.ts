@@ -1111,7 +1111,7 @@ test("§24.4 (6.10): запись через символьную ссылку �
 
 test("§24.4 (6.11): установка не стирает существующие исключения (байт-в-байт без --exclude, слияние с --exclude)", async () => {
   const { base, hooksDir } = await setupHooksEnv("test-6-11-");
-  const origContent = "# Service exclusions\n/tmp/\n/home/ubuntu/kb/\n";
+  const origContent = "# Service exclusions\n/tmp/\n/home/example/kb/\n";
   writeFileSync(join(hooksDir, "exclusions"), origContent);
 
   const prevGcfg = process.env.GIT_CONFIG_GLOBAL;
