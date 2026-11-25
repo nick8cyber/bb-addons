@@ -3595,3 +3595,465 @@ test("Вложения задачи §4.7.14: малый maxTotalBytes — не�
     else delete process.env.BB_CLI;
   }
 });
+
+test("Вложения задачи (PLUG-423): attachmentOmissions всегда массив, ход без пропусков не падает", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-423-omissions-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  // 1. Задача без раздела ## Attachments
+  const textNoAtt = [
+    "# PLUG-423 · No attachments",
+    "## Description",
+    "Some description without attachments section",
+    "## Additional instructions",
+    "Clean instructions",
+  ].join("\n");
+  const session = { cwd: tmp };
+  const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+  const prepNoAtt = await prepareTask({ text: textNoAtt, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+  assert.ok(Array.isArray(prepNoAtt.attachmentOmissions), "attachmentOmissions must be an array");
+  assert.equal(prepNoAtt.attachmentOmissions.length, 0);
+
+  const packageOptions = {
+    signal: AbortSignal.timeout(5000),
+    spillDir: join(tmp, "spill"),
+    maxUploadBytes: 100_000,
+    maxUploadCount: 5,
+    validateUploads: () => ({ files: [] }),
+    ownedFiles: [],
+    limit: 100_000,
+  };
+  const materialsNoAtt = await collectTaskAttachments(prepNoAtt, [], packageOptions);
+  const collectedNoAtt = await collectTask(prepNoAtt, [], materialsNoAtt, packageOptions);
+  const packedNoAtt = packTask(prepNoAtt, collectedNoAtt, packageOptions);
+  assert.ok(packedNoAtt.message);
+  assert.ok(!packedNoAtt.message.includes("Вложения задачи, не вошедшие в пакет"));
+
+  // 2. Восстановление контекста без attachmentOmissions (savedTurn/package)
+  const contextWithoutField = { ...prepNoAtt };
+  delete contextWithoutField.attachmentOmissions;
+  const collectedRestored = await collectTask(contextWithoutField, [], materialsNoAtt, packageOptions);
+  assert.ok(Array.isArray(contextWithoutField.attachmentOmissions));
+  const packedRestored = packTask(contextWithoutField, collectedRestored, packageOptions);
+  assert.ok(packedRestored.message);
+});
+
+test("Точка входа (PLUG-423): index.mjs передаёт WEB_GEMINI_ORCHESTRATOR_DATA_DIR из experimental_dataDir", async (t) => {
+  const plugin = (await import("../index.mjs")).default;
+  const registered = [];
+  const fakeBb = {
+    server: { experimental_dataDir: "/custom/fictitious/bb-data" },
+    providers: {
+      register: (spec) => registered.push(spec),
+    },
+  };
+  const oldEnv = process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  try {
+    delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+    plugin(fakeBb);
+    assert.equal(registered.length, 2);
+    for (const reg of registered) {
+      assert.equal(reg.experimental_bridgeOptions.acpLaunchSpec.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR, "/custom/fictitious/bb-data/plugins/orchestrator");
+      const derived = reg.deriveProviderOptions({ threadId });
+      assert.equal(derived.acpLaunchSpec.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR, "/custom/fictitious/bb-data/plugins/orchestrator");
+    }
+    assert.equal(process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR, "/custom/fictitious/bb-data/plugins/orchestrator");
+
+    const throwingBb = {
+      server: {
+        get experimental_dataDir() { throw new Error("not supported"); },
+      },
+      providers: { register: () => {} },
+    };
+    delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+    assert.doesNotThrow(() => plugin(throwingBb));
+    assert.equal(process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR, undefined);
+  } finally {
+    if (oldEnv !== undefined) process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = oldEnv;
+    else delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  }
+});
+
+test("Вложения задачи (PLUG-423): пакет аудита выкладки доставляется обязательным вложением", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-423-audit-pos-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const fakeHome = join(tmp, "fake-home");
+  const auditDir = join(fakeHome, ".bb", "plugins", "orchestrator", "release-audit");
+  mkdirSync(auditDir, { recursive: true });
+  const packetFile = join(auditDir, "release-101-audit.md");
+  const packetContent = "Release 101 audit report text with secret token\n";
+  writeFileSync(packetFile, packetContent);
+
+  const oldHome = process.env.HOME;
+  const oldOrchDir = process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  process.env.HOME = fakeHome;
+  delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+
+  try {
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    // A. Положительный: путь ~/.bb/plugins/orchestrator/release-audit/release-101-audit.md
+    const textTilde = [
+      "# PLUG-423 · Audit task",
+      "## Description", "Audit description",
+      "## Additional instructions",
+      "Проверь пакет ~/.bb/plugins/orchestrator/release-audit/release-101-audit.md целиком.",
+    ].join("\n");
+    const prepTilde = await prepareTask({ text: textTilde, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    const matsTilde = await collectTaskAttachments(prepTilde, [], packageOptions);
+    assert.equal(matsTilde.length, 1);
+    assert.equal(matsTilde[0].source, "orchestrator-data");
+    assert.equal(matsTilde[0].name, "release-101-audit.md");
+    assert.equal(matsTilde[0].required, true);
+    assert.equal(matsTilde[0].text, packetContent);
+
+    const collTilde = await collectTask(prepTilde, [], matsTilde, packageOptions);
+    const packedTilde = packTask(prepTilde, collTilde, packageOptions);
+    assert.ok(packedTilde.message.includes(`=== orchestrator-data: "release-101-audit.md" (${packetFile}) ===`));
+    assert.ok(packedTilde.message.includes(packetContent.trim()));
+    assert.ok(packedTilde.message.includes('"source": "orchestrator-data"'));
+    assert.ok(packedTilde.message.includes('"required": true'));
+
+    // B. Строка с раскрытым $HOME
+    const textAbs = [
+      "# PLUG-423 · Audit task abs",
+      "## Description", "Audit description",
+      "## Additional instructions",
+      `Входной файл: ${packetFile}.`,
+    ].join("\n");
+    const prepAbs = await prepareTask({ text: textAbs, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    const matsAbs = await collectTaskAttachments(prepAbs, [], packageOptions);
+    assert.equal(matsAbs.length, 1);
+    assert.equal(matsAbs[0].source, "orchestrator-data");
+
+    // C. Корень из WEB_GEMINI_ORCHESTRATOR_DATA_DIR вне $HOME/.bb
+    const customBbData = join(tmp, "custom-bb", "plugins", "orchestrator");
+    const customAuditDir = join(customBbData, "release-audit");
+    mkdirSync(customAuditDir, { recursive: true });
+    const customPacket = join(customAuditDir, "release-102-audit.md");
+    writeFileSync(customPacket, "Custom orchestrator data packet\n");
+    process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = customBbData;
+
+    const textCustom = [
+      "# PLUG-423 · Custom data dir",
+      "## Description", "Audit description",
+      "## Additional instructions",
+      `Проверь ${customPacket} перед релизом`,
+    ].join("\n");
+    const prepCustom = await prepareTask({ text: textCustom, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    const matsCustom = await collectTaskAttachments(prepCustom, [], packageOptions);
+    assert.equal(matsCustom.length, 1);
+    assert.equal(matsCustom[0].name, "release-102-audit.md");
+    assert.equal(matsCustom[0].text, "Custom orchestrator data packet\n");
+
+    // D. Реальные строки rel.auditInstr из ru.ts и en.ts
+    const ruInstr = interpolate(RU["rel.auditInstr"], {
+      taskKey: "PLUG-423",
+      packet: customPacket,
+      repo: "bb-addons",
+      sha: "0123456789abcdef",
+    });
+    const textRu = [
+      "# PLUG-423 · Real RU instructions",
+      "## Description", "Audit description",
+      "## Additional instructions",
+      ruInstr,
+    ].join("\n");
+    const prepRu = await prepareTask({ text: textRu, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    const matsRu = await collectTaskAttachments(prepRu, [], packageOptions);
+    assert.equal(matsRu.length, 1);
+    assert.equal(matsRu[0].name, "release-102-audit.md");
+
+    const enInstr = interpolate(EN["rel.auditInstr"], {
+      taskKey: "PLUG-423",
+      packet: customPacket,
+      repo: "bb-addons",
+      sha: "0123456789abcdef",
+    });
+    const textEn = [
+      "# PLUG-423 · Real EN instructions",
+      "## Description", "Audit description",
+      "## Additional instructions",
+      enInstr,
+    ].join("\n");
+    const prepEn = await prepareTask({ text: textEn, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    const matsEn = await collectTaskAttachments(prepEn, [], packageOptions);
+    assert.equal(matsEn.length, 1);
+    assert.equal(matsEn[0].name, "release-102-audit.md");
+  } finally {
+    if (oldHome !== undefined) process.env.HOME = oldHome;
+    else delete process.env.HOME;
+    if (oldOrchDir !== undefined) process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = oldOrchDir;
+    else delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  }
+});
+
+test("Вложения задачи (PLUG-423): другие файлы каталога оркестратора не читаются и обязательности не дают", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-423-other-files-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const orchDir = join(tmp, "orchestrator");
+  mkdirSync(join(orchDir, "logs"), { recursive: true });
+  mkdirSync(join(orchDir, "git-hooks"), { recursive: true });
+  mkdirSync(join(orchDir, "release-audit"), { recursive: true });
+
+  const logFile = join(orchDir, "logs", "plugin.log");
+  const dbFile = join(orchDir, "data.db");
+  const hookFile = join(orchDir, "git-hooks", "pre-commit");
+  const notesFile = join(orchDir, "release-audit", "notes.md");
+  const dotDotPath = join(orchDir, "release-audit", "..", "logs", "plugin.log");
+
+  writeFileSync(logFile, "SECRET_LOG_MARKER_9876\n");
+  writeFileSync(dbFile, "SQLITE_MARKER_9876\n");
+  writeFileSync(hookFile, "HOOK_MARKER_9876\n");
+  writeFileSync(notesFile, "NOTES_MARKER_9876\n");
+
+  const oldEnv = process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = orchDir;
+
+  try {
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const text = [
+      "# PLUG-423 · Non-audit files",
+      "## Description", "Desc",
+      "## Additional instructions",
+      `Check logs: ${logFile}`,
+      `Check db: ${dbFile}`,
+      `Check hook: ${hookFile}`,
+      `Check notes: ${notesFile}`,
+      `Check dotdot: ${dotDotPath}`,
+    ].join("\n");
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    const mats = await collectTaskAttachments(prep, [], packageOptions);
+    assert.equal(mats.length, 0);
+
+    const coll = await collectTask(prep, [], mats, packageOptions);
+    const packed = packTask(prep, coll, packageOptions);
+    assert.ok(!packed.message.includes("SECRET_LOG_MARKER_9876"));
+    assert.ok(!packed.message.includes("SQLITE_MARKER_9876"));
+    assert.ok(!packed.message.includes("HOOK_MARKER_9876"));
+    assert.ok(!packed.message.includes("NOTES_MARKER_9876"));
+    assert.ok(!packed.message.includes("orchestrator-data"));
+  } finally {
+    if (oldEnv !== undefined) process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = oldEnv;
+    else delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  }
+});
+
+test("Вложения задачи (PLUG-423): отказы обязательного пакета аудита выкладки", async (t) => {
+  const { collectTaskAttachments, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-423-refusals-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const orchDir = join(tmp, "orch");
+  const auditDir = join(orchDir, "release-audit");
+  mkdirSync(auditDir, { recursive: true });
+  mkdirSync(join(orchDir, "logs"), { recursive: true });
+
+  const oldEnv = process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = orchDir;
+
+  try {
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    // 1. Файла нет
+    const textMissing = [
+      "# PLUG-423 · Missing", "## Description", "Desc",
+      "## Additional instructions", `file ${join(auditDir, "release-201-audit.md")} — read`,
+    ].join("\n");
+    const prepMissing = await prepareTask({ text: textMissing, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    await assert.rejects(
+      () => collectTaskAttachments(prepMissing, [], packageOptions),
+      /mandatory audit package is missing: release-201-audit\.md/,
+    );
+
+    // 2. Каталог вместо файла
+    const dirAsFile = join(auditDir, "release-202-audit.md");
+    mkdirSync(dirAsFile);
+    const textDir = [
+      "# PLUG-423 · Directory", "## Description", "Desc",
+      "## Additional instructions", `file ${dirAsFile} — read`,
+    ].join("\n");
+    const prepDir = await prepareTask({ text: textDir, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    await assert.rejects(
+      () => collectTaskAttachments(prepDir, [], packageOptions),
+      /mandatory audit package is not a regular file: release-202-audit\.md/,
+    );
+
+    // 3. Бинарный (байт NUL)
+    const binFile = join(auditDir, "release-203-audit.md");
+    writeFileSync(binFile, Buffer.from([0x41, 0x00, 0x42]));
+    const textBin = [
+      "# PLUG-423 · Binary", "## Description", "Desc",
+      "## Additional instructions", `file ${binFile} — read`,
+    ].join("\n");
+    const prepBin = await prepareTask({ text: textBin, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    await assert.rejects(
+      () => collectTaskAttachments(prepBin, [], packageOptions),
+      /mandatory audit package is binary: release-203-audit\.md/,
+    );
+
+    // 4. Невалидный UTF-8
+    const nonUtfFile = join(auditDir, "release-204-audit.md");
+    writeFileSync(nonUtfFile, Buffer.from([0xff, 0xfe, 0xfa]));
+    const textNonUtf = [
+      "# PLUG-423 · Non-UTF8", "## Description", "Desc",
+      "## Additional instructions", `file ${nonUtfFile} — read`,
+    ].join("\n");
+    const prepNonUtf = await prepareTask({ text: textNonUtf, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    await assert.rejects(
+      () => collectTaskAttachments(prepNonUtf, [], packageOptions),
+      /mandatory audit package is not permitted text: release-204-audit\.md/,
+    );
+
+    // 5. Больше WEB_GEMINI_MAX_UPLOAD_BYTES (переменная уменьшена в тесте, файл не читается)
+    const largeFile = join(auditDir, "release-205-audit.md");
+    writeFileSync(largeFile, "Hello World this is longer than 50 bytes text\n".repeat(5));
+    const oldMaxUpload = process.env.WEB_GEMINI_MAX_UPLOAD_BYTES;
+    process.env.WEB_GEMINI_MAX_UPLOAD_BYTES = "50";
+    try {
+      const textLarge = [
+        "# PLUG-423 · Large", "## Description", "Desc",
+        "## Additional instructions", `file ${largeFile} — read`,
+      ].join("\n");
+      const prepLarge = await prepareTask({ text: textLarge, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+      await assert.rejects(
+        () => collectTaskAttachments(prepLarge, [], packageOptions),
+        /mandatory audit package exceeds upload limit: release-205-audit\.md/,
+      );
+    } finally {
+      if (oldMaxUpload !== undefined) process.env.WEB_GEMINI_MAX_UPLOAD_BYTES = oldMaxUpload;
+      else delete process.env.WEB_GEMINI_MAX_UPLOAD_BYTES;
+    }
+
+    // 6. Симлинк наружу (например, на <корень>/logs/plugin.log) -> вне разрешённых корней
+    const outsideFile = join(orchDir, "logs", "plugin.log");
+    writeFileSync(outsideFile, "SECRET_OUTSIDE_LOG\n");
+    const symlinkFile = join(auditDir, "release-206-audit.md");
+    symlinkSync(outsideFile, symlinkFile);
+    const textSymlink = [
+      "# PLUG-423 · Symlink outside", "## Description", "Desc",
+      "## Additional instructions", `file ${symlinkFile} — read`,
+    ].join("\n");
+    const prepSymlink = await prepareTask({ text: textSymlink, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    await assert.rejects(
+      () => collectTaskAttachments(prepSymlink, [], packageOptions),
+      /mandatory audit package outside allowed roots: release-206-audit\.md/,
+    );
+
+    // 7. Чувствительный путь (каталог данных BB лежит внутри secrets/)
+    const secretsOrchDir = join(tmp, "secrets", "bb-data", "plugins", "orchestrator");
+    const secretsAuditDir = join(secretsOrchDir, "release-audit");
+    mkdirSync(secretsAuditDir, { recursive: true });
+    const secretsFile = join(secretsAuditDir, "release-207-audit.md");
+    writeFileSync(secretsFile, "Valid text inside secrets dir\n");
+    process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = secretsOrchDir;
+
+    const textSecrets = [
+      "# PLUG-423 · Sensitive path", "## Description", "Desc",
+      "## Additional instructions", `file ${secretsFile} — read`,
+    ].join("\n");
+    const prepSecrets = await prepareTask({ text: textSecrets, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    await assert.rejects(
+      () => collectTaskAttachments(prepSecrets, [], packageOptions),
+      /mandatory audit package is sensitive path: release-207-audit\.md/,
+    );
+  } finally {
+    if (oldEnv !== undefined) process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = oldEnv;
+    else delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  }
+});
+
+test("Вложения задачи (PLUG-423): повтор входа после перезаписи файла меняет mandatorySha256", async (t) => {
+  const { collectTaskAttachments, prepareTask, taskInputSha256, taskMandatorySha256 } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-423-replay-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const orchDir = join(tmp, "orchestrator");
+  const auditDir = join(orchDir, "release-audit");
+  mkdirSync(auditDir, { recursive: true });
+  const packetFile = join(auditDir, "release-301-audit.md");
+  writeFileSync(packetFile, "Version 1 audit text\n");
+
+  const oldEnv = process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = orchDir;
+
+  try {
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const text = [
+      "# PLUG-423 · Replay test", "## Description", "Desc",
+      "## Additional instructions", `file ${packetFile} — read`,
+    ].join("\n");
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    const prep1 = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    const mats1 = await collectTaskAttachments(prep1, [], packageOptions);
+    const inputSha = digest(JSON.stringify([{ type: "text", text }]));
+    const taskSha1 = taskInputSha256(inputSha, mats1);
+    const mandSha1 = taskMandatorySha256(inputSha, mats1);
+
+    // Unmodified file -> same fingerprints
+    const mats1Repeat = await collectTaskAttachments(prep1, [], packageOptions);
+    const taskSha1Repeat = taskInputSha256(inputSha, mats1Repeat);
+    const mandSha1Repeat = taskMandatorySha256(inputSha, mats1Repeat);
+    assert.equal(taskSha1Repeat, taskSha1);
+    assert.equal(mandSha1Repeat, mandSha1);
+
+    // Modified file -> changed fingerprints
+    writeFileSync(packetFile, "Version 2 modified audit text\n");
+    const mats2 = await collectTaskAttachments(prep1, [], packageOptions);
+    const taskSha2 = taskInputSha256(inputSha, mats2);
+    const mandSha2 = taskMandatorySha256(inputSha, mats2);
+    assert.notEqual(taskSha2, taskSha1);
+    assert.notEqual(mandSha2, mandSha1);
+  } finally {
+    if (oldEnv !== undefined) process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = oldEnv;
+    else delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  }
+});

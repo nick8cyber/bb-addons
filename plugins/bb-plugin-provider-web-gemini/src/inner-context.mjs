@@ -1,13 +1,16 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import * as tools from "./web-tools.mjs";
 import { agentSettings } from "./fast-agent.mjs";
 import { collectDiff, executePinned, pinReview, readMaterial, readTextFile, repoRoot, worktreeStatus } from "./review-git.mjs";
 import { deserializeVerdict } from "./turn-journal.mjs";
+
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 const runFile = promisify(execFile);
 const DEFAULT_TOTAL = 25_000_000;
@@ -160,7 +163,7 @@ function parseVerdict(text, system, pin) {
   return fields;
 }
 
-function extractAttachmentSearchText(additionalLines) {
+export function extractAttachmentSearchText(additionalLines) {
   const result = [];
   let inGit = false;
   for (const line of additionalLines) {
@@ -178,6 +181,51 @@ function extractAttachmentSearchText(additionalLines) {
     result.push(line);
   }
   return result.join("\n");
+}
+
+export function resolveOrchestratorDataDir() {
+  const custom = process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  if (custom && custom.trim() !== "") return resolve(custom);
+  const bbData = process.env.BB_DATA_DIR;
+  if (bbData && bbData.trim() !== "") return resolve(bbData, "plugins", "orchestrator");
+  const home = process.env.HOME || homedir();
+  return resolve(home, ".bb", "plugins", "orchestrator");
+}
+
+export function findOrchestratorAuditPackageCandidates(searchText) {
+  if (!searchText) return [];
+  const candidates = [];
+  const regex = /(?:^|[\s"'`\(\[\{<«“‘])((?:\/|~\/)[^\s"'`\)\]\}>»”’]+)/g;
+  let match;
+  while ((match = regex.exec(searchText)) !== null) {
+    const raw = match[1].replace(/[.,;:]+$/, "");
+    if (!raw) continue;
+    const rawSegments = raw.split("/");
+    if (rawSegments.some((s) => s === "." || s === "..")) {
+      continue;
+    }
+    const home = process.env.HOME || homedir();
+    const expanded = raw.startsWith("~/") ? join(home, raw.slice(2)) : raw;
+    const fileName = basename(expanded);
+    if (!/^release-[0-9]+-audit\.md$/.test(fileName)) {
+      continue;
+    }
+    const dirName = dirname(expanded);
+    const orchDataDir = resolveOrchestratorDataDir();
+    const allowedRoots = [resolve(orchDataDir)];
+    try {
+      const realRoot = realpathSync(orchDataDir);
+      if (realRoot && !allowedRoots.includes(realRoot)) {
+        allowedRoots.push(realRoot);
+      }
+    } catch {}
+
+    const isMatch = allowedRoots.some((r) => resolve(dirName) === resolve(r, "release-audit"));
+    if (isMatch) {
+      candidates.push({ raw, expanded, fileName });
+    }
+  }
+  return candidates;
 }
 
 export function isAttachmentNamed(text, id, name) {
@@ -272,7 +320,7 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
     }
     attachments.push({ name: match[1], id: match[2] });
   }
-  return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions, attachmentSearchText, key, thread: thread.thread, research };
+  return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions: attachmentOmissions ?? [], attachmentSearchText, key, thread: thread.thread, research };
 }
 
 export function verdictInstruction(context) {
@@ -486,8 +534,96 @@ export async function collectTaskAttachments(context, blocks, options) {
   let omittedNotTextCount = 0;
   let omittedDownloadFailedCount = 0;
 
+  if (!light) {
+    const searchText = context.attachmentSearchText ?? (context.text ? extractAttachmentSearchText(section(context.text, /^## (?:Additional instructions|Дополнительные инструкции)[ \t]*$/, { last: true })) : "");
+    const auditCandidates = findOrchestratorAuditPackageCandidates(searchText);
+    const seenAuditPaths = new Set();
+    for (const cand of auditCandidates) {
+      if (seenAuditPaths.has(cand.expanded)) continue;
+      seenAuditPaths.add(cand.expanded);
+      const fileName = cand.fileName;
+
+      let st;
+      try {
+        st = statSync(cand.expanded);
+      } catch {
+        throw new Error("mandatory audit package is missing: " + mask(fileName));
+      }
+      if (!st.isFile()) {
+        throw new Error("mandatory audit package is not a regular file: " + mask(fileName));
+      }
+
+      let resolvedPath;
+      try {
+        resolvedPath = realpathSync(cand.expanded);
+      } catch {
+        throw new Error("mandatory audit package is missing: " + mask(fileName));
+      }
+      const orchDataDir = resolveOrchestratorDataDir();
+      let realAuditDir;
+      try {
+        realAuditDir = realpathSync(join(orchDataDir, "release-audit"));
+      } catch {
+        realAuditDir = null;
+      }
+      const resolvedDir = dirname(resolvedPath);
+      const resolvedName = basename(resolvedPath);
+      if (!realAuditDir || resolvedDir !== realAuditDir || !/^release-[0-9]+-audit\.md$/.test(resolvedName)) {
+        throw new Error("mandatory audit package outside allowed roots: " + mask(fileName));
+      }
+
+      const realSt = statSync(resolvedPath);
+      if (!realSt.isFile()) {
+        throw new Error("mandatory audit package is not a regular file: " + mask(fileName));
+      }
+
+      const effectiveMaxUploadBytes = Number.isFinite(Number(process.env.WEB_GEMINI_MAX_UPLOAD_BYTES)) && Number(process.env.WEB_GEMINI_MAX_UPLOAD_BYTES) > 0
+        ? (options.maxUploadBytes ? Math.min(options.maxUploadBytes, Number(process.env.WEB_GEMINI_MAX_UPLOAD_BYTES)) : Number(process.env.WEB_GEMINI_MAX_UPLOAD_BYTES))
+        : (options.maxUploadBytes ?? 25 * 1024 * 1024);
+      if (realSt.size > effectiveMaxUploadBytes) {
+        throw new Error("mandatory audit package exceeds upload limit: " + mask(fileName));
+      }
+
+      const pathParts = resolvedPath.split("/").filter(Boolean);
+      if (pathParts.some((part) => tools.isSensitivePath(part)) || tools.isSensitivePath(resolvedPath)) {
+        throw new Error("mandatory audit package is sensitive path: " + mask(fileName));
+      }
+
+      let rawBuf;
+      try {
+        rawBuf = readFileSync(resolvedPath);
+      } catch {
+        throw new Error("mandatory audit package could not be read: " + mask(fileName));
+      }
+      if (rawBuf.includes(0)) {
+        throw new Error("mandatory audit package is binary: " + mask(fileName));
+      }
+      let text;
+      try {
+        text = decoder.decode(rawBuf);
+      } catch {
+        throw new Error("mandatory audit package is not permitted text: " + mask(fileName));
+      }
+
+      const maskedText = mask(text);
+      const size = bytes(maskedText);
+      if (materialBytes + size > maxBytes) {
+        throw new Error("mandatory audit package exceeds byte budget: " + mask(fileName));
+      }
+      mandatoryCount++;
+      add("orchestrator-data", text, {
+        name: fileName,
+        at: resolvedPath,
+        resolvedPath,
+        upload: false,
+        required: true,
+        maskedSha256: digest(maskedText),
+      });
+    }
+  }
+
   if (!light && context.attachments?.length) {
-    const searchText = context.attachmentSearchText ?? "";
+    const searchText = context.attachmentSearchText ?? (context.text ? extractAttachmentSearchText(section(context.text, /^## (?:Additional instructions|Дополнительные инструкции)[ \t]*$/, { last: true })) : "");
     let shown = null;
     let cardError = null;
     try {
@@ -699,6 +835,9 @@ export async function collectTaskAttachments(context, blocks, options) {
 }
 
 export async function collectTask(context, blocks, materials, options) {
+  if (!Array.isArray(context.attachmentOmissions)) {
+    context.attachmentOmissions = [];
+  }
   const { signal, spillDir } = options;
   const { root, pin, settings } = context;
   const maxBytes = settings.maxTotalBytes;
@@ -707,12 +846,12 @@ export async function collectTask(context, blocks, materials, options) {
   const mask = isLightResearch ? (str) => settings.maskResearch(str, context.key) : settings.mask;
   const core = [], omitted = [], materialFiles = [];
   let coreBytes = 0;
-  const add = (source, value, { name, at = revision, delivery = "package", included = "full", required = true, createdAt, id } = {}) => {
+  const add = (source, value, { name, at = revision, delivery = "package", included = "full", required = true, createdAt, id, path } = {}) => {
     const text = mask(value);
     const size = bytes(text);
     coreBytes += size;
     if (coreBytes > maxBytes) throw new Error("mandatory task context exceeds byte budget");
-    const entry = { source, ...(name ? { name: mask(name) } : {}), ...(createdAt ? { createdAt } : {}), ...(id ? { id } : {}), revision: at, required, included, bytes: size, sha256: digest(text), delivery };
+    const entry = { source, ...(name ? { name: mask(name) } : {}), ...(createdAt ? { createdAt } : {}), ...(id ? { id } : {}), ...(path ? { path } : {}), revision: at, required, included, bytes: size, sha256: digest(text), delivery };
     core.push(Object.freeze({ entry: Object.freeze(entry), text }));
   };
   const omit = (source, reason) => omitted.push({ source: mask(source), reason, revision });
@@ -721,7 +860,7 @@ export async function collectTask(context, blocks, materials, options) {
   const optionalMaterials = materials.filter((m) => m.required === false);
 
   add("Task text", context.text);
-  for (const { source, text, name, at, upload, required = true, createdAt, id } of mandatoryMaterials) {
+  for (const { source, text, name, at, upload, required = true, createdAt, id, resolvedPath } of mandatoryMaterials) {
     let delivery = "package";
     if (upload) {
       const { pkgName, pkgPath } = tools.writeSpillPackage(spillDir, randomUUID(), mask(text));
@@ -729,7 +868,7 @@ export async function collectTask(context, blocks, materials, options) {
       materialFiles.push(pkgPath);
       delivery = pkgName;
     }
-    add(source, text, { name, at, delivery, required, createdAt, id });
+    add(source, text, { name, at: at ?? (resolvedPath ? resolvedPath : revision), delivery, required, createdAt, id, path: resolvedPath });
   }
 
   const linkSourceText = isLightResearch ? buildCleanResearchPackage(context) : context.text;
@@ -790,7 +929,7 @@ export async function collectTask(context, blocks, materials, options) {
   }
 
   if (!isLightResearch) {
-    for (const item of context.attachmentOmissions) {
+    for (const item of (context.attachmentOmissions ?? [])) {
       omit("Tracker attachment: " + item.line, item.reason);
     }
     for (const item of allOmittedOptional) {
@@ -939,7 +1078,8 @@ function renderTaskPackage(context, collected, options, supplements, agentOmissi
     const append = (entry, text) => {
       if (entry.delivery !== "package") return { ...entry, range: [0, entry.bytes] };
       const dateSuffix = entry.source === "Tracker attachment" && entry.createdAt ? ` (${entry.createdAt})` : "";
-      const heading = "=== " + entry.source + (entry.name ? ": " + JSON.stringify(entry.name) : "") + dateSuffix + " ===\n";
+      const pathSuffix = entry.source === "orchestrator-data" && (entry.path || entry.revision) ? ` (${entry.path || entry.revision})` : "";
+      const heading = "=== " + entry.source + (entry.name ? ": " + JSON.stringify(entry.name) : "") + dateSuffix + pathSuffix + " ===\n";
       const start = offset + bytes(heading);
       body += heading + text + "\n\n";
       offset = start + entry.bytes + 2;
@@ -1105,3 +1245,51 @@ export function formatTaskToolResult(context, call, result) {
   };
   return ["=== tool: " + context.settings.mask(call.name) + " ===", JSON.stringify(manifest), result.output].join("\n");
 }
+
+export const taskInputSha256 = (inputBlocksSha256, materials, mask = (t) => t) => {
+  const mandatory = [];
+  const includedOptional = [];
+  for (const m of materials || []) {
+    const textHash = m.maskedSha256 ?? digest(mask(m.text));
+    if (m.required !== false) {
+      mandatory.push({
+        source: m.source,
+        idOrPath: m.source === "orchestrator-data" ? (m.resolvedPath ?? m.at ?? m.name) : (m.id ?? m.name ?? m.at),
+        sha256: textHash,
+      });
+    } else {
+      includedOptional.push({
+        id: m.id,
+        sha256: textHash,
+      });
+    }
+  }
+  const omittedOptional = (materials?.omittedOptional || []).map((o) => ({
+    id: o.id,
+    reason: o.reason,
+  }));
+  return digest(JSON.stringify([
+    inputBlocksSha256,
+    mandatory,
+    includedOptional,
+    omittedOptional,
+  ]));
+};
+
+export const taskMandatorySha256 = (inputBlocksSha256, materials, mask = (t) => t) => {
+  const mandatory = [];
+  for (const m of materials || []) {
+    const textHash = m.maskedSha256 ?? digest(mask(m.text));
+    if (m.required !== false) {
+      mandatory.push({
+        source: m.source,
+        idOrPath: m.source === "orchestrator-data" ? (m.resolvedPath ?? m.at ?? m.name) : (m.id ?? m.name ?? m.at),
+        sha256: textHash,
+      });
+    }
+  }
+  return digest(JSON.stringify([
+    inputBlocksSha256,
+    mandatory,
+  ]));
+};

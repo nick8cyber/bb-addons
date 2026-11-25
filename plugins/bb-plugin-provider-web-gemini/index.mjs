@@ -28,6 +28,19 @@ export default function plugin(bb) {
   // Both permissions on a BB thread must share the same journal protocol,
   // including after a restart with a lower launch ceiling.
   const boundScript = resolveServerScript({ requireWriteSupport: true });
+  let orchestratorDataDir;
+  try {
+    const dataDir = bb?.server?.experimental_dataDir;
+    if (dataDir && typeof dataDir === "string") {
+      orchestratorDataDir = path.join(dataDir, "plugins", "orchestrator");
+    }
+  } catch {
+    // при исключении переменную не задавать (дальше шаги 2–3)
+  }
+  if (orchestratorDataDir) {
+    process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = orchestratorDataDir;
+  }
+  const launchEnv = orchestratorDataDir ? { WEB_GEMINI_ORCHESTRATOR_DATA_DIR: orchestratorDataDir } : {};
   for (const [id, displayName, badgeLabel] of [
     ["acp-web-gemini", "Gemini (Web)", "Gemini"],
     ["acp-argon", "Gemini (Argon)", "Argon"],
@@ -36,7 +49,7 @@ export default function plugin(bb) {
       displayName,
       command: process.execPath,
       args: [scriptPath],
-      env: {},
+      env: { ...launchEnv },
       permissionCli: {
         insertAfterArgs: 1,
         full: ["--session-access=read-only"],
@@ -61,7 +74,7 @@ export default function plugin(bb) {
       },
       experimental_bridgeOptions: { acpDialect: "generic", acpLaunchSpec },
       deriveProviderOptions: ({ threadId }) => threadId ? {
-        acpLaunchSpec: { ...acpLaunchSpec, args: [boundScript, "--bb-thread-id=" + threadId] },
+        acpLaunchSpec: { ...acpLaunchSpec, env: { ...acpLaunchSpec.env }, args: [boundScript, "--bb-thread-id=" + threadId] },
       } : {},
     });
   }

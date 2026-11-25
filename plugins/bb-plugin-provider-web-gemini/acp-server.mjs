@@ -2919,7 +2919,7 @@ const taskInputSha256 = (inputBlocksSha256, materials, mask = (t) => t) => {
     if (m.required !== false) {
       mandatory.push({
         source: m.source,
-        idOrPath: m.id ?? m.name ?? m.at,
+        idOrPath: m.source === "orchestrator-data" ? (m.resolvedPath ?? m.at ?? m.name) : (m.id ?? m.name ?? m.at),
         sha256: textHash,
       });
     } else {
@@ -2948,7 +2948,7 @@ const taskMandatorySha256 = (inputBlocksSha256, materials, mask = (t) => t) => {
     if (m.required !== false) {
       mandatory.push({
         source: m.source,
-        idOrPath: m.id ?? m.name ?? m.at,
+        idOrPath: m.source === "orchestrator-data" ? (m.resolvedPath ?? m.at ?? m.name) : (m.id ?? m.name ?? m.at),
         sha256: textHash,
       });
     }
@@ -3044,6 +3044,9 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task, s
   const replay = committed && (isContinue || committed.inputBlocksSha256 === inputSha256) ? committed : null;
   const candidate = replay ?? (isContinue ? retryable : sameBlocks ? exactCandidate : null);
   let context = await prepare(candidate);
+  if (context && !Array.isArray(context.attachmentOmissions)) {
+    context.attachmentOmissions = [];
+  }
   let materials;
   if (candidate) {
     let fingerprint = inputSha256;
@@ -3074,6 +3077,9 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task, s
       return { kind: "resume", sessKey: saved.key, turn: candidate, pkg, exact, context };
     }
     context = await prepare();
+    if (context && !Array.isArray(context.attachmentOmissions)) {
+      context.attachmentOmissions = [];
+    }
     if (context.pin?.sha !== candidate.pin?.sha) materials = undefined;
   }
   if (unfinished && !unfinished.inputBlocksSha256 && unfinished.taskSha256 === sha256(text)) {
@@ -3178,6 +3184,9 @@ async function runBoundPrompt(msg, session) {
         text, system, session, thread, stateDir: STATE_DIR, signal: task.signal,
         onSettings: (settings) => task.heartbeat(settings.progressIntervalMs), savedTurn,
       });
+      if (context && !Array.isArray(context.attachmentOmissions)) {
+        context.attachmentOmissions = [];
+      }
       if ((savedTurn?.mode ?? task.mode) !== "write" || savedTurn?.commit || task.mode !== "write") return context;
       const writeHead = await writer.prepare();
       if (savedTurn && (savedTurn.head?.sha !== writeHead.sha || savedTurn.head?.branch !== writeHead.branch)) {
