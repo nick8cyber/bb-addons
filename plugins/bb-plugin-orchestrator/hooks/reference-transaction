@@ -1,0 +1,43 @@
+#!/usr/bin/env node
+/**
+ * Shared git reference-transaction hook (spec orchestrator §24.1 п.3).
+ * In state `prepared` it refuses any reference change in the service
+ * live copy unless `ORCH_LIVE_TOKEN` matches the one-shot postPublish
+ * token for exactly this copy (`hook-lib.mjs`: the copy is recognised
+ * by its marker or its real path from the accepted settings, the token
+ * map is keyed by real path and expires). Then it chains to the previous
+ * hook with the same stdin.
+ */
+import { readFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HOOK_NAME = "reference-transaction";
+const self = fileURLToPath(import.meta.url);
+const dir = dirname(self);
+
+let lib = null;
+try {
+  lib = await import("./hook-lib.mjs");
+} catch { /* old or partial install */ }
+
+let input = "";
+try {
+  input = readFileSync(0, "utf8");
+} catch { /* no stdin */ }
+
+const state = process.argv[2]; // prepared | committed | aborted
+if (lib && state === "prepared") {
+  const paths = lib.repoPaths();
+  if (lib.isLiveCopy(dir, paths)) {
+    const key = paths.top || paths.common;
+    if (!lib.liveTokenValid(key)) {
+      console.error(
+        "отказ: изменение ссылок в служебной живой копии разрешено только postPublish (нет действующего токена)",
+      );
+      process.exit(1);
+    }
+  }
+}
+
+process.exit(lib ? lib.runChain(dir, HOOK_NAME, self, input) : 0);

@@ -18,6 +18,7 @@ import {
 const HOOK_SRC = new URL("../hooks/pre-push", import.meta.url).pathname;
 const PC_SRC = new URL("../hooks/pre-commit", import.meta.url).pathname;
 const SCAN_SRC = new URL("../hooks/leak-scan.ts", import.meta.url).pathname;
+const LIB_SRC = new URL("../hooks/hook-lib.mjs", import.meta.url).pathname;
 const SHA = "a".repeat(40);
 const OTHER = "b".repeat(40);
 
@@ -27,6 +28,7 @@ function makeEnv(withLocalHook = false) {
   const repo = join(base, "repo");
   mkdirSync(hooksDir, { recursive: true });
   cpSync(HOOK_SRC, join(hooksDir, "pre-push"));
+  cpSync(LIB_SRC, join(hooksDir, "hook-lib.mjs"));
   execFileSync("git", ["init", repo]);
   execFileSync("git", ["-C", repo, "config", "user.email", "a@b.c"]);
   execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
@@ -204,6 +206,7 @@ test("f4/f6: installer inventory sees .bb worktrees, real --self-test run", () =
 // ── §17.3 r26: обёртки всех имён хуков, единый каталог токенов ────────
 
 const PLUGIN_DIR = new URL("..", import.meta.url).pathname;
+const HOOKS_SRC = join(PLUGIN_DIR, "hooks");
 const CHAIN_SRC = new URL("../hooks/chain", import.meta.url).pathname;
 const NAMES_SRC = new URL("../hooks/hook-names", import.meta.url).pathname;
 
@@ -228,18 +231,28 @@ test("Б2/мелко9: installer covers every standard hook name; shared token d
     .filter((l) => l && !l.startsWith("#"));
   const gateSrc = readFileSync(HOOK_SRC, "utf8");
   const pcSrc = readFileSync(PC_SRC, "utf8");
+  const postCheckoutSrc = readFileSync(join(HOOKS_SRC, "post-checkout"), "utf8");
+  const refTxSrc = readFileSync(join(HOOKS_SRC, "reference-transaction"), "utf8");
   const chainSrc = readFileSync(CHAIN_SRC, "utf8");
   for (const n of names) {
     const f = join(gd, n);
     assert.ok(existsSync(f), `${n} installed`);
-    // pre-push and pre-commit carry gates; the rest are chain wrappers
-    assert.equal(
-      readFileSync(f, "utf8"),
-      n === "pre-push" ? gateSrc : n === "pre-commit" ? pcSrc : chainSrc,
-    );
+    // specialized hooks carry gates; the rest are chain wrappers
+    const expected =
+      n === "pre-push"
+        ? gateSrc
+        : n === "pre-commit"
+          ? pcSrc
+          : n === "post-checkout"
+            ? postCheckoutSrc
+            : n === "reference-transaction"
+              ? refTxSrc
+              : chainSrc;
+    assert.equal(readFileSync(f, "utf8"), expected);
   }
   // §22.1: the shared scanner core lands next to the hooks.
   assert.ok(existsSync(join(gd, "leak-scan.ts")), "leak-scan.ts installed");
+  assert.ok(existsSync(join(gd, "hook-lib.mjs")), "hook-lib.mjs installed");
   assert.match(readFileSync(gcfg, "utf8"), /hookspath/i);
   // the token dir is the SAME dir the installer installs into — the
   // plugin's writePushToken lands where the installed hook scans
@@ -320,13 +333,14 @@ test("§17.3 (PLUG-210): pre-push chains only to an EXECUTABLE local hook", () =
   assert.equal(existsSync(join(repo, "local-ran")), false);
 });
 
-test("§17.3: hook-names covers every githooks(5) name incl. server side", () => {
+test("§17.3 / §24.1: hook-names covers every githooks(5) name (exactly 27 names, p4-* included)", () => {
   const names = new Set(
     readFileSync(NAMES_SRC, "utf8")
       .split("\n")
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith("#")),
   );
+  assert.equal(names.size, 27);
   // the full githooks(5) inventory — client AND receive-pack hooks,
   // EXCEPT push-to-checkout (ревью PLUG-214: the hook's mere presence
   // disables git's built-in worktree update on updateInstead pushes)
@@ -337,7 +351,9 @@ test("§17.3: hook-names covers every githooks(5) name incl. server side", () =>
     "pre-push", "pre-receive", "update", "proc-receive", "post-receive",
     "post-update", "reference-transaction",
     "pre-auto-gc", "post-rewrite", "sendemail-validate",
-    "fsmonitor-watchman", "p4-pre-submit", "post-index-change",
+    "fsmonitor-watchman", "post-index-change",
+    "p4-changelist", "p4-prepare-changelist", "p4-post-changelist",
+    "p4-pre-submit",
   ]) {
     assert.ok(names.has(n), `hook-names missing ${n}`);
   }
@@ -463,9 +479,11 @@ function makePcEnv(withLocalHook = false) {
   mkdirSync(hooksDir, { recursive: true });
   cpSync(PC_SRC, join(hooksDir, "pre-commit"));
   cpSync(SCAN_SRC, join(hooksDir, "leak-scan.ts"));
+  cpSync(LIB_SRC, join(hooksDir, "hook-lib.mjs"));
   execFileSync("git", ["init", repo]);
   execFileSync("git", ["-C", repo, "config", "user.email", "a@b.c"]);
   execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
+  execFileSync("git", ["-C", repo, "checkout", "-B", "task/work"]);
   execFileSync("git", ["-C", repo, "commit", "--allow-empty", "-m", "init"]);
   if (withLocalHook) {
     const local = join(repo, ".git", "hooks", "pre-commit");
@@ -482,9 +500,11 @@ function stage(repo: string, file: string, text: string) {
 }
 
 function runPreCommit(repo: string, hooksDir: string) {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_DIR: join(repo, ".git") };
+  delete env.BB_THREAD_ID;
   return spawnSync("node", [join(hooksDir, "pre-commit")], {
     cwd: repo,
-    env: { ...process.env, GIT_DIR: join(repo, ".git") },
+    env,
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024,
   });

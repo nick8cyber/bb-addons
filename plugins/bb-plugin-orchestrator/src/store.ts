@@ -4908,6 +4908,15 @@ export class DelegationStore {
       )
       .run(projectId, key);
   }
+
+  /** §24.1: Active coordinator worktrees for hooks doctor */
+  activeCoordinatorWorktrees(): Array<{ worktree_path: string | null }> {
+    return this.db
+      .prepare(
+        `SELECT worktree_path FROM coordinator_worktrees WHERE state != 'removed'`,
+      )
+      .all() as Array<{ worktree_path: string | null }>;
+  }
 }
 
 

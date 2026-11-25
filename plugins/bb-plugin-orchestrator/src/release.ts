@@ -20,10 +20,20 @@ import {
 } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
-import { delimiter, isAbsolute, join, relative } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
+import { runHooksDoctor, HOOK_NAMES, type DoctorOptions, type DoctorResult } from "./hooks.js";
+import {
+  isLiveCheckoutMigrating,
+  isLiveCheckoutPath,
+  chmodRecursive,
+  liveCopyLockPath,
+  beginPublish,
+  issueLiveToken,
+  revokeLiveToken,
+} from "./live-checkout.js";
 import { verifyReleaseDocumentsGate } from "./spec-gate.js";
 import type { WorkGraphMode } from "./workgraph.js";
 import {
@@ -237,6 +247,13 @@ export interface ReleaseDeps {
   now?: () => number;
   markCoordinatorAction?: (threadId: string | undefined | null) => void;
   workGraphMode?: WorkGraphMode | ((projectId?: string) => WorkGraphMode);
+  /** §24.1: проверка наличия хуков перед шагом 6. */
+  hooksDoctor?: (opts: DoctorOptions) => Promise<DoctorResult>;
+  /** §24.1 п.1: служебные живые копии проекта репозитория из принятой
+   * настройки (`postPublish.checkout`) — doctor проверяет и их. */
+  liveCheckoutsFor?: (repo: string) => string[];
+  /** §24.1 п.1: строка владельцу (doctor: локальный core.hooksPath). */
+  notifyOwner?: (line: string) => Promise<boolean>;
   log?: {
     info?(m: string): void;
     warn?(m: string): void;
@@ -587,6 +604,7 @@ export async function writeLeaksSnapshot(
     allowedEmails: project.allowedEmails,
     hostname: osHostname(),
     excluded: project.excluded,
+    targetBranch: project.target?.branch ?? "main",
     updatedAt: Date.now(),
   };
   writeFileSync(
@@ -1515,6 +1533,13 @@ const PRE_COMMIT_MESSAGE_KEYS = [
   "typeThreadId",
   "typeEmail",
   "typeSecret",
+  "targetBranch",
+  "coordinatorNoCode",
+  "coordinatorMixed",
+  "helperNoCommit",
+  "foreignCopy",
+  "architectNoCode",
+  "dbUnavailable",
 ] as const;
 
 const PLUGIN_PRE_COMMIT = join(PLUGIN_HOOKS_DIR, "pre-commit");
@@ -1595,10 +1620,18 @@ export function syncInstalledPrePush(hooksDir: string, t: T): boolean {
  * fails open. No installed `pre-commit` → nothing to sync. Returns
  * true when the file moved. */
 export function syncInstalledLeakScan(hooksDir: string): boolean {
+  return syncInstalledSupportFile(hooksDir, "leak-scan.ts");
+}
+
+/** §22.1 / §24.1: a module the installed hooks import from their own
+ * directory (`leak-scan.ts`, `hook-lib.mjs`) follows a plugin update
+ * atomically. No installed `pre-commit` → nothing installed, nothing
+ * to sync. Returns true when the file moved. */
+export function syncInstalledSupportFile(hooksDir: string, name: string): boolean {
   const preCommit = join(hooksDir, "pre-commit");
   if (!existsSync(preCommit)) return false;
-  const path = join(hooksDir, "leak-scan.ts");
-  const current = readFileSync(join(PLUGIN_HOOKS_DIR, "leak-scan.ts"));
+  const path = join(hooksDir, name);
+  const current = readFileSync(join(PLUGIN_HOOKS_DIR, name));
   try {
     if (readFileSync(path).equals(current)) return false;
   } catch {
@@ -1623,20 +1656,41 @@ export function syncInstalledGateHooks(hooksDir: string, t: T): boolean {
   const a = syncInstalledHook(hooksDir, "pre-push", renderPrePush, t);
   const b = syncInstalledHook(hooksDir, "pre-commit", renderPreCommit, t);
   const c = syncInstalledLeakScan(hooksDir);
-  return a || b || c;
+  const lib = syncInstalledSupportFile(hooksDir, "hook-lib.mjs");
+  let d = false;
+  let e = false;
+  const postCheckoutSrc = join(PLUGIN_HOOKS_DIR, "post-checkout");
+  const postCheckoutDst = join(hooksDir, "post-checkout");
+  if (existsSync(postCheckoutSrc)) {
+    try {
+      const srcBuf = readFileSync(postCheckoutSrc);
+      const dstBuf = existsSync(postCheckoutDst) ? readFileSync(postCheckoutDst) : null;
+      if (!dstBuf || !dstBuf.equals(srcBuf)) {
+        writeFileSync(postCheckoutDst, srcBuf, { mode: 0o755 });
+        chmodSync(postCheckoutDst, 0o755);
+        d = true;
+      }
+    } catch {}
+  }
+  const refTxSrc = join(PLUGIN_HOOKS_DIR, "reference-transaction");
+  const refTxDst = join(hooksDir, "reference-transaction");
+  if (existsSync(refTxSrc)) {
+    try {
+      const srcBuf = readFileSync(refTxSrc);
+      const dstBuf = existsSync(refTxDst) ? readFileSync(refTxDst) : null;
+      if (!dstBuf || !dstBuf.equals(srcBuf)) {
+        writeFileSync(refTxDst, srcBuf, { mode: 0o755 });
+        chmodSync(refTxDst, 0o755);
+        e = true;
+      }
+    } catch {}
+  }
+  return a || b || c || lib || d || e;
 }
 
-/** §17.3 (Б2): standard names the installer covers — shared with
- * `hooks/install.mjs`, which reads the same `hook-names` file. */
-function standardHookNames(): string[] {
-  try {
-    return readFileSync(join(PLUGIN_HOOKS_DIR, "hook-names"), "utf8")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l && !l.startsWith("#"));
-  } catch {
-    return ["pre-push"];
-  }
+/** §17.3 (Б2) & §24.1: standard names the installer covers — 27 standard hooks from HOOK_NAMES. */
+function standardHookNames(): readonly string[] {
+  return HOOK_NAMES;
 }
 
 /** §18.1: true when `installed` is a byte-for-byte `pre-push` rendered
@@ -1698,9 +1752,15 @@ export function assertInstalledHookFresh(deps: ReleaseDeps): void {
           : null;
     let current: Buffer;
     try {
-      current = gateRender
-        ? gateRender(t)
-        : readFileSync(join(PLUGIN_HOOKS_DIR, "chain"));
+      if (gateRender) {
+        current = gateRender(t);
+      } else if (name === "post-checkout") {
+        current = readFileSync(join(PLUGIN_HOOKS_DIR, "post-checkout"));
+      } else if (name === "reference-transaction") {
+        current = readFileSync(join(PLUGIN_HOOKS_DIR, "reference-transaction"));
+      } else {
+        current = readFileSync(join(PLUGIN_HOOKS_DIR, "chain"));
+      }
     } catch {
       continue;
     }
@@ -1725,24 +1785,26 @@ export function assertInstalledHookFresh(deps: ReleaseDeps): void {
   // fails open). It is not language-versioned, so with `pre-commit`
   // installed the scanner is synced in place; a failed sync (or a stale
   // file without the gate) stays part of the freshness report.
-  const scanName = "leak-scan.ts";
-  const scanFresh = () => {
-    try {
-      return readFileSync(join(dir, scanName)).equals(
-        readFileSync(join(PLUGIN_HOOKS_DIR, scanName)),
-      );
-    } catch {
-      return false;
+  // §24.1: the same for `hook-lib.mjs`, which every hook imports.
+  for (const scanName of ["leak-scan.ts", "hook-lib.mjs"]) {
+    const scanFresh = () => {
+      try {
+        return readFileSync(join(dir, scanName)).equals(
+          readFileSync(join(PLUGIN_HOOKS_DIR, scanName)),
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (!scanFresh() && existsSync(join(dir, "pre-commit"))) {
+      try {
+        syncInstalledSupportFile(dir, scanName);
+      } catch {
+        // stays stale below
+      }
     }
-  };
-  if (!scanFresh() && existsSync(join(dir, "pre-commit"))) {
-    try {
-      syncInstalledLeakScan(dir);
-    } catch {
-      // stays stale below
-    }
+    if (!scanFresh() && present > 0) stale.push(scanName);
   }
-  if (!scanFresh() && present > 0) stale.push(scanName);
   // §17.3 (ревью PLUG-214): `push-to-checkout` is retired — a leftover
   // wrapper still disables git's built-in worktree update on
   // updateInstead pushes. Its presence alone is a stale install.
@@ -1983,6 +2045,21 @@ export async function runRelease(
     cfg.config,
   );
   const project = resolveProject(cfg.config!, settingsProject);
+  const commonDirRaw = await git(deps, repo, [
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir",
+  ]).catch(() => "");
+  const repoRoot = commonDirRaw ? dirname(commonDirRaw) : repo;
+  if (
+    isLiveCheckoutMigrating(deps.store, repoRoot) ||
+    isLiveCheckoutMigrating(deps.store, repo)
+  ) {
+    throw new OrchestratorError(
+      "live-checkout-migrating",
+      "live-checkout-migrating: идёт миграция служебной копии live-checkout",
+    );
+  }
   if (project.excluded) {
     throw new OrchestratorError(
       "release-excluded",
@@ -2680,6 +2757,14 @@ async function runReleaseMergedUpstream(
     config,
   );
   const project = resolveProject(config, settingsProject);
+  if (
+    isLiveCheckoutMigrating(deps.store, repo)
+  ) {
+    throw new OrchestratorError(
+      "live-checkout-migrating",
+      "live-checkout-migrating: идёт миграция служебной копии live-checkout",
+    );
+  }
   if (project.excluded) {
     throw new OrchestratorError(
       "release-excluded",
@@ -4372,8 +4457,40 @@ async function publishRelease(
   row: ReleaseRow,
   s: PumpSummary,
 ): Promise<void> {
-  const t = deps.t ?? T_RU;
   const repo = row.repo_path;
+
+  // §24.1 п.1–2: метка публикации ставится ДО проверки миграции
+  // (setup проверяет метки после своего замка — одна из сторон видит
+  // другую), держится до конца шага 6; затем doctor по всем копиям.
+  const endPublish = beginPublish(deps.store, repo, row.id);
+  try {
+    await publishReleaseLocked(deps, row, s, repo);
+  } finally {
+    endPublish();
+  }
+}
+
+async function publishReleaseLocked(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+  s: PumpSummary,
+  repo: string,
+): Promise<void> {
+  const t = deps.t ?? T_RU;
+  const doctorFn = deps.hooksDoctor ?? runHooksDoctor;
+  const doctorRes = await doctorFn({
+    hooksDir: deps.hooksDir(),
+    repo,
+    store: deps.store,
+    liveCheckouts: deps.liveCheckoutsFor?.(repo) ?? [],
+    ...(deps.notifyOwner ? { notifyOwner: deps.notifyOwner } : {}),
+  });
+  if (!doctorRes.ok) {
+    throw new OrchestratorError(
+      "hooks-missing",
+      `hooks-missing: ${doctorRes.message}`,
+    );
+  }
   const headSha = row.head_sha ?? (await git(deps, repo, ["rev-parse", "HEAD"]));
 
   if (row.target_action === "push") {
@@ -5435,10 +5552,19 @@ export async function runPostPublish(
     if (!co || postPublishLocks.has(row.id)) return true;
     // §18.5: флаг «остановлен» — идущий такт новых замков не берёт.
     if (deps.commandRunner?.isStopped?.()) return false;
+    // §24.1 п.2–3: живая копия опознаётся по маркеру/реестру (любой
+    // путь, не только ~/.bb/plugin-live); её замок — вне защищённой
+    // .git, общий с live-checkout setup; пока идёт миграция — ждём.
+    const isLive = isLiveCheckoutPath(co, deps.hooksDir());
+    if (isLive && isLiveCheckoutMigrating(deps.store, row.repo_path)) {
+      return false;
+    }
     const gitDir = await gitOut(["rev-parse", "--absolute-git-dir"]).catch(
       () => "",
     );
-    const lockPath = join(gitDir || join(co, ".git"), MERGE_LOCK_NAME);
+    const lockPath = isLive
+      ? liveCopyLockPath(co)
+      : join(gitDir || join(co, ".git"), MERGE_LOCK_NAME);
     try {
       const release = await acquireCopyLock(coGit, co, lockPath, {
         owner: deps.instanceId ?? `postPublish:${process.pid}`,
@@ -5450,7 +5576,17 @@ export async function runPostPublish(
         release();
         return false;
       }
-      postPublishLocks.set(row.id, release);
+      // Конец postPublish (все команды с cwd: checkout отработали) —
+      // живая копия целиком снова «только чтение».
+      const combinedRelease = () => {
+        try {
+          if (isLive) {
+            chmodRecursive(co, false);
+          }
+        } catch {}
+        release();
+      };
+      postPublishLocks.set(row.id, combinedRelease);
       return true;
     } catch (e) {
       // §6 r11: копия занята merge — такт уходит, команды ждут.
@@ -5523,108 +5659,135 @@ export async function runPostPublish(
               saveMeta();
             }
           }
-          const fetchRes = await deps.cmd.run(
-            "git",
-            ["-C", co, "fetch", "origin"],
-            { timeoutMs: 180_000 },
-          );
-          // §22.3: инфраструктурный сбой (fetch/ff) — понятная строка,
-          // сырой вывод git — только в журнал плагина.
-          const copyInfraFailed = (
-            cmdline: string,
-            res: { stdout: string; stderr: string },
-          ) => {
-            deps.log?.warn?.(
-              `orchestrator: postPublish ${cmdline} ${row.task_key}: ` +
-                (res.stderr || res.stdout || "").trim().slice(0, 2000),
+          const isLive = isLiveCheckoutPath(co, deps.hooksDir());
+          let liveTokenVal: string | null = null;
+          if (isLive) {
+            // §24.1 п.3: одноразовый токен этой копии + временная запись.
+            liveTokenVal = issueLiveToken(co, 300_000);
+            chmodRecursive(co, true);
+          }
+          const liveEnv = liveTokenVal
+            ? { ORCH_LIVE_TOKEN: liveTokenVal }
+            : undefined;
+          try {
+            const fetchRes = await deps.cmd.run(
+              "git",
+              ["-C", co, "fetch", "origin"],
+              { timeoutMs: 180_000, ...(liveEnv ? { env: liveEnv } : {}) },
             );
-            copyErr = t("pp.copyUpdateFailed");
-          };
-          if (fetchRes.exitCode !== 0) {
-            copyInfraFailed("fetch", fetchRes);
-          } else {
-            const origin = `origin/${row.target_branch}`;
-            // (2) целевая ветка разошлась с origin — локальные коммиты,
-            // которых в удалённой цели нет.
-            const ahead = Number(
-              await gitOut(["rev-list", "--count", `${origin}..HEAD`]).catch(
-                () => "",
-              ),
-            );
-            if (ahead > 0) {
-              copyErr = t("pp.copyDiverged", {
-                n: ahead,
-                target: row.target_branch,
-              });
+            // §22.3: инфраструктурный сбой (fetch/ff) — понятная строка,
+            // сырой вывод git — только в журнал плагина.
+            const copyInfraFailed = (
+              cmdline: string,
+              res: { stdout: string; stderr: string },
+            ) => {
+              deps.log?.warn?.(
+                `orchestrator: postPublish ${cmdline} ${row.task_key}: ` +
+                  (res.stderr || res.stdout || "").trim().slice(0, 2000),
+              );
+              copyErr = t("pp.copyUpdateFailed");
+            };
+            if (fetchRes.exitCode !== 0) {
+              copyInfraFailed("fetch", fetchRes);
             } else {
-              // (3) грязная: правки в отслеживаемых файлах или
-              // неотслеживаемые файлы, пересекающиеся с входящим диффом
-              // `HEAD..origin/<цель>` (прочие untracked не мешают).
-              const trackedDirty = (
-                await gitOut(["status", "--porcelain", "-uno"]).catch(
+              const origin = `origin/${row.target_branch}`;
+              // (2) целевая ветка разошлась с origin — локальные коммиты,
+              // которых в удалённой цели нет.
+              const ahead = Number(
+                await gitOut(["rev-list", "--count", `${origin}..HEAD`]).catch(
                   () => "",
-                )
-              )
-                .split("\n")
-                .filter(Boolean).length;
-              const incoming = new Set(
-                (
-                  await gitOut([
-                    "diff",
-                    "--name-only",
-                    `HEAD..${origin}`,
-                  ]).catch(() => "")
+                ),
+              );
+              if (ahead > 0) {
+                copyErr = t("pp.copyDiverged", {
+                  n: ahead,
+                  target: row.target_branch,
+                });
+              } else {
+                // (3) грязная: правки в отслеживаемых файлах или
+                // неотслеживаемые файлы, пересекающиеся с входящим диффом
+                // `HEAD..origin/<цель>` (прочие untracked не мешают).
+                const trackedDirty = (
+                  await gitOut(["status", "--porcelain", "-uno"]).catch(
+                    () => "",
+                  )
                 )
                   .split("\n")
-                  .filter(Boolean),
-              );
-              const untrackedOverlap = (
-                await gitOut(["status", "--porcelain"]).catch(() => "")
-              )
-                .split("\n")
-                .filter((l) => l.startsWith("?? "))
-                .map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
-                .filter(
-                  (f) =>
-                    incoming.has(f) ||
-                    // `?? foo/` is an untracked DIRECTORY; an untracked
-                    // FILE `foo` also overlaps `foo/bar.ts` — a checked-
-                    // out `foo/bar.ts` cannot coexist with it.
-                    [...incoming].some((p) =>
-                      p.startsWith(f.endsWith("/") ? f : `${f}/`),
-                    ),
-                ).length;
-              const dirtyN = trackedDirty + untrackedOverlap;
-              if (dirtyN > 0) {
-                copyErr = t("pp.copyDirty", { n: dirtyN });
-              } else {
-                const ffRes = await deps.cmd.run(
-                  "git",
-                  ["-C", co, "merge", "--ff-only", origin],
-                  { timeoutMs: 120_000 },
+                  .filter(Boolean).length;
+                const incoming = new Set(
+                  (
+                    await gitOut([
+                      "diff",
+                      "--name-only",
+                      `HEAD..${origin}`,
+                    ]).catch(() => "")
+                  )
+                    .split("\n")
+                    .filter(Boolean),
                 );
-                if (ffRes.exitCode !== 0) {
-                  copyInfraFailed("ff", ffRes);
+                const untrackedOverlap = (
+                  await gitOut(["status", "--porcelain"]).catch(() => "")
+                )
+                  .split("\n")
+                  .filter((l) => l.startsWith("?? "))
+                  .map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
+                  .filter(
+                    (f) =>
+                      incoming.has(f) ||
+                      // `?? foo/` is an untracked DIRECTORY; an untracked
+                      // FILE `foo` also overlaps `foo/bar.ts` — a checked-
+                      // out `foo/bar.ts` cannot coexist with it.
+                      [...incoming].some((p) =>
+                        p.startsWith(f.endsWith("/") ? f : `${f}/`),
+                      ),
+                  ).length;
+                const dirtyN = trackedDirty + untrackedOverlap;
+                if (dirtyN > 0) {
+                  copyErr = t("pp.copyDirty", { n: dirtyN });
                 } else {
-                  copyOk = true;
-                  newHead = await gitOut(["rev-parse", "HEAD"]).catch(
-                    () => "",
+                  const ffRes = await deps.cmd.run(
+                    "git",
+                    ["-C", co, "merge", "--ff-only", origin],
+                    { timeoutMs: 120_000, ...(liveEnv ? { env: liveEnv } : {}) },
                   );
-                  copyChanged = base
-                    ? (
-                        await gitOut([
-                          "diff",
-                          "--name-only",
-                          `${base}..${newHead}`,
-                        ]).catch(() => "")
-                      )
-                        .split("\n")
-                        .filter(Boolean)
-                    : [];
-                  meta.copy = { head: newHead, changed: copyChanged };
-                  saveMeta();
+                  if (ffRes.exitCode !== 0) {
+                    copyInfraFailed("ff", ffRes);
+                  } else {
+                    copyOk = true;
+                    newHead = await gitOut(["rev-parse", "HEAD"]).catch(
+                      () => "",
+                    );
+                    copyChanged = base
+                      ? (
+                          await gitOut([
+                            "diff",
+                            "--name-only",
+                            `${base}..${newHead}`,
+                          ]).catch(() => "")
+                        )
+                          .split("\n")
+                          .filter(Boolean)
+                      : [];
+                    meta.copy = { head: newHead, changed: copyChanged };
+                    saveMeta();
+                  }
                 }
               }
+            }
+          } finally {
+            if (isLive) {
+              // §24.1 п.3: окно записи — ff + сборка под замком цели.
+              // Ссылки и объекты — «только чтение» сразу после ff; дерево
+              // записываемо для сборки (dist/, node_modules/) и снова
+              // «только чтение» в конце postPublish — и при ошибке сборки.
+              // Без маркера `.bb-live-checkout` права не трогаются.
+              if (liveTokenVal) revokeLiveToken(co, liveTokenVal);
+              const coCommon = await gitOut([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+              ]).catch(() => "");
+              chmodRecursive(coCommon || join(co, ".git"), false);
             }
           }
         }
@@ -5889,6 +6052,11 @@ export async function runPostPublish(
     bits.push(t("pp.reloadPage", { list: appPlugins.join(", ") }));
   }
 
+  if (co && isLiveCheckoutPath(co)) {
+    try {
+      chmodRecursive(co, false);
+    } catch {}
+  }
   releasePostPublishLock(row.id);
   if (!bits.length) return { done: true, summary: null, selfReload };
   return {

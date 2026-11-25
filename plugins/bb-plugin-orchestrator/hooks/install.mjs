@@ -78,6 +78,17 @@ function pluginHooksDir() {
   }
 }
 const hooksDirArg = flag("--hooks-dir") ?? pluginHooksDir();
+
+// §24.1 п.1: moving a copy's local core.hooksPath into chain.json is
+// an owner decision — only the plugin command checks the owner and
+// verifies the effective path afterwards (one route, no second copy of
+// the logic here).
+if (flag("--fix-local")) {
+  console.error(
+    "fix-local: используйте `bb orchestrator hooks install --fix-local <копия> --confirm` из терминала владельца",
+  );
+  process.exit(1);
+}
 // §17.3 (ревью PLUG-216 мелко): the hooks dir is required only to
 // INSTALL — `--self-test` falls back to this package's own wrappers and
 // `--dry-run` only prints the inventory.
@@ -194,7 +205,12 @@ if (selfTest) {
   const testHooksDir = join(tmp, "hooks");
   mkdirSync(testHooksDir, { recursive: true });
   const srcDir = dirname(fileURLToPath(import.meta.url));
-  const GATE_HOOKS = new Set(["pre-push", "pre-commit"]);
+  const GATE_HOOKS = new Set([
+    "pre-push",
+    "pre-commit",
+    "post-checkout",
+    "reference-transaction",
+  ]);
   for (const name of HOOK_NAMES) {
     const srcName = GATE_HOOKS.has(name) ? name : "chain";
     const dst = join(testHooksDir, name);
@@ -212,6 +228,13 @@ if (selfTest) {
       ? join(hooksDir, "leak-scan.ts")
       : join(srcDir, "leak-scan.ts"),
     join(testHooksDir, "leak-scan.ts"),
+  );
+  // §24.1: every wrapper imports the shared helpers next to it.
+  copyFileSync(
+    hooksDir && existsSync(join(hooksDir, "hook-lib.mjs"))
+      ? join(hooksDir, "hook-lib.mjs")
+      : join(srcDir, "hook-lib.mjs"),
+    join(testHooksDir, "hook-lib.mjs"),
   );
   const SHA = "a".repeat(40);
   const LINE = `refs/heads/x ${SHA} refs/heads/x ${"0".repeat(40)}\n`;
@@ -234,6 +257,12 @@ if (selfTest) {
   for (const kind of kinds) {
     const base = join(tmp, kind.name.replace(/\W+/g, "-"));
     execFileSync("git", ["init", ...(kind.bare ? ["--bare"] : []), base], { stdio: "ignore" });
+    if (!kind.bare) {
+      execFileSync("git", ["-C", base, "config", "user.email", "test@test.local"], { stdio: "ignore" });
+      execFileSync("git", ["-C", base, "config", "user.name", "Test"], { stdio: "ignore" });
+      execFileSync("git", ["-C", base, "checkout", "-B", "selftest-branch"], { stdio: "ignore" });
+      execFileSync("git", ["-C", base, "commit", "--allow-empty", "-m", "init"], { stdio: "ignore" });
+    }
     const repo = kind.mk(base);
     const commonRaw = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
     const common = isAbsolute(commonRaw) ? commonRaw : join(repo, commonRaw);
@@ -245,6 +274,7 @@ if (selfTest) {
       execFileSync("chmod", ["+x", lh]);
       const mark = join(tmp, `mark-${kind.name.replace(/\W+/g, "-")}-${name}`);
       const env = { ...process.env, GIT_DIR: gitDir, ORCH_MARK: mark };
+      delete env.BB_THREAD_ID;
       if (name === "pre-push") {
         writeFileSync(join(testHooksDir, "push-token-selftest.json"),
           JSON.stringify({ token: "t", sha: SHA, branch: "x", expiresAt: Date.now() + 60000 }));
@@ -288,15 +318,21 @@ if (hooksPathNow && resolve(hooksPathNow) !== hooksDir && !force) {
   process.exit(1);
 }
 
+const SPECIALIZED_HOOKS = new Set([
+  "pre-commit",
+  "post-checkout",
+  "pre-push",
+  "reference-transaction",
+]);
+
 // §17.3 (Б2): a global core.hooksPath shadows EVERY hook name — install
-// a wrapper under each: `pre-push` is the orchestrator gate (it chains
-// to the local hook itself), the rest are copies of the `chain`
-// pass-through so repository-local hooks keep firing.
-mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
+// a wrapper under each: specialized hooks for orchestrator gates,
+// the rest are copies of the `chain` pass-through.
+mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
 for (const name of HOOK_NAMES) {
   const src = join(
     HOOKS_SRC,
-    name === "pre-push" || name === "pre-commit" ? name : "chain",
+    SPECIALIZED_HOOKS.has(name) ? name : "chain",
   );
   const dst = join(hooksDir, name);
   copyFileSync(src, dst);
@@ -305,6 +341,8 @@ for (const name of HOOK_NAMES) {
 // §22.1: the shared scanner core `pre-commit` imports — lives next to
 // the hook, not executable and not a hook name.
 copyFileSync(join(HOOKS_SRC, "leak-scan.ts"), join(hooksDir, "leak-scan.ts"));
+// §24.1: shared helpers every hook imports (chain, live copy, roles).
+copyFileSync(join(HOOKS_SRC, "hook-lib.mjs"), join(hooksDir, "hook-lib.mjs"));
 // §17.3 (ревью PLUG-214): `push-to-checkout` is retired — its mere
 // presence disables git's built-in worktree update on
 // receive.denyCurrentBranch=updateInstead. Remove a wrapper an older
@@ -314,6 +352,24 @@ writeFileSync(
   join(hooksDir, "exclusions"),
   exclusions.map((e) => `${e}\n`).join(""),
 );
+
+const chainPath = join(hooksDir, "chain.json");
+let chain = {};
+if (existsSync(chainPath)) {
+  try {
+    chain = JSON.parse(readFileSync(chainPath, "utf8"));
+  } catch {}
+}
+// §24.1 п.1: the previous global path is kept as git reads it — an
+// absolute or `~/` path as is, a relative one unresolved (git resolves
+// it from the directory the hook runs in; so does `hook-lib.mjs`).
+const prevAbs = hooksPathNow.startsWith("~/")
+  ? join(homedir(), hooksPathNow.slice(2))
+  : isAbsolute(hooksPathNow) ? resolve(hooksPathNow) : null;
+if (hooksPathNow && prevAbs !== hooksDir && !chain.previousGlobalHooksPath) {
+  chain.previousGlobalHooksPath = prevAbs ?? hooksPathNow;
+}
+writeFileSync(chainPath, JSON.stringify(chain, null, 2) + "\n", { mode: 0o644 });
 
 execFileSync("git", ["config", "--global", "core.hooksPath", hooksDir]);
 console.log(report);

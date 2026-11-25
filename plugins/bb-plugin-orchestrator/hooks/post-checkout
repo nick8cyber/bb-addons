@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+/**
+ * Shared git post-checkout hook (spec orchestrator §24 п.3).
+ * A thread with a plugin role (`BB_THREAD_ID`) switched the branch of a
+ * copy that is not its own → one line to the owner and to the caller
+ * «тред <id> переключил копию <путь> на <ветку>». Git cannot forbid a
+ * checkout; the live copy itself is protected by §24.1 п.3.
+ *
+ * Own copy, by real path: executor — the result environment of its
+ * delegation, else its thread's environment; coordinator — its
+ * registered coordinator copies only (the owner's working copy is not
+ * the coordinator's); helper and other roles — the thread's
+ * environment. Unknown own copy → treated as foreign.
+ *
+ * Delivery is the plugin's: `bb orchestrator checkout-notice` resolves
+ * the owner's thread and the callers, deduplicates and reports failed
+ * deliveries. If that call fails the line goes to stderr.
+ */
+import { spawnSync } from "node:child_process";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HOOK_NAME = "post-checkout";
+const self = fileURLToPath(import.meta.url);
+const dir = dirname(self);
+
+let lib = null;
+try {
+  lib = await import("./hook-lib.mjs");
+} catch { /* old or partial install */ }
+
+const threadId = process.env.BB_THREAD_ID;
+const isBranchCheckout = process.argv[4] === "1"; // $3: 1 = branch checkout
+
+async function ownCopies(role, db) {
+  const own = [];
+  if (role === "orchestrator") {
+    for (const r of db.all(
+      "SELECT worktree_path FROM coordinator_worktrees WHERE coordinator_thread_id = ? AND worktree_path IS NOT NULL",
+      threadId,
+    )) {
+      own.push(lib.real(String(r.worktree_path)));
+    }
+    return own;
+  }
+  let envId = null;
+  if (role === "executor") {
+    const d = db.get(
+      "SELECT result_env_id FROM delegations WHERE thread_id = ? ORDER BY id DESC LIMIT 1",
+      threadId,
+    );
+    envId = d?.result_env_id ?? null;
+  }
+  const envs = await lib.envPaths(threadId, [envId]);
+  const p = (envId && envs.byEnv.get(envId)) || envs.thread;
+  if (p) own.push(p);
+  return own;
+}
+
+if (lib && threadId && isBranchCheckout) {
+  const { role, error, db } = await lib.readThreadRole(threadId);
+  if (!error && role && role !== "none") {
+    let foreign = true;
+    const paths = lib.repoPaths();
+    const here = paths.top || lib.real(process.cwd());
+    try {
+      const own = await ownCopies(role, db);
+      foreign = !own.some((o) => lib.inside(here, o));
+    } catch {
+      foreign = true;
+    } finally {
+      db?.close();
+    }
+    if (foreign) {
+      const br = spawnSync("git", ["symbolic-ref", "--short", "-q", "HEAD"], {
+        encoding: "utf8",
+      });
+      const branch = (br.status === 0 ? br.stdout.trim() : "") || "detached";
+      const line = `тред ${threadId} переключил копию ${here} на ${branch}`;
+      const res = spawnSync(
+        process.env.BB_CLI ?? "bb",
+        ["orchestrator", "checkout-notice", "--copy", here, "--branch", branch, "--json"],
+        { encoding: "utf8", timeout: 20_000, env: process.env },
+      );
+      if (res.status !== 0) {
+        process.stderr.write(`[orchestrator] ${line} (строка не доставлена: ${(res.stderr || res.error?.message || "").trim().slice(0, 200)})\n`);
+      }
+    }
+  } else if (error) {
+    db?.close();
+  }
+}
+
+process.exit(lib ? lib.runChain(dir, HOOK_NAME, self) : 0);

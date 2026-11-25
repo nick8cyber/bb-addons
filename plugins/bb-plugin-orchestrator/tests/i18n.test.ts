@@ -158,10 +158,16 @@ function installWrappers(dir: string, prePush: Buffer) {
     .filter((l) => l && !l.startsWith("#"));
   for (const n of names) {
     if (n === "pre-push") writeFileSync(join(dir, n), prePush);
-    else if (n === "pre-commit") cpSync(join(hooksSrc, n), join(dir, n));
-    else cpSync(join(hooksSrc, "chain"), join(dir, n));
+    else if (
+      n === "pre-commit" ||
+      n === "post-checkout" ||
+      n === "reference-transaction"
+    ) {
+      cpSync(join(hooksSrc, n), join(dir, n));
+    } else cpSync(join(hooksSrc, "chain"), join(dir, n));
   }
   cpSync(join(hooksSrc, "leak-scan.ts"), join(dir, "leak-scan.ts"));
+  cpSync(join(hooksSrc, "hook-lib.mjs"), join(dir, "hook-lib.mjs"));
 }
 
 test("§22.1 (ревью): syncInstalledGateHooks кладёт leak-scan.ts рядом с установленным pre-commit", () => {
@@ -224,6 +230,9 @@ test("§18.1 (ревью PLUG-247a п.7): a language change via settings.onChang
   );
   // what install.mjs drops — the shipped (ru) pre-push
   installWrappers(hooksDir, renderPrePush(T_RU));
+  const prevHooksEnv = process.env.ORCHESTRATOR_HOOKS_DIR;
+  process.env.ORCHESTRATOR_HOOKS_DIR = hooksDir;
+  try {
   await createPlugin(host.bb, { bbCli: cli });
   // default language=en — the startup sync already rewrote the hook
   const enRender = renderPrePush(createT("en")).toString("utf8");
@@ -241,6 +250,10 @@ test("§18.1 (ревью PLUG-247a п.7): a language change via settings.onChang
       t: createT("ru"),
     } as unknown as ReleaseDeps),
   );
+  } finally {
+    if (prevHooksEnv === undefined) delete process.env.ORCHESTRATOR_HOOKS_DIR;
+    else process.env.ORCHESTRATOR_HOOKS_DIR = prevHooksEnv;
+  }
 });
 
 test("§18.1: default settings resolve the English skills", async () => {

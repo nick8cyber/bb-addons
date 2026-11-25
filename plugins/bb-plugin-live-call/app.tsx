@@ -11,8 +11,9 @@
  */
 import "./app.css";
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
-import type { ComponentType } from "react";
+import { useEffect, useState, useSyncExternalStore, type ComponentType } from "react";
 
+import { CALL_PANEL_PATH, getCallButtonFooter, getCallButtonNav, shouldAutoCallOnMount } from "./src/ui/button-placement.js";
 import { CallOverlay } from "./src/ui/CallOverlay.js";
 import { Icon } from "./src/ui/icons.js";
 import { SettingsSection } from "./src/ui/SettingsSection.js";
@@ -53,6 +54,66 @@ function ThreadCallButton({ threadId, isCompactViewport }: ThreadHeaderActionPro
 /** Нет звонка — позвонить; звонок идёт — развернуть док. */
 const callOrFocus = () => (callEngine.isActive() ? callEngine.requestExpand() : callEngine.start());
 
+const useCallView = () => useSyncExternalStore(callEngine.subscribe, callEngine.getSnapshot, callEngine.getSnapshot);
+
+function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const mm = String(Math.floor(total / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+}
+
+/**
+ * Экран управления звонком — страница панели слева (§3.2).
+ * Не тупик: статус и кнопки «Позвонить» / «Развернуть» / «Завершить».
+ * Автозвонок при монтировании — только при клиентском переходе, не при свежей
+ * загрузке документа. `callOrFocus` идемпотентен (активный звонок — requestExpand).
+ */
+function CallPanelPage() {
+  const view = useCallView();
+  const active = view.phase === "connecting" || view.phase === "live";
+
+  // Один раз при монтировании: клиентский переход — звоним, свежая загрузка — ждём жеста.
+  useEffect(() => {
+    if (shouldAutoCallOnMount()) callOrFocus();
+  }, []);
+
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (view.phase !== "live") return;
+    const t = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [view.phase]);
+
+  // Таймер — по view.startedAt (момент начала звонка), как в CallOverlay: он не
+  // сбрасывается при переподключении WebSocket. `liveSince` в движке — служебная
+  // отметка последнего ready и на каждый resent пишется заново (engine ~664).
+  const status =
+    view.phase === "connecting"
+      ? "идёт звонок · соединение"
+      : view.phase === "live"
+        ? `идёт звонок · ${view.startedAt ? formatElapsed(Date.now() - view.startedAt) : "00:00"}`
+        : "звонка нет";
+
+  return (
+    <div className="lc-root lc-panel">
+      <div className="lc-panel__status">{status}</div>
+      <div className="lc-panel__actions">
+        <button type="button" className="lc-btn lc-btn--primary" onClick={() => callOrFocus()}>
+          <Icon name="phone" />
+          Позвонить
+        </button>
+        <button type="button" className="lc-btn lc-btn--ghost" disabled={!active} onClick={() => callEngine.requestExpand()}>
+          Развернуть
+        </button>
+        <button type="button" className="lc-btn lc-btn--danger" disabled={!active} onClick={() => callEngine.end()}>
+          Завершить
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.experimental_appOverlay({ id: "live-call", component: CallOverlay });
 
@@ -63,13 +124,31 @@ export default definePluginApp((app) => {
     icon: LiveCallProviderGlyph,
   });
 
-  app.experimental_sidebarFooter.register({
-    kind: "action",
-    id: "call",
-    label: "Позвонить координатору",
-    icon: PHONE_ICON,
-    onActivate: callOrFocus,
-  });
+  // §2–3 спеки live-call-button-placement: два независимых тумблера читаются
+  // один раз при старте бандла (регистрации одноразовые, смена — после перезагрузки).
+  const showInFooter = getCallButtonFooter();
+  const showInNav = getCallButtonNav();
+
+  if (showInFooter) {
+    app.experimental_sidebarFooter.register({
+      kind: "action",
+      id: "call",
+      label: "Позвонить координатору",
+      icon: PHONE_ICON,
+      onActivate: callOrFocus,
+    });
+  }
+
+  // §3.2: иконка в левой панели навигации (иконочная строка destinations).
+  if (showInNav) {
+    app.slots.navPanel({
+      id: "call",
+      title: "Live Call",
+      icon: "Phone",
+      path: CALL_PANEL_PATH,
+      component: CallPanelPage,
+    });
+  }
 
   (app.slots as unknown as {
     experimental_threadHeaderAction(registration: {
