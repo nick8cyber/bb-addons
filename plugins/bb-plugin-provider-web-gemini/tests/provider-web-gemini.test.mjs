@@ -6955,8 +6955,10 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
     // --- 8a. Explicit stallMs is unclamped — the thinking-high floor must not apply ---
     {
       const h = harness();
-      h.state.doc = frozenDoc();
-      h.state.stopVisible = true;
+      // PLUG-413: for thinking: "high" a visible stop button excludes the stall
+      // window — the stall requires a first poll without stop button and answer.
+      h.state.doc = streamDoc("", { stop: false });
+      h.state.stopVisible = false;
       await assert.rejects(
         h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 300 }),
         (err) => {
@@ -6997,8 +6999,8 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
       process.env.WEB_GEMINI_STALL_MS = "500";
       process.env.WEB_GEMINI_SESSION_CAP_MS = "3600000"; // cap must exceed the 600s floor
       const h = harness({ advanceMs: 60_000 }); // one fake minute per poll
-      h.state.doc = frozenDoc();
-      h.state.stopVisible = true;
+      h.state.doc = streamDoc("", { stop: false });
+      h.state.stopVisible = false;
       await assert.rejects(
         h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high" }),
         (err) => {
@@ -7019,9 +7021,9 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
     {
       process.env.WEB_GEMINI_STALL_MS = "900000"; // 15 min
       process.env.WEB_GEMINI_SESSION_CAP_MS = "3600000";
-      const h = harness({ advanceMs: 60_000 });
-      h.state.doc = frozenDoc();
-      h.state.stopVisible = true;
+      const h = harness({ advanceMs: 60_000 }); // one fake minute per poll
+      h.state.doc = streamDoc("", { stop: false });
+      h.state.stopVisible = false;
       await assert.rejects(
         h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high" }),
         (err) => {
@@ -7036,6 +7038,74 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
       );
       delete process.env.WEB_GEMINI_STALL_MS;
       process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+    }
+
+    // --- 9. PLUG-413: thinking high — stop button is the only stall gate ---
+    // (a) Stop visible → no stall for thinking high; the turn waits for the stop
+    // press / session cap / finished answer instead of declaring a stall early.
+    {
+      const h = harness({ advanceMs: 60_000 });
+      h.state.doc = frozenDoc();
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high" }),
+        (err) => err.code === "WEB_GEMINI_STREAM_TIMEOUT"
+      );
+    }
+
+    // (б) Stop gone + no answer → full STALL_MS window from the first poll without
+    // stop button and answer; spinner / isGenerating / domSig progress must not
+    // extend the window.
+    {
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = thinkingDoc({ stop: false });
+      h.state.stopVisible = false;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 400 }),
+        (err) => err.code === "WEB_GEMINI_STALLED"
+      );
+      const delta = h.state.now - h.state.firstStatusAt;
+      assert.ok(
+        delta >= 400 && delta <= 700,
+        `high must stall at the end of the full window (400ms) from first poll without stop/answer, got ${delta}ms`
+      );
+    }
+
+    // (в) Stop reappears mid-window → window resets; after re-disappearance a new
+    // full window starts before the stall is declared.
+    {
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = thinkingDoc({ stop: false });
+      h.state.stopVisible = false;
+      // p2: author presses stop (window must reset); p4: stop released — the
+      // generation is author-driven again, so a fresh full window starts here.
+      h.state.onPoll = (p) => {
+        if (p === 2) h.state.stopVisible = true;
+        if (p === 4) h.state.stopVisible = false;
+      };
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 400 }),
+        (err) => err.code === "WEB_GEMINI_STALLED"
+      );
+    }
+
+    // (г) Answer that is only a generated file (download button) — no text/image —
+    // is finished content: the turn completes instead of opening a stall window.
+    {
+      const h = harness({ advanceMs: 60_000 });
+      h.state.doc = docOf([
+        uq(["p0", "r0"]),
+        createMockElement({
+          id: "r0",
+          tagName: "model-response",
+          preceding: ["q0"],
+          innerText: "Here is the file you asked for.",
+          children: [createMockElement({ id: "cb0", tagName: "button", innerText: "Download" })],
+        }),
+      ]);
+      h.state.stopVisible = false;
+      const res = await h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high" });
+      assert.equal(String(res), "Here is the file you asked for.");
     }
   } finally {
     restoreAll();
