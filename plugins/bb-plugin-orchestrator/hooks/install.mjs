@@ -175,6 +175,45 @@ for (const repo of repos) {
 
 const exclusions = [...new Set(normalizedExcludes)];
 
+let existingWarnings = [];
+if (hooksDir) {
+  const projFile = join(hooksDir, "projects.json");
+  let projectsList = null;
+  if (existsSync(projFile)) {
+    try {
+      projectsList = JSON.parse(readFileSync(projFile, "utf8"));
+    } catch {}
+  }
+
+  const liveFile = join(hooksDir, "live-copies.json");
+  let liveList = null;
+  if (existsSync(liveFile)) {
+    try {
+      liveList = JSON.parse(readFileSync(liveFile, "utf8"));
+    } catch {}
+  }
+
+  if (projectsList || liveList) {
+    const targets = [];
+    for (const p of projectsList ?? []) targets.push(dirname(p));
+    for (const l of liveList ?? []) targets.push(l);
+
+    const exclusionsPath = join(hooksDir, "exclusions");
+    if (existsSync(exclusionsPath)) {
+      const existingLines = readFileSync(exclusionsPath, "utf8").split("\n");
+      for (const line of existingLines) {
+        const raw = line.trim();
+        if (!raw || raw.startsWith("#")) continue;
+        for (const t of targets) {
+          if (covers(raw, t)) {
+            existingWarnings.push(`существующее исключение ${raw} покрывает проект ${t}`);
+          }
+        }
+      }
+    }
+  }
+}
+
 const report = [
   `hooks dir:      ${hooksDir ?? "(не определён — для установки передайте --hooks-dir)"}`,
   `repos root:     ${reposRoot} (${repos.length} репозиториев)`,
@@ -190,6 +229,13 @@ const report = [
   "",
   "проекты с excluded:true в настройке release: их репозитории хук не трогает —",
   "добавьте пути через --exclude <path> (или запишите в exclusions вручную).",
+  ...(existingWarnings.length > 0
+    ? [
+        "",
+        "предупреждения о существующих исключениях:",
+        ...existingWarnings.map((w) => `  - ${w}`),
+      ]
+    : []),
 ].join("\n");
 
 if (dryRun) {
@@ -438,6 +484,12 @@ if (hooksPathNow && prevAbs !== hooksDir && !chain.previousGlobalHooksPath) {
   chain.previousGlobalHooksPath = prevAbs ?? hooksPathNow;
 }
 writeFileSync(chainPath, JSON.stringify(chain, null, 2) + "\n", { mode: 0o644 });
+
+if (existingWarnings.length > 0) {
+  for (const w of existingWarnings) {
+    console.warn(`предупреждение: ${w}`);
+  }
+}
 
 execFileSync("git", ["config", "--global", "core.hooksPath", hooksDir]);
 console.log(report);

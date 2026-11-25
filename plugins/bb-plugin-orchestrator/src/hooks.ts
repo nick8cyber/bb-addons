@@ -137,6 +137,7 @@ export interface InstallHooksResult {
   fixedLocalCopy?: string;
   moved?: Array<{ copy: string; scope: string; value: string }>;
   projectsRegistry?: string[];
+  warnings?: string[];
 }
 
 /**
@@ -285,7 +286,10 @@ export async function collectProjectsRegistry(
       if (deps.asyncGit) {
         const r = await deps.asyncGit(mainPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
         if (r.exitCode !== 0) {
-          failures.push({ project: pid, reason: `${mainPath} — не git-репозиторий` });
+          failures.push({
+            project: pid,
+            reason: `${mainPath} — не git-репозиторий: ${r.stderr?.trim() || "код " + r.exitCode}`,
+          });
           continue;
         }
         commonRaw = r.stdout.trim();
@@ -294,13 +298,16 @@ export async function collectProjectsRegistry(
         commonRaw = exec("git", ["-C", mainPath, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
       }
       if (!commonRaw) {
-        failures.push({ project: pid, reason: `${mainPath} — не git-репозиторий` });
+        failures.push({ project: pid, reason: `${mainPath} — пустой путь git-common-dir` });
         continue;
       }
       const commonReal = realpathSync(commonRaw);
       registry.push(commonReal);
     } catch (err) {
-      failures.push({ project: pid, reason: `${mainPath} — не git-репозиторий` });
+      failures.push({
+        project: pid,
+        reason: `${mainPath} — ${err instanceof Error ? err.message : String(err)}`,
+      });
     }
   }
 
@@ -579,6 +586,32 @@ export async function installHooks(
   if (existsSync(exclusionsFile)) {
     existingContent = readFileSync(exclusionsFile, "utf8");
   }
+
+  // §24.4 п.5: проверка существующих записей в exclusions на покрытие проектов
+  const warnings: string[] = [];
+  if (existingContent.trim()) {
+    const targets: string[] = [];
+    for (const p of projRegistry ?? []) targets.push(dirname(p));
+    const liveFile = join(hooksDir, "live-copies.json");
+    if (existsSync(liveFile)) {
+      try {
+        const liveList = JSON.parse(readFileSync(liveFile, "utf8"));
+        if (Array.isArray(liveList)) {
+          for (const l of liveList) targets.push(l);
+        }
+      } catch {}
+    }
+    const lines = existingContent.split("\n");
+    for (const line of lines) {
+      const raw = line.trim();
+      if (!raw || raw.startsWith("#")) continue;
+      for (const t of targets) {
+        if (covers(raw, t)) {
+          warnings.push(`существующее исключение ${raw} покрывает проект ${t}`);
+        }
+      }
+    }
+  }
   let newContent = existingContent;
   if (normalizedExcludes.length > 0) {
     const existingLines = existingContent.split("\n");
@@ -641,11 +674,17 @@ export async function installHooks(
     );
   }
 
+  let message = `хуки оркестратора установлены в ${hooksDir} (${names.length} хуков)`;
+  if (warnings.length > 0) {
+    message += `\nпредупреждение: ${warnings.join("; ")}`;
+  }
+
   return {
     ok: true,
     hooksDir,
-    message: `хуки оркестратора установлены в ${hooksDir} (${names.length} хуков)`,
+    message,
     projectsRegistry: projRegistry,
+    ...(warnings.length > 0 ? { warnings } : {}),
   };
 }
 

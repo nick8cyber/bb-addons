@@ -7,6 +7,8 @@ import Database from "better-sqlite3";
 import { makeTempDir } from "./helpers/temp.js";
 import { writePushToken } from "../src/release.js";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { createPlugin } from "../server.js";
 import {
   HOOK_NAMES,
   SPECIALIZED_HOOK_NAMES,
@@ -1174,10 +1176,13 @@ test("§24.4 (6.12): exclusion-covers-project при попытке исключ
         return true;
       },
     );
+    // Проверяем, что projects.json сохранён до отказа (§24.4 п.5 шаг 1)
+    assert.ok(existsSync(join(hooksDir, "projects.json")), "projects.json должен сохраняться до отказа");
+    const savedProjects = JSON.parse(readFileSync(join(hooksDir, "projects.json"), "utf8"));
+    assert.deepEqual(savedProjects, [realpathSync(join(managedRepo, ".git"))]);
     assert.equal(readFileSync(join(hooksDir, "exclusions"), "utf8"), "");
 
     // install.mjs с уже записанным projects.json
-    writeFileSync(join(hooksDir, "projects.json"), JSON.stringify([realpathSync(join(managedRepo, ".git"))]));
     const resMjs = spawnSync("node", ["hooks/install.mjs", "--hooks-dir", hooksDir, "--exclude", join(base, "managed") + "/"], {
       cwd: PLUGIN_DIR,
       env: { ...process.env, GIT_CONFIG_GLOBAL: join(base, "gitconfig") },
@@ -1187,8 +1192,22 @@ test("§24.4 (6.12): exclusion-covers-project при попытке исключ
     assert.match(resMjs.stderr, /exclusion-covers-project/);
     assert.equal(readFileSync(join(hooksDir, "exclusions"), "utf8"), "");
 
-    // Запись, уже лежащая в exclusions -> doctor код 2
+    // Существующая запись в exclusions не срывает установку, но даёт предупреждение (§24.4 п.5)
     writeFileSync(join(hooksDir, "exclusions"), join(base, "managed") + "/\n");
+    const resWarn = await installHooks({
+      hooksDir,
+      releaseConfig: {
+        projects: { proj_m: { checks: [] } },
+      },
+      projectsList: [
+        { id: "proj_m", sources: [{ type: "local_path", path: managedRepo, isDefault: true }] },
+      ],
+    });
+    assert.equal(resWarn.ok, true);
+    assert.ok(resWarn.warnings && resWarn.warnings.length > 0);
+    assert.match(resWarn.message, /предупреждение: существующее исключение/);
+
+    // Запись, уже лежащая в exclusions -> doctor код 2
     const doc = await runHooksDoctor({ hooksDir, repo: managedRepo });
     assert.equal(doc.ok, false);
     assert.equal(doc.code, 2);
@@ -1236,6 +1255,51 @@ test("§24.4 (6.14): сбор реестра projects.json (local_path missing, 
   assert.equal(resWt.ok, true);
   assert.deepEqual(resWt.registry, [realpathSync(join(repo1, ".git"))]);
 
+  // Вызов реального обработчика CLI hooks install (проверка реальной связки cmdRunner)
+  const cliHooksDir = join(base, "cli-hooks");
+  const hostA = createFakePluginHost({
+    pluginId: "orchestrator",
+    dataDir: makeTempDir("orch-cli-test-"),
+    settings: {
+      policy: '{"version":1,"levels":{"simple":{"chain":["s"]}},"routes":{"s":{"preset":"s","provider":"p"}}}',
+      release: JSON.stringify({
+        commitIdentity: "Agent <agent@x.io>",
+        projects: {
+          p1: { checks: [] },
+          p2: { checks: [] },
+        },
+      }),
+    },
+  });
+  await createPlugin(hostA.bb, {
+    bbCli: {
+      run: async (args: string[]) => {
+        if (args[0] === "project" && args[1] === "list") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify([
+              { id: "p1", sources: [{ type: "local_path", path: repo1, isDefault: true }] },
+              { id: "p2", sources: [{ type: "local_path", path: join(base, "nonexistent"), isDefault: true }] },
+            ]),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    },
+  });
+  const prevGcfgA = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = join(base, "gitconfig-cli");
+  try {
+    const cliRes = await hostA.harness.runCli(["hooks", "install", "--hooks-dir", cliHooksDir, "--confirm"], {});
+    assert.equal(cliRes.exitCode, 0, `CLI hooks install failed: ${cliRes.stderr || cliRes.stdout}`);
+    assert.ok(existsSync(join(cliHooksDir, "projects.json")));
+    const cliSavedProjects = JSON.parse(readFileSync(join(cliHooksDir, "projects.json"), "utf8"));
+    assert.deepEqual(cliSavedProjects, [realpathSync(join(repo1, ".git"))]);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prevGcfgA;
+  }
+
   // (б) local_path существует, но не git-репозиторий -> projects-registry-failed
   const notRepo = join(base, "not-repo");
   mkdirSync(notRepo);
@@ -1257,28 +1321,128 @@ test("§24.4 (6.14): сбор реестра projects.json (local_path missing, 
     (err: any) => {
       assert.equal(err.code, "projects-registry-failed");
       assert.match(err.message, /p_bad/);
+      assert.match(err.message, /not a git repository|не git-репозиторий/i);
       return true;
     },
   );
   // В hooksDir ничего не записано
   assert.equal(existsSync(hooksDir), false);
 
-  // (в) Асинхронный сбор: ошибка логгируется в warn, прежний файл на месте
+  // (в) Асинхронный сбор при createPlugin (syncHookRegistries):
+  // 1) Ошибка логируется в mock bb.log.warn, прежний файл на месте
   const hooksDir2 = join(base, "hooks2");
   mkdirSync(hooksDir2);
   writeFileSync(join(hooksDir2, "projects.json"), JSON.stringify(["old-entry"]));
-  const warnings: string[] = [];
-  const fakeLog = { warn: (msg: string) => warnings.push(msg) };
-  // Симуляция фонового сбора
-  const resBad = await collectProjectsRegistry(
-    { projects: { p_bad: {} } },
-    {
-      projectsList: [{ id: "p_bad", sources: [{ type: "local_path", path: notRepo, isDefault: true }] }],
-    },
-  );
-  if (!resBad.ok) {
-    fakeLog.warn(`orchestrator: projects.json: ${resBad.failures.map(f => `${f.project}: ${f.reason}`).join("; ")}`);
+
+  const prevHooksDirEnv = process.env.ORCHESTRATOR_HOOKS_DIR;
+  process.env.ORCHESTRATOR_HOOKS_DIR = hooksDir2;
+
+  try {
+    const warnMessages: string[] = [];
+    const hostBad = createFakePluginHost({
+      pluginId: "orchestrator",
+      dataDir: makeTempDir("orch-bad-sync-"),
+      settings: {
+        policy: '{"version":1,"levels":{"simple":{"chain":["s"]}},"routes":{"s":{"preset":"s","provider":"p"}}}',
+        release: JSON.stringify({
+          commitIdentity: "Agent <agent@x.io>",
+          projects: {
+            p_bad: { checks: [] },
+          },
+        }),
+      },
+    });
+    const origWarn = hostBad.bb.log.warn;
+    hostBad.bb.log.warn = (msg: string) => {
+      warnMessages.push(msg);
+      origWarn(msg);
+    };
+
+    await createPlugin(hostBad.bb, {
+      bbCli: {
+        run: async (args: string[]) => {
+          if (args[0] === "project" && args[1] === "list") {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify([
+                { id: "p_bad", sources: [{ type: "local_path", path: notRepo, isDefault: true }] },
+              ]),
+              stderr: "",
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      },
+    });
+
+    // Ожидаем завершения асинхронного вызова syncProjectsRegistry
+    for (let i = 0; i < 20; i++) {
+      if (warnMessages.some((w) => w.includes("projects.json") && w.includes("p_bad"))) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    assert.ok(
+      warnMessages.some((w) => w.includes("projects.json") && w.includes("p_bad")),
+      `expected warning in bb.log.warn, got: ${JSON.stringify(warnMessages)}`,
+    );
+    assert.equal(readFileSync(join(hooksDir2, "projects.json"), "utf8"), JSON.stringify(["old-entry"]));
+
+    // 2) Успешный асинхронный сбор: запись projects.json создаётся корректно
+    const hooksDirOk = join(base, "hooks-ok");
+    mkdirSync(hooksDirOk);
+    process.env.ORCHESTRATOR_HOOKS_DIR = hooksDirOk;
+
+    const hostOk = createFakePluginHost({
+      pluginId: "orchestrator",
+      dataDir: makeTempDir("orch-ok-sync-"),
+      settings: {
+        policy: '{"version":1,"levels":{"simple":{"chain":["s"]}},"routes":{"s":{"preset":"s","provider":"p"}}}',
+        release: JSON.stringify({
+          commitIdentity: "Agent <agent@x.io>",
+          projects: {
+            p1: { checks: [] },
+          },
+        }),
+      },
+    });
+
+    const warnMessagesOk: string[] = [];
+    const origWarnOk = hostOk.bb.log.warn;
+    hostOk.bb.log.warn = (msg: string) => {
+      warnMessagesOk.push(msg);
+      origWarnOk(msg);
+    };
+
+    await createPlugin(hostOk.bb, {
+      bbCli: {
+        run: async (args: string[]) => {
+          if (args[0] === "project" && args[1] === "list") {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify([
+                { id: "p1", sources: [{ type: "local_path", path: repo1, isDefault: true }] },
+              ]),
+              stderr: "",
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      },
+    });
+
+    // Ожидаем завершения асинхронного вызова syncProjectsRegistry
+    for (let i = 0; i < 20; i++) {
+      if (existsSync(join(hooksDirOk, "projects.json"))) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    assert.ok(
+      existsSync(join(hooksDirOk, "projects.json")),
+      "projects.json должен быть записан syncProjectsRegistry",
+    );
+    const okProjects = JSON.parse(readFileSync(join(hooksDirOk, "projects.json"), "utf8"));
+    assert.deepEqual(okProjects, [realpathSync(join(repo1, ".git"))]);
+  } finally {
+    process.env.ORCHESTRATOR_HOOKS_DIR = prevHooksDirEnv;
   }
-  assert.ok(warnings.some(w => w.includes("p_bad")));
-  assert.equal(readFileSync(join(hooksDir2, "projects.json"), "utf8"), JSON.stringify(["old-entry"]));
 });

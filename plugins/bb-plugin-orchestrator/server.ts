@@ -1840,7 +1840,7 @@ export async function createPlugin(
       bbCli,
       localHostId,
       asyncGit: async (repo, args) => {
-        const r = await cmd.run("git", ["-C", repo, ...args], { timeoutMs: 30_000 });
+        const r = await cmdRunner.run("git", ["-C", repo, ...args], { timeoutMs: 30_000 });
         return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr };
       },
     });
@@ -1849,7 +1849,7 @@ export async function createPlugin(
       bb.log.warn(`orchestrator: projects.json: ${msg}`);
       return;
     }
-    writeJsonAtomic(join(dir, "projects.json"), res.registry);
+    writeJsonAtomic(joinPath(dir, "projects.json"), res.registry);
   };
 
   /** §24.1 п.2 (г): одна подтверждённая запись postPublish.checkout в
@@ -5222,7 +5222,7 @@ export async function createPlugin(
               bbCli,
               localHostId,
               asyncGit: async (repo, args) => {
-                const r = await cmd.run("git", ["-C", repo, ...args], { timeoutMs: 30_000 });
+                const r = await cmdRunner.run("git", ["-C", repo, ...args], { timeoutMs: 30_000 });
                 return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr };
               },
             });
