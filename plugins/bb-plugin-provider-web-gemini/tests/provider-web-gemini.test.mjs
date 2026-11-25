@@ -69,6 +69,7 @@ const {
   upsellDialogConfirmsLock,
   markVisibleDialogs,
   collectGeneratedFiles,
+  findGeneratedFileCandidates,
   sanitizeDownloadName,
   isAllowedDownloadHost,
   downloadUrlHost,
@@ -100,6 +101,9 @@ function createMockElement({
     parent: null,
     getAttribute(attr) {
       return attributes[attr] ?? null;
+    },
+    hasAttribute(attr) {
+      return Object.prototype.hasOwnProperty.call(attributes, attr);
     },
     setAttribute(attr, val) {
       attributes[attr] = String(val);
@@ -6488,18 +6492,22 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
       innerText: text,
       attributes: { class: "animated-thinking-content" },
     });
-  const thinkingDoc = ({ stop = true } = {}) =>
+  // PLUG-413: like the live DOM, the pending-response's innerText carries the
+  // status chrome ("Searching the web…") — raw text that is NOT an answer.
+  const thinkingDoc = ({ stop = true, text = "Searching the web…", spinner = false } = {}) =>
     docOf([
       uq(["p0", "r0"]),
       createMockElement({
         id: "p0",
         tagName: "pending-response",
         preceding: ["q0"],
+        innerText: text,
         children: [
+          ...(spinner ? [createMockElement({ id: "sp0", tagName: "mat-spinner" })] : []),
           createMockElement({
             id: "ov0",
             tagName: "thinking-overlay",
-            children: [animatedThinking()],
+            children: [animatedThinking(text)],
           }),
         ],
       }),
@@ -6570,6 +6578,19 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
           const p = state.poll++;
           state.onPoll?.(p, status);
           return status;
+        }
+        if (arg && arg.candSrc) {
+          // collectGeneratedFiles scan: REAL findGeneratedFileCandidates.
+          state.fileScans = (state.fileScans || 0) + 1;
+          const target = findTurnTarget(state.doc, arg.idx, arg.promptPrefix);
+          if (!target) return { candidates: [], meta: {} };
+          return {
+            candidates: findGeneratedFileCandidates(target, {
+              detectOnly: arg.detectOnly,
+              tagAttr: arg.tagAttr,
+            }),
+            meta: {},
+          };
         }
         if (arg && arg.fnSrc) {
           const target = findTurnTarget(state.doc, arg.idx, arg.promptPrefix);
@@ -6972,8 +6993,10 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
     // --- 8a. Explicit stallMs is unclamped — the thinking-high floor must not apply ---
     {
       const h = harness();
-      h.state.doc = frozenDoc();
-      h.state.stopVisible = true;
+      // PLUG-413: for thinking: "high" a visible stop button excludes the stall
+      // window — the stall requires a first poll without stop button and answer.
+      h.state.doc = streamDoc("", { stop: false });
+      h.state.stopVisible = false;
       await assert.rejects(
         h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 300 }),
         (err) => {
@@ -7014,8 +7037,8 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
       process.env.WEB_GEMINI_STALL_MS = "500";
       process.env.WEB_GEMINI_SESSION_CAP_MS = "3600000"; // cap must exceed the 600s floor
       const h = harness({ advanceMs: 60_000 }); // one fake minute per poll
-      h.state.doc = frozenDoc();
-      h.state.stopVisible = true;
+      h.state.doc = streamDoc("", { stop: false });
+      h.state.stopVisible = false;
       await assert.rejects(
         h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high" }),
         (err) => {
@@ -7036,9 +7059,9 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
     {
       process.env.WEB_GEMINI_STALL_MS = "900000"; // 15 min
       process.env.WEB_GEMINI_SESSION_CAP_MS = "3600000";
-      const h = harness({ advanceMs: 60_000 });
-      h.state.doc = frozenDoc();
-      h.state.stopVisible = true;
+      const h = harness({ advanceMs: 60_000 }); // one fake minute per poll
+      h.state.doc = streamDoc("", { stop: false });
+      h.state.stopVisible = false;
       await assert.rejects(
         h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high" }),
         (err) => {
@@ -7053,6 +7076,264 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
       );
       delete process.env.WEB_GEMINI_STALL_MS;
       process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+    }
+
+    // --- 9. PLUG-413 §2.3: thinking high — stop button is the only stall gate ---
+    // Session cap for this block exceeds the poll interval many times over, so a
+    // premature stall on the old code path is observable (not masked by the cap).
+    const HIGH_CAP_MS = 20 * 60_000;
+    const noTargetDoc = ({ stop = false } = {}) => docOf([uq([]), ...(stop ? [stopBtnEl()] : [])]);
+
+    // (а) Stop visible 15+ min, DOM and text frozen — no stall; the turn runs to
+    // the session cap (truncated-answer timeout), never WEB_GEMINI_STALLED.
+    {
+      process.env.WEB_GEMINI_SESSION_CAP_MS = String(HIGH_CAP_MS);
+      const h = harness({ advanceMs: 60_000 }); // one fake minute per poll
+      h.state.doc = streamDoc("");
+      h.state.stopVisible = true;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 120_000 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STREAM_TIMEOUT", `stop visible must never stall, got ${err.code}`);
+          return true;
+        }
+      );
+      const span = h.state.now - h.state.firstStatusAt;
+      assert.ok(span >= 15 * 60_000, `stop-visible turn must survive 15 min, got ${span}ms`);
+      assert.ok(h.state.poll >= 15, `cap must exceed the poll interval (>=15 polls), got ${h.state.poll}`);
+      process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+    }
+
+    // (б) Stop disappears, no answer; spinner stays and statusText (domSig) changes
+    // every poll; the pending-response carries raw "Searching the web…" text —
+    // stalled on the first poll at stallMs after the stop vanished, not earlier.
+    {
+      process.env.WEB_GEMINI_SESSION_CAP_MS = String(HIGH_CAP_MS);
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = thinkingDoc({ stop: false, spinner: true });
+      h.state.stopVisible = true;
+      let goneAt = null;
+      h.state.onPoll = (p) => {
+        h.state.doc = thinkingDoc({ stop: false, spinner: true, text: `Searching the web… step ${p}` });
+        if (p === 3) {
+          h.state.stopVisible = false;
+          goneAt = h.state.now;
+        }
+      };
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 1000 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED");
+          return true;
+        }
+      );
+      const delta = h.state.now - goneAt;
+      assert.ok(delta >= 1000 && delta < 1200, `stall must come at stallMs after stop vanished, got ${delta}ms`);
+      process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+    }
+
+    // (в) Stop never shown, target empty — stalled at stallMs from the first poll.
+    {
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = streamDoc("", { stop: false });
+      h.state.stopVisible = false;
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 1000 }),
+        (err) => err.code === "WEB_GEMINI_STALLED"
+      );
+      const delta = h.state.now - h.state.firstStatusAt;
+      assert.ok(delta >= 1000 && delta < 1200, `stall must come at stallMs from the first poll, got ${delta}ms`);
+    }
+
+    // (г1) Target lost without an answer — stalled at stallMs.
+    {
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = noTargetDoc();
+      // Stop is seen by the generation-start check only, then vanishes on poll 0.
+      h.state.stopVisible = true;
+      h.state.onPoll = (p) => {
+        if (p === 0) h.state.stopVisible = false;
+      };
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 1000 }),
+        (err) => err.code === "WEB_GEMINI_STALLED"
+      );
+      const delta = h.state.now - h.state.firstStatusAt;
+      assert.ok(delta >= 1000 && delta < 1200, `lost target must stall at stallMs, got ${delta}ms`);
+    }
+
+    // (г2) Target lost after message-content text was captured, no stop — the turn
+    // completes with the captured answer right away (not at the session cap).
+    {
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = streamDoc("Captured answer.");
+      h.state.stopVisible = true;
+      h.state.onPoll = (p) => {
+        if (p === 1) {
+          h.state.doc = noTargetDoc();
+          h.state.stopVisible = false;
+        }
+      };
+      const res = await h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 5000 });
+      assert.equal(String(res), "Captured answer.");
+      const span = h.state.now - h.state.firstStatusAt;
+      assert.ok(span < 2000, `lost target after the answer must finish immediately, got ${span}ms`);
+    }
+
+    // (г3) Raw pending-response text is not an answer: target lost after only
+    // "Searching the web…" was seen, no stop — stall, never an "answer".
+    {
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = thinkingDoc({ stop: false });
+      h.state.stopVisible = false;
+      h.state.onPoll = (p) => {
+        if (p === 1) h.state.doc = noTargetDoc();
+      };
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 1000 }),
+        (err) => err.code === "WEB_GEMINI_STALLED"
+      );
+    }
+
+    // (г5) Target still found, but message-content empties after text was captured
+    // under Stop, then Stop vanishes — stale captured text is not an answer
+    // (§2.3 п.3: with the target found the answer is hasFinishedContent only):
+    // stalled at stallMs after Stop vanished, not held until the session cap.
+    {
+      process.env.WEB_GEMINI_SESSION_CAP_MS = String(HIGH_CAP_MS);
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = streamDoc("Answer text");
+      h.state.stopVisible = true;
+      let goneAt = null;
+      h.state.onPoll = (p) => {
+        if (p === 2) {
+          h.state.doc = streamDoc("", { stop: false });
+          h.state.stopVisible = false;
+          goneAt = h.state.now;
+        }
+      };
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 1000 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED", `emptied message-content must stall, got ${err.code}`);
+          return true;
+        }
+      );
+      const delta = h.state.now - goneAt;
+      assert.ok(delta >= 1000 && delta < 1400, `stall must come at stallMs after stop vanished, got ${delta}ms`);
+      process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+    }
+
+    // (г4) Brief target loss mid-stream while the stop button is visible must not
+    // truncate the answer in any thinking mode — the full answer is returned.
+    for (const thinking of ["low", "medium", "high"]) {
+      const h = harness({ advanceMs: 200 });
+      const FULL = "Partial head. And the full tail of the answer.";
+      h.state.doc = streamDoc("Partial head.");
+      h.state.stopVisible = true;
+      h.state.onPoll = (p) => {
+        if (p === 1) h.state.doc = noTargetDoc({ stop: true });
+        if (p === 3) h.state.doc = streamDoc("Partial head. And the full");
+        if (p === 4) h.state.doc = streamDoc(FULL);
+        if (p === 5) {
+          h.state.doc = streamDoc(FULL, { stop: false, done: true });
+          h.state.stopVisible = false;
+        }
+      };
+      const res = await h.drive({ prompt: PROMPT, isNewChat: false, thinking, stallMs: 5000 });
+      assert.equal(String(res), FULL, `thinking ${thinking}: brief target loss with stop visible must not truncate`);
+    }
+
+    // (д) Stop vanishes, returns after half the window, vanishes again — a new full
+    // window from the second disappearance (the first window is reset by Stop).
+    {
+      process.env.WEB_GEMINI_SESSION_CAP_MS = String(HIGH_CAP_MS);
+      const h = harness({ advanceMs: 100 });
+      h.state.doc = thinkingDoc({ stop: false });
+      h.state.stopVisible = false;
+      let secondGoneAt = null;
+      h.state.onPoll = (p) => {
+        if (p === 5) h.state.stopVisible = true; // half of the 1000ms window passed
+        if (p === 7) {
+          h.state.stopVisible = false;
+          secondGoneAt = h.state.now;
+        }
+      };
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 1000 }),
+        (err) => err.code === "WEB_GEMINI_STALLED"
+      );
+      const delta = h.state.now - secondGoneAt;
+      assert.ok(
+        delta >= 1000 && delta < 1100,
+        `second window must be a full stallMs from the second disappearance, got ${delta}ms`
+      );
+      process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+    }
+
+    // (е) Answer is only an image (no text) — completion, not stalled.
+    {
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = docOf([
+        uq(["r0"]),
+        createMockElement({
+          id: "r0",
+          tagName: "model-response",
+          preceding: ["q0"],
+          children: [
+            createMockElement({ id: "mc0", tagName: "message-content", innerText: "" }),
+            createMockElement({ id: "gi0", tagName: "generated-image" }),
+            createMockElement({ id: "fb0", tagName: "response-feedback" }),
+          ],
+        }),
+      ]);
+      h.state.stopVisible = false;
+      const res = await h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 1000 });
+      assert.equal(String(res), "", "image-only answer completes with empty text");
+      const span = h.state.now - h.state.firstStatusAt;
+      assert.ok(span < 1000, `image-only answer must complete before the stall window, got ${span}ms`);
+    }
+
+    // (е2) Answer is only a generated file — a link with an empty download=""
+    // attribute, no text, no "download" label, no file extension — completion by
+    // §4.2 (one hasFinishedContent predicate), the file is detected by
+    // collectGeneratedFiles, not stalled.
+    {
+      const fileDoc = () =>
+        docOf([
+          uq(["r0"]),
+          createMockElement({
+            id: "r0",
+            tagName: "model-response",
+            preceding: ["q0"],
+            children: [
+              createMockElement({
+                id: "fl0",
+                tagName: "a",
+                innerText: "report",
+                attributes: { href: "https://contribution.usercontent.google.com/file?id=abc", download: "" },
+              }),
+              createMockElement({ id: "fb0", tagName: "response-feedback" }),
+            ],
+          }),
+        ]);
+      const st = checkTurnStatus(fileDoc(), 0, PREFIX);
+      assert.equal(st.hasFinishedContent, true, 'download="" link must count as finished content');
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = fileDoc();
+      h.state.stopVisible = false;
+      const res = await h.drive({
+        prompt: PROMPT,
+        isNewChat: false,
+        thinking: "high",
+        stallMs: 2000,
+        requireFullDelivery: true,
+      });
+      assert.equal(String(res), "", "file-only answer completes with empty text");
+      assert.equal(res.hasGeneratedFile, true, "collectGeneratedFiles must detect the generated file");
+      assert.ok(h.state.fileScans >= 1, "collectGeneratedFiles scan must run");
+      const span = h.state.now - h.state.firstStatusAt;
+      assert.ok(span < 2000, `file-only answer must complete before the stall window, got ${span}ms`);
     }
   } finally {
     restoreAll();

@@ -1223,7 +1223,54 @@ function checkTurnStatus(doc, idx, promptPrefix) {
       target.querySelector(
         'generated-image, img.generated-image, message-content img, .image-container img[src*="googleusercontent"], .image-container img[src*="blob:"], .image-container img[src*="data:image"]'
       ) !== null;
-    hasFinishedContent = hasText || hasImg;
+    // PLUG-411 / PLUG-413: a generated file (file card / download button in the
+    // target) is finished content as well as text or image — one hasFinishedContent
+    // predicate feeds both the turn-completion check (§4.2) and the stall window
+    // (§2.3): an answer that is only a generated file must not open a stall window.
+    let hasGeneratedFile = false;
+    try {
+      const fileAnchors = target ? Array.from(target.querySelectorAll('a[href]')) : [];
+      for (const a of fileAnchors) {
+        const href = (a.getAttribute ? a.getAttribute('href') : '') || (a.href || '');
+        if (!href) continue;
+        let hostOk = false;
+        try {
+          const base = (typeof location !== 'undefined' && location.href) ? location.href : 'http://localhost';
+          const h = new URL(href, base).hostname.toLowerCase();
+          hostOk =
+            h === 'google.com' ||
+            h.endsWith('.google.com') ||
+            h === 'googleusercontent.com' ||
+            h.endsWith('.googleusercontent.com') ||
+            h === 'googleapis.com' ||
+            h.endsWith('.googleapis.com');
+        } catch {
+          hostOk = false;
+        }
+        // download="" (empty value) still marks a file link — same as collectGeneratedFiles.
+        const hasDl = a.hasAttribute ? a.hasAttribute('download') : Boolean(a.getAttribute && a.getAttribute('download') !== null);
+        const label = ((a.getAttribute ? a.getAttribute('aria-label') : '') || '') + ' ' + (a.innerText || '');
+        const fileExt = /\.(pdf|pptx?|xlsx?|docx?|csv|tsv|md|txt|zip|json|png|jpe?g|gif|svg|webp|mp3|wav|mp4|html?|ics|epub)(?:$|[?#])/i;
+        if (hostOk && (hasDl || /download|скачать|export|экспорт/i.test(label) || fileExt.test(href))) {
+          hasGeneratedFile = true;
+          break;
+        }
+      }
+      if (!hasGeneratedFile) {
+        const fileBtns = target ? Array.from(target.querySelectorAll('button, [role="button"]')) : [];
+        for (const b of fileBtns) {
+          const label = ((b.getAttribute ? b.getAttribute('aria-label') : '') || '') + ' ' + (b.innerText || '');
+          const hasDl = b.hasAttribute ? b.hasAttribute('download') : Boolean(b.getAttribute && b.getAttribute('download') !== null);
+          if (hasDl || /download|скачать|export|экспорт/i.test(label)) {
+            hasGeneratedFile = true;
+            break;
+          }
+        }
+      }
+    } catch {
+      hasGeneratedFile = false;
+    }
+    hasFinishedContent = hasText || hasImg || hasGeneratedFile;
 
     const actionSelector = [
       'response-feedback',
@@ -1868,6 +1915,20 @@ async function sendPrompt({
     lastThoughtText = '';
     let accordionExpanded = false;
     let lastOverlayCheck = 0;
+    const thinkingKey = String(thinking || '').trim().toLowerCase();
+    const isHighThinking = thinkingKey === 'high';
+    // PLUG-411 / PLUG-413: stall window for thinking: "high" — starts at the first
+    // poll without a stop button and without an answer, is not extended by progress
+    // signals (spinner / isGenerating / domSig), resets when the stop button
+    // reappears or finished content is captured, and is skipped while the stop
+    // button is visible (the turn then waits for the stop press, the session cap or
+    // a finished answer instead of declaring a stall).
+    let highWindowStart = null;
+    // PLUG-413: whether the last poll that found the target reported finished
+    // content (text / image / generated file, §4.2). Used after the target is lost:
+    // the answer counts as captured only from real content, never from raw
+    // pending-response chrome ("Searching the web…", "Show thinking…").
+    let lastHadFinishedContent = false;
 
     while (Date.now() - streamStartTime < SESSION_CAP_MS) {
       await throwIfCancelled();
@@ -1972,19 +2033,59 @@ async function sendPrompt({
       const isBusyOrThinking = Boolean(status?.isBusyOrThinking);
       const isGenerating = hasStopButton || isBusyOrThinking;
 
+      // PLUG-411 / PLUG-413: stall-window predicate for thinking: "high". While the
+      // stop button is visible the turn may not be stalled (author-driven); the
+      // window starts at the first poll without a stop button and without an answer
+      // and is not extended by spinner / isGenerating / domSig progress signals.
+      // PLUG-413: "answer" = hasFinishedContent (§4.2) or text captured from
+      // message-content. Raw pending-response text (src 'raw': "Searching the
+      // web…", "Show thinking…") is not an answer and does not reset the window.
+      // With the target found the answer is hasFinishedContent only (§2.3 п.3):
+      // stale captured text must not count once message-content has emptied.
+      const answered = () =>
+        Boolean(
+          status && status.targetFound
+            ? status.hasFinishedContent
+            : lastHadFinishedContent || (lastSrc === 'mc' && lastText && lastText.length > 0)
+        );
+      const highStalled = () => {
+        if (hasStopButton) {
+          highWindowStart = null;
+          return false;
+        }
+        if (answered()) {
+          highWindowStart = null;
+          return false;
+        }
+        if (highWindowStart === null) highWindowStart = Date.now();
+        return Date.now() - highWindowStart >= STALL_MS;
+      };
+
       if (!status || !status.targetFound) {
         stableStartTime = null;
         // Цель потеряна и захваченного текста нет — ждать до потолка сессии
         // бессмысленно: fail fast, как при застрявшей генерации.
         const lostWithoutContent = !isGenerating && !(lastText && lastText.length);
-        if ((isGenerating || lostWithoutContent) && Date.now() - lastProgressTime >= STALL_MS) {
+        const stalled = isHighThinking ? highStalled() : (isGenerating || lostWithoutContent) && Date.now() - lastProgressTime >= STALL_MS;
+        if (stalled) {
           await stopGeneration(page);
           const e = new Error(`generation stalled — no progress for ${Math.round(STALL_MS / 1000)}s`);
           e.code = 'WEB_GEMINI_STALLED';
           throw e;
         }
+        // §2.3 п.2 (thinking: high): target lost AFTER a captured answer and with
+        // no stop button — completion with the captured content, not a stall.
+        // With the stop button visible the generation is still running (a brief
+        // target loss during a DOM re-render) — keep polling, never truncate.
+        // low/medium keep the previous behaviour (keep polling until the target
+        // returns, a stall or the cap).
+        if (isHighThinking && !hasStopButton && answered()) {
+          break;
+        }
         continue;
       }
+
+      lastHadFinishedContent = Boolean(status.hasFinishedContent);
 
       let hadProgress = false;
       const currentText = status.currentText;
@@ -2038,7 +2139,8 @@ async function sendPrompt({
       // Стол — и в активной генерации, и в послегенерационном лимбе:
       // stop-кнопка ушла, но готового контента так и нет — не висеть до cap.
       const awaitingContent = !isGenerating && !effectiveStatus.hasFinishedContent;
-      if ((isGenerating || awaitingContent) && Date.now() - lastProgressTime >= STALL_MS) {
+      const stalled = isHighThinking ? highStalled() : (isGenerating || awaitingContent) && Date.now() - lastProgressTime >= STALL_MS;
+      if (stalled) {
         await stopGeneration(page);
         const e = new Error(`generation stalled — no progress for ${Math.round(STALL_MS / 1000)}s`);
         e.code = 'WEB_GEMINI_STALLED';
@@ -2187,14 +2289,15 @@ async function sendPrompt({
           }
           return null;
         }, { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }).catch(() => null);
-        if (domRespId) {
+        if (typeof domRespId === 'string' && /^(?:r_)?[0-9a-f]{16}$/i.test(domRespId)) {
           capturedResponseId = domRespId;
         }
       }
 
       if (!searchResult) {
         searchResult = { status: 'unbound', queries: [], sources: [], unknownRows: [] };
-        for (let retry = 0; retry < 3; retry++) {
+        if (typeof capturedResponseId === 'string' && /^(?:r_)?[0-9a-f]{16}$/i.test(capturedResponseId)) {
+          for (let retry = 0; retry < 3; retry++) {
           await throwIfCancelled();
           let rawHNvQHb = null;
           if (driverHooks?.fetchHNvQHb) {
@@ -2252,6 +2355,7 @@ async function sendPrompt({
           if (retry < 2 && page && typeof page.waitForTimeout === 'function') {
             await page.waitForTimeout(2000);
           }
+        }
         }
         driverLog('driver:search', {
           account: accountId || (backend && backend.id) || profile,
