@@ -34,7 +34,7 @@ related: docs/specs/live-call-contract.md §15.1, docs/specs/nav-icon-row.md
 Левая панель — нативный регион навигации (`[data-sidebar-navigation-item]`, туда же попадает «Задачи Pro»). Единственная поверхность SDK, дающая туда иконку плагина, — `app.slots.navPanel`:
 
 - Регистрация `navPanel`: `id:"call"`, `title:"Live Call"`, `icon` — глиф телефона плагина, `path:"call"`.
-- **Автозвонок только при клиентском переходе.** Компонент панели вызывает `callOrFocus()` при монтировании, но **только если app-бандл загружен давно** (отметка времени в `definePluginApp`; порог ~3 с). При свежей загрузке документа (F5 / восстановление вкладки на URL панели / перезагрузка из §3.4) автозвонка **нет** — иначе открытие микрофона и сессия Gemini происходили бы без жеста пользователя. StrictMode-двойной mount безвреден: `callOrFocus` идемпотентен при активном звонке (requestExpand).
+- **Автозвонок только при клиентском переходе.** Компонент панели вызывает `callOrFocus()` при монтировании, но **только если app-бандл загружен давно** (отметка времени на уровне модуля app-бандла — `APP_BUNDLE_LOADED_AT` в `src/ui/button-placement.ts`; порог ~3 с). При свежей загрузке документа (F5 / восстановление вкладки на URL панели / перезагрузка из §3.4) автозвонка **нет** — иначе открытие микрофона и сессия Gemini происходили бы без жеста пользователя. StrictMode-двойной mount безвреден: `callOrFocus` идемпотентен при активном звонке (requestExpand).
 - Тело панели — экран управления звонком (страница не тупик): статус «идёт звонок · mm:ss» / «звонка нет» и кнопки **«Позвонить»**, **«Развернуть»** (при активном свёрнутом звонке — разворачивает док, покрывает повторный клик по иконке без перемонтажа), **«Завершить»**. Оверлей звонка работает как обычно.
 
 ### 3.3. Оба включены / оба выключены
@@ -46,7 +46,7 @@ related: docs/specs/live-call-contract.md §15.1, docs/specs/nav-icon-row.md
 
 ## 4. Файлы
 - `plugins/bb-plugin-live-call/src/ui/button-placement.ts` — носитель механизма §2: ключи `bb_live_call_button_footer`/`bb_live_call_button_nav`, синхронные getter/setter, `readCallButtonPlacement()`, хук `useCallButtonPlacement()` со слушателем `storage`, `CALL_PANEL_PATH`, `AUTO_CALL_MIN_AGE_MS`, `APP_BUNDLE_LOADED_AT`.
-- `plugins/bb-plugin-live-call/app.tsx` — условные регистрации (footer action по `callButtonFooter`, navPanel по `callButtonNav`), компонент страницы панели, отметка загрузки бандла для §3.2.
+- `plugins/bb-plugin-live-call/app.tsx` — условные регистрации (footer action по `callButtonFooter`, navPanel по `callButtonNav`), компонент страницы панели.
 - `plugins/bb-plugin-live-call/src/ui/SettingsSection.tsx` — два тумблера + подсказка про перезагрузку; `app.css` — стили страницы.
 - `plugins/bb-plugin-live-call/package.json` (+ `package-lock.json`) — devDependencies `jsdom` и `@types/jsdom` под jsdom-окружение эффект-тестов хука.
 - Тесты в `plugins/bb-plugin-live-call/tests/*.test.ts` (vitest): выбор регистраций по каждой из четырёх комбинаций тумблеров (моки **обоих** API — `app.experimental_sidebarFooter.register` и `app.slots.navPanel`), дефолты без ключей (footer вкл, nav выкл), автозвонок панели только после порога загрузки, экран управления («Позвонить»/«Развернуть»/«Завершить»).
