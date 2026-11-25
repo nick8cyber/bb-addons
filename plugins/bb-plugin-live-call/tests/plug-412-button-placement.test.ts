@@ -6,22 +6,29 @@
  * (`callButtonNav`, по умолчанию выкл) в localStorage. Все четыре комбинации,
  * дефолты без ключей, автозвонок панели только после порога загрузки бандла,
  * экран управления («Позвонить» / «Развернуть» / «Завершить»).
+ *
+ * @vitest-environment jsdom
  */
 import React from "react";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server.browser";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import appDef from "../app.js";
 import {
+  APP_BUNDLE_LOADED_AT,
   AUTO_CALL_MIN_AGE_MS,
   CALL_BUTTON_FOOTER_KEY,
   CALL_BUTTON_NAV_KEY,
   CALL_PANEL_PATH,
   getCallButtonFooter,
   getCallButtonNav,
+  readCallButtonPlacement,
   setCallButtonFooter,
   setCallButtonNav,
   shouldAutoCallOnMount,
+  useCallButtonPlacement,
 } from "../src/ui/button-placement.js";
 import { callEngine } from "../src/ui/engine.js";
 import { PlacementToggles } from "../src/ui/SettingsSection.js";
@@ -181,39 +188,106 @@ describe("PLUG-412 · место кнопки звонка (§2–3 спеки l
 });
 
 describe("PLUG-412 · экран управления на странице панели (§3.2)", () => {
+  const mounted: Array<() => void> = [];
+
   beforeEach(() => {
     (globalThis as any).localStorage = memories();
+    // React 19: act() из react знает про это флаг; без него эффекты не чистятся и он предупреждает.
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   });
 
   afterEach(() => {
+    for (const unmount of mounted.splice(0)) unmount();
+    vi.restoreAllMocks();
     delete (globalThis as any).localStorage;
+    document.body.innerHTML = "";
   });
 
-  it("рендерит статус и кнопки «Позвонить»/«Развернуть»/«Завершить»", () => {
-    const { app } = makeApp();
+  /** Компонент страницы панели из последней регистрации navPanel (nav надо включить до setup). */
+  function panelComponent(): React.ComponentType<{ subPath: string }> {
+    setCallButtonFooter(false);
     setCallButtonNav(true);
+    const { app, nav } = makeApp();
     appDef.setup(app);
-    const Page = (app.slots.navPanel as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0].component as React.ComponentType<{ subPath: string }>;
-    expect(Page).toBeTypeOf("function");
+    expect(nav).toHaveLength(1);
+    return nav[0]!.component;
+  }
 
-    const html = renderToString(React.createElement(Page, { subPath: "" }));
+  /** Заглушка снимка движка: эффекты исполняются в jsdom, сети и медиа нет. */
+  function stubView(patch: Partial<ReturnType<typeof callEngine.getSnapshot>>) {
+    const view = { ...callEngine.getSnapshot(), ...patch };
+    return vi.spyOn(callEngine, "getSnapshot").mockImplementation(() => view);
+  }
+
+  /** Монтировать страницу панели настоящим React-корнем и прогнать эффекты. */
+  function mountPanel(): HTMLElement {
+    const Page = panelComponent();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root: Root = createRoot(container);
+    act(() => root.render(React.createElement(Page, { subPath: "" })));
+    mounted.push(() => {
+      act(() => root.unmount());
+      container.remove();
+    });
+    return container;
+  }
+
+  it("рендерит статус и кнопки «Позвонить»/«Развернуть»/«Завершить»", () => {
+    const snap = stubView({ phase: "idle", startedAt: null, endedAt: null });
+    const container = mountPanel();
+    const html = container.innerHTML;
     expect(html).toContain("lc-panel__status");
     expect(html).toContain("звонка нет");
     expect(html).toContain("Позвонить");
     expect(html).toContain("Развернуть");
     expect(html).toContain("Завершить");
+    snap.mockRestore();
   });
 
-  it("без активного звонка «Развернуть»/«Завершить» неактивны, звонок не начинается сам", () => {
+  it("свежая загрузка документа: автозвонок при монтировании не начинается (§3.2)", () => {
+    // Бандл только загружен: прошло меньше порога — эффект не звонит.
+    vi.spyOn(Date, "now").mockReturnValue(APP_BUNDLE_LOADED_AT + 1000);
+    const startSpy = vi.spyOn(callEngine, "start").mockReturnValue(undefined);
+    const snap = stubView({ phase: "idle", startedAt: null, endedAt: null });
+
+    const container = mountPanel();
+
+    expect(startSpy).not.toHaveBeenCalled();
     expect(callEngine.isActive()).toBe(false);
-    setCallButtonNav(true);
-    const { app } = makeApp();
-    setCallButtonNav(true);
-    appDef.setup(app);
-    const Page = (app.slots.navPanel as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0].component as React.ComponentType<{ subPath: string }>;
-    const html = renderToString(React.createElement(Page, { subPath: "" }));
-    expect(html.match(/disabled/g)?.length ?? 0).toBe(2);
-    expect(callEngine.isActive()).toBe(false);
+    // «Развернуть» и «Завершить» неактивны, «Позвонить» активна.
+    expect(container.querySelectorAll("button:disabled")).toHaveLength(2);
+    startSpy.mockRestore();
+    snap.mockRestore();
+  });
+
+  it("клиентский переход: после порога загрузки бандла эффект звонит (§3.2)", () => {
+    vi.spyOn(Date, "now").mockReturnValue(APP_BUNDLE_LOADED_AT + AUTO_CALL_MIN_AGE_MS + 1000);
+    const startSpy = vi.spyOn(callEngine, "start").mockReturnValue(undefined);
+    const snap = stubView({ phase: "idle", startedAt: null, endedAt: null });
+
+    mountPanel();
+
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    startSpy.mockRestore();
+    snap.mockRestore();
+  });
+
+  it("соединение: статус «идёт звонок · соединение», все кнопки активны", () => {
+    const snap = stubView({ phase: "connecting", startedAt: null, endedAt: null });
+    const container = mountPanel();
+    expect(container.textContent).toContain("идёт звонок · соединение");
+    expect(container.querySelectorAll("button:disabled")).toHaveLength(0);
+    snap.mockRestore();
+  });
+
+  it("идёт звонок: таймер от view.startedAt (mm:ss), кнопки активны", () => {
+    const startedAt = Date.now() - 95_000;
+    const snap = stubView({ phase: "live", startedAt, endedAt: null });
+    const container = mountPanel();
+    expect(container.textContent).toContain("идёт звонок · 01:35");
+    expect(container.querySelectorAll("button:disabled")).toHaveLength(0);
+    snap.mockRestore();
   });
 });
 
@@ -243,6 +317,49 @@ describe("PLUG-412 · тумблеры в разделе настроек (§2�
     );
     expect(html).toContain("Кнопок не будет");
     expect(html).toContain("⇧ L");
+  });
+});
+
+describe("PLUG-412 · хук useCallButtonPlacement (§2)", () => {
+  let root: Root | null = null;
+
+  beforeEach(() => {
+    (globalThis as any).localStorage = memories();
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  afterEach(() => {
+    if (root) act(() => root!.unmount());
+    root = null;
+    vi.restoreAllMocks();
+    delete (globalThis as any).localStorage;
+    document.body.innerHTML = "";
+  });
+
+  function Harness({ onChange }: { onChange: (p: ReturnType<typeof readCallButtonPlacement>) => void }) {
+    const { placement } = useCallButtonPlacement();
+    onChange(placement);
+    return null;
+  }
+
+  it("отдаёт положение из localStorage и перечитывает его по событию storage другой вкладки", () => {
+    setCallButtonFooter(true);
+    setCallButtonNav(false);
+
+    const seen: Array<{ footer: boolean; nav: boolean }> = [];
+    const container = document.createElement("div");
+    root = createRoot(container);
+    act(() => root!.render(React.createElement(Harness, { onChange: (p) => seen.push(p) })));
+
+    expect(seen.at(-1)).toEqual({ footer: true, nav: false });
+
+    // Другая вкладка поменяла nav — приходит storage:bb_live_call_button_nav.
+    act(() => {
+      setCallButtonNav(true);
+      dispatchEvent(new StorageEvent("storage", { key: CALL_BUTTON_NAV_KEY }));
+    });
+
+    expect(seen.at(-1)).toEqual({ footer: true, nav: true });
   });
 });
 

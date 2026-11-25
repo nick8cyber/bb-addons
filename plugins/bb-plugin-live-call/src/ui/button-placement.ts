@@ -10,6 +10,7 @@
  * Невалидное значение или исключение доступа к localStorage → дефолт
  * (footer вкл — текущий вид, nav выкл — новая поверхность по умолчанию молчит).
  */
+import { useCallback, useEffect, useState } from "react";
 
 export const CALL_BUTTON_FOOTER_KEY = "bb_live_call_button_footer";
 export const CALL_BUTTON_NAV_KEY = "bb_live_call_button_nav";
@@ -50,6 +51,57 @@ export function getCallButtonNav(): boolean {
 
 export function setCallButtonNav(value: boolean): void {
   writeFlag(CALL_BUTTON_NAV_KEY, value);
+}
+
+export type CallButtonPlacement = { footer: boolean; nav: boolean };
+
+/** Текущее положение обоих тумблеров разом — как состояние хука. */
+export function readCallButtonPlacement(): CallButtonPlacement {
+  return { footer: getCallButtonFooter(), nav: getCallButtonNav() };
+}
+
+export const sameCallButtonPlacement = (a: CallButtonPlacement, b: CallButtonPlacement): boolean =>
+  a.footer === b.footer && a.nav === b.nav;
+
+/**
+ * §2: хук по образцу `useHideClaude()` в usage-pro — синхронные setter с записью
+ * в localStorage и подпиской на `storage`, чтобы смена в другой вкладке этого
+ * браузера сразу отражалась в контролах (событие `storage` приходит только
+ * другим вкладкам, поэтому локальная запись обновляет state сама).
+ */
+export function useCallButtonPlacement(): {
+  placement: CallButtonPlacement;
+  setFooter: (value: boolean) => void;
+  setNav: (value: boolean) => void;
+} {
+  const [placement, setPlacement] = useState<CallButtonPlacement>(readCallButtonPlacement);
+
+  const setFooter = useCallback((value: boolean) => {
+    setCallButtonFooter(value);
+    setPlacement((prev) => (prev.footer === value ? prev : { ...prev, footer: value }));
+  }, []);
+
+  const setNav = useCallback((value: boolean) => {
+    setCallButtonNav(value);
+    setPlacement((prev) => (prev.nav === value ? prev : { ...prev, nav: value }));
+  }, []);
+
+  useEffect(() => {
+    if (typeof globalThis.addEventListener !== "function") return;
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== CALL_BUTTON_FOOTER_KEY && event.key !== CALL_BUTTON_NAV_KEY) return;
+      setPlacement((prev) => {
+        const next = readCallButtonPlacement();
+        return sameCallButtonPlacement(prev, next) ? prev : next;
+      });
+    };
+    globalThis.addEventListener("storage", onStorage as EventListener);
+    return () => {
+      globalThis.removeEventListener("storage", onStorage as EventListener);
+    };
+  }, []);
+
+  return { placement, setFooter, setNav };
 }
 
 /**

@@ -343,11 +343,6 @@ export class CallEngine {
     this.patch({ expandSignal: this.view.expandSignal + 1 });
   }
 
-  /** §3.2 спеки места кнопки: сколько идёт текущий звонок (страница панели слева). */
-  getLiveSince(): number {
-    return this.liveSince;
-  }
-
   start(opts?: CallMode | { mode?: CallMode; threadId?: string; projectId?: string; messageSeq?: number; selectedText?: string }) {
     if (this.isActive()) {
       this.requestExpand();

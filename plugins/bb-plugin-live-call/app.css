@@ -828,6 +828,11 @@
 }
 
 /* ── место кнопки звонка: футер / левая панель (§2–3 спеки placement) ── */
+.lc-placement {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
 .lc-toggle {
   display: flex;
   align-items: center;

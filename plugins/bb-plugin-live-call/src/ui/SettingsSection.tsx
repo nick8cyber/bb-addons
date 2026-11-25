@@ -6,10 +6,9 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
-  getCallButtonFooter,
-  getCallButtonNav,
   setCallButtonFooter,
   setCallButtonNav,
+  useCallButtonPlacement,
 } from "./button-placement.js";
 import { callEngine } from "./engine.js";
 import { Icon } from "./icons.js";
@@ -37,8 +36,13 @@ export function SettingsSection() {
   const [busyProjectId, setBusyProjectId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [probe, setProbe] = useState<{ running: boolean; result?: ProbeResult; error?: string }>({ running: false });
-  const [footerButton, setFooterButton] = useState(getCallButtonFooter);
-  const [navButton, setNavButton] = useState(getCallButtonNav);
+  // §2: хук с подпиской на storage; setter'ы принимают boolean прямо, без
+  // замыкания на текущее значение и без расхождения соседних тумблеров.
+  const {
+    placement: { footer: footerButton, nav: navButton },
+    setFooter: setFooterButton,
+    setNav: setNavButton,
+  } = useCallButtonPlacement();
 
   const refresh = useCallback(async () => {
     try {
@@ -127,18 +131,14 @@ export function SettingsSection() {
             <span className="lc-sub">нет</span>
           )}
         </Row>
-        <PlacementToggles
-          footer={footerButton}
-          nav={navButton}
-          onFooter={() => {
-            setCallButtonFooter(!footerButton);
-            setFooterButton(!footerButton);
-          }}
-          onNav={() => {
-            setCallButtonNav(!navButton);
-            setNavButton(!navButton);
-          }}
-        />
+        <Row label="Кнопка звонка">
+          <PlacementToggles
+            footer={footerButton}
+            nav={navButton}
+            onFooter={setFooterButton}
+            onNav={setNavButton}
+          />
+        </Row>
         <Row label="Горячие клавиши">
           <span className="lc-sub">
             <kbd>⌘/Ctrl ⇧ L</kbd> позвонить или завершить · <kbd>⌘/Ctrl ⇧ K</kbd> сменить режим. Переназначить — в палитре команд.
@@ -187,8 +187,8 @@ export function PlacementToggles({
 }: {
   footer: boolean;
   nav: boolean;
-  onFooter: () => void;
-  onNav: () => void;
+  onFooter: (value: boolean) => void;
+  onNav: (value: boolean) => void;
 }) {
   return (
     <div className="lc-placement" data-testid="call-button-placement">
@@ -224,12 +224,12 @@ function Toggle({
   id: string;
   label: string;
   checked: boolean;
-  onChange: () => void;
+  onChange: (value: boolean) => void;
   hint: string;
 }) {
   return (
     <label className="lc-toggle" htmlFor={id} title={hint}>
-      <input id={id} type="checkbox" role="switch" checked={checked} onChange={onChange} />
+      <input id={id} type="checkbox" role="switch" checked={checked} onChange={(e) => onChange(e.target.checked)} />
       <span>{label}</span>
     </label>
   );

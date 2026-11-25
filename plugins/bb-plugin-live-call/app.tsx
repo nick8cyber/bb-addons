@@ -85,11 +85,14 @@ function CallPanelPage() {
     return () => clearInterval(t);
   }, [view.phase]);
 
+  // Таймер — по view.startedAt (момент начала звонка), как в CallOverlay: он не
+  // сбрасывается при переподключении WebSocket. `liveSince` в движке — служебная
+  // отметка последнего ready и на каждый resent пишется заново (engine ~664).
   const status =
     view.phase === "connecting"
       ? "идёт звонок · соединение"
       : view.phase === "live"
-        ? `идёт звонок · ${formatElapsed(Date.now() - callEngine.getLiveSince())}`
+        ? `идёт звонок · ${view.startedAt ? formatElapsed(Date.now() - view.startedAt) : "00:00"}`
         : "звонка нет";
 
   return (
