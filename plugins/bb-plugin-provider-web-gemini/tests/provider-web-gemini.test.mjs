@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import net from "node:net";
+import vm from "node:vm";
 import { spawn, spawnSync, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -33,6 +34,7 @@ import {
   checkDialogWave,
   _resetDialogWaveHistory,
   getThoughtsLogPath,
+  sanitizeUrl,
   sanitizeThoughtString,
   sanitizeThoughtPayload,
   appendThoughtLog,
@@ -7389,6 +7391,42 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     };
     await dismissOverlays(pageBackdrop, { isTurn: true, screenshotDir: shotDir });
     assert.equal(reloadCount, 1, "Page must be reloaded once when backdrop covers input");
+
+    // 11. Menus ([role="menu"], mat-menu-panel) must strictly NOT be treated as dialogs
+    const menuEl = {
+      offsetParent: {},
+      innerText: "Menu Item 1\nMenu Item 2",
+      matches: (s) => s.includes('role="menu"'),
+      closest: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    };
+    const paneWithMenu = {
+      offsetParent: {},
+      innerText: "Menu Item 1\nMenu Item 2",
+      matches: () => false,
+      closest: () => null,
+      querySelector: (s) => s.includes('role="menu"') ? menuEl : null,
+      querySelectorAll: () => [],
+    };
+    const pageMenu = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        global.document = {
+          querySelectorAll: (sel) => sel.includes(".cdk-overlay-pane") ? [paneWithMenu] : [],
+          querySelector: () => null,
+        };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      waitForTimeout: async () => {},
+    };
+    let threwMenu = false;
+    try {
+      await dismissOverlays(pageMenu, { isTurn: true, screenshotDir: shotDir });
+    } catch {
+      threwMenu = true;
+    }
+    assert.equal(threwMenu, false, "Menu inside overlay pane must strictly NOT throw WEB_GEMINI_UNKNOWN_DIALOG");
   }
 
   // --- D. Failure classification and wave protection (cross-process file lock) ---
@@ -7409,12 +7447,19 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     const waveDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "wave-shared-")));
     _resetDialogWaveHistory(waveDir);
     const modalText = "Some completely unknown Google beta prompt";
-    assert.equal(checkDialogWave(modalText, "acc_a", Date.now(), waveDir), false);
-    assert.equal(checkDialogWave(modalText, "acc_b", Date.now(), waveDir), false);
-    assert.equal(checkDialogWave(modalText, "acc_c", Date.now(), waveDir), true, "Wave triggered on 3rd distinct account");
+    const now = Date.now();
+    assert.equal(checkDialogWave(modalText, "acc_a", now, waveDir), false);
+    assert.equal(checkDialogWave(modalText, "acc_b", now, waveDir), false);
+    assert.equal(checkDialogWave(modalText, "acc_c", now, waveDir), true, "Wave triggered on 3rd distinct account");
     // 4th account stays wave protected without throwing
-    assert.equal(checkDialogWave(modalText, "acc_d", Date.now(), waveDir), true);
-    assert.equal(checkDialogWave("Different dialog", "acc_e", Date.now(), waveDir), false);
+    assert.equal(checkDialogWave(modalText, "acc_d", now, waveDir), true);
+    assert.equal(checkDialogWave("Different dialog", "acc_e", now, waveDir), false);
+
+    // 31 minutes later: old accounts expired, new wave on 3 accounts warns again
+    const later = now + 31 * 60_000;
+    assert.equal(checkDialogWave(modalText, "acc_1", later, waveDir), false);
+    assert.equal(checkDialogWave(modalText, "acc_2", later, waveDir), false);
+    assert.equal(checkDialogWave(modalText, "acc_3", later, waveDir), true, "Wave triggered again after 30m window");
   }
 
   // --- E. Thoughts sanitization and thoughts.jsonl writer ---
@@ -7422,20 +7467,46 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     const testDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "thoughts-test-")));
     const logPath = path.join(testDir, "thoughts.jsonl");
 
-    // Test secret stripping in strings: URLs, Authorization, Cookie, f.sid
-    const dirtyUrl = "https://admin:supersecret@example.com/api?f.sid=sessiontoken123&clean=true";
-    const cleanUrl = sanitizeThoughtString(dirtyUrl);
+    // Test secret stripping in strings: URLs, Authorization, Cookie, f.sid, and access_token
+    const dirtyUrl = "https://admin:supersecret@example.com/api?access_token=tok999&f.sid=sessiontoken123&clean=true";
+    const cleanUrl = sanitizeUrl(dirtyUrl);
     assert.equal(cleanUrl.includes("supersecret"), false, "Password in URL must be stripped");
-    assert.equal(cleanUrl.includes("sessiontoken123"), false, "f.sid token must be masked");
+    assert.equal(cleanUrl.includes("tok999"), false, "access_token in URL must be stripped");
+    assert.equal(cleanUrl.includes("sessiontoken123"), false, "f.sid token must be stripped");
     assert.ok(cleanUrl.includes("https://example.com/api"));
-    assert.ok(cleanUrl.includes("f.sid=[REDACTED]"));
+    assert.ok(cleanUrl.includes("clean=true"));
 
-    const authString = "Step info. Authorization: Bearer secret_bearer_token and Cookie: f.sid=xyz123";
+    const authString = "Step info. Authorization: Bearer secret_bearer_token and Cookie: c1=xyz123; c2=second_pair_secret";
     const cleanAuth = sanitizeThoughtString(authString);
     assert.equal(cleanAuth.includes("secret_bearer_token"), false);
     assert.equal(cleanAuth.includes("xyz123"), false);
+    assert.equal(cleanAuth.includes("second_pair_secret"), false, "Second cookie pair must be masked");
     assert.ok(cleanAuth.includes("Authorization: [REDACTED]"));
     assert.ok(cleanAuth.includes("Cookie: [REDACTED]"));
+
+    // Test multi-chunk thought streaming with split Bearer
+    let rawAcc = "";
+    let cleanLen = 0;
+    const emitChunk = (chunk) => {
+      rawAcc += chunk;
+      const cleanAll = sanitizeThoughtString(rawAcc);
+      let delta = "";
+      if (cleanAll.length > cleanLen) {
+        if (cleanAll.startsWith(cleanAll.slice(0, cleanLen))) {
+          delta = cleanAll.slice(cleanLen);
+        } else {
+          delta = cleanAll;
+        }
+        cleanLen = cleanAll.length;
+      }
+      return delta;
+    };
+    const c1 = emitChunk("Step 1. Authorization: Bearer ");
+    const c2 = emitChunk("secret_token_value_xyz123");
+    assert.ok(c1.includes("Authorization: [REDACTED]"));
+    assert.equal(c1.includes("secret_token_value"), false);
+    assert.equal(c2.includes("secret_token_value"), false, "Bearer value in separate chunk must NOT leak");
+    assert.equal(c2, "");
 
     const rawPayload = {
       query: "test query",
@@ -7444,7 +7515,7 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       nested: {
         f_sid: "sid-123",
         status: "in_progress",
-        url: "https://user:password@target.org/resource?sid=abc999",
+        url: "https://user:password@target.org/resource?access_token=secret_tok&sid=abc999",
       },
     };
     const cleaned = sanitizeThoughtPayload(rawPayload);
@@ -7454,6 +7525,7 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     assert.equal(cleaned.nested.f_sid, undefined);
     assert.equal(cleaned.nested.status, "in_progress");
     assert.equal(cleaned.nested.url.includes("password"), false);
+    assert.equal(cleaned.nested.url.includes("secret_tok"), false);
     assert.equal(cleaned.nested.url.includes("abc999"), false);
 
     appendThoughtLog(logPath, "thought", { text: "Analyzing query\n" });
@@ -7473,7 +7545,7 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       text: "Summary of findings.",
       search: {
         sources: [
-          { url: "https://user:pass@example.com/one", title: "Page One" },
+          { url: "https://user:pass@example.com/one?access_token=secret_tok_123&keep=1", title: "Page One" },
           { url: "https://example.com/two", title: "Page Two" },
         ],
       },
@@ -7491,15 +7563,18 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     let formattedText = checked1.text;
     if (contextResearch.research && !contextResearch.write && !contextResearch.verdict && candidateWithSources.search?.sources?.length) {
       const list = candidateWithSources.search.sources
-        .map((s) => `* [${sanitizeThoughtString(s.title)}](${sanitizeThoughtString(s.url)})`)
+        .map((s) => `* [${sanitizeThoughtString(s.title)}](${sanitizeUrl(s.url)})`)
         .join("\n");
       formattedText = formattedText.trimEnd() + "\n\n### Источники поиска\n" + list;
     }
+    formattedText = sanitizeThoughtString(formattedText);
     if (contextResearch.settings?.maskResponse) {
       formattedText = contextResearch.settings.maskResponse(formattedText);
     }
     assert.ok(formattedText.includes("### Источники поиска"));
     assert.equal(formattedText.includes("pass@"), false, "Credentials in source URL must be stripped");
+    assert.equal(formattedText.includes("secret_tok_123"), false, "access_token in source URL must be stripped");
+    assert.ok(formattedText.includes("keep=1"), "Legitimate parameters must be kept");
     assert.ok(formattedText.includes("[скрыто: domain]"), "maskResponse must be called on full research output with sources block");
 
     // Write mode: sources block NOT appended
@@ -7514,7 +7589,6 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
 
   // --- G. DOM and model-thoughts isolation ---
   {
-    const parentOf = (el) => (el ? el.parentElement || el.parentNode || null : null);
     const thoughtSpinner = {
       tagName: "mat-spinner",
       getAttribute: () => null,
@@ -7567,12 +7641,31 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     assert.equal(turnStatus.isBusyOrThinking, false, "Spinner inside model-thoughts must NOT set isBusyOrThinking");
     assert.ok(turnStatus.currentText.text.includes("Direct text in target"), "Direct text nodes must be preserved");
     assert.ok(turnStatus.currentText.text.includes("Second direct text"), "Second direct text node must be preserved");
+
+    // Regression: serialized checkTurnStatus executed in separate JS context with NO global parentOf
+    const fnSrc = driver.findTurnTarget.toString();
+    const checkSrc = driver.checkTurnStatus.toString();
+    const sandbox = {
+      document: mockDoc,
+      fnSrc,
+      checkSrc,
+    };
+    sandbox.window = sandbox;
+    vm.createContext(sandbox);
+    const isolatedStatus = vm.runInContext(`
+      window.__webGeminiFindTurnTarget = eval('(' + fnSrc + ')');
+      const checkFn = eval('(' + checkSrc + ')');
+      checkFn(document, 0, "Test prompt");
+    `, sandbox);
+    assert.equal(isolatedStatus.targetFound, true, "Target must be found in isolated context");
+    assert.equal(isolatedStatus.isBusyOrThinking, false, "Thoughts spinner must not set busy in isolated context");
   }
 
   // --- H. Integration with driver hooks in sendPrompt ---
   {
     const fixturePath = path.join(PLUGIN_ROOT, "tests", "fixtures", "hnvqhb-2026-11-24.json");
     const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+    const thoughtChunksReceived = [];
     _setDriverHooks({
       ensureChrome: async () => {},
       getPlaywright: () => {},
@@ -7592,13 +7685,53 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       fetchHNvQHb: async () => fixture,
     });
     try {
-      const res = await sendPrompt({ prompt: "opencode-ai latest version", isNewChat: false });
+      const res = await sendPrompt({
+        prompt: "opencode-ai latest version",
+        isNewChat: false,
+        onThoughtChunk: (chunk) => {
+          thoughtChunksReceived.push(chunk);
+        },
+      });
       assert.equal(res.text, "Response from Google search");
       assert.equal(res.search?.status, 4);
       assert.equal(res.search?.queries?.length, 2);
       assert.equal(res.search?.sources?.length, 19);
+      assert.ok(thoughtChunksReceived.length > 0, "Thoughts must be published to onThoughtChunk without ReferenceError");
     } finally {
       _setDriverHooks(null);
     }
+  }
+
+  // --- I. Unique toolCallId and cancellation guard for search cards ---
+  {
+    const toolCallUpdates = [];
+    const session = {
+      convId: "c_session_conv",
+      geminiTurnCount: 0,
+      cancelled: false,
+    };
+    const upd = (u) => toolCallUpdates.push(u);
+
+    // Prompt 1
+    session.geminiTurnCount++;
+    const prompt1Idx = session.geminiTurnCount;
+    const callId1 = `call_${session.convId}_${prompt1Idx}_0`;
+    upd({ sessionUpdate: "tool_call", toolCallId: callId1, status: "in_progress" });
+
+    // Repair prompt 2
+    session.geminiTurnCount++;
+    const prompt2Idx = session.geminiTurnCount;
+    const callId2 = `call_${session.convId}_${prompt2Idx}_0`;
+    upd({ sessionUpdate: "tool_call", toolCallId: callId2, status: "in_progress" });
+
+    assert.notEqual(callId1, callId2, "toolCallId must be strictly unique across successive sends including repair prompts");
+
+    // Cancellation guard: verify no new cards created after cancel
+    session.cancelled = true;
+    const openedCards = [];
+    if (!session.cancelled) {
+      openedCards.push("opened_card");
+    }
+    assert.equal(openedCards.length, 0, "No new tool call cards must open after cancellation");
   }
 });

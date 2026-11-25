@@ -788,14 +788,20 @@ export function checkDialogWave(dialogText, accountId, now = Date.now(), stateDi
     state.entries = state.entries.filter((e) => now - e.ts <= windowMs);
     state.entries.push({ text120, accountId, ts: now });
 
+    // Warned entries expire with the 30-minute window so subsequent waves trigger driver:dialog-wave again
+    state.warned = (state.warned || [])
+      .map((w) => (typeof w === "string" ? { text120: w, ts: 0 } : w))
+      .filter((w) => w && typeof w.text120 === "string" && now - w.ts <= windowMs);
+
     const accounts = new Set(
       state.entries
         .filter((e) => e.text120 === text120 && e.accountId)
         .map((e) => e.accountId)
     );
     const isWave = accounts.size >= 3;
-    if (isWave && !state.warned.includes(text120)) {
-      state.warned.push(text120);
+    const hasWarned = state.warned.some((w) => w.text120 === text120);
+    if (isWave && !hasWarned) {
+      state.warned.push({ text120, ts: now });
       slog("driver:dialog-wave", { text120, accountCount: accounts.size, accounts: Array.from(accounts) });
       console.warn(`[web-gemini] Dialog wave detected across ${accounts.size} accounts for: ${text120}`);
     }
@@ -824,19 +830,47 @@ export function getThoughtsLogPath(stateDir, sessionId, tj = null) {
   return join(stateDir, "sessions", sessionId, "thoughts.jsonl");
 }
 
+export function sanitizeUrl(rawUrl) {
+  if (typeof rawUrl !== "string") return rawUrl;
+  let s = rawUrl.trim();
+  try {
+    const parsed = new URL(s);
+    parsed.username = "";
+    parsed.password = "";
+    const sensitiveParamRegex = /^(?:access_token|refresh_token|id_token|auth_token|token|api_key|apikey|secret|password|passwd|bearer|sid|f\.sid|f_sid|session_id|sessionid|cookie|client_secret)$/i;
+    const toDelete = [];
+    for (const [k] of parsed.searchParams.entries()) {
+      if (sensitiveParamRegex.test(k) || /(?:token|secret|password|auth|cookie|passwd)/i.test(k)) {
+        toDelete.push(k);
+      }
+    }
+    for (const k of toDelete) {
+      parsed.searchParams.delete(k);
+    }
+    s = parsed.toString();
+  } catch {
+    s = s.replace(/(\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@]+@/g, "$1");
+    s = s.replace(/(^|[\s?&;])(access_token|refresh_token|id_token|auth_token|token|api_key|apikey|secret|password|passwd|bearer|sid|f\.sid|f_sid|session_id|sessionid|cookie|client_secret)=[^&\s#;,]*/gi, "$1$2=[REDACTED]");
+  }
+  return s;
+}
+
 export function sanitizeThoughtString(str) {
   if (typeof str !== "string") return str;
   let val = str;
   // 1. Strip URL credentials: https://user:pass@host -> https://host
   val = val.replace(/(\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@]+@/g, "$1");
-  // 2. Mask Authorization headers and Bearer tokens
-  val = val.replace(/\b(?:authorization\s*:\s*)(?:bearer|basic)\s+[^\s,;]+/gi, "Authorization: [REDACTED]");
-  val = val.replace(/\b(?:authorization\s*:\s*)[^\s,;]+/gi, "Authorization: [REDACTED]");
-  val = val.replace(/\bbearer\s+[A-Za-z0-9_\-\.~+/]{8,}=*/gi, "Bearer [REDACTED]");
-  // 3. Mask Cookie headers
-  val = val.replace(/\bcookie\s*:\s*[^\s,;]+/gi, "Cookie: [REDACTED]");
-  // 4. Mask sensitive parameters in query strings or assignments
-  val = val.replace(/(^|[\s?&;])(f\.sid|f_sid|sid|cookie|auth_token|token|password)=[^&\s#;,]*/gi, "$1$2=[REDACTED]");
+  // 2. Structural URL sanitization for URLs found in text
+  val = val.replace(/https?:\/\/[^\s<>"'()]+/g, (u) => sanitizeUrl(u));
+  // 3. Mask Authorization headers and Bearer tokens (with or without token value)
+  val = val.replace(/\b(?:authorization\s*:\s*)(?:bearer|basic)(\s+[A-Za-z0-9_\-\.~+/=]+|\s*)/gi, "Authorization: [REDACTED]");
+  val = val.replace(/\b(?:authorization\s*:\s*)\S+/gi, "Authorization: [REDACTED]");
+  val = val.replace(/\bbearer(\s+[A-Za-z0-9_\-\.~+/=]{4,}|\s*)/gi, "Bearer [REDACTED]");
+  val = val.replace(/\bbearer\s*[:=]\s*\S+/gi, "Bearer: [REDACTED]");
+  // 4. Mask Cookie headers (entire line / all pairs, including second and further pairs)
+  val = val.replace(/\b(?:set-cookie|cookie)\s*:\s*[^\r\n]+/gi, "Cookie: [REDACTED]");
+  // 5. Mask sensitive parameters in query strings or assignments
+  val = val.replace(/(^|[\s?&;])(access_token|refresh_token|id_token|auth_token|token|api_key|apikey|secret|password|passwd|bearer|sid|f\.sid|f_sid|session_id|sessionid|cookie|client_secret)=[^&\s#;,]*/gi, "$1$2=[REDACTED]");
   return val;
 }
 
@@ -847,12 +881,16 @@ export function sanitizeThoughtPayload(payload) {
   if (!payload || typeof payload !== "object") return payload;
   const sanitized = Array.isArray(payload) ? [] : {};
   for (const [k, v] of Object.entries(payload)) {
-    if (/^(?:cookie|token|auth|authorization|sid|f\.sid|f_sid|password|secret|bearer)$/i.test(k) ||
-        /(?:cookie|token|auth|authorization|password|secret)/i.test(k)) {
+    if (/^(?:cookie|token|auth|authorization|sid|f\.sid|f_sid|password|secret|bearer|access_token|refresh_token|apikey|api_key)$/i.test(k) ||
+        /(?:cookie|token|auth|authorization|password|secret|passwd)/i.test(k)) {
       continue;
     }
     if (typeof v === "string") {
-      sanitized[k] = sanitizeThoughtString(v);
+      if (k === "url" || k === "uri") {
+        sanitized[k] = sanitizeUrl(v);
+      } else {
+        sanitized[k] = sanitizeThoughtString(v);
+      }
     } else if (typeof v === "object" && v !== null) {
       sanitized[k] = sanitizeThoughtPayload(v);
     } else {
@@ -2145,6 +2183,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 chars: message.length,
                 convId: s.convId || null,
               });
+              let rawThoughtAccumulator = "";
+              let emittedCleanLength = 0;
               const request = {
                 prompt: message,
                 model: profile.model,
@@ -2176,14 +2216,24 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 ...(fileCapture ? { fileCapture } : {}),
                 onThoughtChunk: (chunk) => {
                   if (!chunk || s.cancelled || s.activeGen !== gen) return;
-                  const cleanChunk = sanitizeThoughtString(chunk);
-                  if (!cleanChunk) return;
-                  appendThoughtLog(thoughtsLogPath, "thought", { text: cleanChunk });
+                  rawThoughtAccumulator += chunk;
+                  const cleanAll = sanitizeThoughtString(rawThoughtAccumulator);
+                  let delta = "";
+                  if (cleanAll.length > emittedCleanLength) {
+                    if (cleanAll.startsWith(cleanAll.slice(0, emittedCleanLength))) {
+                      delta = cleanAll.slice(emittedCleanLength);
+                    } else {
+                      delta = cleanAll;
+                    }
+                    emittedCleanLength = cleanAll.length;
+                  }
+                  if (!delta) return;
+                  appendThoughtLog(thoughtsLogPath, "thought", { text: delta });
                   if (streamThoughtsEnabled) {
                     streamedAny = true;
                     upd({
                       sessionUpdate: "agent_thought_chunk",
-                      content: { type: "text", text: cleanChunk },
+                      content: { type: "text", text: delta },
                     });
                   }
                 },
@@ -2202,15 +2252,15 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               try {
                 s.geminiTurnCount = (s.geminiTurnCount ?? 0) + 1;
                 res = await sendWebPrompt(request);
-                if (res?.search?.queries?.length) {
-                  let turnIdx = s.geminiTurnCount;
-                  if (tj?.turn?.turnNo) turnIdx = tj.turn.turnNo;
-                  else if (budgets?.toolRounds) turnIdx = budgets.toolRounds;
+
+                const isCancelled = s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted;
+                if (!isCancelled && res?.search?.queries?.length) {
+                  const promptIdx = s.geminiTurnCount;
                   const activeConvId = res.convId || s.convId || sessionId;
                   for (let qIdx = 0; qIdx < res.search.queries.length; qIdx++) {
                     const q = res.search.queries[qIdx];
                     const cleanQ = sanitizeThoughtString(q);
-                    const toolCallId = `call_${activeConvId}_${turnIdx}_${qIdx}`;
+                    const toolCallId = `call_${activeConvId}_${promptIdx}_${qIdx}`;
                     openSearchToolCalls.push(toolCallId);
                     if (streamThoughtsEnabled) {
                       upd({
@@ -2227,8 +2277,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                       status: "in_progress",
                     });
 
-                    const isCancelled = s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted;
-                    if (!isCancelled && res.search.status === 4) {
+                    const cancelDuring = s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted;
+                    if (!cancelDuring && res.search.status === 4) {
                       if (streamThoughtsEnabled) {
                         upd({
                           sessionUpdate: "tool_call_update",
@@ -2238,7 +2288,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                             type: "content",
                             content: {
                               type: "resource_link",
-                              uri: sanitizeThoughtString(src.url),
+                              uri: sanitizeUrl(src.url),
                               name: sanitizeThoughtString(src.title),
                             },
                           })) || [],
@@ -2248,7 +2298,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                         toolCallId,
                         status: "completed",
                         sources: res.search.sources?.map((src) => ({
-                          url: sanitizeThoughtString(src.url),
+                          url: sanitizeUrl(src.url),
                           title: sanitizeThoughtString(src.title),
                           ...(src.snippet ? { snippet: sanitizeThoughtString(src.snippet) } : {}),
                         })) || [],
@@ -2461,10 +2511,11 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   let text = final.text;
                   if (context.research && !write && !context.verdict && candidate?.search?.sources?.length) {
                     const list = candidate.search.sources
-                      .map((s) => `* [${sanitizeThoughtString(s.title)}](${sanitizeThoughtString(s.url)})`)
+                      .map((s) => `* [${sanitizeThoughtString(s.title)}](${sanitizeUrl(s.url)})`)
                       .join("\n");
                     text = text.trimEnd() + "\n\n### Источники поиска\n" + list;
                   }
+                  text = sanitizeThoughtString(text);
                   if (context.settings?.maskResponse) {
                     text = context.settings.maskResponse(text);
                   }

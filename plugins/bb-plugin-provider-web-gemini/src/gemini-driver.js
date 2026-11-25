@@ -122,7 +122,8 @@ function parseHNvQHb(raw, targetResponseId) {
         Array.isArray(node[1]) &&
         node[1][0] === 'google' &&
         Array.isArray(node[1][1]) &&
-        node[1][1].some((x) => typeof x === 'string' && /google search/i.test(x)) &&
+        typeof node[1][1][2] === 'string' &&
+        /google search/i.test(node[1][1][2]) &&
         typeof node[1][2] === 'number'
       ) {
         const code = node[1][2];
@@ -1079,6 +1080,20 @@ function findTurnTarget(doc, idx, promptPrefix) {
 }
 
 function checkTurnStatus(doc, idx, promptPrefix) {
+  const parentOf = (el) => (el ? el.parentElement || el.parentNode || el.parent || null : null);
+  const isInsideThoughts = (el) => {
+    if (!el) return false;
+    if (el.closest) {
+      try {
+        if (el.closest('model-thoughts')) return true;
+      } catch {}
+    }
+    for (let p = el; p; p = parentOf(p)) {
+      if ((p.tagName || '').toLowerCase() === 'model-thoughts') return true;
+    }
+    return false;
+  };
+
   if (!doc) {
     return {
       targetFound: false,
@@ -1144,22 +1159,25 @@ function checkTurnStatus(doc, idx, promptPrefix) {
       isBusyOrThinking = true;
     } else if (target.querySelectorAll) {
       const busyEls = Array.from(target.querySelectorAll(busySelector));
-      const nonThoughtBusy = busyEls.filter((el) => {
-        for (let p = el; p && p !== target; p = parentOf(p)) {
-          if ((p.tagName || '').toLowerCase() === 'model-thoughts') return false;
-        }
-        return true;
-      });
+      const nonThoughtBusy = busyEls.filter((el) => !isInsideThoughts(el));
       if (nonThoughtBusy.length > 0) isBusyOrThinking = true;
     } else if (target.querySelector && target.querySelector(busySelector) !== null) {
-      isBusyOrThinking = true;
+      const el = target.querySelector(busySelector);
+      if (!isInsideThoughts(el)) isBusyOrThinking = true;
     }
   }
-  if (!isBusyOrThinking) {
-    const globalBusy = doc.querySelector(
+  if (!isBusyOrThinking && doc.querySelectorAll) {
+    const globalBusyList = Array.from(doc.querySelectorAll(
+      '.conversation-container [aria-busy="true"], main [aria-busy="true"], .input-area [aria-busy="true"]'
+    ));
+    if (globalBusyList.some((el) => !isInsideThoughts(el))) {
+      isBusyOrThinking = true;
+    }
+  } else if (!isBusyOrThinking && doc.querySelector) {
+    const el = doc.querySelector(
       '.conversation-container [aria-busy="true"], main [aria-busy="true"], .input-area [aria-busy="true"]'
     );
-    if (globalBusy) isBusyOrThinking = true;
+    if (el && !isInsideThoughts(el)) isBusyOrThinking = true;
   }
 
   let currentText = null;
@@ -1173,7 +1191,7 @@ function checkTurnStatus(doc, idx, promptPrefix) {
       if (node.nodeType === 3) {
         return node.nodeValue || '';
       }
-      if (node.nodeType === 1) {
+      if (node.nodeType === 1 || node === root || !node.nodeType) {
         const tag = (node.tagName || '').toLowerCase();
         if (tag === 'model-thoughts') return '';
         let text = '';
@@ -1186,7 +1204,10 @@ function checkTurnStatus(doc, idx, promptPrefix) {
       return '';
     }
     const res = collect(root);
-    return res || (root.innerText || '');
+    if (!res && (!root.childNodes || root.childNodes.length === 0) && (!root.querySelector || !root.querySelector('model-thoughts')) && root.innerText) {
+      return root.innerText;
+    }
+    return res;
   };
 
   if (target) {
@@ -1296,13 +1317,8 @@ function checkTurnStatus(doc, idx, promptPrefix) {
     if (thoughts.length > 0) {
       thoughtText = (thoughts[0].innerText || '').trim();
     }
-    const allChildren = Array.from(target.querySelectorAll('*'));
-    childCount = allChildren.filter((el) => {
-      for (let p = el; p; p = parentOf(p)) {
-        if ((p.tagName || '').toLowerCase() === 'model-thoughts') return false;
-      }
-      return true;
-    }).length;
+    const allChildren = Array.from(target.querySelectorAll ? target.querySelectorAll('*') : []);
+    childCount = allChildren.filter((el) => !isInsideThoughts(el)).length;
     targetTextLength = getTextExcludingThoughts(target).length;
   }
 
@@ -1504,18 +1520,38 @@ async function sendPrompt({
   let capturedResponseId = null;
   let lastHNvQHbBody = null;
   let onPageResponse = null;
+  let onPageRequest = null;
+  let ourStreamGenerateRequest = null;
   let submissionStartTime = 0;
+  let lastThoughtText = '';
   try {
     page = driverHooks?.getGeminiPage
       ? await driverHooks.getGeminiPage(browser, { waitForVerification, port })
       : await getGeminiPage(browser, { waitForVerification, port });
     await throwIfCancelled();
 
+    onPageRequest = (req) => {
+      try {
+        if (!submissionStartTime) return;
+        const u = typeof req.url === 'function' ? req.url() : String(req.url || '');
+        if (u.includes('StreamGenerate') && !ourStreamGenerateRequest) {
+          ourStreamGenerateRequest = req;
+        }
+      } catch {}
+    };
+    if (page && typeof page.on === 'function') {
+      page.on('request', onPageRequest);
+    }
+
     onPageResponse = async (resp) => {
       try {
         if (!submissionStartTime) return;
         const u = typeof resp.url === 'function' ? resp.url() : String(resp.url || '');
         if (u.includes('StreamGenerate')) {
+          const req = typeof resp.request === 'function' ? resp.request() : null;
+          if (ourStreamGenerateRequest && req && req !== ourStreamGenerateRequest) {
+            return;
+          }
           const text = await resp.text().catch(() => '');
           const m = text.match(/\["c_([a-zA-Z0-9_-]+)","r_([a-f0-9]{16})"]/);
           if (m) {
@@ -1788,12 +1824,13 @@ async function sendPrompt({
     let lastProgressTime = streamStartTime;
     let lastDomSignature = null;
     let lastStatusText = null;
-    let lastThoughtText = '';
+    lastThoughtText = '';
     let accordionExpanded = false;
 
     while (Date.now() - streamStartTime < SESSION_CAP_MS) {
       await throwIfCancelled();
       await page.waitForTimeout(POLL_INTERVAL_MS);
+      await dismissOverlays(page, overlayOpts);
 
       const status = await safeEval(page,
         ({ idx, promptPrefix, fnSrc, checkSrc }) => {
@@ -2081,7 +2118,7 @@ async function sendPrompt({
 
     let searchResult = resObj?.search || null;
     try {
-      if (page) {
+      if (!capturedResponseId && page) {
         const domRespId = await safeEval(page, ({ idx, promptPrefix, fnSrc }) => {
           const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
           const target = fn ? fn(document, idx, promptPrefix) : null;
@@ -2143,15 +2180,18 @@ async function sendPrompt({
                 if (at) body += '&at=' + encodeURIComponent(at);
                 const controller = new AbortController();
                 const tid = setTimeout(() => controller.abort(), 6000);
-                const res = await window.fetch(url, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-                  body,
-                  signal: controller.signal,
-                });
-                clearTimeout(tid);
-                if (!res.ok) return null;
-                return await res.text();
+                try {
+                  const res = await window.fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                    body,
+                    signal: controller.signal,
+                  });
+                  if (!res.ok) return null;
+                  return await res.text();
+                } finally {
+                  clearTimeout(tid);
+                }
               } catch {
                 return null;
               }
@@ -2176,22 +2216,32 @@ async function sendPrompt({
         });
         if (searchResult.unknownRows && searchResult.unknownRows.length > 0) {
           for (const row of searchResult.unknownRows) {
+            const shape = Array.isArray(row)
+              ? `array[${row.length}](${row.map((x) => (x === null ? 'null' : typeof x)).join(',')})`
+              : typeof row;
             driverLog('driver:thoughts-error', {
               kind: 'unknown-source-row',
-              row,
+              shape,
             });
           }
         }
-        if (searchResult.thoughtText && onThoughtChunk && typeof onThoughtChunk === 'function') {
-          if (searchResult.thoughtText.length > lastThoughtText.length) {
-            if (searchResult.thoughtText.startsWith(lastThoughtText)) {
-              const delta = searchResult.thoughtText.slice(lastThoughtText.length);
-              if (delta) onThoughtChunk(delta);
-            } else {
-              onThoughtChunk(searchResult.thoughtText);
+        try {
+          if (searchResult.thoughtText && onThoughtChunk && typeof onThoughtChunk === 'function') {
+            if (searchResult.thoughtText.length > lastThoughtText.length) {
+              if (searchResult.thoughtText.startsWith(lastThoughtText)) {
+                const delta = searchResult.thoughtText.slice(lastThoughtText.length);
+                if (delta) onThoughtChunk(delta);
+              } else {
+                onThoughtChunk(searchResult.thoughtText);
+              }
+              lastThoughtText = searchResult.thoughtText;
             }
-            lastThoughtText = searchResult.thoughtText;
           }
+        } catch (thoughtErr) {
+          driverLog('driver:thoughts-error', {
+            kind: 'thought-chunk-failed',
+            message: thoughtErr?.message || String(thoughtErr),
+          });
         }
       }
     } catch (searchErr) {
@@ -2298,17 +2348,20 @@ async function dismissOverlays(page, opts = {}) {
 
         // 2. Visible dialog container: mat-dialog-container, [role="dialog"], .cdk-overlay-pane with text
         // Exclude menu and tooltip
+        const isMenuOrTooltip = (el) => {
+          if (!el) return false;
+          const sel = '[role="menu"], mat-menu-panel, .mat-mdc-menu-panel, .mat-menu-panel, [role="tooltip"], mat-tooltip-component';
+          if (el.matches && el.matches(sel)) return true;
+          if (el.closest && el.closest(sel)) return true;
+          if (el.querySelector && el.querySelector(sel)) return true;
+          return false;
+        };
         const candidates = Array.from(
           document.querySelectorAll('mat-dialog-container, [role="dialog"], .cdk-overlay-pane')
         );
         const visibleDialogs = candidates.filter((el) => {
           if (el.offsetParent === null) return false;
-          if (
-            el.matches('[role="menu"], mat-menu-panel, [role="tooltip"]') ||
-            el.closest('[role="menu"], mat-menu-panel, [role="tooltip"]')
-          ) {
-            return false;
-          }
+          if (isMenuOrTooltip(el)) return false;
           const text = (el.innerText || '').trim();
           return text.length > 0;
         });
