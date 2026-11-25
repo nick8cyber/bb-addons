@@ -1675,6 +1675,7 @@ async function sendPrompt({
       stateDir,
       screenshotDir,
       reloadedBackdrop: false,
+      loggedBackdropCoversInput: false,
     };
     await dismissOverlays(page, overlayOpts);
     await throwIfCancelled();
@@ -1807,6 +1808,7 @@ async function sendPrompt({
       submissionStartTime = Date.now();
       await page.keyboard.press('Enter').catch(() => {});
     }
+    overlayOpts.allowReload = false;
 
     // Poll manually (1s slices) so cancellation interrupts the 120s wait —
     // a bare waitForFunction can't be aborted.
@@ -1872,7 +1874,7 @@ async function sendPrompt({
       await page.waitForTimeout(POLL_INTERVAL_MS);
       if (Date.now() - lastOverlayCheck >= 2000) {
         lastOverlayCheck = Date.now();
-        await dismissOverlays(page, { ...overlayOpts, allowReload: false });
+        await dismissOverlays(page, overlayOpts);
       }
 
       const status = await safeEval(page,
@@ -2531,7 +2533,10 @@ async function dismissOverlays(page, opts = {}) {
         await page.waitForTimeout(500);
         continue;
       }
-      driverLog('driver:dialog', { account, action: 'backdrop-covers-input' });
+      if (!opts.loggedBackdropCoversInput) {
+        opts.loggedBackdropCoversInput = true;
+        driverLog('driver:dialog', { account, action: 'backdrop-covers-input' });
+      }
       break;
     }
 

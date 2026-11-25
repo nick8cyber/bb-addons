@@ -865,12 +865,12 @@ export function sanitizeThoughtString(str) {
   // 3. Mask Authorization headers and Bearer tokens (with or without token value)
   val = val.replace(/\b(?:authorization\s*:\s*)(?:bearer|basic)(\s+[A-Za-z0-9_\-\.~+/=]+|\s*)/gi, "Authorization: [REDACTED]");
   val = val.replace(/\b(?:authorization\s*:\s*)\S+/gi, "Authorization: [REDACTED]");
-  val = val.replace(/\bbearer(\s+[A-Za-z0-9_\-\.~+/=]{4,}|\s*)/gi, "Bearer [REDACTED]");
   val = val.replace(/\bbearer\s*[:=]\s*\S+/gi, "Bearer: [REDACTED]");
+  val = val.replace(/\bbearer(?:\s+(?!\[REDACTED\])[A-Za-z0-9_\-\.~+/=]{4,}|\s*(?![:=]|\s*\[REDACTED\])\b)/gi, "Bearer [REDACTED]");
   // 4. Mask Cookie headers (entire line / all pairs, including second and further pairs)
   val = val.replace(/\b(?:set-cookie|cookie)\s*:\s*[^\r\n]+/gi, "Cookie: [REDACTED]");
   // 5. Mask sensitive parameters in query strings or assignments
-  val = val.replace(/(^|[\s?&;])(access_token|refresh_token|id_token|auth_token|token|api_key|apikey|secret|password|passwd|bearer|sid|f\.sid|f_sid|session_id|sessionid|cookie|client_secret)=[^&\s#;,]*/gi, "$1$2=[REDACTED]");
+  val = val.replace(/(^|[\s?&;])(access_token|refresh_token|id_token|auth_token|token|api_key|apikey|secret|password|passwd|bearer|sid|f\.sid|f_sid|session_id|sessionid|cookie|client_secret)\s*([:=])\s*[^&\s#;,]+/gi, (m, p1, p2, p3) => `${p1}${p2}${p3 === ":" ? ": " : "="}[REDACTED]`);
   return val;
 }
 
@@ -2194,7 +2194,7 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
                 let delta = "";
                 if (cleanAll.startsWith(emittedCleanText)) {
                   delta = cleanAll.slice(emittedCleanText.length);
-                } else if (cleanAll.length > emittedCleanText.length) {
+                } else {
                   let i = 0;
                   while (i < emittedCleanText.length && i < cleanAll.length && emittedCleanText[i] === cleanAll[i]) i++;
                   delta = cleanAll.slice(i);
@@ -2244,16 +2244,14 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
                   rawThoughtAccumulator += chunk;
                   // Hold uncompleted token/URL tail until whitespace or newline
                   const lastSpaceIdx = rawThoughtAccumulator.search(/\s[^\s]*$/);
-                  const safeCut = lastSpaceIdx !== -1
-                    ? lastSpaceIdx + 1
-                    : (rawThoughtAccumulator.length > 512 ? rawThoughtAccumulator.length - 256 : -1);
+                  const safeCut = lastSpaceIdx !== -1 ? lastSpaceIdx + 1 : -1;
                   if (safeCut === -1) return;
                   const safePart = rawThoughtAccumulator.slice(0, safeCut);
                   const cleanSafe = sanitizeThoughtString(safePart);
                   let delta = "";
                   if (cleanSafe.startsWith(emittedCleanText)) {
                     delta = cleanSafe.slice(emittedCleanText.length);
-                  } else if (cleanSafe.length > emittedCleanText.length) {
+                  } else {
                     let i = 0;
                     while (i < emittedCleanText.length && i < cleanSafe.length && emittedCleanText[i] === cleanSafe[i]) i++;
                     delta = cleanSafe.slice(i);
@@ -2283,13 +2281,17 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
               let res;
               try {
                 s.geminiTurnCount = (s.geminiTurnCount ?? 0) + 1;
+                if (tj?.turn) {
+                  tj.turn.sendCount = (tj.turn.sendCount ?? 0) + 1;
+                  persistJournal();
+                }
                 res = await sendWebPrompt(request);
                 flushThoughts();
 
                 const isCancelled = s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted;
                 if (!isCancelled && res?.search?.queries?.length) {
                   const promptIdx = (tj?.turn?.turnNo != null)
-                    ? `${tj.turn.turnNo}_${budgets.repairRounds ?? 0}`
+                    ? `${tj.turn.turnNo}_${budgets.repairRounds ?? 0}_${tj.turn.sendCount ?? 1}`
                     : `${s.geminiTurnCount}`;
                   const activeConvId = res.convId || s.convId || sessionId;
                   for (let qIdx = 0; qIdx < res.search.queries.length; qIdx++) {

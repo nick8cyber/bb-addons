@@ -7396,6 +7396,28 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     await dismissOverlays(pageBackdrop, { isTurn: true, screenshotDir: shotDir });
     assert.equal(reloadCount, 1, "Page must be reloaded once when backdrop covers input");
 
+    const pageBackdropPersistent = {
+      evaluate: async (fn) => {
+        const origDoc = global.document;
+        const backdrop = { offsetParent: {}, contains: () => true };
+        const textbox = { getBoundingClientRect: () => ({ x: 100, y: 100, width: 200, height: 50 }) };
+        global.document = {
+          querySelectorAll: () => [],
+          querySelector: (sel) => sel.includes("backdrop") ? backdrop : textbox,
+          elementFromPoint: () => backdrop,
+        };
+        try { return await fn(); } finally { global.document = origDoc; }
+      },
+      reload: async () => {},
+      waitForTimeout: async () => {},
+    };
+    const backdropOpts = { isTurn: true, screenshotDir: shotDir, allowReload: false, loggedBackdropCoversInput: false };
+    await dismissOverlays(pageBackdropPersistent, backdropOpts);
+    assert.equal(backdropOpts.loggedBackdropCoversInput, true, "loggedBackdropCoversInput must be set on backdrop-covers-input");
+    // Call again with same opts in generation loop: loggedBackdropCoversInput remains true, logged once
+    await dismissOverlays(pageBackdropPersistent, backdropOpts);
+    assert.equal(backdropOpts.loggedBackdropCoversInput, true);
+
     // 11. Menus ([role="menu"], mat-menu-panel) must strictly NOT be treated as dialogs
     const menuEl = {
       offsetParent: {},
@@ -7503,6 +7525,10 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
         // Stream URL with userinfo credentials split across chunks
         req.onThoughtChunk("\nURL https://alice:s3cr3tPW");
         req.onThoughtChunk("@host.example.com/x and finish");
+        // Stream long unbroken sequence > 512 chars with URL
+        req.onThoughtChunk("\n" + "b".repeat(300) + "https://bob:p");
+        req.onThoughtChunk("assw0rdSECRET".repeat(25));
+        req.onThoughtChunk("@sub.example.com/y and final word");
         return {
           text: "Response text",
           convId: "c_thought_test",
@@ -7521,12 +7547,22 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       assert.ok(fullThoughtText.includes("then safe words"), "Text following secret must not be lost");
       assert.equal(fullThoughtText.includes("s3cr3tPW"), false, "Userinfo password split across chunks must NOT leak");
       assert.ok(fullThoughtText.includes("https://host.example.com/x and finish"), "Sanitized URL and trailing text must be preserved");
+      assert.equal(fullThoughtText.includes("assw0rdSECRET"), false, "Unbroken chunk > 512 URL password must NOT leak");
+      assert.ok(fullThoughtText.includes("https://sub.example.com/y and final word"), "Preserved trailing URL and word after > 512 chars");
     } finally {
       _setDriverHooks(null);
       _setOutputHook(null);
     }
 
-    // Test that review verdict containing Cookie and Bearer text is NOT corrupted by sanitizeThoughtString
+    // Test sanitizer rules order & patterns
+    assert.equal(sanitizeThoughtString("Bearer: SECRETXYZ"), "Bearer: [REDACTED]");
+    assert.equal(sanitizeThoughtString("bearer=SECRETXYZ"), "Bearer: [REDACTED]");
+    assert.equal(sanitizeThoughtString("Bearer secret_tok_123"), "Bearer [REDACTED]");
+    assert.equal(sanitizeThoughtString("api_key: SECRETXYZ"), "api_key: [REDACTED]");
+    assert.equal(sanitizeThoughtString("token = SECRETXYZ"), "token=[REDACTED]");
+    assert.equal(sanitizeThoughtString("?access_token=SECRETXYZ&other=1"), "?access_token=[REDACTED]&other=1");
+
+    // Test that review verdict containing Cookie and Bearer text is NOT corrupted in task branch
     const rawVerdictJson = JSON.stringify({
       verdict: "CHANGES",
       findings: [{ text: "Header Cookie: sid=12345; session=abc and Bearer secret_tok" }],
@@ -7534,9 +7570,8 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     });
     _setDriverHooks({
       sendPrompt: async (req) => {
-        req.onChunk?.(rawVerdictJson);
         return {
-          text: rawVerdictJson,
+          text: "Review analysis report.\n" + rawVerdictJson,
           convId: "c_verdict_test",
         };
       },
@@ -7546,14 +7581,64 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       _setOutputHook((msg) => {
         if (msg?.result?.stopReason || msg?.params?.update) verdictUpdates.push(msg);
       });
-      await runPrompt(992, "s_verdict_test", "check code");
+      const taskVerdict = {
+        journal: {
+          sessKey: "s_verdict_test",
+          entry: { key: "s_verdict_test", record: {} },
+          turn: {
+            turnNo: 1,
+            sendCount: 0,
+            profile: { model: "neon" },
+            budgets: { repairRounds: 0, toolRounds: 0 },
+            attempts: [{ n: 1, inputSha256: "abc" }],
+          },
+        },
+        signal: new AbortController().signal,
+        aborted: new Promise(() => {}),
+        finish: async () => {},
+        ping: () => {},
+        started: Date.now(),
+        deadline: Date.now() + 60000,
+        sessionCapAt: Date.now() + 60000,
+        ownedFiles: [],
+      };
+      const contextVerdict = {
+        text: "Review code and report verdict.",
+        research: false,
+        write: false,
+        verdict: new Map(),
+        key: "REV-1",
+        root: null,
+        cwd: testDir,
+        pin: null,
+        repoFiles: [],
+        attachments: [],
+        attachmentOmissions: [],
+        settings: {
+          mask: (s) => s,
+          maskResponse: (s) => s,
+          maskResearch: (s) => s,
+          maxTotalBytes: 100000,
+          maxRepairRounds: 1,
+          innerAgent: false,
+        },
+      };
+      await runPrompt(992, "s_verdict_test", "check code", {
+        task: taskVerdict,
+        context: contextVerdict,
+        blocks: [],
+        materials: [],
+      });
       const msgChunk = verdictUpdates.find((m) => m?.params?.update?.sessionUpdate === "agent_message_chunk");
       assert.ok(msgChunk, "Should have received an agent_message_chunk update");
-      assert.ok(msgChunk.params.update.content.text.includes("Header Cookie: sid=12345"));
-      assert.ok(msgChunk.params.update.content.text.includes("Bearer secret_tok"));
-      const parsed = JSON.parse(msgChunk.params.update.content.text);
+      const fullText = msgChunk.params.update.content.text;
+      assert.ok(fullText.includes("Header Cookie: sid=12345; session=abc"), "Cookie text must be preserved verbatim in task verdict");
+      assert.ok(fullText.includes("Bearer secret_tok"), "Bearer token in JSON verdict must not be corrupted by sanitizer");
+      const lastLine = fullText.trim().split("\n").at(-1);
+      const parsed = JSON.parse(lastLine);
       assert.equal(parsed.verdict, "CHANGES");
       assert.equal(parsed.blockers, 1);
+      assert.equal(parsed.findings[0].text, "Header Cookie: sid=12345; session=abc and Bearer secret_tok");
     } finally {
       _setDriverHooks(null);
       _setOutputHook(null);
@@ -7593,48 +7678,120 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
   // --- F. Search sources block appended strictly in research && !write && !verdict, with maskResponse ---
   {
     const candidateWithSources = {
-      text: "Summary of findings.",
+      text: "Summary of research findings.",
+      convId: "c_sources_test",
       search: {
+        status: 4,
+        queries: ["npm query"],
         sources: [
           { url: "https://user:pass@example.com/one?access_token=secret_tok_123&keep=1", title: "Page One" },
           { url: "https://example.com/two", title: "Page Two" },
         ],
       },
     };
-    const contextResearch = {
-      research: true,
-      write: false,
-      settings: {
-        maskResponse: (text) => text.replace(/example\.com/g, "[скрыто: domain]"),
-      },
-    };
-    const checked1 = checkedAnswer(contextResearch, candidateWithSources);
-    assert.equal(checked1.text, "Summary of findings.");
+    _setDriverHooks({
+      sendPrompt: async () => candidateWithSources,
+    });
+    try {
+      const researchUpdates = [];
+      _setOutputHook((msg) => {
+        if (msg?.result?.stopReason || msg?.params?.update) researchUpdates.push(msg);
+      });
+      const taskResearch = {
+        journal: {
+          sessKey: "s_sources_test",
+          entry: { key: "s_sources_test", record: {} },
+          turn: {
+            turnNo: 1,
+            sendCount: 0,
+            profile: { model: "neon" },
+            budgets: { repairRounds: 0, toolRounds: 0 },
+            attempts: [{ n: 1, inputSha256: "abc" }],
+          },
+        },
+        signal: new AbortController().signal,
+        aborted: new Promise(() => {}),
+        finish: async () => {},
+        ping: () => {},
+        started: Date.now(),
+        deadline: Date.now() + 60000,
+        sessionCapAt: Date.now() + 60000,
+        ownedFiles: [],
+      };
+      const contextResearch = {
+        text: "Research query.",
+        research: true,
+        write: false,
+        verdict: null,
+        key: "RES-1",
+        root: null,
+        cwd: os.tmpdir(),
+        pin: null,
+        repoFiles: [],
+        attachments: [],
+        attachmentOmissions: [],
+        settings: {
+          mask: (s) => s,
+          maskResponse: (text) => text.replace(/example\.com/g, "[скрыто: domain]"),
+          maskResearch: (s) => s,
+          maxTotalBytes: 100000,
+          maxRepairRounds: 1,
+          innerAgent: false,
+        },
+      };
+      await runPrompt(993, "s_sources_test", "research query", {
+        task: taskResearch,
+        context: contextResearch,
+        blocks: [],
+        materials: [],
+      });
+      const chunkMsg = researchUpdates.find((m) => m?.params?.update?.sessionUpdate === "agent_message_chunk");
+      assert.ok(chunkMsg, "Must receive agent_message_chunk in research task");
+      const formattedText = chunkMsg.params.update.content.text;
+      assert.ok(formattedText.includes("### Источники поиска"), "Sources block must be appended in research mode");
+      assert.equal(formattedText.includes("pass@"), false, "Credentials in source URL must be stripped");
+      assert.equal(formattedText.includes("secret_tok_123"), false, "access_token in source URL must be stripped");
+      assert.ok(formattedText.includes("keep=1"), "Legitimate parameters must be kept");
+      assert.ok(formattedText.includes("[скрыто: domain]"), "maskResponse must be called on full research output with sources block");
 
-    let formattedText = checked1.text;
-    if (contextResearch.research && !contextResearch.write && !contextResearch.verdict && candidateWithSources.search?.sources?.length) {
-      const list = candidateWithSources.search.sources
-        .map((s) => `* [${sanitizeThoughtString(s.title)}](${sanitizeUrl(s.url)})`)
-        .join("\n");
-      formattedText = formattedText.trimEnd() + "\n\n### Источники поиска\n" + list;
+      // In verdict mode: sources block NOT appended even if search sources exist
+      const verdictUpdates2 = [];
+      _setOutputHook((msg) => {
+        if (msg?.result?.stopReason || msg?.params?.update) verdictUpdates2.push(msg);
+      });
+      const verdictResp = "Summary.\n" + JSON.stringify({ verdict: "OK", blockers: 0 });
+      _setDriverHooks({
+        sendPrompt: async () => ({
+          text: verdictResp,
+          convId: "c_verdict_sources_test",
+          search: candidateWithSources.search,
+        }),
+      });
+      const taskVerdict2 = {
+        ...taskResearch,
+        journal: {
+          ...taskResearch.journal,
+          sessKey: "s_verdict_sources_test",
+          entry: { key: "s_verdict_sources_test", record: {} },
+        },
+      };
+      const contextVerdict2 = {
+        ...contextResearch,
+        research: true,
+        verdict: new Map(),
+      };
+      await runPrompt(994, "s_verdict_sources_test", "verdict query", {
+        task: taskVerdict2,
+        context: contextVerdict2,
+        blocks: [],
+        materials: [],
+      });
+      const chunkMsg2 = verdictUpdates2.find((m) => m?.params?.update?.sessionUpdate === "agent_message_chunk");
+      assert.equal(chunkMsg2.params.update.content.text.includes("### Источники поиска"), false, "Sources block must not be appended when verdict is expected");
+    } finally {
+      _setDriverHooks(null);
+      _setOutputHook(null);
     }
-    if (contextResearch.settings?.maskResponse) {
-      formattedText = contextResearch.settings.maskResponse(formattedText);
-    }
-    assert.ok(formattedText.includes("### Источники поиска"));
-    assert.equal(formattedText.includes("pass@"), false, "Credentials in source URL must be stripped");
-    assert.equal(formattedText.includes("secret_tok_123"), false, "access_token in source URL must be stripped");
-    assert.ok(formattedText.includes("keep=1"), "Legitimate parameters must be kept");
-    assert.ok(formattedText.includes("[скрыто: domain]"), "maskResponse must be called on full research output with sources block");
-
-    // Write mode: sources block NOT appended
-    const contextWrite = { research: true, write: true, settings: { maskResponse: (x) => x } };
-    let writeText = "File commit response.";
-    if (contextWrite.research && !contextWrite.write && !contextWrite.verdict && candidateWithSources.search?.sources?.length) {
-      const list = candidateWithSources.search.sources.map((s) => `* [${s.title}](${s.url})`).join("\n");
-      writeText = writeText.trimEnd() + "\n\n### Источники поиска\n" + list;
-    }
-    assert.equal(writeText.includes("### Источники поиска"), false, "Sources block must not be appended in write mode");
   }
 
   // --- G. DOM and model-thoughts isolation ---
@@ -7816,6 +7973,93 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
       await runPrompt(1003, "s_cancel_test_session", "Prompt that gets cancelled");
       const cancelledToolCalls = cancelUpdates.filter((u) => u.sessionUpdate === "tool_call");
       assert.equal(cancelledToolCalls.length, 0, "No new tool call cards must open after cancellation");
+
+      // Multi-round task tool loop emits unique toolCallId across rounds (§2.5 п.3)
+      const capturedTaskUpdates = [];
+      _setOutputHook((msg) => {
+        if (msg?.params?.update) capturedTaskUpdates.push(msg.params.update);
+      });
+      let roundNum = 0;
+      _setDriverHooks({
+        sendPrompt: async (req) => {
+          roundNum++;
+          if (roundNum === 1) {
+            return {
+              text: 'Investigating files.\n<tool name="list_dir" path="."/>',
+              convId: "c_task_multiround",
+              search: {
+                status: 4,
+                queries: ["npm package metadata round 1"],
+                sources: [{ title: "Source 1", url: "https://example.com/1" }],
+              },
+            };
+          }
+          return {
+            text: "Final analysis complete without further tool calls.",
+            convId: "c_task_multiround",
+            search: {
+              status: 4,
+              queries: ["npm package metadata round 2"],
+              sources: [{ title: "Source 2", url: "https://example.com/2" }],
+            },
+          };
+        },
+      });
+      const taskMulti = {
+        journal: {
+          sessKey: "s_task_multiround",
+          entry: { key: "s_task_multiround", record: {} },
+          turn: {
+            turnNo: 1,
+            sendCount: 0,
+            profile: { model: "neon" },
+            budgets: { repairRounds: 0, toolRounds: 0 },
+            attempts: [{ n: 1, inputSha256: "abc" }],
+          },
+        },
+        signal: new AbortController().signal,
+        aborted: new Promise(() => {}),
+        finish: async () => {},
+        ping: () => {},
+        started: Date.now(),
+        deadline: Date.now() + 60000,
+        sessionCapAt: Date.now() + 60000,
+        ownedFiles: [],
+      };
+      const contextMulti = {
+        text: "Task with multi-round tool loop.",
+        research: false,
+        write: false,
+        verdict: null,
+        key: "TASK-MULTI",
+        root: null,
+        cwd: os.tmpdir(),
+        pin: null,
+        repoFiles: [],
+        attachments: [],
+        attachmentOmissions: [],
+        settings: {
+          mask: (s) => s,
+          maskResponse: (s) => s,
+          maskResearch: (s) => s,
+          maxTotalBytes: 100000,
+          maxRepairRounds: 1,
+          innerAgent: false,
+        },
+      };
+      await runPrompt(1005, "s_task_multiround", "run multi round", {
+        task: taskMulti,
+        context: contextMulti,
+        blocks: [],
+        materials: [],
+      });
+      const searchCards = capturedTaskUpdates.filter((u) => u.sessionUpdate === "tool_call" && u.kind === "search");
+      assert.equal(searchCards.length, 2, "Must emit 2 search tool_calls across 2 rounds");
+      const id1 = searchCards[0].toolCallId;
+      const id2 = searchCards[1].toolCallId;
+      assert.notEqual(id1, id2, "Search cards in round 1 and round 2 must have distinct toolCallIds");
+      assert.ok(id1.includes("_1_0_1_0"), `Round 1 card should include turn_repair_send_q _1_0_1_0, got: ${id1}`);
+      assert.ok(id2.includes("_1_0_2_0"), `Round 2 card should include turn_repair_send_q _1_0_2_0, got: ${id2}`);
     } finally {
       _setDriverHooks(null);
       _setOutputHook(null);
