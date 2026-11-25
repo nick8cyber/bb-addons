@@ -4506,9 +4506,9 @@ test("34. PLUG-371 e2e: real runPrompt stall-retry, budget cutoff, rotation, and
   await t.test("stall with <=25% phase budget fails with reason stalled and no retry", async () => {
     const { response, calls, serverLog } = await runFixture({ scenario: "stall-late", delayMs: 9500, sendDeadlineMs: 12000 });
     assert.equal(response.error?.code, -32000, `turn must fail: ${JSON.stringify(response)}`);
-    assert.equal(response.error?.data?.reason, "stalled", `failure reason must be stalled: ${JSON.stringify(response)}`);
+    assert.match(response.error?.data?.reason, /^stalled\b/, `failure reason must be stalled: ${JSON.stringify(response)}`);
     assert.equal(calls.length, 1, "no retry once the phase budget is exhausted");
-    assert.match(serverLog, /task:outcome.*"reason":"stalled"/, "task:outcome must record reason stalled");
+    assert.match(serverLog, /task:outcome.*"reason":"stalled/, "task:outcome must record reason stalled");
     assert.doesNotMatch(serverLog, /task:stall-retry/);
   });
 
@@ -4524,7 +4524,7 @@ test("34. PLUG-371 e2e: real runPrompt stall-retry, budget cutoff, rotation, and
   await t.test("stall on a follow-up round with established convId never retries", async () => {
     const { response, calls, serverLog } = await runFixture({ scenario: "tool-then-stall", sendDeadlineMs: 20000 });
     assert.equal(response.error?.code, -32000, `turn must fail: ${JSON.stringify(response)}`);
-    assert.equal(response.error?.data?.reason, "stalled", `failure reason must be stalled: ${JSON.stringify(response)}`);
+    assert.match(response.error?.data?.reason, /^stalled\b/, `failure reason must be stalled: ${JSON.stringify(response)}`);
     assert.equal(calls.length, 2, "no stall retry once the conversation is bound to a backend (convId set)");
     assert.doesNotMatch(serverLog, /task:stall-retry/);
   });

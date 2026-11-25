@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const profileManager = require('./profile-manager');
 const usageLimits = require('./usage-limits');
 const browserGroups = require('./browser-groups.cjs');
@@ -1533,6 +1534,8 @@ async function sendPrompt({
   verifyConversation = false,
   fileCapture = null,
   stallMs = null,
+  maskText = null,
+  attempt = 1,
   ...extraArgs
 } = {}) {
   if (driverHooks?.sendPrompt) {
@@ -1569,6 +1572,8 @@ async function sendPrompt({
       verifyConversation,
       fileCapture,
       stallMs,
+      maskText,
+      attempt,
       ...extraArgs,
     });
   }
@@ -1579,11 +1584,303 @@ async function sendPrompt({
   // finishing after the queue moved on must still only touch its own backend.
   const port = cdpPort != null ? String(cdpPort) : CDP_PORT;
   let page = null;
+  let isGenerationStage = false;
+  let generationWaitStartTime = null;
+  let streamStartTime = null;
+  let lastProgressTime = null;
+  let lastDomChangeAt = null;
+  let lastThoughtTime = null;
+  let highWindowStart = null;
+  let STALL_MS_RECORD = null;
+  let isHighThinkingRecord = false;
+  let stallEvidenceCaptured = null;
+  let initialCount = 0;
+
+  const collectStallEvidence = async (branch, { code = null, dialogErr = null } = {}) => {
+    if (stallEvidenceCaptured) return stallEvidenceCaptured;
+    const effectiveStateDir = stateDir || process.env.WEB_GEMINI_STATE_DIR || process.env.ARGON_STATE_DIR || path.join(os.homedir(), '.bb', 'plugins', 'provider-web-gemini');
+    let evidenceDir;
+    let baseName;
+    if (screenshotDir && /(?:^|[\\/])turn-\d+(?:[\\/]|$)/.test(screenshotDir)) {
+      evidenceDir = path.join(screenshotDir, 'evidence');
+      baseName = `a${attempt}-${branch}`;
+    } else if (screenshotDir) {
+      evidenceDir = path.join(screenshotDir, 'evidence');
+      const sidHash = crypto.createHash('sha256').update(String(sessionId || '')).digest('hex').slice(0, 16);
+      const isoClean = new Date().toISOString().replace(/[:.]/g, '');
+      baseName = `${sidHash}-${isoClean}-${branch}`;
+    } else {
+      evidenceDir = path.join(effectiveStateDir, 'screenshots', 'evidence');
+      const sidHash = crypto.createHash('sha256').update(String(sessionId || '')).digest('hex').slice(0, 16);
+      const isoClean = new Date().toISOString().replace(/[:.]/g, '');
+      baseName = `${sidHash}-${isoClean}-${branch}`;
+    }
+
+    try { fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 }); } catch {}
+    try { fs.chmodSync(evidenceDir, 0o700); } catch {}
+
+    const shotPath = path.join(evidenceDir, `${baseName}.png`);
+    const jsonPath = path.join(evidenceDir, `${baseName}.json`);
+    const tmpJsonPath = path.join(evidenceDir, `${baseName}.json.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+
+    const errors = [];
+    let snapshotRel = null;
+
+    // 1. Screenshot (budget: 3000ms)
+    if (branch === 'dialog' && dialogErr?.screenshotPath) {
+      try {
+        if (fs.existsSync(dialogErr.screenshotPath)) {
+          fs.copyFileSync(dialogErr.screenshotPath, shotPath);
+          try { fs.chmodSync(shotPath, 0o600); } catch {}
+          snapshotRel = path.relative(effectiveStateDir, shotPath);
+        } else {
+          snapshotRel = null;
+        }
+      } catch (e) {
+        errors.push(e.message || String(e));
+      }
+    } else if (page && typeof page.screenshot === 'function') {
+      try {
+        const shotDeadline = Date.now() + 3000;
+        const shotPromise = page.screenshot({ type: 'png', fullPage: false });
+        const shotBuf = await Promise.race([
+          shotPromise,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('screenshot timeout')), 3000)),
+        ]);
+        if (shotBuf && shotBuf.length > 5 * 1024 * 1024) {
+          const remainingMs = Math.max(0, shotDeadline - Date.now());
+          if (remainingMs <= 0) {
+            errors.push('snapshot too large');
+          } else {
+            try {
+              const jpegPromise = page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
+              const jpegBuf = await Promise.race([
+                jpegPromise,
+                new Promise((_, rej) => setTimeout(() => rej(new Error('jpeg screenshot timeout')), remainingMs)),
+              ]);
+              if (jpegBuf && jpegBuf.length <= 5 * 1024 * 1024) {
+                const jpegShotPath = path.join(evidenceDir, `${baseName}.jpeg`);
+                fs.writeFileSync(jpegShotPath, jpegBuf, { mode: 0o600 });
+                try { fs.chmodSync(jpegShotPath, 0o600); } catch {}
+                snapshotRel = path.relative(effectiveStateDir, jpegShotPath);
+              } else {
+                errors.push('snapshot too large');
+              }
+            } catch {
+              errors.push('snapshot too large');
+            }
+          }
+        } else if (shotBuf) {
+          fs.writeFileSync(shotPath, shotBuf, { mode: 0o600 });
+          try { fs.chmodSync(shotPath, 0o600); } catch {}
+          snapshotRel = path.relative(effectiveStateDir, shotPath);
+        }
+      } catch (e) {
+        errors.push(e.message || String(e));
+      }
+    } else {
+      errors.push('page screenshot unavailable');
+    }
+
+    // 2. Fresh state reading (budget: 1500ms)
+    let rawState = null;
+    if (page && typeof page.evaluate === 'function') {
+      try {
+        const evalPromise = safeEval(page, ({ idx, promptPrefix, fnSrc, checkSrc }) => {
+          let status = null;
+          try {
+            if (!window.__webGeminiFindTurnTarget && !window.__argonFindTurnTarget && fnSrc) {
+              window.__webGeminiFindTurnTarget = (0, eval)('(' + fnSrc + ')');
+            }
+            if (!window.__webGeminiCheckTurnStatus && checkSrc) {
+              window.__webGeminiCheckTurnStatus = (0, eval)('(' + checkSrc + ')');
+            }
+            const checkFn = window.__webGeminiCheckTurnStatus;
+            if (checkFn) {
+              status = checkFn(document, idx, promptPrefix);
+            }
+          } catch {}
+
+          const stopBtn = typeof document !== 'undefined' && typeof document.querySelector === 'function' ? document.querySelector(
+            'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
+          ) : null;
+          const hasStopButton = Boolean(status?.hasStopButton || stopBtn !== null);
+
+          const dialogEls = typeof document !== 'undefined' && typeof document.querySelectorAll === 'function'
+            ? Array.from(document.querySelectorAll('mat-dialog-container, [role="dialog"], [role="alertdialog"], cdk-overlay-pane'))
+            : [];
+          const rawDialogs = [];
+          for (const el of dialogEls) {
+            if (rawDialogs.length >= 5) break;
+            const isVisible = el.offsetParent !== null ||
+              (typeof el.getBoundingClientRect === 'function' && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0);
+            const text = (el.innerText || '').trim();
+            if (isVisible && text.length > 0) {
+              rawDialogs.push({
+                role: el.getAttribute('role') || (el.tagName.toLowerCase().includes('dialog') ? 'dialog' : 'dialog'),
+                ariaLabel: el.getAttribute('aria-label') || el.getAttribute('aria-labelledby') || null,
+                text,
+              });
+            }
+          }
+
+          const bodyText = typeof document !== 'undefined' && document.body ? (document.body.innerText || '') : '';
+          return {
+            targetFound: Boolean(status?.targetFound),
+            hasStopButton,
+            isBusyOrThinking: Boolean(status?.isBusyOrThinking),
+            hasFinishedContent: Boolean(status?.hasFinishedContent),
+            hasActiveThinkingOrTool: Boolean(status?.hasActiveThinkingOrTool),
+            statusText: status?.statusText ?? null,
+            targetTextLength: status?.targetTextLength ?? 0,
+            bodyText,
+            rawDialogs,
+          };
+        }, {
+          idx: initialCount,
+          promptPrefix,
+          fnSrc: findTurnTarget.toString(),
+          checkSrc: checkTurnStatus.toString(),
+        });
+        rawState = await Promise.race([
+          evalPromise,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('state eval timeout')), 1500)),
+        ]);
+      } catch (e) {
+        errors.push(e.message || String(e));
+      }
+    }
+
+    // 3. Visible text, dialogs & statusText masking
+    let visibleTextTail = null;
+    let dialogs = null;
+    let maskedStatusText = null;
+
+    if (rawState != null) {
+      dialogs = [];
+      if (typeof maskText === 'function') {
+        try {
+          const normBody = String(rawState.bodyText || '').replace(/\s+/g, ' ').trim();
+          const maskedBody = maskText(normBody);
+          visibleTextTail = maskedBody.slice(-500);
+          for (const d of rawState.rawDialogs || []) {
+            const normD = String(d.text || '').replace(/\s+/g, ' ').trim();
+            const maskedD = maskText(normD).slice(0, 120);
+            dialogs.push({
+              role: d.role ?? 'dialog',
+              ariaLabel: d.ariaLabel ?? null,
+              text: maskedD,
+            });
+          }
+          if (rawState.statusText != null) {
+            const normStatus = String(rawState.statusText).replace(/\s+/g, ' ').trim();
+            maskedStatusText = maskText(normStatus);
+          }
+        } catch (e) {
+          visibleTextTail = null;
+          dialogs = (rawState.rawDialogs || []).slice(0, 5).map((d) => ({
+            role: d.role ?? 'dialog',
+            ariaLabel: d.ariaLabel ?? null,
+            text: null,
+          }));
+          maskedStatusText = null;
+          errors.push('mask unavailable');
+        }
+      } else {
+        visibleTextTail = null;
+        dialogs = (rawState.rawDialogs || []).slice(0, 5).map((d) => ({
+          role: d.role ?? 'dialog',
+          ariaLabel: d.ariaLabel ?? null,
+          text: null,
+        }));
+        maskedStatusText = null;
+        errors.push('mask unavailable');
+      }
+    }
+
+    const nowMs = Date.now();
+    const effectiveDomChangeAt = lastDomChangeAt || streamStartTime || generationWaitStartTime || nowMs;
+    const effectiveStallMs = STALL_MS_RECORD != null ? STALL_MS_RECORD : (stallMs != null ? Number(stallMs) : null);
+    const effectiveElapsedMs = streamStartTime ? nowMs - streamStartTime : (generationWaitStartTime ? nowMs - generationWaitStartTime : null);
+    const effectiveSinceProgressMs = lastProgressTime ? nowMs - lastProgressTime : (generationWaitStartTime ? nowMs - generationWaitStartTime : null);
+    const effectiveHighWindowMs = isHighThinkingRecord && highWindowStart !== null ? nowMs - highWindowStart : null;
+
+    const record = {
+      schema: 'web-gemini-stall-evidence/1',
+      code,
+      branch,
+      at: new Date(nowMs).toISOString(),
+      attempt: Number(attempt) || 1,
+      account: accountId || (backend && backend.id) || profile || null,
+      thinking: thinking || null,
+      stallMs: effectiveStallMs,
+      elapsedMs: effectiveElapsedMs,
+      sinceProgressMs: effectiveSinceProgressMs,
+      highWindowMs: effectiveHighWindowMs,
+      lastThoughtAt: lastThoughtTime ? new Date(lastThoughtTime).toISOString() : null,
+      page: {
+        targetFound: rawState == null ? null : Boolean(rawState.targetFound),
+        hasStopButton: rawState == null ? null : Boolean(rawState.hasStopButton),
+        isGenerating: rawState == null ? null : Boolean(rawState.hasStopButton || rawState.isBusyOrThinking),
+        isBusyOrThinking: rawState == null ? null : Boolean(rawState.isBusyOrThinking),
+        hasFinishedContent: rawState == null ? null : Boolean(rawState.hasFinishedContent),
+        hasActiveThinkingOrTool: rawState == null ? null : Boolean(rawState.hasActiveThinkingOrTool),
+        statusText: rawState == null ? null : maskedStatusText,
+        targetTextLength: rawState == null ? null : (rawState.targetTextLength ?? 0),
+        lastDomChangeAt: new Date(effectiveDomChangeAt).toISOString(),
+        domIdleMs: nowMs - effectiveDomChangeAt,
+        visibleTextTail,
+        dialogs,
+      },
+      snapshot: snapshotRel,
+      errors,
+    };
+
+    try {
+      fs.writeFileSync(tmpJsonPath, JSON.stringify(record, null, 2), { mode: 0o600 });
+      try { fs.chmodSync(tmpJsonPath, 0o600); } catch {}
+      fs.renameSync(tmpJsonPath, jsonPath);
+      try { fs.chmodSync(jsonPath, 0o600); } catch {}
+    } catch (e) {
+      errors.push(e.message || String(e));
+      try { if (fs.existsSync(tmpJsonPath)) fs.unlinkSync(tmpJsonPath); } catch {}
+    }
+
+    if (!fs.existsSync(jsonPath)) {
+      stallEvidenceCaptured = null;
+      return null;
+    }
+
+    const relJsonPath = path.relative(effectiveStateDir, jsonPath);
+    stallEvidenceCaptured = { path: relJsonPath, record };
+    return stallEvidenceCaptured;
+  };
+
+  const safeDismissOverlays = async (targetPage, opts) => {
+    try {
+      return await dismissOverlays(targetPage, opts);
+    } catch (err) {
+      if (err.code === 'WEB_GEMINI_UNKNOWN_DIALOG' || err.code === 'WEB_GEMINI_DIALOG_UNCLOSED') {
+        const evidence = await collectStallEvidence('dialog', { code: err.code, dialogErr: err });
+        if (evidence) err.stallEvidence = evidence;
+      }
+      throw err;
+    }
+  };
+
   const throwIfCancelled = async () => {
-    if ((signal && signal.aborted) || (shouldCancel && shouldCancel())) {
+    const cancelReason = (signal && signal.reason) || (shouldCancel && shouldCancel());
+    if ((signal && signal.aborted) || cancelReason) {
+      const effectiveReason = typeof cancelReason === 'string' ? cancelReason : 'cancelled';
+      let stallEvidence = null;
+      if (effectiveReason === 'deadline' && isGenerationStage) {
+        stallEvidence = await collectStallEvidence('deadline', { code: 'ARGON_CANCELLED' });
+      }
       if (page) await stopGeneration(page);
       const e = new Error('prompt cancelled by user');
       e.code = 'ARGON_CANCELLED';
+      e.cancelReason = effectiveReason;
+      if (stallEvidence) e.stallEvidence = stallEvidence;
       throw e;
     }
   };
@@ -1663,7 +1960,7 @@ async function sendPrompt({
 
     let lastText = '';
     let rawText = null;
-    let initialCount = 0;
+    initialCount = 0;
     let fileResponse;
     let downloadedPath = null;
     let generatedFiles = [];
@@ -1724,7 +2021,7 @@ async function sendPrompt({
       reloadedBackdrop: false,
       loggedBackdropCoversInput: false,
     };
-    await dismissOverlays(page, overlayOpts);
+    await safeDismissOverlays(page, overlayOpts);
     await throwIfCancelled();
     if (verifyConversation && convId && !atSavedConversation()) throw lostConversation();
 
@@ -1732,7 +2029,7 @@ async function sendPrompt({
     try {
       await page.waitForSelector(textboxSelector, { timeout: 15000 });
     } catch (err) {
-      await dismissOverlays(page, overlayOpts);
+      await safeDismissOverlays(page, overlayOpts);
       await checkRobotVerification(page, { waitForVerification, port });
       await page.waitForSelector(textboxSelector, { timeout: 10000 });
     }
@@ -1856,13 +2153,15 @@ async function sendPrompt({
       await page.keyboard.press('Enter').catch(() => {});
     }
     overlayOpts.allowReload = false;
+    isGenerationStage = true;
+    generationWaitStartTime = Date.now();
 
     // Poll manually (1s slices) so cancellation interrupts the 120s wait —
     // a bare waitForFunction can't be aborted.
     const genDeadline = Date.now() + 120000;
     for (;;) {
       await throwIfCancelled();
-      await dismissOverlays(page, overlayOpts).catch((e) => {
+      await safeDismissOverlays(page, overlayOpts).catch((e) => {
         if (e.code === 'WEB_GEMINI_UNKNOWN_DIALOG' || e.code === 'WEB_GEMINI_DIALOG_UNCLOSED') throw e;
       });
       const started = await safeEval(page,
@@ -1882,7 +2181,10 @@ async function sendPrompt({
       );
       if (started) break;
       if (Date.now() >= genDeadline) {
-        throw new Error('generation did not start within 120s (no model-response, no stop button)');
+        const evidence = await collectStallEvidence('no-start', { code: null });
+        const e = new Error('generation did not start within 120s (no model-response, no stop button)');
+        if (evidence) e.stallEvidence = evidence;
+        throw e;
       }
       await page.waitForTimeout(1000);
     }
@@ -1908,22 +2210,25 @@ async function sendPrompt({
       const baseStall = Number.isFinite(envStall) && envStall > 0 ? envStall : 120_000;
       STALL_MS = String(thinking || '').toLowerCase() === 'high' ? Math.max(baseStall, 600_000) : baseStall;
     }
-    const streamStartTime = Date.now();
-    let lastProgressTime = streamStartTime;
+    const thinkingKey = String(thinking || '').trim().toLowerCase();
+    const isHighThinking = thinkingKey === 'high';
+    streamStartTime = Date.now();
+    lastProgressTime = streamStartTime;
+    lastDomChangeAt = streamStartTime;
+    STALL_MS_RECORD = STALL_MS;
+    isHighThinkingRecord = isHighThinking;
     let lastDomSignature = null;
     let lastStatusText = null;
     lastThoughtText = '';
     let accordionExpanded = false;
     let lastOverlayCheck = 0;
-    const thinkingKey = String(thinking || '').trim().toLowerCase();
-    const isHighThinking = thinkingKey === 'high';
     // PLUG-411 / PLUG-413: stall window for thinking: "high" — starts at the first
     // poll without a stop button and without an answer, is not extended by progress
     // signals (spinner / isGenerating / domSig), resets when the stop button
     // reappears or finished content is captured, and is skipped while the stop
     // button is visible (the turn then waits for the stop press, the session cap or
     // a finished answer instead of declaring a stall).
-    let highWindowStart = null;
+    highWindowStart = null;
     // PLUG-413: whether the last poll that found the target reported finished
     // content (text / image / generated file, §4.2). Used after the target is lost:
     // the answer counts as captured only from real content, never from raw
@@ -1935,7 +2240,7 @@ async function sendPrompt({
       await page.waitForTimeout(POLL_INTERVAL_MS);
       if (Date.now() - lastOverlayCheck >= 2000) {
         lastOverlayCheck = Date.now();
-        await dismissOverlays(page, overlayOpts);
+        await safeDismissOverlays(page, overlayOpts);
       }
 
       const status = await safeEval(page,
@@ -1982,6 +2287,7 @@ async function sendPrompt({
 
       if (status && status.statusText && status.statusText !== lastStatusText) {
         lastStatusText = status.statusText;
+        lastThoughtTime = Date.now();
         if (onThoughtChunk && typeof onThoughtChunk === 'function') {
           onThoughtChunk(status.statusText + '\n');
         }
@@ -2011,6 +2317,7 @@ async function sendPrompt({
       }
 
       if (status && status.thoughtText && status.thoughtText.length > lastThoughtText.length) {
+        lastThoughtTime = Date.now();
         if (status.thoughtText.startsWith(lastThoughtText)) {
           const delta = status.thoughtText.slice(lastThoughtText.length);
           if (delta && onThoughtChunk && typeof onThoughtChunk === 'function') {
@@ -2068,9 +2375,11 @@ async function sendPrompt({
         const lostWithoutContent = !isGenerating && !(lastText && lastText.length);
         const stalled = isHighThinking ? highStalled() : (isGenerating || lostWithoutContent) && Date.now() - lastProgressTime >= STALL_MS;
         if (stalled) {
+          const evidence = await collectStallEvidence('target-lost', { code: 'WEB_GEMINI_STALLED' });
           await stopGeneration(page);
           const e = new Error(`generation stalled — no progress for ${Math.round(STALL_MS / 1000)}s`);
           e.code = 'WEB_GEMINI_STALLED';
+          if (evidence) e.stallEvidence = evidence;
           throw e;
         }
         // §2.3 п.2 (thinking: high): target lost AFTER a captured answer and with
@@ -2129,6 +2438,7 @@ async function sendPrompt({
         lastDomSignature = domSig;
       } else if (domSig !== lastDomSignature) {
         lastDomSignature = domSig;
+        lastDomChangeAt = Date.now();
         hadProgress = true;
       }
 
@@ -2141,9 +2451,11 @@ async function sendPrompt({
       const awaitingContent = !isGenerating && !effectiveStatus.hasFinishedContent;
       const stalled = isHighThinking ? highStalled() : (isGenerating || awaitingContent) && Date.now() - lastProgressTime >= STALL_MS;
       if (stalled) {
+        const evidence = await collectStallEvidence('target-found', { code: 'WEB_GEMINI_STALLED' });
         await stopGeneration(page);
         const e = new Error(`generation stalled — no progress for ${Math.round(STALL_MS / 1000)}s`);
         e.code = 'WEB_GEMINI_STALLED';
+        if (evidence) e.stallEvidence = evidence;
         throw e;
       }
 
@@ -2168,9 +2480,11 @@ async function sendPrompt({
     if (Date.now() - streamStartTime >= SESSION_CAP_MS && (await safeQuery(page,
       'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
     ))) {
+      const evidence = await collectStallEvidence('cap', { code: 'WEB_GEMINI_STREAM_TIMEOUT' });
       await stopGeneration(page);
       const e = new Error(`generation still running after ${SESSION_CAP_MS / 1000}s cap — answer truncated`);
       e.code = 'WEB_GEMINI_STREAM_TIMEOUT';
+      if (evidence) e.stallEvidence = evidence;
       throw e;
     }
 

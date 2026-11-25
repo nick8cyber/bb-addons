@@ -542,6 +542,59 @@ export function pruneJournal(stateDir, { retentionMs = DEFAULT_RETENTION_MS, max
     remove(oldest);
     survivors.splice(survivors.indexOf(oldest), 1);
   }
+
+  // §7.4.7: Каталог screenshots/evidence/ обычного чата чистится тем же проходом:
+  // удаляются файлы старше state.retentionMs и всё сверх 50 самых новых пар.
+  try {
+    const chatEvidenceDir = join(stateDir, "screenshots", "evidence");
+    if (existsSync(chatEvidenceDir)) {
+      const files = readdirSync(chatEvidenceDir);
+      const pairs = new Map();
+      for (const f of files) {
+        if (f.includes(".json.tmp-")) {
+          try {
+            const mt = statSync(join(chatEvidenceDir, f)).mtimeMs;
+            if (now - mt > 60_000) {
+              rmSync(join(chatEvidenceDir, f), { force: true });
+            }
+          } catch {}
+          continue;
+        }
+        const match = f.match(/^(.*)\.(json|png|jpeg|jpg)$/);
+        if (!match) continue;
+        const base = match[1];
+        const ext = match[2];
+        if (!pairs.has(base)) {
+          pairs.set(base, { base, json: null, snapshot: null, mtime: 0 });
+        }
+        const p = pairs.get(base);
+        if (ext === "json") p.json = f;
+        else p.snapshot = f;
+        try {
+          const mt = statSync(join(chatEvidenceDir, f)).mtimeMs;
+          if (mt > p.mtime) p.mtime = mt;
+        } catch {}
+      }
+      const remaining = [];
+      for (const p of pairs.values()) {
+        if (now - p.mtime > retentionMs) {
+          if (p.json) try { rmSync(join(chatEvidenceDir, p.json), { force: true }); } catch {}
+          if (p.snapshot) try { rmSync(join(chatEvidenceDir, p.snapshot), { force: true }); } catch {}
+        } else {
+          remaining.push(p);
+        }
+      }
+      remaining.sort((a, b) => b.mtime - a.mtime);
+      if (remaining.length > 50) {
+        const toRemove = remaining.slice(50);
+        for (const p of toRemove) {
+          if (p.json) try { rmSync(join(chatEvidenceDir, p.json), { force: true }); } catch {}
+          if (p.snapshot) try { rmSync(join(chatEvidenceDir, p.snapshot), { force: true }); } catch {}
+        }
+      }
+    }
+  } catch {}
+
   return stats;
 }
 

@@ -1087,6 +1087,230 @@ async function fakeTaskReply({ onSubmitted, convId, signal }) {
   return { convId: convId ?? "fake-task", text: 'FAKE_WEB_GEMINI_TASK\n{"verdict":"OK","blockers":0}' };
 }
 
+export const BUILTIN_QUOTA_PATTERNS = [
+  "429",
+  "rate limit",
+  "quota",
+  "usage limit",
+  "free usage limit reached",
+  "insufficient credits",
+];
+
+export const BUILTIN_UNAVAILABLE_PATTERNS = [
+  "model not found",
+  "model_not_found",
+  "unknown model",
+];
+
+export const RATE_LIMIT_CATEGORY_RE = /rate-limit|rate limit|quota|limit resets|thinking level unavailable|thinking level is rate-limited|try again later|too many requests|лимит|повторите попытку позже/i;
+
+export function replaceNonBoundary429(str) {
+  return str.replace(/(?<=^|[\s\S])429(?=[\s\S]|$)/g, (match, offset, full) => {
+    const prevChar = offset > 0 ? full[offset - 1] : "";
+    const nextChar = offset + 3 < full.length ? full[offset + 3] : "";
+    const isBoundary = (!prevChar || !/[0-9a-zA-Z_#-]/.test(prevChar)) && (!nextChar || !/[0-9a-zA-Z_-]/.test(nextChar));
+    return isBoundary ? "429" : "-";
+  });
+}
+
+export function formatStallDuration(ms) {
+  const safeMs = Math.max(0, Number(ms) || 0);
+  const mins = Math.floor(safeMs / 60000);
+  const secs = Math.floor((safeMs % 60000) / 1000);
+  return `${mins}m${secs}s`;
+}
+
+export function formatStallOutcomeReason(branch, rec, maskFn = webTools?.maskForWeb) {
+  const branchPrefixes = {
+    "target-found": `stalled (${branch}):`,
+    "target-lost": `stalled (${branch}):`,
+    "cap": "stream timeout:",
+    "deadline": "deadline exceeded:",
+    "dialog": "unknown dialog:",
+    "no-start": "generation did not start:",
+  };
+  const prefix = branchPrefixes[branch] ?? `stalled (${branch}):`;
+
+  if (!rec) {
+    return `${prefix} evidence=none`;
+  }
+
+  const stop = rec.page?.hasStopButton == null ? "?" : (rec.page.hasStopButton ? "yes" : "no");
+  const target = rec.page?.targetFound == null ? "?" : (rec.page.targetFound ? "yes" : "no");
+  const generating = rec.page?.isGenerating == null ? "?" : (rec.page.isGenerating ? "yes" : "no");
+  const answer = rec.page?.hasFinishedContent == null ? "?" : (rec.page.hasFinishedContent ? "yes" : "no");
+  const domIdle = formatStallDuration(rec.page?.domIdleMs ?? rec.domIdleMs);
+  const noProgress = formatStallDuration(rec.sinceProgressMs);
+  const dialogsCount = rec.page?.dialogs == null ? "?" : (Array.isArray(rec.page.dialogs) ? rec.page.dialogs.length : 0);
+  const shot = rec.snapshot ? "yes" : "no";
+
+  let shortEvidence = rec.evidence ? String(rec.evidence).replace(/^inner-agent\/turns\/[^/]+\//, "") : "none";
+
+  // Status handling
+  let hasStatusLimit = false;
+  let statusFragment = "-";
+  let statusStart = 0;
+  let statusMinLen = 0;
+
+  if (rec.page?.statusText != null && String(rec.page.statusText).trim().length > 0) {
+    const mask = typeof maskFn === "function" ? maskFn : (webTools?.maskForWeb ?? ((t) => t));
+    const rawStatus = mask(String(rec.page.statusText)).replace(/\s+/g, " ").trim().replace(/"/g, "'");
+    const replacedStatus = replaceNonBoundary429(rawStatus);
+
+    const matchA = replacedStatus.match(RATE_LIMIT_CATEGORY_RE);
+    let matchB = null;
+    let matchBIndex = -1;
+    let matchBLen = 0;
+    const lowerReplaced = replacedStatus.toLowerCase();
+    for (const pat of BUILTIN_QUOTA_PATTERNS) {
+      const idx = lowerReplaced.indexOf(pat.toLowerCase());
+      if (idx !== -1) {
+        if (matchBIndex === -1 || idx < matchBIndex) {
+          matchB = pat;
+          matchBIndex = idx;
+          matchBLen = pat.length;
+        }
+      }
+    }
+
+    if (!matchA && !matchB) {
+      hasStatusLimit = false;
+      statusFragment = replacedStatus.slice(0, 40);
+      statusMinLen = 0;
+    } else {
+      hasStatusLimit = true;
+      let earliestIdx = -1;
+      if (matchA && matchB) {
+        earliestIdx = Math.min(matchA.index, matchBIndex);
+      } else if (matchA) {
+        earliestIdx = matchA.index;
+      } else {
+        earliestIdx = matchBIndex;
+      }
+
+      if (matchB && earliestIdx + 40 < matchBIndex + matchBLen) {
+        statusStart = matchBIndex;
+      } else {
+        statusStart = earliestIdx;
+      }
+      statusFragment = replacedStatus.slice(statusStart, statusStart + 40);
+      if (matchB) {
+        statusMinLen = Math.max(0, (matchBIndex + matchBLen) - statusStart);
+      } else if (matchA) {
+        statusMinLen = Math.max(0, (matchA.index + matchA[0].length) - statusStart);
+      }
+    }
+  }
+
+  // Dialog handling: only on branch "dialog" and only if rec.page.dialogs[0]?.text exists
+  let hasDialogLimit = false;
+  let dialogFragment = null;
+  let dialogStart = 0;
+  let dialogMinLen = 0;
+
+  if (branch === "dialog" && rec.page?.dialogs?.[0]?.text) {
+    const rawDialog = String(rec.page.dialogs[0].text).replace(/\s+/g, " ").trim().replace(/"/g, "'");
+    const matchA = rawDialog.match(RATE_LIMIT_CATEGORY_RE);
+    let matchB = null;
+    let matchBIndex = -1;
+    let matchBLen = 0;
+    const lowerDialog = rawDialog.toLowerCase();
+    for (const pat of BUILTIN_QUOTA_PATTERNS) {
+      const idx = lowerDialog.indexOf(pat.toLowerCase());
+      if (idx !== -1) {
+        if (matchBIndex === -1 || idx < matchBIndex) {
+          matchB = pat;
+          matchBIndex = idx;
+          matchBLen = pat.length;
+        }
+      }
+    }
+
+    if (matchA || matchB) {
+      hasDialogLimit = true;
+      let earliestIdx = -1;
+      if (matchA && matchB) {
+        earliestIdx = Math.min(matchA.index, matchBIndex);
+      } else if (matchA) {
+        earliestIdx = matchA.index;
+      } else {
+        earliestIdx = matchBIndex;
+      }
+
+      if (matchB && earliestIdx + 40 < matchBIndex + matchBLen) {
+        dialogStart = matchBIndex;
+      } else {
+        dialogStart = earliestIdx;
+      }
+      dialogFragment = rawDialog.slice(dialogStart, dialogStart + 40);
+      if (matchB) {
+        dialogMinLen = Math.max(0, (matchBIndex + matchBLen) - dialogStart);
+      } else if (matchA) {
+        dialogMinLen = Math.max(0, (matchA.index + matchA[0].length) - dialogStart);
+      }
+    }
+  }
+
+  const allFilterPatterns = [...BUILTIN_QUOTA_PATTERNS, ...BUILTIN_UNAVAILABLE_PATTERNS];
+  function applyStep2Filter(text) {
+    let res = text;
+    for (const pat of allFilterPatterns) {
+      const re = new RegExp(pat.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+      res = res.replace(re, "-");
+    }
+    return res;
+  }
+
+  let statusVal = statusFragment === "-" ? "-" : `"${statusFragment}"`;
+  if (!hasStatusLimit && statusVal !== "-") {
+    statusVal = `"${applyStep2Filter(statusFragment)}"`;
+  }
+  const filteredEvidence = applyStep2Filter(shortEvidence);
+
+  const assemble = (curStatus, curDialog, incEvidence = true) => {
+    let sPart = `status=${curStatus}`;
+    let dPart = curDialog !== null ? `dialog="${curDialog}" ` : "";
+    let evPart = incEvidence ? ` evidence=${filteredEvidence}` : "";
+    return `${prefix} stop=${stop} target=${target} generating=${generating} answer=${answer} ${sPart} ${dPart}domIdle=${domIdle} noProgress=${noProgress} dialogs=${dialogsCount} shot=${shot}${evPart}`;
+  };
+
+  let curStatusStr = statusVal;
+  let curDialogStr = dialogFragment;
+  let includeEvidence = true;
+
+  const MAX_LINE_LEN = 284;
+  const PREFIX_LEN = "[web-gemini:failed] ".length; // 20
+  const MAX_REASON_LEN = MAX_LINE_LEN - PREFIX_LEN; // 264
+
+  let line = assemble(curStatusStr, curDialogStr, includeEvidence);
+
+  // If line exceeds 264 chars, shorten status from the end
+  if (line.length > MAX_REASON_LEN && curStatusStr.startsWith('"') && curStatusStr.endsWith('"')) {
+    let inner = curStatusStr.slice(1, -1);
+    while (line.length > MAX_REASON_LEN && inner.length > statusMinLen) {
+      inner = inner.slice(0, -1);
+      curStatusStr = `"${inner}"`;
+      line = assemble(curStatusStr, curDialogStr, includeEvidence);
+    }
+  }
+
+  // If still exceeds, shorten dialog from the end
+  if (line.length > MAX_REASON_LEN && curDialogStr !== null) {
+    while (line.length > MAX_REASON_LEN && curDialogStr.length > dialogMinLen) {
+      curDialogStr = curDialogStr.slice(0, -1);
+      line = assemble(curStatusStr, curDialogStr, includeEvidence);
+    }
+  }
+
+  // If still exceeds, drop evidence
+  if (line.length > MAX_REASON_LEN) {
+    includeEvidence = false;
+    line = assemble(curStatusStr, curDialogStr, includeEvidence);
+  }
+
+  return line;
+}
+
 let out = (v) => process.stdout.write(`${JSON.stringify(v)}\n`);
 export function _setOutputHook(fn) {
   out = fn || ((v) => process.stdout.write(`${JSON.stringify(v)}\n`));
@@ -1601,7 +1825,7 @@ export function cancelSession(sessionId) {
   s.cancelled = true;
   s.activeTask?.stop("cancelled");
   s._cancelRes?.();
-  if (sessions.get(activePromptSessionId) === s) activeAbort?.abort();
+  if (sessions.get(activePromptSessionId) === s) activeAbort?.abort("cancelled");
 }
 
 /* ---------- auth probe on error path ---------- */
@@ -1816,6 +2040,7 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
   s.gen = gen;
   s.activeGen = gen;
   s.cancelled = false;
+  s._cancelRequested = false;
 
   // PLUG-291: локальные файлы-вложения текущего промпта (уже провалидированы
   // в session/prompt через collectUploadFiles) + собранные файлы Gemini.
@@ -1845,6 +2070,7 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
     }
   };
 
+  let currentAttempt = 0;
   try {
     // PLUG-281: >~100KB prompts hang execCommand('insertText') in the driver
     // and used to surface as model-unavailable — fail fast BEFORE any
@@ -1868,9 +2094,9 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
         activePromptSessionId = sessionId;
         const abortCtrl = new AbortController();
         activeAbort = {
-          abort: () => {
+          abort: (reason = "cancelled") => {
             s.cancelled = true;
-            abortCtrl.abort();
+            abortCtrl.abort(reason || "cancelled");
           },
         };
         const fakeAttempt = (async () => {
@@ -1914,6 +2140,66 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
       let excludeBackendId = null;
       let lastErr = null;
       let streamedAny = false;
+
+      const loggedStallEvidence = new Set();
+      const recordStallEvidence = (stallEvidence) => {
+        if (!stallEvidence || !stallEvidence.record) return;
+        const rec = stallEvidence.record;
+        const relPath = stallEvidence.path;
+        const key = relPath || `${rec.attempt}-${rec.branch}`;
+        if (loggedStallEvidence.has(key)) return;
+        loggedStallEvidence.add(key);
+        if (tj && tj.turn) {
+          if (!Array.isArray(tj.turn.stallEvidence)) tj.turn.stallEvidence = [];
+          if (!tj.turn.stallEvidence.some((e) => e.evidence === relPath)) {
+            tj.turn.stallEvidence.push({
+              attempt: rec.attempt,
+              code: rec.code,
+              branch: rec.branch,
+              at: rec.at,
+              evidence: relPath,
+              snapshot: rec.snapshot,
+            });
+            if (!Array.isArray(tj.stallRecords)) tj.stallRecords = [];
+            tj.stallRecords.push({ ...rec, evidence: relPath });
+            try {
+              persistJournal();
+            } catch (e) {
+              slog("driver:stall:persist_error", {
+                sessionId,
+                error: e?.message || String(e),
+              });
+            }
+          }
+        }
+        const page = rec.page || {};
+        slog("driver:stall", {
+          sessionId,
+          turn: tj?.turn?.turnNo ?? null,
+          attempt: rec.attempt,
+          account: rec.account,
+          code: rec.code,
+          branch: rec.branch,
+          targetFound: page.targetFound,
+          hasStopButton: page.hasStopButton,
+          isGenerating: page.isGenerating,
+          isBusyOrThinking: page.isBusyOrThinking,
+          hasFinishedContent: page.hasFinishedContent,
+          hasActiveThinkingOrTool: page.hasActiveThinkingOrTool,
+          statusText: page.statusText,
+          targetTextLength: page.targetTextLength,
+          lastDomChangeAt: page.lastDomChangeAt,
+          domIdleMs: page.domIdleMs,
+          visibleTextTailChars: page.visibleTextTail ? page.visibleTextTail.length : 0,
+          dialogs: (page.dialogs || []).map((d) => ({ role: d.role, ariaLabel: d.ariaLabel })),
+          stallMs: rec.stallMs,
+          sinceProgressMs: rec.sinceProgressMs,
+          highWindowMs: rec.highWindowMs,
+          lastThoughtAt: rec.lastThoughtAt,
+          snapshot: rec.snapshot,
+          evidence: relPath,
+        });
+      };
 
       // §5 web-gemini-tools: первое сообщение нового разговора несёт
       // системную шапку инструментов и упакованные материалы (дифф, файлы,
@@ -2106,7 +2392,7 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
         activeBackendId = backend.id;
         activePromptSessionId = sessionId;
         const abortCtrl = new AbortController();
-        activeAbort = { abort: () => abortCtrl.abort() };
+        activeAbort = { abort: (reason = "deadline") => abortCtrl.abort(reason || "deadline") };
 
         const renew = setInterval(() => {
           try {
@@ -2120,6 +2406,8 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
         renew.unref?.();
 
         const mappedThinking = normalizeThinking(profile.thinking);
+        currentAttempt = attempts + 1;
+        if (tj) tj.currentAttempt = currentAttempt;
         const attempt = (async () => {
           try {
             const sendWebPrompt = task && FAKE ? fakeTaskReply : getDriver().sendPrompt;
@@ -2231,7 +2519,15 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
                 downloadsDir: task ? null : DOWNLOADS_DIR,
                 requireFullDelivery: Boolean(task),
                 onSubmitted: task ? () => task.ping("generation") : null,
-                shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted || s.activeGen !== gen,
+                shouldCancel: () => {
+                  if (s.cancelled || s._cancelRequested) return "cancelled";
+                  if (abortCtrl.signal.aborted && abortCtrl.signal.reason === "deadline") return "deadline";
+                  if (task?.signal?.aborted && task?.signal?.reason === "deadline exceeded") return "deadline";
+                  if (abortCtrl.signal.aborted || task?.signal?.aborted || s.activeGen !== gen) return "cancelled";
+                  return false;
+                },
+                attempt: attempts + 1,
+                maskText: (task && context?.settings?.maskResponse) ? context.settings.maskResponse : webTools.maskForWeb,
                 backend: backend,
                 accountId: backend.id,
                 tier: backend.tier,
@@ -2623,7 +2919,10 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
         const outcome = await Promise.race([
           attempt.then(() => "done", () => "failed"),
           new Promise((res) => {
-            s._cancelRes = () => res("cancelled");
+            s._cancelRes = () => {
+              s._cancelRequested = true;
+              res("cancelled");
+            };
           }),
           deadlineP,
         ]);
@@ -2632,7 +2931,7 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
         s._cancelRes = null;
 
         if (outcome === "cancelled") {
-          abortCtrl.abort();
+          abortCtrl.abort("cancelled");
           if (s.activeGen === gen) s.cancelled = true;
           await Promise.race([attempt.catch(() => {}), sleep(15_000)]);
           await releaseLease(backend.id);
@@ -2643,8 +2942,11 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
           return { cancelled: true };
         }
         if (outcome === "deadline") {
-          abortCtrl.abort();
-          await Promise.race([attempt.catch(() => {}), sleep(15_000)]);
+          abortCtrl.abort("deadline");
+          const attemptErr = await Promise.race([attempt.then(() => null, (e) => e), sleep(15_000)]);
+          if (attemptErr && (attemptErr.cancelReason === "deadline" || attemptErr.code === "ARGON_CANCELLED") && attemptErr.stallEvidence) {
+            recordStallEvidence(attemptErr.stallEvidence);
+          }
           await releaseLease(backend.id);
           activeBackendId = null;
           activeAbort = null;
@@ -2662,6 +2964,9 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
           activePromptSessionId = null;
           return r;
         } catch (err) {
+          if (err?.stallEvidence) {
+            recordStallEvidence(err.stallEvidence);
+          }
           lastErr = err;
           slog("driver:error", {
             sessionId,
@@ -2703,8 +3008,11 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
               cls.parkedReason = null;
               cls.rotatable = false;
               const text120 = String(dialogText).slice(0, 120);
-              err = new Error("unknown dialog: " + text120);
-              err.code = "WEB_GEMINI_UNKNOWN_DIALOG";
+              const next = new Error("unknown dialog: " + text120);
+              next.code = "WEB_GEMINI_UNKNOWN_DIALOG";
+              next.stallEvidence = err.stallEvidence;
+              next.dialogText = err.dialogText || text120;
+              err = next;
             }
           }
           const cooled = await settleBackend(backend.id, sessionId, cls.untilMs, task ? "task request failed" : hint || err.message, cls.parkedReason, cls.lockedModel);
@@ -2816,16 +3124,57 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
     if (!isExiting) {
       // PLUG-281: caller-side refusal — report verbatim, no driver framing.
       if (task) {
+        let stallRecord = tj?.stallRecords?.at(-1) || null;
+        if (!stallRecord && tj?.turn?.stallEvidence?.length) {
+          const lastEv = tj.turn.stallEvidence.at(-1);
+          if (lastEv && (currentAttempt === 0 || lastEv.attempt === currentAttempt)) {
+            try {
+              const fullEvPath = join(STATE_DIR, lastEv.evidence);
+              stallRecord = JSON.parse(readFileSync(fullEvPath, "utf8"));
+              stallRecord.evidence = lastEv.evidence;
+            } catch {}
+          }
+        }
+        if (stallRecord && (currentAttempt === 0 || stallRecord.attempt !== currentAttempt)) {
+          stallRecord = null;
+        }
+
         const isStalled = Boolean(
           err && (err.code === "WEB_GEMINI_STALLED" || err.code === "ARGON_STALLED" || /generation stalled|stalled generation/i.test(err.message || ""))
         );
         const isDialogError = Boolean(
           err && (err.code === "WEB_GEMINI_UNKNOWN_DIALOG" || err.code === "ARGON_UNKNOWN_DIALOG" || err.code === "WEB_GEMINI_DIALOG_UNCLOSED" || /unknown dialog/i.test(err.message || ""))
         );
-        const reason = task.signal.reason === "deadline exceeded" && !err.message?.startsWith("recovery_required:") ? "deadline exceeded" :
-          isStalled ? "stalled" :
-          isDialogError ? (err.message || "unknown dialog") :
-          err instanceof TaskTurnError ? err.message : "web model request failed at " + task.stage;
+        const isStreamTimeout = Boolean(
+          err && (err.code === "WEB_GEMINI_STREAM_TIMEOUT" || err.code === "ARGON_STREAM_TIMEOUT" || /stream timeout|stream_timeout/i.test(err.message || ""))
+        );
+        const isNoStart = Boolean(
+          err && /generation did not start within 120s/i.test(err.message || "")
+        );
+        const isDeadline = task.signal.reason === "deadline exceeded" || err?.cancelReason === "deadline" || /turn exceeded.*deadline|turn exceeded.*cap/i.test(err?.message || "");
+
+        const maskFn = (task && context?.settings?.maskResponse) ? context.settings.maskResponse : webTools.maskForWeb;
+        let reason;
+        if (err?.message?.startsWith("recovery_required:")) {
+          reason = err.message;
+        } else if (isStalled) {
+          const branch = stallRecord?.branch ?? "target-lost";
+          reason = formatStallOutcomeReason(branch, stallRecord, maskFn);
+        } else if (isStreamTimeout) {
+          reason = formatStallOutcomeReason("cap", stallRecord, maskFn);
+        } else if (isNoStart) {
+          reason = formatStallOutcomeReason("no-start", stallRecord, maskFn);
+        } else if (isDialogError) {
+          reason = formatStallOutcomeReason("dialog", stallRecord, maskFn);
+        } else if (isDeadline) {
+          if (stallRecord || task.stage === "generation") {
+            reason = formatStallOutcomeReason("deadline", stallRecord, maskFn);
+          } else {
+            reason = "deadline exceeded";
+          }
+        } else {
+          reason = err instanceof TaskTurnError ? err.message : "web model request failed at " + task.stage;
+        }
         if (tj && reason.startsWith("recovery_required:")) tj.turn.recoveryRequired = true;
         await task.finish("failed", reason);
         turnError(id, "failed", reason, task.stage);
@@ -2852,7 +3201,7 @@ async function cleanShutdown() {
     const tasks = [...new Set([...sessions.values()].map((session) => session.activeTask).filter(Boolean))];
     for (const task of tasks) task.stop("cancelled");
     if (activeAbort) {
-      activeAbort.abort();
+      activeAbort.abort("cancelled");
     }
     const pending = [activeAttempt, ...tasks.map((task) => task.applying)].filter(Boolean);
     if (pending.length) {
