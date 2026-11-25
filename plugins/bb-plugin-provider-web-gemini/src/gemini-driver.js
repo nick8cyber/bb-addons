@@ -1486,7 +1486,45 @@ async function sendPrompt({
   verifyConversation = false,
   fileCapture = null,
   stallMs = null,
-}) {
+  ...extraArgs
+} = {}) {
+  if (driverHooks?.sendPrompt) {
+    return await driverHooks.sendPrompt({
+      prompt,
+      model,
+      thinking,
+      isNewChat,
+      convId,
+      signal,
+      onChunk,
+      onThoughtChunk,
+      headless,
+      profile,
+      restart,
+      ephemeral,
+      file,
+      files,
+      requireFullDelivery,
+      onSubmitted,
+      waitForVerification,
+      download,
+      sessionId,
+      downloadsDir,
+      cdpPort,
+      strictModel,
+      strict,
+      shouldCancel,
+      backend,
+      accountId,
+      tier,
+      stateDir,
+      screenshotDir,
+      verifyConversation,
+      fileCapture,
+      stallMs,
+      ...extraArgs,
+    });
+  }
   const isStrict = Boolean(strict || strictModel);
   throwIfPromptTooLarge(prompt);
   const promptPrefix = prompt.replace(/\s+/g, ' ').trim().slice(0, 40);
@@ -1636,6 +1674,7 @@ async function sendPrompt({
       isTurn: true,
       stateDir,
       screenshotDir,
+      reloadedBackdrop: false,
     };
     await dismissOverlays(page, overlayOpts);
     await throwIfCancelled();
@@ -1826,11 +1865,15 @@ async function sendPrompt({
     let lastStatusText = null;
     lastThoughtText = '';
     let accordionExpanded = false;
+    let lastOverlayCheck = 0;
 
     while (Date.now() - streamStartTime < SESSION_CAP_MS) {
       await throwIfCancelled();
       await page.waitForTimeout(POLL_INTERVAL_MS);
-      await dismissOverlays(page, overlayOpts);
+      if (Date.now() - lastOverlayCheck >= 2000) {
+        lastOverlayCheck = Date.now();
+        await dismissOverlays(page, { ...overlayOpts, allowReload: false });
+      }
 
       const status = await safeEval(page,
         ({ idx, promptPrefix, fnSrc, checkSrc }) => {
@@ -2268,8 +2311,13 @@ async function sendPrompt({
 
     return resObj;
   } finally {
-    if (page && typeof page.off === 'function' && onPageResponse) {
-      page.off('response', onPageResponse);
+    if (page && typeof page.off === 'function') {
+      if (onPageRequest) {
+        page.off('request', onPageRequest);
+      }
+      if (onPageResponse) {
+        page.off('response', onPageResponse);
+      }
     }
     // Capture usage limits post-turn on every turn (including rate-limited / failed turns)
     // before parking tab on about:blank
@@ -2325,8 +2373,7 @@ async function dismissOverlays(page, opts = {}) {
   const isTurn = Boolean(opts.isTurn);
   const stateDir = opts.stateDir || process.env.WEB_GEMINI_STATE_DIR || process.env.ARGON_STATE_DIR || path.join(os.homedir(), '.bb', 'plugins', 'provider-web-gemini');
   const screenshotDir = opts.screenshotDir || path.join(stateDir, 'screenshots');
-
-  let reloadedBackdrop = false;
+  const allowReload = opts.allowReload !== false;
 
   for (let iter = 0; iter < 5; iter++) {
     let outcome = null;
@@ -2353,7 +2400,17 @@ async function dismissOverlays(page, opts = {}) {
           const sel = '[role="menu"], mat-menu-panel, .mat-mdc-menu-panel, .mat-menu-panel, [role="tooltip"], mat-tooltip-component';
           if (el.matches && el.matches(sel)) return true;
           if (el.closest && el.closest(sel)) return true;
-          if (el.querySelector && el.querySelector(sel)) return true;
+          const isDialogContainer = Boolean(
+            el.matches && (el.matches('mat-dialog-container, [role="dialog"]') || (el.closest && el.closest('mat-dialog-container, [role="dialog"]')))
+          );
+          if (!isDialogContainer && el.querySelector) {
+            const inner = el.querySelector(sel);
+            if (inner) {
+              const elText = (el.innerText || '').trim();
+              const innerText = (inner.innerText || '').trim();
+              if (!elText || elText === innerText) return true;
+            }
+          }
           return false;
         };
         const candidates = Array.from(
@@ -2465,8 +2522,8 @@ async function dismissOverlays(page, opts = {}) {
     }
 
     if (outcome.type === 'backdrop-covers-input') {
-      if (!reloadedBackdrop) {
-        reloadedBackdrop = true;
+      if (allowReload && !opts.reloadedBackdrop) {
+        opts.reloadedBackdrop = true;
         if (typeof page.reload === 'function') {
           await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
         }
@@ -2474,6 +2531,7 @@ async function dismissOverlays(page, opts = {}) {
         await page.waitForTimeout(500);
         continue;
       }
+      driverLog('driver:dialog', { account, action: 'backdrop-covers-input' });
       break;
     }
 

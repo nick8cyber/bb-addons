@@ -38,6 +38,10 @@ import {
   sanitizeThoughtString,
   sanitizeThoughtPayload,
   appendThoughtLog,
+  runPrompt,
+  cancelSession,
+  sessions,
+  _setOutputHook,
 } from "../acp-server.mjs";
 import { checkedAnswer } from "../src/inner-context.mjs";
 
@@ -7484,29 +7488,76 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
     assert.ok(cleanAuth.includes("Authorization: [REDACTED]"));
     assert.ok(cleanAuth.includes("Cookie: [REDACTED]"));
 
-    // Test multi-chunk thought streaming with split Bearer
-    let rawAcc = "";
-    let cleanLen = 0;
-    const emitChunk = (chunk) => {
-      rawAcc += chunk;
-      const cleanAll = sanitizeThoughtString(rawAcc);
-      let delta = "";
-      if (cleanAll.length > cleanLen) {
-        if (cleanAll.startsWith(cleanAll.slice(0, cleanLen))) {
-          delta = cleanAll.slice(cleanLen);
-        } else {
-          delta = cleanAll;
-        }
-        cleanLen = cleanAll.length;
+    // Test multi-chunk thought streaming with split Bearer and credentials via real runPrompt
+    const thoughtUpdates = [];
+    _setOutputHook((msg) => {
+      if (msg?.params?.update) {
+        thoughtUpdates.push(msg.params.update);
       }
-      return delta;
-    };
-    const c1 = emitChunk("Step 1. Authorization: Bearer ");
-    const c2 = emitChunk("secret_token_value_xyz123");
-    assert.ok(c1.includes("Authorization: [REDACTED]"));
-    assert.equal(c1.includes("secret_token_value"), false);
-    assert.equal(c2.includes("secret_token_value"), false, "Bearer value in separate chunk must NOT leak");
-    assert.equal(c2, "");
+    });
+    _setDriverHooks({
+      sendPrompt: async (req) => {
+        // Stream chunk with partial Bearer header and secret across chunks
+        req.onThoughtChunk("Step 1. Authorization: Bearer ");
+        req.onThoughtChunk("secret_token_value_xyz123 then safe words");
+        // Stream URL with userinfo credentials split across chunks
+        req.onThoughtChunk("\nURL https://alice:s3cr3tPW");
+        req.onThoughtChunk("@host.example.com/x and finish");
+        return {
+          text: "Response text",
+          convId: "c_thought_test",
+        };
+      },
+    });
+    try {
+      await runPrompt(991, "s_thought_test", "test prompt");
+      const thoughtChunks = thoughtUpdates
+        .filter((u) => u.sessionUpdate === "agent_thought_chunk")
+        .map((u) => u.content?.text || "");
+      const fullThoughtText = thoughtChunks.join("");
+
+      assert.ok(fullThoughtText.includes("Authorization: [REDACTED]"), "Authorization header must be redacted");
+      assert.equal(fullThoughtText.includes("secret_token_value_xyz123"), false, "Split Bearer token value must NOT leak");
+      assert.ok(fullThoughtText.includes("then safe words"), "Text following secret must not be lost");
+      assert.equal(fullThoughtText.includes("s3cr3tPW"), false, "Userinfo password split across chunks must NOT leak");
+      assert.ok(fullThoughtText.includes("https://host.example.com/x and finish"), "Sanitized URL and trailing text must be preserved");
+    } finally {
+      _setDriverHooks(null);
+      _setOutputHook(null);
+    }
+
+    // Test that review verdict containing Cookie and Bearer text is NOT corrupted by sanitizeThoughtString
+    const rawVerdictJson = JSON.stringify({
+      verdict: "CHANGES",
+      findings: [{ text: "Header Cookie: sid=12345; session=abc and Bearer secret_tok" }],
+      blockers: 1,
+    });
+    _setDriverHooks({
+      sendPrompt: async (req) => {
+        req.onChunk?.(rawVerdictJson);
+        return {
+          text: rawVerdictJson,
+          convId: "c_verdict_test",
+        };
+      },
+    });
+    try {
+      const verdictUpdates = [];
+      _setOutputHook((msg) => {
+        if (msg?.result?.stopReason || msg?.params?.update) verdictUpdates.push(msg);
+      });
+      await runPrompt(992, "s_verdict_test", "check code");
+      const msgChunk = verdictUpdates.find((m) => m?.params?.update?.sessionUpdate === "agent_message_chunk");
+      assert.ok(msgChunk, "Should have received an agent_message_chunk update");
+      assert.ok(msgChunk.params.update.content.text.includes("Header Cookie: sid=12345"));
+      assert.ok(msgChunk.params.update.content.text.includes("Bearer secret_tok"));
+      const parsed = JSON.parse(msgChunk.params.update.content.text);
+      assert.equal(parsed.verdict, "CHANGES");
+      assert.equal(parsed.blockers, 1);
+    } finally {
+      _setDriverHooks(null);
+      _setOutputHook(null);
+    }
 
     const rawPayload = {
       query: "test query",
@@ -7567,7 +7618,6 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
         .join("\n");
       formattedText = formattedText.trimEnd() + "\n\n### Источники поиска\n" + list;
     }
-    formattedText = sanitizeThoughtString(formattedText);
     if (contextResearch.settings?.maskResponse) {
       formattedText = contextResearch.settings.maskResponse(formattedText);
     }
@@ -7704,34 +7754,71 @@ test("36. PLUG-408: search metrics, hNvQHb parser, whitelist dialogs, wave prote
 
   // --- I. Unique toolCallId and cancellation guard for search cards ---
   {
-    const toolCallUpdates = [];
-    const session = {
-      convId: "c_session_conv",
-      geminiTurnCount: 0,
-      cancelled: false,
-    };
-    const upd = (u) => toolCallUpdates.push(u);
+    const capturedUpdates = [];
+    _setOutputHook((msg) => {
+      if (msg?.params?.update) capturedUpdates.push(msg.params.update);
+    });
 
-    // Prompt 1
-    session.geminiTurnCount++;
-    const prompt1Idx = session.geminiTurnCount;
-    const callId1 = `call_${session.convId}_${prompt1Idx}_0`;
-    upd({ sessionUpdate: "tool_call", toolCallId: callId1, status: "in_progress" });
+    let sendCount = 0;
+    _setDriverHooks({
+      sendPrompt: async (req) => {
+        sendCount++;
+        return {
+          text: `Reply ${sendCount}`,
+          convId: "c_search_session",
+          search: {
+            status: 4,
+            queries: [`query for send ${sendCount}`],
+            sources: [{ title: "Source 1", url: "https://example.com/1" }],
+          },
+        };
+      },
+    });
 
-    // Repair prompt 2
-    session.geminiTurnCount++;
-    const prompt2Idx = session.geminiTurnCount;
-    const callId2 = `call_${session.convId}_${prompt2Idx}_0`;
-    upd({ sessionUpdate: "tool_call", toolCallId: callId2, status: "in_progress" });
+    try {
+      // Send 1
+      await runPrompt(1001, "s_search_cards_session", "Prompt 1");
+      const toolCalls1 = capturedUpdates.filter((u) => u.sessionUpdate === "tool_call");
+      assert.equal(toolCalls1.length, 1, "First prompt must emit one tool_call");
+      const callId1 = toolCalls1[0].toolCallId;
+      assert.ok(callId1.startsWith("call_c_search_session_"), `Expected toolCallId prefix, got ${callId1}`);
 
-    assert.notEqual(callId1, callId2, "toolCallId must be strictly unique across successive sends including repair prompts");
+      // Send 2 on same session (e.g. repair or next turn)
+      await runPrompt(1002, "s_search_cards_session", "Prompt 2");
+      const toolCalls2 = capturedUpdates.filter((u) => u.sessionUpdate === "tool_call");
+      assert.equal(toolCalls2.length, 2, "Second prompt must emit second tool_call");
+      const callId2 = toolCalls2[1].toolCallId;
+      assert.ok(callId2.startsWith("call_c_search_session_"), `Expected toolCallId prefix, got ${callId2}`);
 
-    // Cancellation guard: verify no new cards created after cancel
-    session.cancelled = true;
-    const openedCards = [];
-    if (!session.cancelled) {
-      openedCards.push("opened_card");
+      assert.notEqual(callId1, callId2, "toolCallId must be strictly unique across successive sends");
+
+      // Cancellation guard: when session is cancelled before sendWebPrompt returns, zero tool_call emitted
+      const cancelUpdates = [];
+      _setOutputHook((msg) => {
+        if (msg?.params?.update) cancelUpdates.push(msg.params.update);
+      });
+      _setDriverHooks({
+        sendPrompt: async (req) => {
+          // Cancel session during send
+          cancelSession("s_cancel_test_session");
+          return {
+            text: "Cancelled reply",
+            convId: "c_cancel_conv",
+            search: {
+              status: 4,
+              queries: ["cancelled query"],
+              sources: [],
+            },
+          };
+        },
+      });
+
+      await runPrompt(1003, "s_cancel_test_session", "Prompt that gets cancelled");
+      const cancelledToolCalls = cancelUpdates.filter((u) => u.sessionUpdate === "tool_call");
+      assert.equal(cancelledToolCalls.length, 0, "No new tool call cards must open after cancellation");
+    } finally {
+      _setDriverHooks(null);
+      _setOutputHook(null);
     }
-    assert.equal(openedCards.length, 0, "No new tool call cards must open after cancellation");
   }
 });

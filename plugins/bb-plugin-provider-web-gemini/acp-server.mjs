@@ -1087,7 +1087,10 @@ async function fakeTaskReply({ onSubmitted, convId, signal }) {
   return { convId: convId ?? "fake-task", text: 'FAKE_WEB_GEMINI_TASK\n{"verdict":"OK","blockers":0}' };
 }
 
-const out = (v) => process.stdout.write(`${JSON.stringify(v)}\n`);
+let out = (v) => process.stdout.write(`${JSON.stringify(v)}\n`);
+export function _setOutputHook(fn) {
+  out = fn || ((v) => process.stdout.write(`${JSON.stringify(v)}\n`));
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Stage log: every prompt transition lands here so a silent hang shows its
@@ -1313,7 +1316,7 @@ const ppidWatch = setInterval(() => {
 ppidWatch.unref?.();
 
 /* ---------- session state ---------- */
-const sessions = new Map();
+export const sessions = new Map();
 let sessionCounter = 0;
 
 export function normalizeThinking(val) {
@@ -1592,7 +1595,7 @@ export function createTaskTurn(sessionId) {
   return turn;
 }
 
-function cancelSession(sessionId) {
+export function cancelSession(sessionId) {
   const s = sessions.get(sessionId);
   if (!s) return;
   s.cancelled = true;
@@ -1761,7 +1764,7 @@ let activeAbort = null;
 let activeAttempt = null;
 let activePromptSessionId = null;
 
-async function runPrompt(id, sessionId, text, attachments = {}) {
+export async function runPrompt(id, sessionId, text, attachments = {}) {
   const s = sessions.get(sessionId) ?? {
     model: "neon",
     thinking: "thinking",
@@ -2184,7 +2187,29 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 convId: s.convId || null,
               });
               let rawThoughtAccumulator = "";
-              let emittedCleanLength = 0;
+              let emittedCleanText = "";
+              const flushThoughts = () => {
+                if (!rawThoughtAccumulator || s.cancelled || s.activeGen !== gen) return;
+                const cleanAll = sanitizeThoughtString(rawThoughtAccumulator);
+                let delta = "";
+                if (cleanAll.startsWith(emittedCleanText)) {
+                  delta = cleanAll.slice(emittedCleanText.length);
+                } else if (cleanAll.length > emittedCleanText.length) {
+                  let i = 0;
+                  while (i < emittedCleanText.length && i < cleanAll.length && emittedCleanText[i] === cleanAll[i]) i++;
+                  delta = cleanAll.slice(i);
+                }
+                if (!delta) return;
+                emittedCleanText = cleanAll;
+                appendThoughtLog(thoughtsLogPath, "thought", { text: delta });
+                if (streamThoughtsEnabled) {
+                  streamedAny = true;
+                  upd({
+                    sessionUpdate: "agent_thought_chunk",
+                    content: { type: "text", text: delta },
+                  });
+                }
+              };
               const request = {
                 prompt: message,
                 model: profile.model,
@@ -2217,17 +2242,24 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 onThoughtChunk: (chunk) => {
                   if (!chunk || s.cancelled || s.activeGen !== gen) return;
                   rawThoughtAccumulator += chunk;
-                  const cleanAll = sanitizeThoughtString(rawThoughtAccumulator);
+                  // Hold uncompleted token/URL tail until whitespace or newline
+                  const lastSpaceIdx = rawThoughtAccumulator.search(/\s[^\s]*$/);
+                  const safeCut = lastSpaceIdx !== -1
+                    ? lastSpaceIdx + 1
+                    : (rawThoughtAccumulator.length > 512 ? rawThoughtAccumulator.length - 256 : -1);
+                  if (safeCut === -1) return;
+                  const safePart = rawThoughtAccumulator.slice(0, safeCut);
+                  const cleanSafe = sanitizeThoughtString(safePart);
                   let delta = "";
-                  if (cleanAll.length > emittedCleanLength) {
-                    if (cleanAll.startsWith(cleanAll.slice(0, emittedCleanLength))) {
-                      delta = cleanAll.slice(emittedCleanLength);
-                    } else {
-                      delta = cleanAll;
-                    }
-                    emittedCleanLength = cleanAll.length;
+                  if (cleanSafe.startsWith(emittedCleanText)) {
+                    delta = cleanSafe.slice(emittedCleanText.length);
+                  } else if (cleanSafe.length > emittedCleanText.length) {
+                    let i = 0;
+                    while (i < emittedCleanText.length && i < cleanSafe.length && emittedCleanText[i] === cleanSafe[i]) i++;
+                    delta = cleanSafe.slice(i);
                   }
                   if (!delta) return;
+                  emittedCleanText = cleanSafe;
                   appendThoughtLog(thoughtsLogPath, "thought", { text: delta });
                   if (streamThoughtsEnabled) {
                     streamedAny = true;
@@ -2252,10 +2284,13 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               try {
                 s.geminiTurnCount = (s.geminiTurnCount ?? 0) + 1;
                 res = await sendWebPrompt(request);
+                flushThoughts();
 
                 const isCancelled = s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted;
                 if (!isCancelled && res?.search?.queries?.length) {
-                  const promptIdx = s.geminiTurnCount;
+                  const promptIdx = (tj?.turn?.turnNo != null)
+                    ? `${tj.turn.turnNo}_${budgets.repairRounds ?? 0}`
+                    : `${s.geminiTurnCount}`;
                   const activeConvId = res.convId || s.convId || sessionId;
                   for (let qIdx = 0; qIdx < res.search.queries.length; qIdx++) {
                     const q = res.search.queries[qIdx];
@@ -2399,7 +2434,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   tj.turn.backendId = backend.id;
                 }
                 persistJournal();
-                if (res.convId) persistJournal(() => journal.saveSessionRecord(STATE_DIR, tj.entry, { convId: res.convId, backendId: backend.id }));
+                if (res.convId) persistJournal(() => journal.saveSessionRecord(STATE_DIR, tj.entry, { convId: res.convId, backendId: backend.id, geminiTurnCount: s.geminiTurnCount }));
               }
               if (!task) emitGenerated(res);
               slog("driver:done", { sessionId, convId: s.convId || null, streamedAny });
@@ -2515,7 +2550,6 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                       .join("\n");
                     text = text.trimEnd() + "\n\n### Источники поиска\n" + list;
                   }
-                  text = sanitizeThoughtString(text);
                   if (context.settings?.maskResponse) {
                     text = context.settings.maskResponse(text);
                   }
@@ -3178,6 +3212,7 @@ function restoreSessionFromRecord(requestedId, entry, cwd) {
     convId: entry.record.convId ?? null,
     account: entry.record.account ?? "auto",
     backend: BACKENDS.find((b) => b.id === entry.record.backendId) ?? null,
+    geminiTurnCount: entry.record.geminiTurnCount ?? (entry.record.lastTurnNo ?? 0),
     journal: entry,
     mode: WRITE_LAUNCH && entry.record.accessMode === "write" ? "write" : "read-only",
   };
