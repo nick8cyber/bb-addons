@@ -3689,8 +3689,10 @@ test("Вложения задачи (PLUG-423): пакет аудита выкл
 
   const oldHome = process.env.HOME;
   const oldOrchDir = process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  const oldBbData = process.env.BB_DATA_DIR;
   process.env.HOME = fakeHome;
   delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+  delete process.env.BB_DATA_DIR;
 
   try {
     const session = { cwd: tmp };
@@ -3793,11 +3795,37 @@ test("Вложения задачи (PLUG-423): пакет аудита выкл
     const matsEn = await collectTaskAttachments(prepEn, [], packageOptions);
     assert.equal(matsEn.length, 1);
     assert.equal(matsEn[0].name, "release-102-audit.md");
+
+    // E. Корень из BB_DATA_DIR ($BB_DATA_DIR/plugins/orchestrator/release-audit/...)
+    const customBbDataDir = join(tmp, "custom-bb-data");
+    const bbDataAuditDir = join(customBbDataDir, "plugins", "orchestrator", "release-audit");
+    mkdirSync(bbDataAuditDir, { recursive: true });
+    const bbDataPacket = join(bbDataAuditDir, "release-103-audit.md");
+    const bbDataContent = "Custom BB_DATA_DIR audit packet\n";
+    writeFileSync(bbDataPacket, bbDataContent);
+    delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+    process.env.BB_DATA_DIR = customBbDataDir;
+
+    const textBbData = [
+      "# PLUG-423 · BB_DATA_DIR audit task",
+      "## Description", "Audit description",
+      "## Additional instructions",
+      `Проверь ${bbDataPacket} перед релизом`,
+    ].join("\n");
+    const prepBbData = await prepareTask({ text: textBbData, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    const matsBbData = await collectTaskAttachments(prepBbData, [], packageOptions);
+    assert.equal(matsBbData.length, 1);
+    assert.equal(matsBbData[0].source, "orchestrator-data");
+    assert.equal(matsBbData[0].name, "release-103-audit.md");
+    assert.equal(matsBbData[0].required, true);
+    assert.equal(matsBbData[0].text, bbDataContent);
   } finally {
     if (oldHome !== undefined) process.env.HOME = oldHome;
     else delete process.env.HOME;
     if (oldOrchDir !== undefined) process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR = oldOrchDir;
     else delete process.env.WEB_GEMINI_ORCHESTRATOR_DATA_DIR;
+    if (oldBbData !== undefined) process.env.BB_DATA_DIR = oldBbData;
+    else delete process.env.BB_DATA_DIR;
   }
 });
 
