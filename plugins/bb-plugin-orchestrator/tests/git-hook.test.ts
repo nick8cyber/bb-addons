@@ -333,14 +333,14 @@ test("§17.3 (PLUG-210): pre-push chains only to an EXECUTABLE local hook", () =
   assert.equal(existsSync(join(repo, "local-ran")), false);
 });
 
-test("§17.3 / §24.1: hook-names covers every githooks(5) name (exactly 23 names)", () => {
+test("§17.3 / §24.1: hook-names covers every githooks(5) name (exactly 27 names, p4-* included)", () => {
   const names = new Set(
     readFileSync(NAMES_SRC, "utf8")
       .split("\n")
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith("#")),
   );
-  assert.equal(names.size, 23);
+  assert.equal(names.size, 27);
   // the full githooks(5) inventory — client AND receive-pack hooks,
   // EXCEPT push-to-checkout (ревью PLUG-214: the hook's mere presence
   // disables git's built-in worktree update on updateInstead pushes)
@@ -352,6 +352,8 @@ test("§17.3 / §24.1: hook-names covers every githooks(5) name (exactly 23 name
     "post-update", "reference-transaction",
     "pre-auto-gc", "post-rewrite", "sendemail-validate",
     "fsmonitor-watchman", "post-index-change",
+    "p4-changelist", "p4-prepare-changelist", "p4-post-changelist",
+    "p4-pre-submit",
   ]) {
     assert.ok(names.has(n), `hook-names missing ${n}`);
   }

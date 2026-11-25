@@ -70,8 +70,14 @@ export interface ChainConfig {
   /** Как прочитано из git: абсолютный путь, либо относительный (git
    * отсчитывает его от каталога запуска хука — так же `hook-lib.mjs`). */
   previousGlobalHooksPath?: string | null;
-  /** Реальный путь копии (top level) → прежний действующий каталог хуков. */
+  /** Реальный путь копии (top level) → прежний действующий каталог хуков
+   * (область `worktree` — касается только этой копии). */
   localHooks?: Record<string, string>;
+  /** Реальный путь общего каталога git репозитория → исходное значение
+   * `local` core.hooksPath как его записал владелец. Относительное значение
+   * хук разрешает от корня ТЕКУЩЕЙ копии (как git), поэтому оно работает и
+   * в worktree, созданных после `--fix-local` (§24.1 п.1, п.6). */
+  repoHooks?: Record<string, string>;
 }
 
 export function readChainConfig(hooksDir: string): ChainConfig {
@@ -170,6 +176,13 @@ function listWorktrees(exec: RunCmd, copy: string): string[] {
 
 const OVERRIDE_SCOPES = new Set(["local", "worktree", "command"]);
 
+/** Значение core.hooksPath, разрешённое как git (от корня копии,
+ * `~/` — от домашнего), указывает на каталог `target`. */
+function pointsAt(value: string, copy: string, target: string): boolean {
+  const v = value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
+  return realPath(isAbsolute(v) ? v : resolve(copy, v)) === target;
+}
+
 /**
  * `hooks install --fix-local <копия>` (§24.1 п.1): только по
  * подтверждению владельца. Переносит действующий локальный путь хуков
@@ -223,12 +236,34 @@ function fixLocal(
       }
     }
   }
+  const commonRaw = tryExec(exec, "git", [
+    "-C",
+    copy,
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir",
+  ]);
+  if (local && !commonRaw) {
+    throw new OrchestratorError("git-failed", `не удалось определить общий каталог git копии ${copy}`);
+  }
+  const common = commonRaw ? realPath(commonRaw) : "";
   mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
   const chainBefore = readChainConfig(hooksDir);
   const chain: ChainConfig = JSON.parse(JSON.stringify(chainBefore));
-  chain.localHooks = chain.localHooks ?? {};
-  for (const [c, p] of affected) {
-    if (p !== realPath(hooksDir)) chain.localHooks[c] = p;
+  const want0 = realPath(hooksDir);
+  // `local` — значение репозитория: хранится как записано, по общему
+  // каталогу (действует во всех копиях, в т.ч. будущих worktree).
+  if (local && !pointsAt(local.value, copy, want0)) {
+    chain.repoHooks = chain.repoHooks ?? {};
+    chain.repoHooks[common] = local.value;
+  }
+  // `worktree` — только эта копия: её прежний действующий путь.
+  if (wt) {
+    const p = affected.get(copy);
+    if (p && p !== want0) {
+      chain.localHooks = chain.localHooks ?? {};
+      chain.localHooks[copy] = p;
+    }
   }
   writeChainConfig(hooksDir, chain);
 

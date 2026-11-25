@@ -1688,7 +1688,7 @@ export function syncInstalledGateHooks(hooksDir: string, t: T): boolean {
   return a || b || c || lib || d || e;
 }
 
-/** §17.3 (Б2) & §24.1: standard names the installer covers — 23 standard hooks from HOOK_NAMES. */
+/** §17.3 (Б2) & §24.1: standard names the installer covers — 27 standard hooks from HOOK_NAMES. */
 function standardHookNames(): readonly string[] {
   return HOOK_NAMES;
 }
@@ -5776,9 +5776,11 @@ export async function runPostPublish(
             }
           } finally {
             if (isLive) {
-              // Ссылки и объекты — снова «только чтение» сразу после ff;
-              // рабочее дерево остаётся записываемым для команд с
-              // cwd: checkout (сборка) до конца postPublish (§24.1 п.3).
+              // §24.1 п.3: окно записи — ff + сборка под замком цели.
+              // Ссылки и объекты — «только чтение» сразу после ff; дерево
+              // записываемо для сборки (dist/, node_modules/) и снова
+              // «только чтение» в конце postPublish — и при ошибке сборки.
+              // Без маркера `.bb-live-checkout` права не трогаются.
               if (liveTokenVal) revokeLiveToken(co, liveTokenVal);
               const coCommon = await gitOut([
                 "rev-parse",

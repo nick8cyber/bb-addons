@@ -32,6 +32,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -41,7 +42,7 @@ import type { DelegationStore } from "./store.js";
 import type { BbCli } from "./bb-cli.js";
 import { acquireCopyLock, type MergeGit } from "./merge.js";
 
-export const LIVE_MARKER = "orchestrator-live.json";
+export const LIVE_MARKER = ".bb-live-checkout";
 
 function real(p: string): string {
   try {
@@ -105,24 +106,42 @@ export function defaultLiveDir(repoRoot: string): string {
 
 // ── Живая копия: маркер, реестр, токен ─────────────────────────────────
 
-/** Живая копия опознаётся по маркеру в её общем каталоге git (пишет
- * setup) или по реестру `live-copies.json` в каталоге хуков (пишет
- * плагин из принятой настройки) — не по подстроке пути. */
-export function isLiveCheckoutPath(p: string, hooksDir?: string): boolean {
+/** Живая копия опознаётся ТОЛЬКО по маркеру в её общем каталоге git,
+ * который ставит `live-checkout setup` (§24.1 п.1–3): ни путь, ни
+ * `postPublish.checkout` настройки, ни запись реестра сами по себе копию
+ * живой не делают — обычная рабочая копия владельца никогда не станет
+ * «только для чтения» и не попадёт под reference-transaction. */
+export function hasLiveMarker(p: string): boolean {
+  if (!p || !existsSync(p)) return false;
   const common = gitOut(["-C", resolve(p), "rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  if (common && existsSync(join(common, LIVE_MARKER))) return true;
-  if (hooksDir) {
-    try {
-      const list = JSON.parse(readFileSync(join(hooksDir, "live-copies.json"), "utf8"));
-      if (Array.isArray(list)) {
-        const me = real(gitOut(["-C", resolve(p), "rev-parse", "--show-toplevel"]) || p);
-        return list.some((x) => typeof x === "string" && real(x) === me);
-      }
-    } catch {
-      /* нет реестра */
-    }
+  return Boolean(common && existsSync(join(common, LIVE_MARKER)));
+}
+
+/** Маркер живой копии в её общем каталоге git — пишет только setup
+ * после успешной миграции. `.git` уже может быть «только чтение»
+ * (продолжение после самоперевода) — права каталога временно
+ * возвращаются и восстанавливаются. */
+export function writeLiveMarker(
+  liveDir: string,
+  data: { projectId: string; repo: string; sha: string },
+): void {
+  const common =
+    gitOut(["-C", liveDir, "rev-parse", "--path-format=absolute", "--git-common-dir"]) ||
+    join(liveDir, ".git");
+  const mode = statSync(common).mode & 0o777;
+  if ((mode & 0o200) === 0) chmodSync(common, mode | 0o700);
+  try {
+    const file = join(common, LIVE_MARKER);
+    rmSync(file, { force: true });
+    writeFileSync(file, JSON.stringify({ ...data, at: Date.now() }) + "\n", { mode: 0o444 });
+  } finally {
+    if ((mode & 0o200) === 0) chmodSync(common, mode);
   }
-  return false;
+}
+
+/** `hooksDir` оставлен для совместимости вызовов; реестр не источник. */
+export function isLiveCheckoutPath(p: string, _hooksDir?: string): boolean {
+  return hasLiveMarker(p);
 }
 
 function writeJsonAtomic(file: string, value: unknown, mode = 0o644): void {
@@ -132,11 +151,24 @@ function writeJsonAtomic(file: string, value: unknown, mode = 0o644): void {
   renameSync(tmp, file);
 }
 
-/** Реестр живых копий для хуков (реальные пути из принятой настройки). */
+/** Реестр живых копий (`live-copies.json`) — только каталоги успешной
+ * миграции setup: путь без маркера в реестр не попадает никогда. */
 export function writeLiveRegistry(hooksDir: string, paths: string[]): void {
   if (!existsSync(hooksDir)) return;
-  const list = [...new Set(paths.filter(Boolean).map(real))].sort();
+  const list = [...new Set(paths.filter((x) => x && hasLiveMarker(x)).map(real))].sort();
   writeJsonAtomic(join(hooksDir, "live-copies.json"), list);
+}
+
+/** Чистка реестра при загрузке настроек и `hooks install`: остаются только
+ * записи с маркером (снимает пути, внесённые прежней версией из настройки). */
+export function pruneLiveRegistry(hooksDir: string): void {
+  if (!existsSync(join(hooksDir, "live-copies.json"))) return;
+  writeLiveRegistry(hooksDir, readRegistry(hooksDir));
+}
+
+/** Внести каталог успешной миграции (с маркером) в реестр. */
+export function registerLiveCopy(hooksDir: string, liveDir: string): void {
+  writeLiveRegistry(hooksDir, [...readRegistry(hooksDir), liveDir]);
 }
 
 /** Целевые ветки всех проектов принятой настройки — для pre-commit. */
@@ -644,13 +676,20 @@ async function verifySwitched(
   }
 }
 
+/** Порядок отката: обратный порядку перевода, но сам orchestrator —
+ * ПОСЛЕДНИМ: его перезагрузка посреди отката не оставит прочие плагины
+ * на служебной копии (аудит р.5 п.5б). */
+export function rollbackOrder<T extends { id: string }>(switched: T[], selfId: string): T[] {
+  const rev = [...switched].reverse();
+  return [...rev.filter((s) => s.id !== selfId), ...rev.filter((s) => s.id === selfId)];
+}
+
 async function rollback(
   deps: MigrationDeps,
   switched: Array<{ id: string; prevDir: string }>,
 ): Promise<string[]> {
   const errors: string[] = [];
-  for (let i = switched.length - 1; i >= 0; i--) {
-    const s = switched[i]!;
+  for (const s of rollbackOrder(switched, deps.selfPluginId ?? "orchestrator")) {
     try {
       await defaultSwitch(deps, s.id, s.prevDir);
     } catch (e) {
@@ -784,12 +823,6 @@ export async function runLiveCheckoutMigration(
         );
       }
     }
-    // Маркер живой копии (до «только чтение»).
-    const common = gitOut(["-C", liveDir, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
-    writeFileSync(
-      join(common || join(liveDir, ".git"), LIVE_MARKER),
-      JSON.stringify({ projectId: req.projectId, repo: repoRoot, at: Date.now() }) + "\n",
-    );
 
     // (в) перевод по одному.
     for (const p of plan) {
@@ -851,9 +884,11 @@ export async function runLiveCheckoutMigration(
         `сбой записи postPublish.checkout: ${(e as Error).message ?? String(e)}; ${rollbackText(errs)}`,
       );
     }
+    // Маркер `.bb-live-checkout` — только после успешной миграции (§24.1 п.3).
+    writeLiveMarker(liveDir, { projectId: req.projectId, repo: repoRoot, sha: liveSha });
     if (deps.hooksDir) {
       try {
-        writeLiveRegistry(deps.hooksDir, [...readRegistry(deps.hooksDir), liveDir]);
+        registerLiveCopy(deps.hooksDir, liveDir);
       } catch {}
     }
     const msg = `live-checkout ${req.id}: служебная копия ${liveDir} (${liveSha.slice(0, 7)}), переведены: ${switched.map((s) => s.id).join(", ") || "нет"}; postPublish.checkout проекта ${req.projectId} → ${liveDir}`;
@@ -925,9 +960,10 @@ export async function resumeLiveCheckout(
     if (loadedFromLive && readBuildSha(selfRoot) === inf.liveSha) {
       try {
         await deps.writeCheckout(inf.projectId, inf.liveDir);
+        writeLiveMarker(inf.liveDir, { projectId: inf.projectId, repo: inf.canonicalRoot, sha: inf.liveSha });
         if (deps.hooksDir) {
           try {
-            writeLiveRegistry(deps.hooksDir, [...readRegistry(deps.hooksDir), inf.liveDir]);
+            registerLiveCopy(deps.hooksDir, inf.liveDir);
           } catch {}
         }
         const msg = `live-checkout ${req.id}: переведены ${switchedAll.map((s) => s.id).join(", ")}; postPublish.checkout проекта ${inf.projectId} → ${inf.liveDir} (${inf.liveSha.slice(0, 7)})`;

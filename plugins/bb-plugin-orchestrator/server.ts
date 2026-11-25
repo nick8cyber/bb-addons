@@ -154,7 +154,7 @@ import {
   listLiveCheckoutRequests,
   runLiveCheckoutMigration,
   resumeLiveCheckout,
-  writeLiveRegistry,
+  pruneLiveRegistry,
   writeTargetsRegistry,
   type LiveCheckoutRequest,
   type MigrationDeps,
@@ -1798,8 +1798,8 @@ export async function createPlugin(
     return [...out];
   };
 
-  /** §24.1: реестры для хуков — реальные пути живых копий и целевые
-   * ветки всех проектов (pre-commit видит их и в копии без снимка). */
+  /** §24.1: реестры для хуков — целевые ветки всех проектов (pre-commit
+   * видит их и в копии без снимка) и чистка реестра живых копий. */
   const syncHookRegistries = () => {
     const cfg = releaseConfig.config;
     if (!cfg) return;
@@ -1816,7 +1816,10 @@ export async function createPlugin(
       bb.log.warn(`orchestrator: targets.json: ${describeError(e)}`);
     }
     try {
-      writeLiveRegistry(dir, liveCheckoutsForRepo(""));
+      // §24.1 п.1: реестр живых копий пишет только setup (каталог
+      // успешной миграции с маркером); здесь — лишь чистка записей без
+      // маркера. postPublish.checkout настройки в реестр не вносится.
+      pruneLiveRegistry(dir);
     } catch (e) {
       bb.log.warn(`orchestrator: live-copies.json: ${describeError(e)}`);
     }

@@ -15,6 +15,7 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -40,11 +41,16 @@ import {
   liveCopyLockPath,
   migrationLockPath,
   parsePluginList,
+  pruneLiveRegistry,
+  registerLiveCopy,
   requestLiveCheckout,
+  resumeLiveCheckout,
   revokeLiveToken,
+  rollbackOrder,
   runLiveCheckoutMigration,
   saveLiveCheckoutRequest,
   setLiveCheckoutMigrating,
+  writeLiveRegistry,
   writeTargetsRegistry,
   type LiveCheckoutRequest,
   type MigrationDeps,
@@ -139,7 +145,10 @@ function commit(repo: string, env: NodeJS.ProcessEnv, file: string, content = "x
 
 test("§24.1 п.1: HOOK_NAMES — тот же список, что hooks/hook-names (один источник для обеих установок)", () => {
   assert.deepEqual([...HOOK_NAMES], [...readHookNames()]);
-  assert.equal(HOOK_NAMES.length, 23);
+  assert.equal(HOOK_NAMES.length, 27);
+  for (const n of ["p4-changelist", "p4-prepare-changelist", "p4-post-changelist", "p4-pre-submit"]) {
+    assert.ok(HOOK_NAMES.includes(n), `HOOK_NAMES missing ${n}`);
+  }
   assert.ok(!HOOK_NAMES.includes("push-to-checkout"));
 });
 
@@ -327,6 +336,43 @@ test("§24.1 п.1 (аудит р.3 п.4): --fix-local только владел�
   } finally {
     process.env.GIT_CONFIG_GLOBAL = prev;
   }
+});
+
+test("§24.1 п.1 (аудит р.5 п.2): --fix-local local=scripts/hooks — хук репозитория срабатывает и в worktree, созданном ПОСЛЕ переноса", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-fixlocal-rel-");
+  const repo = join(tmp, "repo");
+  initRepo(repo);
+  git(repo, ["checkout", "-q", "-b", "work"], env);
+  const log = join(tmp, "repo-hook.log");
+  mkdirSync(join(repo, "scripts", "hooks"), { recursive: true });
+  writeFileSync(
+    join(repo, "scripts", "hooks", "commit-msg"),
+    `#!/bin/sh\nbasename "$(git rev-parse --show-toplevel)" >> "${log}"\nexit 0\n`,
+  );
+  chmodSync(join(repo, "scripts", "hooks", "commit-msg"), 0o755);
+  assert.equal(commit(repo, env, "scripts/hooks/commit-msg", readFileSync(join(repo, "scripts", "hooks", "commit-msg"), "utf8")).status, 0);
+  git(repo, ["config", "--local", "core.hooksPath", "scripts/hooks"], env);
+  const prev = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = env.GIT_CONFIG_GLOBAL;
+  try {
+    const res = await installHooks({ hooksDir, fixLocalCopy: repo, confirmed: true, owner: true });
+    assert.equal(res.ok, true, res.message);
+    const common = realpathSync(git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout.trim());
+    // stored as written, by the repository's common dir — not per copy
+    assert.equal(readChainConfig(hooksDir).repoHooks?.[common], "scripts/hooks");
+    assert.equal(readChainConfig(hooksDir).localHooks?.[realpathSync(repo)], undefined);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prev;
+  }
+  writeFileSync(log, "");
+  const wt = join(tmp, "wt-new");
+  assert.equal(git(repo, ["worktree", "add", "-q", "-b", "task", wt], env).status, 0);
+  const r1 = commit(wt, env, "w.txt");
+  assert.equal(r1.status, 0, r1.stderr);
+  const r2 = commit(repo, env, "m.txt");
+  assert.equal(r2.status, 0, r2.stderr);
+  // the hook ran in BOTH copies (2 of 2), each resolved from its own top
+  assert.deepEqual(readFileSync(log, "utf8").trim().split("\n"), ["wt-new", "repo"]);
 });
 
 // ────────────────────────────────────────────────────────────────────────
@@ -611,6 +657,90 @@ test("§24.1 п.6 (аудит р.3 п.2/п.5): штатный runPostPublish —
   }
 });
 
+test("§24.1 п.1 (аудит р.5 п.1): postPublish.checkout = обычная копия владельца → не живая: реестр её не берёт, права не меняются, ссылки не блокируются", async () => {
+  const { tmp, hooksDir, env } = await hookEnv("orch-owner-copy-");
+  const seed = join(tmp, "seed");
+  const origin = join(tmp, "origin.git");
+  initRepo(seed);
+  execFileSync("git", ["clone", "-q", "--bare", seed, origin]);
+  const owner = join(tmp, "work", "bb-addons");
+  execFileSync("git", ["clone", "-q", origin, owner], { env });
+  writeFileSync(join(owner, "secret.env"), "k=v\n", { mode: 0o600 });
+  // a registry entry left by an older build (or written by hand) does
+  // not make a marker-less copy live, and is pruned
+  writeFileSync(join(hooksDir, "live-copies.json"), JSON.stringify([owner]) + "\n");
+  assert.equal(isLiveCheckoutPath(owner, hooksDir), false);
+  const br0 = git(owner, ["checkout", "-q", "-b", "owner-1"], env);
+  assert.equal(br0.status, 0, br0.stderr);
+  pruneLiveRegistry(hooksDir);
+  assert.deepEqual(JSON.parse(readFileSync(join(hooksDir, "live-copies.json"), "utf8")), []);
+  writeLiveRegistry(hooksDir, [owner]);
+  registerLiveCopy(hooksDir, owner);
+  assert.deepEqual(JSON.parse(readFileSync(join(hooksDir, "live-copies.json"), "utf8")), []);
+  git(owner, ["checkout", "-q", "main"], env);
+
+  execFileSync("git", ["-C", seed, "commit", "-q", "--allow-empty", "-m", "next"], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  execFileSync("git", ["-C", seed, "push", "-q", origin, "main"], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  const newSha = git(seed, ["rev-parse", "HEAD"]).stdout.trim();
+  const repo = join(tmp, "repo");
+  execFileSync("git", ["clone", "-q", origin, repo]);
+  const gitMode = statSync(join(owner, ".git")).mode & 0o777;
+  const { store, db } = initDb(join(tmp, "data.db"));
+  const { runPostPublish } = await import("../src/release.js");
+  const { parseReleaseConfig } = await import("../src/release-config.js");
+  const { createCmd } = await import("../src/cmd.js");
+  const cfg = parseReleaseConfig(
+    JSON.stringify({
+      defaults: { target: { action: "push", branch: "main" } },
+      projects: { p1: { postPublish: { checkout: owner, on: "published" } } },
+    }),
+  );
+  assert.deepEqual(cfg.errors, []);
+  const prevG = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = env.GIT_CONFIG_GLOBAL;
+  try {
+    const deps = {
+      store,
+      cmd: createCmd(),
+      loadReleaseConfig: () => cfg,
+      hooksDir: () => hooksDir,
+      instanceId: "inst-owner",
+      log: {},
+    } as never;
+    const row = {
+      id: 43,
+      task_key: "PLUG-410",
+      repo_path: repo,
+      repo_root: repo,
+      settings_project_id: "p1",
+      project_id: "p1",
+      target_action: "push",
+      target_branch: "main",
+      branch: "main",
+      head_sha: newSha,
+      published_sha: newSha,
+    } as never;
+    const res = await runPostPublish(deps, row, "release.published");
+    assert.equal(git(owner, ["rev-parse", "HEAD"]).stdout.trim(), newSha, JSON.stringify(res));
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = prevG;
+    db.close();
+  }
+  // permissions untouched: secret stays 0600, .git and tree writable
+  assert.equal(statSync(join(owner, "secret.env")).mode & 0o777, 0o600);
+  assert.equal(statSync(join(owner, ".git")).mode & 0o777, gitMode);
+  writeFileSync(join(owner, ".git", "probe"), "x");
+  writeFileSync(join(owner, "probe.txt"), "x");
+  // reference-transaction does not refuse the owner's ref updates
+  const br = git(owner, ["checkout", "-q", "-b", "owner-2"], env);
+  assert.equal(br.status, 0, br.stderr);
+  assert.equal(isLiveCheckoutPath(owner, hooksDir), false);
+});
+
 // ────────────────────────────────────────────────────────────────────────
 // §24.1 п.2: live-checkout setup под §23
 // ────────────────────────────────────────────────────────────────────────
@@ -834,6 +964,125 @@ test("§24.1 п.3 (аудит р.3 п.2): замок живой копии то�
 // ────────────────────────────────────────────────────────────────────────
 // Тест-страж: настоящий глобальный core.hooksPath машины не тронут
 // ────────────────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────────────────
+// §24.1 п.2 (аудит р.5 п.5): самоперевод orchestrator, продолжение, откат
+// ────────────────────────────────────────────────────────────────────────
+
+/** Миграция, в которой plug-1 — «этот» orchestrator: прежний экземпляр
+ * переводит себя последним и отдаёт итог новому (pendingSelf). */
+async function selfHandoff(prefix: string) {
+  const f = migrationFixture(prefix);
+  const oldSelf = join(realpathSync(f.repo), "plugins", "p1");
+  const res = await runLiveCheckoutMigration(
+    f.deps({ selfPluginId: "plug-1", selfRoot: oldSelf }),
+    f.approved,
+  );
+  assert.equal(res.ok, true);
+  assert.equal(res.pendingSelf, true);
+  // orchestrator переведён последним; запись настройки и маркер — ещё нет
+  assert.deepEqual(f.switches, ["plug-2→live", "plug-1→live"]);
+  assert.deepEqual(f.writes, []);
+  assert.equal(isLiveCheckoutPath(f.liveDir), false, "marker only after success");
+  assert.equal(isLiveCheckoutMigrating(f.store, f.repo), true);
+  assert.equal(getLiveCheckoutRequest(f.store, f.approved.id)?.status, "migrating");
+  const newSelf = realpathSync(join(f.liveDir, "plugins", "p1"));
+  return { ...f, oldSelf, newSelf, liveSha: res.headSha };
+}
+
+test("§24.1 п.2 (аудит р.5 п.5): самоперевод → новый экземпляр из служебной копии с верным build-info пишет checkout и маркер", async () => {
+  const f = await selfHandoff("orch-self-ok-");
+  const out = await resumeLiveCheckout(f.deps({ selfPluginId: "plug-1", selfRoot: f.newSelf }));
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.ok, true, out[0]!.message);
+  assert.deepEqual(f.writes, [f.liveDir]);
+  assert.deepEqual(f.switches, ["plug-2→live", "plug-1→live"], "no rollback");
+  assert.equal(getLiveCheckoutRequest(f.store, f.approved.id)?.status, "done");
+  assert.equal(isLiveCheckoutMigrating(f.store, f.repo), false);
+  assert.equal(existsSync(migrationLockPath(f.repo)), false, "migration lock released");
+  // marker `.bb-live-checkout` written into the read-only .git
+  assert.equal(LIVE_MARKER, ".bb-live-checkout");
+  assert.equal(isLiveCheckoutPath(f.liveDir), true);
+  assert.throws(() => writeFileSync(join(f.liveDir, ".git", "x"), "x"), ".git stays read-only");
+  assert.match(f.owner.at(-1)!, /plug-2, plug-1/);
+  // повтор — заявка закрыта, ничего не делает
+  assert.deepEqual(await resumeLiveCheckout(f.deps({ selfPluginId: "plug-1", selfRoot: f.newSelf })), []);
+  chmodRecursive(f.liveDir, true);
+  f.db.close();
+});
+
+test("§24.1 п.2 (аудит р.5 п.5): build-info ≠ SHA → откат всех, orchestrator ПОСЛЕДНИМ, записи и маркера нет", async () => {
+  const f = await selfHandoff("orch-self-badsha-");
+  const info = join(f.newSelf, "dist", "build-info.json");
+  chmodRecursive(f.liveDir, true);
+  writeFileSync(info, JSON.stringify({ gitSha: "0".repeat(40) }));
+  chmodRecursive(f.liveDir, false);
+  const out = await resumeLiveCheckout(f.deps({ selfPluginId: "plug-1", selfRoot: f.newSelf }));
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.ok, false);
+  assert.match(out[0]!.message, /build-info/);
+  assert.deepEqual(f.switches, ["plug-2→live", "plug-1→live", "plug-2→prev", "plug-1→prev"]);
+  assert.deepEqual(f.writes, []);
+  assert.equal(isLiveCheckoutPath(f.liveDir), false);
+  assert.equal(getLiveCheckoutRequest(f.store, f.approved.id)?.status, "failed");
+  assert.equal(isLiveCheckoutMigrating(f.store, f.repo), false);
+  assert.equal(existsSync(migrationLockPath(f.repo)), false);
+  assert.match(f.owner.at(-1)!, /не выполнен/);
+  chmodRecursive(f.liveDir, true);
+  f.db.close();
+});
+
+test("§24.1 п.2 (аудит р.5 п.5): новый экземпляр не из служебной копии — до срока ждёт, по истечении откат прочих", async () => {
+  const f = await selfHandoff("orch-self-expire-");
+  const early = await resumeLiveCheckout(f.deps({ selfPluginId: "plug-1", selfRoot: f.oldSelf }));
+  assert.deepEqual(early, [], "within the deadline — still waiting");
+  assert.equal(isLiveCheckoutMigrating(f.store, f.repo), true);
+  const out = await resumeLiveCheckout(f.deps({ selfPluginId: "plug-1", selfRoot: f.oldSelf }), { maxAgeMs: -1 });
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.ok, false);
+  assert.match(out[0]!.message, /не завершился/);
+  // orchestrator остался на прежнем источнике — откатываются только прочие
+  assert.deepEqual(f.switches, ["plug-2→live", "plug-1→live", "plug-2→prev"]);
+  assert.deepEqual(f.writes, []);
+  assert.equal(getLiveCheckoutRequest(f.store, f.approved.id)?.status, "failed");
+  assert.equal(isLiveCheckoutMigrating(f.store, f.repo), false);
+  assert.equal(existsSync(migrationLockPath(f.repo)), false);
+  chmodRecursive(f.liveDir, true);
+  f.db.close();
+});
+
+test("§24.1 п.2 (аудит р.5 п.5б): сбой перевода самого orchestrator → откат в обратном порядке, orchestrator последним", async () => {
+  const f = migrationFixture("orch-self-fail-");
+  const base = f.deps();
+  await assert.rejects(
+    runLiveCheckoutMigration(
+      f.deps({
+        selfPluginId: "plug-1",
+        switchPlugin: async (id, dir) => {
+          if (id === "plug-1" && dir.includes("/live/")) {
+            f.switches.push("plug-1→live!");
+            throw new Error("simulated self install failure");
+          }
+          await base.switchPlugin!(id, dir);
+        },
+      }),
+      f.approved,
+    ),
+    /simulated self install failure/,
+  );
+  assert.deepEqual(f.switches, ["plug-2→live", "plug-1→live!", "plug-2→prev", "plug-1→prev"]);
+  assert.deepEqual(f.writes, []);
+  assert.equal(isLiveCheckoutPath(f.liveDir), false);
+  chmodRecursive(f.liveDir, true);
+  f.db.close();
+});
+
+test("§24.1 п.2 (аудит р.5 п.5б): rollbackOrder — обратный порядок, self в конце", () => {
+  const ids = (xs: Array<{ id: string }>) => xs.map((x) => x.id);
+  assert.deepEqual(ids(rollbackOrder([{ id: "a" }, { id: "orchestrator" }, { id: "b" }], "orchestrator")), ["b", "a", "orchestrator"]);
+  assert.deepEqual(ids(rollbackOrder([{ id: "a" }, { id: "b" }, { id: "orchestrator" }], "orchestrator")), ["b", "a", "orchestrator"]);
+  assert.deepEqual(ids(rollbackOrder([{ id: "a" }, { id: "b" }], "orchestrator")), ["b", "a"]);
+});
 
 test("тест-страж: глобальный core.hooksPath реальной машины до и после прогона совпадает", () => {
   assert.notEqual(process.env.HOME, REAL_HOME, "HOME тестов изолирован");

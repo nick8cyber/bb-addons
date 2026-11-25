@@ -8,16 +8,17 @@
  * - `chainTarget(name, self)` — the previous hook to call after our own
  *   checks: a migrated local `core.hooksPath` of THIS copy
  *   (`chain.json` → `localHooks`, keyed by the copy's real top-level
- *   path), then the repository's own `$GIT_DIR/hooks/<name>` and
+ *   path — `worktree` scope), the repository's migrated `local` value
+ *   (`repoHooks`, keyed by the real common git dir, a relative value
+ *   resolved from the current copy's top), then the repository's own `$GIT_DIR/hooks/<name>` and
  *   `<common dir>/hooks/<name>`, then the previous global
  *   `core.hooksPath`. The repository's hook keeps priority over the old
  *   global one (§24.1 п.1). A relative previous global path is resolved
  *   from the directory the hook runs in, like git itself does.
  * - `isLiveCopy()` — the service live copy (§24 п.1) is recognised by
- *   its marker `<common dir>/orchestrator-live.json`, written by
- *   `live-checkout setup`, or by its real path in
- *   `<hooks dir>/live-copies.json`, written by the plugin from the
- *   accepted `postPublish.checkout` — never by a path substring.
+ *   its marker `<common dir>/.bb-live-checkout`, written by
+ *   `live-checkout setup` — never by a path substring, the accepted
+ *   `postPublish.checkout` or a registry entry alone.
  * - `liveTokenValid(top)` — the one-shot postPublish token (§24.1 п.3):
  *   `~/.bb/plugin-live/.token` holds `{ "<real copy path>": { token,
  *   expiresAt } }`; valid when it equals `ORCH_LIVE_TOKEN`, is not
@@ -34,7 +35,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-export const LIVE_MARKER = "orchestrator-live.json";
+export const LIVE_MARKER = ".bb-live-checkout";
 
 export function real(p) {
   if (!p) return p;
@@ -98,6 +99,15 @@ export function chainTarget(hooksDir, name, self) {
       candidates.push(join(local[key], name));
     }
   }
+  // The repository's migrated `local` core.hooksPath, kept as written and
+  // keyed by the common git dir: a relative value is resolved from THIS
+  // copy's top level (like git), so worktrees added later keep it.
+  const repo = chain.repoHooks && typeof chain.repoHooks === "object" ? chain.repoHooks : {};
+  if (common && typeof repo[common] === "string" && repo[common]) {
+    const raw = expandHome(repo[common]);
+    const base = isAbsolute(raw) ? raw : resolve(top || gitDir || process.cwd(), raw);
+    candidates.push(join(base, name));
+  }
   if (process.env.GIT_DIR) {
     candidates.push(join(resolve(process.env.GIT_DIR), "hooks", name));
   }
@@ -133,7 +143,7 @@ export function runChain(hooksDir, name, self, input) {
   return res.status ?? 1;
 }
 
-/** Real paths of the configured live copies (plugin-written registry). */
+/** Real paths of migrated live copies (registry written by setup). */
 export function registeredLiveCopies(hooksDir) {
   const list = readJson(join(hooksDir, "live-copies.json"));
   const out = new Set();
@@ -143,10 +153,11 @@ export function registeredLiveCopies(hooksDir) {
   return out;
 }
 
-export function isLiveCopy(hooksDir, paths = repoPaths()) {
-  if (paths.common && existsSync(join(paths.common, LIVE_MARKER))) return true;
-  const reg = registeredLiveCopies(hooksDir);
-  return Boolean(paths.top && reg.has(paths.top));
+/** Live ONLY by the setup marker in the copy's common git dir. The
+ * registry is informational (successful migrations) and never makes a
+ * marker-less copy — e.g. the owner's checkout — live (§24.1 п.1). */
+export function isLiveCopy(_hooksDir, paths = repoPaths()) {
+  return Boolean(paths.common && existsSync(join(paths.common, LIVE_MARKER)));
 }
 
 export function liveTokenFile() {
