@@ -1622,10 +1622,13 @@ async function sendPrompt({
       // PLUG-413: "answer" = hasFinishedContent (§4.2) or text captured from
       // message-content. Raw pending-response text (src 'raw': "Searching the
       // web…", "Show thinking…") is not an answer and does not reset the window.
+      // With the target found the answer is hasFinishedContent only (§2.3 п.3):
+      // stale captured text must not count once message-content has emptied.
       const answered = () =>
         Boolean(
-          (status && status.targetFound ? status.hasFinishedContent : lastHadFinishedContent) ||
-            (lastSrc === 'mc' && lastText && lastText.length > 0)
+          status && status.targetFound
+            ? status.hasFinishedContent
+            : lastHadFinishedContent || (lastSrc === 'mc' && lastText && lastText.length > 0)
         );
       const highStalled = () => {
         if (hasStopButton) {

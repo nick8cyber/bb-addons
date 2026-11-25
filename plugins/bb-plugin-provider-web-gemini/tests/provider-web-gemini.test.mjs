@@ -7178,6 +7178,35 @@ test("35. PLUG-407: thinking/search progress extends stall, pending-response tar
       );
     }
 
+    // (г5) Target still found, but message-content empties after text was captured
+    // under Stop, then Stop vanishes — stale captured text is not an answer
+    // (§2.3 п.3: with the target found the answer is hasFinishedContent only):
+    // stalled at stallMs after Stop vanished, not held until the session cap.
+    {
+      process.env.WEB_GEMINI_SESSION_CAP_MS = String(HIGH_CAP_MS);
+      const h = harness({ advanceMs: 200 });
+      h.state.doc = streamDoc("Answer text");
+      h.state.stopVisible = true;
+      let goneAt = null;
+      h.state.onPoll = (p) => {
+        if (p === 2) {
+          h.state.doc = streamDoc("", { stop: false });
+          h.state.stopVisible = false;
+          goneAt = h.state.now;
+        }
+      };
+      await assert.rejects(
+        h.drive({ prompt: PROMPT, isNewChat: false, thinking: "high", stallMs: 1000 }),
+        (err) => {
+          assert.equal(err.code, "WEB_GEMINI_STALLED", `emptied message-content must stall, got ${err.code}`);
+          return true;
+        }
+      );
+      const delta = h.state.now - goneAt;
+      assert.ok(delta >= 1000 && delta < 1400, `stall must come at stallMs after stop vanished, got ${delta}ms`);
+      process.env.WEB_GEMINI_SESSION_CAP_MS = "20000";
+    }
+
     // (г4) Brief target loss mid-stream while the stop button is visible must not
     // truncate the answer in any thinking mode — the full answer is returned.
     for (const thinking of ["low", "medium", "high"]) {
