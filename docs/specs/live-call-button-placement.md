@@ -2,7 +2,7 @@
 title: Live Call — где показывать кнопку звонка
 status: approved
 owner: coordinator
-date: 2026-11-26
+date: 2026-11-25
 tags: [live-call, sidebar, settings]
 repo: nick8cyber/bb-addons → plugins/bb-plugin-live-call
 related: docs/specs/live-call-contract.md §15.1, docs/specs/nav-icon-row.md
@@ -45,8 +45,10 @@ related: docs/specs/live-call-contract.md §15.1, docs/specs/nav-icon-row.md
 Регистрации слотов одноразовые (у footer-action нет unregister, navPanel декларативная): значение читается один раз при старте app-бандла, **смена настройки применяется после перезагрузки страницы**. Под контролом в секции настроек — строка-подсказка «Применяется после перезагрузки страницы».
 
 ## 4. Файлы
+- `plugins/bb-plugin-live-call/src/ui/button-placement.ts` — носитель механизма §2: ключи `bb_live_call_button_footer`/`bb_live_call_button_nav`, синхронные getter/setter, `readCallButtonPlacement()`, хук `useCallButtonPlacement()` со слушателем `storage`, `CALL_PANEL_PATH`, `AUTO_CALL_MIN_AGE_MS`, `APP_BUNDLE_LOADED_AT`.
 - `plugins/bb-plugin-live-call/app.tsx` — условные регистрации (footer action по `callButtonFooter`, navPanel по `callButtonNav`), компонент страницы панели, отметка загрузки бандла для §3.2.
 - `plugins/bb-plugin-live-call/src/ui/SettingsSection.tsx` — два тумблера + подсказка про перезагрузку; `app.css` — стили страницы.
+- `plugins/bb-plugin-live-call/package.json` (+ `package-lock.json`) — devDependencies `jsdom` и `@types/jsdom` под jsdom-окружение эффект-тестов хука.
 - Тесты в `plugins/bb-plugin-live-call/tests/*.test.ts` (vitest): выбор регистраций по каждой из четырёх комбинаций тумблеров (моки **обоих** API — `app.experimental_sidebarFooter.register` и `app.slots.navPanel`), дефолты без ключей (footer вкл, nav выкл), автозвонок панели только после порога загрузки, экран управления («Позвонить»/«Развернуть»/«Завершить»).
 - Документы: этот файл; `docs/specs/live-call-contract.md` §15.1 п. 3 — пометка, что место кнопки сайдбара управляется тумблерами `callButtonFooter`/`callButtonNav`; раздел в `plugins/bb-plugin-live-call/README.md`.
 
