@@ -681,7 +681,7 @@ function dirRootsFrom(p) {
  * не в чёрном списке чувствительных файлов. Ошибка → { error } —
  * session/prompt отвечает JSON-RPC -32602.
  */
-export function collectUploadFiles(promptBlocks, s) {
+export function collectUploadFiles(promptBlocks, s, { limitCount = true } = {}) {
   const cands = [];
   for (const b of promptBlocks || []) {
     if (!b || typeof b !== "object") continue;
@@ -740,7 +740,7 @@ export function collectUploadFiles(promptBlocks, s) {
     seen.add(real);
     // Лимит считается по уникальным файлам после дедупликации:
     // N блоков на один и тот же файл — это один файл.
-    if (out.length >= maxCount) {
+    if (limitCount !== false && out.length >= maxCount) {
       return {
         error: `too many upload files: exceeds limit ${maxCount} (WEB_GEMINI_MAX_UPLOAD_COUNT)`,
       };
@@ -2000,7 +2000,10 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
           } else {
             packageOptions = { ...taskAttachmentOptions(s, task), limit: messageLimit, reserveBytes: write ? FILE_CAPTURE_MARKER_BYTES : 0, isFirstTurn: !s.convId };
             const materials = attachments.materials ?? await collectTaskAttachments(context, attachments.blocks, packageOptions);
-            tj.turn.taskSha256 = taskInputSha256(tj.turn.inputBlocksSha256, materials);
+            if (materials.stats && !task.resume) {
+              slog("task:attachments", materials.stats);
+            }
+            tj.turn.taskSha256 = taskInputSha256(tj.turn.inputBlocksSha256, materials, context.settings.mask);
             tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
             collected = await collectTask(context, attachments.blocks, materials, packageOptions);
             packed = packTask(context, collected, packageOptions);
@@ -2907,16 +2910,42 @@ function normalizeInput(value) {
   return value;
 }
 
-const taskInputSha256 = (inputBlocksSha256, materials) => sha256(JSON.stringify([
-  inputBlocksSha256, materials.map(({ text, ...material }) => ({ ...material, sha256: sha256(text) })),
-]));
+const taskInputSha256 = (inputBlocksSha256, materials, mask = (t) => t) => {
+  const mandatory = [];
+  const includedOptional = [];
+  for (const m of materials || []) {
+    const textHash = m.maskedSha256 ?? sha256(mask(m.text));
+    if (m.required !== false) {
+      mandatory.push({
+        source: m.source,
+        idOrPath: m.id ?? m.name ?? m.at,
+        sha256: textHash,
+      });
+    } else {
+      includedOptional.push({
+        id: m.id,
+        sha256: textHash,
+      });
+    }
+  }
+  const omittedOptional = (materials?.omittedOptional || []).map((o) => ({
+    id: o.id,
+    reason: o.reason,
+  }));
+  return sha256(JSON.stringify([
+    inputBlocksSha256,
+    mandatory,
+    includedOptional,
+    omittedOptional,
+  ]));
+};
 
 function taskAttachmentOptions(session, task) {
   return {
     signal: task.signal,
     maxUploadBytes: argonMaxUploadBytes(),
     maxUploadCount: argonMaxUploadCount(),
-    validateUploads: (blocks) => collectUploadFiles(blocks, session),
+    validateUploads: (blocks, opts) => collectUploadFiles(blocks, session, { limitCount: false, ...opts }),
     spillDir: UPLOADS_DIR,
     ownedFiles: task.ownedFiles,
   };
@@ -3001,9 +3030,14 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
     let fingerprint = inputSha256;
     let exact = false;
     if (!isContinue && candidate.taskSha256) {
-      materials = await collectTaskAttachments(context, blocks, taskAttachmentOptions(session, task));
-      fingerprint = taskInputSha256(inputSha256, materials);
-      exact = fingerprint === candidate.taskSha256;
+      if (candidate.commit) {
+        exact = true;
+        fingerprint = candidate.taskSha256;
+      } else {
+        materials = await collectTaskAttachments(context, blocks, taskAttachmentOptions(session, task));
+        fingerprint = taskInputSha256(inputSha256, materials, context.settings.mask);
+        exact = fingerprint === candidate.taskSha256;
+      }
     }
     if (isContinue || exact || !candidate.taskSha256) {
       if (replay) return { kind: "committed", sessKey: saved.key, turn: replay, context };

@@ -391,7 +391,7 @@ test("session/load resumes by redelivering the saved package when the conversati
   assert.equal(redelivery.convId, null);
   assert.match(redelivery.prompt, /=== Опись \/ Manifest ===/);
   assert.match(redelivery.prompt, /=== tool: read_file/);
-  assert.equal(redelivery.files[0].text, "saved attachment bytes\n");
+  assert.match(redelivery.prompt, /saved attachment bytes/);
   assert.match(redelivery.prompt, /продолжай/);
 });
 
@@ -420,7 +420,7 @@ test("a backend change redelivers the original pinned review and attachments", a
   assert.equal(request.account, "alternate-fixture");
   assert.ok(request.prompt.includes(repo.sha));
   assert.match(request.prompt, /=== tool: read_file/);
-  assert.equal(request.files[0].text, "review value\nZX12-marker\n");
+  assert.match(request.prompt, /review value\nZX12-marker/);
 });
 
 test("the BB ACP bridge restores the original session and review after the provider restarts", async (t) => {
@@ -531,8 +531,8 @@ test("an exact retry requires the same ACP blocks and the same validated attachm
         assert.equal(saved[0].record.reason, "superseded by a new task input");
         assert.notEqual(saved[0].record.taskSha256, saved[1].record.taskSha256);
         assert.match(request.prompt, kind === "embedded changed" ? /modified embedded material/ : /original embedded material/);
-        assert.equal(request.files[0].text, kind === "file contents changed" ? "replacement appendix\n"
-          : kind === "file link changed" ? "alternative appendix\n" : "original appendix\n");
+        assert.match(request.prompt, kind === "file contents changed" ? /replacement appendix/
+          : kind === "file link changed" ? /alternative appendix/ : /original appendix/);
       }
     });
   }

@@ -91,9 +91,13 @@ export function loadSettings(stateDir, projectId) {
       throw new Error("invalid project context.maskPatterns expression");
     }
   });
+  const maxTotalBytes = setting(input.context?.maxTotalBytes, DEFAULT_TOTAL, 1, "context.maxTotalBytes");
+  const optionalBytesRaw = setting(input.context?.optionalAttachmentBytes, 240_000, 0, "context.optionalAttachmentBytes");
+  const optionalAttachmentBytes = Math.min(optionalBytesRaw, maxTotalBytes);
   return Object.freeze({
     innerAgent: agentSettings(input.innerAgent, setting),
-    maxTotalBytes: setting(input.context?.maxTotalBytes, DEFAULT_TOTAL, 1, "context.maxTotalBytes"),
+    maxTotalBytes,
+    optionalAttachmentBytes,
     maxRepairRounds: setting(input.apply?.maxRepairRounds, 2, 0, "apply.maxRepairRounds"),
     progressIntervalMs: setting(input.progressIntervalMs, 15_000, 1, "progressIntervalMs"),
     stateRetentionMs: setting(input.state?.retentionMs, 86_400_000, 1, "state.retentionMs"),
@@ -156,6 +160,67 @@ function parseVerdict(text, system, pin) {
   return fields;
 }
 
+function extractAttachmentSearchText(additionalLines) {
+  const result = [];
+  let inGit = false;
+  for (const line of additionalLines) {
+    if (inGit) {
+      if (line.trim() === "") inGit = false;
+      continue;
+    }
+    if (/^\s*(?:Работа с git|Git work):/.test(line)) {
+      inGit = true;
+      continue;
+    }
+    if (/^\s*(?:Приложенные файлы \(прочитай в репозитории\)|Attached files \(read them in the repo\))/i.test(line)) continue;
+    if (/^\s*(?:Проверяемый итог: коммит|Result under review: commit)/i.test(line)) continue;
+    if (/^\s*Диапазон проверки спецификации/i.test(line)) continue;
+    result.push(line);
+  }
+  return result.join("\n");
+}
+
+export function isAttachmentNamed(text, id, name) {
+  if (id && text.includes(id)) return true;
+  if (!name) return false;
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(?:^|[^A-Za-z0-9._/\\\\-])${escaped}(?:$|[^A-Za-z0-9._-])`);
+  return re.test(text);
+}
+
+function compareAttachmentsNewestFirst(a, b) {
+  const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+  const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+  if (timeA !== timeB) return timeB - timeA;
+  return String(b.id).localeCompare(String(a.id));
+}
+
+function buildSkippedAttachmentsBlock(omittedOptional, mask = (t) => t) {
+  if (!omittedOptional || omittedOptional.length === 0) return "";
+  const byReason = {
+    budget: [],
+    "not text": [],
+    "download failed": [],
+  };
+  for (const item of omittedOptional) {
+    if (byReason[item.reason]) {
+      byReason[item.reason].push(mask(item.name));
+    }
+  }
+  const lines = [];
+  if (byReason["budget"].length) {
+    lines.push(`Не вошли по бюджету (${byReason["budget"].length}): ${byReason["budget"].join(", ")}`);
+  }
+  if (byReason["not text"].length) {
+    lines.push(`Пропущены как нетекстовые (${byReason["not text"].length}): ${byReason["not text"].join(", ")}`);
+  }
+  if (byReason["download failed"].length) {
+    lines.push(`Не скачались (${byReason["download failed"].length}): ${byReason["download failed"].join(", ")}`);
+  }
+  if (lines.length === 0) return "";
+  return "=== Вложения задачи, не вошедшие в пакет ===\n" + lines.join("\n");
+}
+
 export async function prepareTask({ text, system, session, thread, stateDir, signal, onSettings, savedTurn }) {
   if (!text.trim()) throw new Error("task text is empty");
   if (!session.cwd || !isAbsolute(session.cwd)) throw new Error("task requires an absolute session working directory");
@@ -171,6 +236,7 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
   const settings = loadSettings(stateDir, thread.thread.projectId);
   onSettings?.(settings);
   const additional = section(text, /^## (?:Additional instructions|Дополнительные инструкции)[ \t]*$/, { last: true });
+  const attachmentSearchText = extractAttachmentSearchText(additional);
   const refs = [];
   const repoFiles = [];
   for (const line of additional) {
@@ -206,7 +272,7 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
     }
     attachments.push({ name: match[1], id: match[2] });
   }
-  return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions, key, thread: thread.thread, research };
+  return { text, settings, verdict, cwd, root, pin, repoFiles, attachments, attachmentOmissions, attachmentSearchText, key, thread: thread.thread, research };
 }
 
 export function verdictInstruction(context) {
@@ -363,14 +429,25 @@ export async function collectTaskAttachments(context, blocks, options) {
   const materials = [];
   let uploadCount = 0;
   let materialBytes = 0;
-  const add = (source, text, { name, at, upload = false }) => {
-    const size = bytes(mask(text));
+  const add = (source, text, { name, at, upload = false, required = true, createdAt, id, maskedSha256 }) => {
+    const maskedText = mask(text);
+    const size = bytes(maskedText);
     if (upload && (++uploadCount > maxUploadCount || bytes(text) > maxUploadBytes || size > maxUploadBytes)) {
       throw new Error("mandatory attachment exceeds upload count or size limit");
     }
     materialBytes += size;
     if (materialBytes > maxBytes) throw new Error("mandatory task context exceeds byte budget");
-    materials.push({ source, text, name, at, upload });
+    materials.push({
+      source,
+      text,
+      name,
+      at,
+      upload,
+      required,
+      createdAt,
+      id,
+      maskedSha256: maskedSha256 ?? digest(maskedText),
+    });
   };
   for (const block of blocks) {
     signal.throwIfAborted();
@@ -380,7 +457,7 @@ export async function collectTaskAttachments(context, blocks, options) {
       if (typeof block.resource?.text !== "string" || /^(?:image|audio|video)\//i.test(block.resource?.mimeType ?? "")) {
         throw new Error("mandatory embedded resource is not text");
       }
-      add("Embedded resource", block.resource.text, { name, at: "ACP input" });
+      add("Embedded resource", block.resource.text, { name, at: "ACP input", upload: false, required: true });
     }
   }
   // PLUG-384: публичный research — без авто-подобранных локальных файлов
@@ -391,7 +468,7 @@ export async function collectTaskAttachments(context, blocks, options) {
   const light = context.research && !context.write;
   if (!light) for (const file of new Set(context.repoFiles)) {
     try {
-      add("Repository attachment", await readMaterial(root ?? context.cwd, pin, file, maxBytes, signal), { name: file });
+      add("Repository attachment", await readMaterial(root ?? context.cwd, pin, file, maxBytes, signal), { name: file, upload: false, required: true });
     } catch {
       throw new Error("mandatory repository attachment could not be collected");
     }
@@ -411,35 +488,234 @@ export async function collectTaskAttachments(context, blocks, options) {
     seenPaths.add(abs);
     if (!light && pin && repoFile) {
       add("Repository attachment", await readMaterial(root, pin, repoFile, maxUploadBytes, signal), {
-        name: repoFile, at: pin.sha, upload: true,
+        name: repoFile, at: pin.sha, upload: false, required: true,
       });
     } else {
       externalBlocks.push(block);
     }
   }
   if (externalBlocks.length) {
-    const result = validateUploads(externalBlocks);
+    const result = validateUploads(externalBlocks, { limitCount: light });
     if (result.error) throw new Error("mandatory ACP attachment is inaccessible or exceeds upload limits");
     for (const file of result.files) {
       add("ACP attachment", await readTextFile(file, maxUploadBytes, signal), {
-        name: basename(file), at: "ACP input", upload: true,
+        name: basename(file), at: "ACP input", upload: light, required: true,
       });
     }
   }
+
+  const omittedOptional = [];
+  let mandatoryCount = 0;
+  let includedOptionalCount = 0;
+  let omittedBudgetCount = 0;
+  let omittedNotTextCount = 0;
+  let omittedDownloadFailedCount = 0;
+
   if (!light && context.attachments?.length) {
-    if (uploadCount + new Set(context.attachments.map((item) => item.id)).size > maxUploadCount) {
-      throw new Error("mandatory attachments exceed upload count");
-    }
-    mkdirSync(spillDir, { recursive: true, mode: 0o700 });
-    const scratch = mkdtempSync(join(spillDir, "tracker-"));
+    const searchText = context.attachmentSearchText ?? "";
+    let shown = null;
+    let cardError = null;
     try {
-      for (const file of await trackerFiles(context, scratch, maxUploadBytes, signal)) {
-        add("Tracker attachment", file.text, { name: file.name, at: "BB Tasks input", upload: true });
+      if (!context.key) throw new Error("tracker attachments require a task key");
+      const raw = await bb(["tasks", "show", context.key, "--json"], signal);
+      shown = JSON.parse(raw);
+      if (shown.task?.key !== context.key || shown.project?.linkedBbProjectId !== context.thread?.projectId ||
+          !shown.taskThreads?.some((entry) => entry.threadId === context.thread?.id)) {
+        throw new Error("tracker attachment task does not match the current BB thread");
       }
-    } finally {
-      rmSync(scratch, { recursive: true, force: true });
+    } catch (err) {
+      cardError = err;
+    }
+
+    const taskAtts = context.attachments;
+    const namedById = new Set();
+    const namedByName = new Set();
+
+    for (const att of taskAtts) {
+      if (att.id && searchText.includes(att.id)) namedById.add(att.id);
+    }
+
+    if (shown?.attachments) {
+      const byName = new Map();
+      for (const att of taskAtts) {
+        const cardEntry = shown.attachments.find((item) => item.id === att.id);
+        const fileName = cardEntry?.fileName ?? att.name;
+        if (!byName.has(fileName)) byName.set(fileName, []);
+        byName.get(fileName).push({
+          id: att.id,
+          name: fileName,
+          createdAt: cardEntry?.createdAt ?? null,
+          cardEntry,
+        });
+      }
+      for (const [name, list] of byName.entries()) {
+        if (isAttachmentNamed(searchText, null, name)) {
+          list.sort(compareAttachmentsNewestFirst);
+          namedByName.add(list[0].id);
+        }
+      }
+    } else {
+      for (const att of taskAtts) {
+        if (isAttachmentNamed(searchText, null, att.name)) {
+          namedByName.add(att.id);
+        }
+      }
+    }
+
+    const isMandatory = (att) => namedById.has(att.id) || namedByName.has(att.id);
+
+    if (cardError) {
+      const anyMandatory = taskAtts.find(isMandatory);
+      if (anyMandatory) {
+        throw new Error("mandatory tracker attachment task card could not be confirmed: " + mask(anyMandatory.name));
+      }
+      for (const att of taskAtts) {
+        omittedOptional.push({ id: att.id, name: att.name, reason: "download failed" });
+        omittedDownloadFailedCount++;
+      }
+    } else {
+      const mandatoryList = [];
+      const optionalList = [];
+      const seen = new Set();
+
+      for (const att of taskAtts) {
+        if (seen.has(att.id)) continue;
+        seen.add(att.id);
+        const cardEntry = shown.attachments?.find((item) => item.id === att.id);
+        const item = {
+          id: att.id,
+          name: cardEntry?.fileName ?? att.name,
+          createdAt: cardEntry?.createdAt ?? null,
+          sizeBytes: cardEntry?.sizeBytes,
+          isImage: cardEntry?.isImage === true,
+          cardEntry,
+          mandatory: isMandatory(att),
+        };
+        if (item.mandatory) {
+          mandatoryList.push(item);
+        } else {
+          optionalList.push(item);
+        }
+      }
+
+      mkdirSync(spillDir, { recursive: true, mode: 0o700 });
+      const scratch = mkdtempSync(join(spillDir, "tracker-"));
+      try {
+        for (const item of mandatoryList) {
+          mandatoryCount++;
+          if (!item.cardEntry) {
+            throw new Error("mandatory tracker attachment is missing: " + mask(item.name));
+          }
+          if (item.isImage) {
+            throw new Error("mandatory tracker attachment is not permitted text: " + mask(item.name));
+          }
+          if (Number.isFinite(item.sizeBytes) && item.sizeBytes > maxUploadBytes) {
+            throw new Error("mandatory tracker attachment exceeds upload limit: " + mask(item.name));
+          }
+          const dest = join(scratch, randomUUID());
+          try {
+            await bb(["tasks", "attachment", "get", item.id, "--out", dest], signal);
+          } catch {
+            throw new Error("mandatory tracker attachment could not be downloaded: " + mask(item.name));
+          }
+          let text;
+          try {
+            text = await readTextFile(dest, maxUploadBytes, signal);
+          } catch {
+            throw new Error("mandatory tracker attachment is not permitted text: " + mask(item.name));
+          }
+          const masked = mask(text);
+          const size = bytes(masked);
+          if (size > maxUploadBytes) {
+            throw new Error("mandatory tracker attachment exceeds upload limit: " + mask(item.name));
+          }
+          if (materialBytes + size > maxBytes) {
+            throw new Error("mandatory tracker attachment exceeds byte budget: " + mask(item.name));
+          }
+          add("Tracker attachment", text, {
+            name: item.name,
+            at: item.createdAt ?? "BB Tasks input",
+            upload: false,
+            required: true,
+            createdAt: item.createdAt,
+            id: item.id,
+            maskedSha256: digest(masked),
+          });
+        }
+
+        optionalList.sort(compareAttachmentsNewestFirst);
+        let optionalBudgetRemaining = settings.optionalAttachmentBytes;
+
+        for (const item of optionalList) {
+          signal.throwIfAborted();
+          if (!item.cardEntry) {
+            omittedOptional.push({ id: item.id, name: item.name, reason: "download failed" });
+            omittedDownloadFailedCount++;
+            continue;
+          }
+          if (item.isImage) {
+            omittedOptional.push({ id: item.id, name: item.name, reason: "not text" });
+            omittedNotTextCount++;
+            continue;
+          }
+          const effectiveBudget = Math.min(optionalBudgetRemaining, maxBytes - materialBytes);
+          if (Number.isFinite(item.sizeBytes) && (item.sizeBytes > effectiveBudget || item.sizeBytes > maxUploadBytes)) {
+            omittedOptional.push({ id: item.id, name: item.name, reason: "budget" });
+            omittedBudgetCount++;
+            continue;
+          }
+          const dest = join(scratch, randomUUID());
+          try {
+            await bb(["tasks", "attachment", "get", item.id, "--out", dest], signal);
+          } catch {
+            omittedOptional.push({ id: item.id, name: item.name, reason: "download failed" });
+            omittedDownloadFailedCount++;
+            continue;
+          }
+          let text;
+          try {
+            text = await readTextFile(dest, maxUploadBytes, signal);
+          } catch (e) {
+            const isNonText = /binary|non-UTF-8|not a permitted text file/i.test(e?.message ?? "");
+            const reason = isNonText ? "not text" : "download failed";
+            omittedOptional.push({ id: item.id, name: item.name, reason });
+            if (reason === "not text") omittedNotTextCount++;
+            else omittedDownloadFailedCount++;
+            continue;
+          }
+          const masked = mask(text);
+          const size = bytes(masked);
+          if (size > effectiveBudget || size > maxUploadBytes) {
+            omittedOptional.push({ id: item.id, name: item.name, reason: "budget" });
+            omittedBudgetCount++;
+            continue;
+          }
+          optionalBudgetRemaining -= size;
+          includedOptionalCount++;
+          add("Tracker attachment", text, {
+            name: item.name,
+            at: item.createdAt ?? "BB Tasks input",
+            upload: false,
+            required: false,
+            createdAt: item.createdAt,
+            id: item.id,
+            maskedSha256: digest(masked),
+          });
+        }
+      } finally {
+        rmSync(scratch, { recursive: true, force: true });
+      }
     }
   }
+
+  materials.omittedOptional = omittedOptional;
+  materials.stats = {
+    mandatory: mandatoryCount,
+    includedOptional: includedOptionalCount,
+    omittedBudget: omittedBudgetCount,
+    omittedNotText: omittedNotTextCount,
+    omittedDownloadFailed: omittedDownloadFailedCount,
+  };
   return materials;
 }
 
@@ -452,18 +728,18 @@ export async function collectTask(context, blocks, materials, options) {
   const mask = isLightResearch ? (str) => settings.maskResearch(str, context.key) : settings.mask;
   const core = [], omitted = [], materialFiles = [];
   let coreBytes = 0;
-  const add = (source, value, { name, at = revision, delivery = "package", included = "full" } = {}) => {
+  const add = (source, value, { name, at = revision, delivery = "package", included = "full", required = true, createdAt, id } = {}) => {
     const text = mask(value);
     const size = bytes(text);
     coreBytes += size;
     if (coreBytes > maxBytes) throw new Error("mandatory task context exceeds byte budget");
-    const entry = { source, ...(name ? { name: mask(name) } : {}), revision: at, required: true, included, bytes: size, sha256: digest(text), delivery };
+    const entry = { source, ...(name ? { name: mask(name) } : {}), ...(createdAt ? { createdAt } : {}), ...(id ? { id } : {}), revision: at, required, included, bytes: size, sha256: digest(text), delivery };
     core.push(Object.freeze({ entry: Object.freeze(entry), text }));
   };
   const omit = (source, reason) => omitted.push({ source: mask(source), reason, revision });
 
   add("Task text", context.text);
-  for (const { source, text, name, at, upload } of materials) {
+  for (const { source, text, name, at, upload, required = true, createdAt, id } of materials) {
     let delivery = "package";
     if (upload) {
       const { pkgName, pkgPath } = tools.writeSpillPackage(spillDir, randomUUID(), mask(text));
@@ -471,11 +747,14 @@ export async function collectTask(context, blocks, materials, options) {
       materialFiles.push(pkgPath);
       delivery = pkgName;
     }
-    add(source, text, { name, at, delivery });
+    add(source, text, { name, at, delivery, required, createdAt, id });
   }
   if (!isLightResearch) {
     for (const item of context.attachmentOmissions) {
       omit("Tracker attachment: " + item.line, item.reason);
+    }
+    for (const item of (materials.omittedOptional ?? [])) {
+      omit("Tracker attachment: " + item.name, "optional attachment: " + item.reason);
     }
   }
 
@@ -514,8 +793,11 @@ export async function collectTask(context, blocks, materials, options) {
   } else if (!root) {
     omit("Git status and diff", "working directory is not a Git worktree");
   }
+  const skippedAttachmentsBlock = !isLightResearch && materials.omittedOptional?.length
+    ? buildSkippedAttachmentsBlock(materials.omittedOptional, mask)
+    : "";
   return Object.freeze({ core: Object.freeze(core), omitted: Object.freeze(omitted.map(Object.freeze)),
-    files: Object.freeze(materialFiles), reviewDiff, fileBases });
+    files: Object.freeze(materialFiles), reviewDiff, fileBases, skippedAttachmentsBlock });
 }
 
 export function filterServiceLines(text) {
@@ -651,13 +933,18 @@ function renderTaskPackage(context, collected, options, supplements, agentOmissi
     let body = "";
     const append = (entry, text) => {
       if (entry.delivery !== "package") return { ...entry, range: [0, entry.bytes] };
-      const heading = "=== " + entry.source + (entry.name ? ": " + JSON.stringify(entry.name) : "") + " ===\n";
+      const dateSuffix = entry.source === "Tracker attachment" && entry.createdAt ? ` (${entry.createdAt})` : "";
+      const heading = "=== " + entry.source + (entry.name ? ": " + JSON.stringify(entry.name) : "") + dateSuffix + " ===\n";
       const start = offset + bytes(heading);
       body += heading + text + "\n\n";
       offset = start + entry.bytes + 2;
       return { ...entry, delivery, range: [start, start + entry.bytes] };
     };
     const included = collected.core.map(({ entry, text }) => append(entry, text));
+    if (collected.skippedAttachmentsBlock) {
+      body += collected.skippedAttachmentsBlock + "\n\n";
+      offset += bytes(collected.skippedAttachmentsBlock + "\n\n");
+    }
     if (supplements.length) {
       const heading = "=== Дополнения быстрого агента / Fast agent additions ===\n";
       body += heading;

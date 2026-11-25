@@ -109,7 +109,7 @@ function setup(t) {
   return { tmp, repo, git, write, sha, base, head };
 }
 
-function task(text, dictionary, { ref, paths, tracker = false } = {}) {
+function task(text, dictionary, { ref, paths, tracker = false, instructions = "" } = {}) {
   const review = ref ? interpolate(dictionary["instr.reviewRound"], {
     from: ref,
     tail: " (" + interpolate(dictionary["instr.reviewBranch"], { branch: "review" }) + ", " +
@@ -119,7 +119,7 @@ function task(text, dictionary, { ref, paths, tracker = false } = {}) {
   return [
     "# " + key + " · Audit fixture", "## Description", text,
     "## Attachments", tracker ? "- tracker.md · " + attachmentId + "\n  Fetch with: bb tasks attachment get " + attachmentId + " --out <path>" : "None.",
-    "## Additional instructions", [review, attached].filter(Boolean).join("\n"),
+    "## Additional instructions", [review, attached, instructions].filter(Boolean).join("\n"),
   ].join("\n\n");
 }
 
@@ -158,20 +158,22 @@ function rpcProcess(t, args, env) {
       return messages.find((message) => message.id === current);
     });
   }
-  return { messages, send, notify };
+  return { child, messages, send, notify };
 }
 
 function fixture(t, repo, model, options = {}) {
   const dir = mkdtempSync(join(repo.tmp, "instance-"));
   const cli = join(dir, "bb-fixture.mjs");
-  const state = join(dir, "state");
+  const state = options.stateDir ?? join(dir, "state");
   const requests = join(dir, "requests.jsonl");
-  mkdirSync(state);
+  const cliLog = join(state, "cli.log");
+  mkdirSync(state, { recursive: true });
   if (options.settings) writeFileSync(join(state, "inner-agent.json"), JSON.stringify(options.settings));
   if (options.badUploadDir) writeFileSync(join(state, "uploads"), "unavailable directory");
   const quoted = JSON.stringify;
   writeFileSync(cli, "#!/usr/bin/env node\n" + String.raw`
-import { writeFileSync } from "node:fs";
+import { writeFileSync, appendFileSync } from "node:fs";
+appendFileSync(${quoted(cliLog)}, process.argv.slice(2).join(" ") + "\n");
 const [area, action, arg, ...extra] = process.argv.slice(2);
 const threadId = ${quoted(threadId)};
 const projectId = ${quoted(projectId)};
@@ -214,7 +216,7 @@ startServer({ webDriver: { async sendPrompt(options) {
   // options.bindEnv — привязка через env BB_THREAD_ID, канал customAgents
   // provider-acp со статическим argv (без --bb-thread-id).
   if (!options.bindEnv) launchArgs.push("--bb-thread-id=" + threadId);
-  const { messages, send, notify } = rpcProcess(t, launchArgs, {
+  const { child, messages, send, notify } = rpcProcess(t, launchArgs, {
     ...inheritedEnv,
     BB_CLI: cli, WEB_GEMINI_FAKE: "0", ARGON_FAKE: "0",
     WEB_GEMINI_STATE_DIR: state, WEB_GEMINI_POOL_FILE: join(dir, "absent"),
@@ -224,7 +226,9 @@ startServer({ webDriver: { async sendPrompt(options) {
     ...options.env,
   });
   return {
-    messages, send, notify, state,
+    child, messages, send, notify, state, cliLog,
+    kill: () => child.kill("SIGKILL"),
+    loadSession: (sessionId, cwd = repo.repo) => send("session/load", { sessionId, cwd }),
     requests: () => existsSync(requests) ? readFileSync(requests, "utf8").trimEnd().split("\n").map(JSON.parse) : [],
     newSession: async (cwd = repo.repo) => {
       const response = await send("session/new", { cwd });
@@ -232,6 +236,7 @@ startServer({ webDriver: { async sendPrompt(options) {
       return response.result.sessionId;
     },
     prompt: (sessionId, text, extra = []) => send("session/prompt", { sessionId, prompt: [...extra, blockText(text)] }),
+    notifyPrompt: (sessionId, text, extra = []) => notify("session/prompt", { sessionId, prompt: [...extra, blockText(text)] }, 999),
   };
 }
 
@@ -795,7 +800,7 @@ test("live RU/EN task templates pin branch or SHA, pack the complete review and 
     assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response.error));
     const [first, tools, log] = app.requests();
     assert.equal(first.strict, true);
-    assert.ok(first.files.length === 2 && Buffer.byteLength(first.prompt) <= 8500);
+    assert.ok(first.files.length === 1 && Buffer.byteLength(first.prompt) <= 8500);
     const actual = delivered(first);
     packages.push(actual);
     assert.equal(actual.summary, "проверяемый коммит: " + repo.sha);
@@ -941,7 +946,7 @@ test("required delivery errors, upload limits, binary task content and write att
   const pic = join(repo.repo, "test-image.png");
   writeFileSync(pic, Buffer.from([0, 120, 255]));
   const limited = fixture(t, repo, () => ({ text: "unreachable" }), { env: { WEB_GEMINI_MAX_UPLOAD_BYTES: "2" } });
-  const tooLarge = await limited.prompt(await limited.newSession(), task("Review", EN, { tracker: true }));
+  const tooLarge = await limited.prompt(await limited.newSession(), task("Review", EN, { tracker: true, instructions: "Review tracker.md" }));
   assert.equal(tooLarge.error?.data.outcome, "failed");
   const writable = fixture(t, repo, () => ({ text: '{"format":"web-gemini-files-v1","files":[{"path":"docs/new.txt"}]}' }));
   const id = await writable.newSession();
@@ -2533,4 +2538,807 @@ test("research-пакет: при запрещённом материале по
   assert.doesNotMatch(secondPrompt, /tool/i);
   assert.doesNotMatch(secondPrompt, /envelope/i);
   assert.doesNotMatch(secondPrompt, /Correct the previous reply/i);
+});
+
+/* ========================================================================= */
+/* §12.1 Срез 1. Вложения задачи (§4.7, PLUG-419)                           */
+/* ========================================================================= */
+
+test("Вложения задачи §4.7.1: 12 текстовых вложений карточки, ни одно не названо — сбор успешен, uploadFiles <= 1 spill, нет exceed upload count", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test1-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const atts = Array.from({ length: 12 }, (_, i) => ({
+    id: `01M7ATT${String(i + 1).padStart(2, "0")}` + "0".repeat(17),
+    name: `att-${String(i + 1).padStart(2, "0")}.txt`,
+    createdAt: `2026-11-25T01:${String(i).padStart(2, "0")}:00Z`,
+    sizeBytes: 50,
+  }));
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts.map((a) => ({ id: a.id, fileName: a.name, createdAt: a.createdAt, sizeBytes: a.sizeBytes }))) + ",\n" +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    '  const outIdx = args.indexOf("--out");\n' +
+    '  writeFileSync(args[outIdx + 1], "Content for " + args[args.indexOf("get") + 1] + "\\n");\n' +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Task with 12 attachments",
+      "",
+      "## Description",
+      "Process all attachments",
+      "",
+      "## Attachments",
+      ...atts.map((a) => `- ${a.name} · ${a.id}\n  Fetch with: bb tasks attachment get ${a.id} --out <path>`),
+      "",
+      "## Additional instructions",
+      "Do not name any attachment directly here",
+    ].join("\n");
+
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5, // 12 > 5: in old code this threw "mandatory attachments exceed upload count"
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    const materials = await collectTaskAttachments(prep, [], packageOptions);
+    assert.equal(materials.length, 12);
+    // All 12 are optional and inlined, not uploaded
+    assert.ok(materials.every((m) => m.required === false && m.upload === false));
+
+    const collected = await collectTask(prep, [], materials, packageOptions);
+    const packed = packTask(prep, collected, packageOptions);
+    assert.ok(packed.files.length <= 1, "uploadFiles must contain at most 1 spill file");
+    // Header check
+    assert.ok(packed.message.includes('=== Tracker attachment: "att-01.txt" (2026-11-25T01:00:00Z) ==='));
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.2: малый optionalAttachmentBytes — новые по createdAt входят, остальные в 'Не вошли по бюджету'", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test2-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const id2 = "01M7" + "0".repeat(21) + "2";
+  const id3 = "01M7" + "0".repeat(21) + "3";
+  const atts = [
+    { id: id1, name: "old.txt", createdAt: "2026-11-20T10:00:00Z", sizeBytes: 80, content: "old ".repeat(20) },
+    { id: id2, name: "mid.txt", createdAt: "2026-11-22T10:00:00Z", sizeBytes: 80, content: "mid ".repeat(20) },
+    { id: id3, name: "new.txt", createdAt: "2026-11-25T10:00:00Z", sizeBytes: 80, content: "new ".repeat(20) },
+  ];
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts.map((a) => ({ id: a.id, fileName: a.name, createdAt: a.createdAt, sizeBytes: a.sizeBytes }))) + ",\n" +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    '  const id = args[args.indexOf("get") + 1];\n' +
+    '  const att = ' + JSON.stringify(atts) + '.find(a => a.id === id);\n' +
+    '  const outIdx = args.indexOf("--out");\n' +
+    '  writeFileSync(args[outIdx + 1], att ? att.content : "unknown\\n");\n' +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Task budget test",
+      "",
+      "## Description",
+      "Check budget ordering",
+      "",
+      "## Attachments",
+      ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "",
+      "## Additional instructions",
+      "Regular instructions",
+    ].join("\n");
+
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    // Set budget enough for only 1 attachment of ~80 bytes
+    prep.settings = { ...prep.settings, optionalAttachmentBytes: 120 };
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    const materials = await collectTaskAttachments(prep, [], packageOptions);
+    assert.equal(materials.length, 1);
+    assert.equal(materials[0].name, "new.txt");
+    assert.equal(materials.omittedOptional.length, 2);
+    assert.deepEqual(materials.omittedOptional.map((o) => o.name), ["mid.txt", "old.txt"]);
+    assert.ok(materials.omittedOptional.every((o) => o.reason === "budget"));
+
+    const collected = await collectTask(prep, [], materials, packageOptions);
+    const packed = packTask(prep, collected, packageOptions);
+    assert.match(packed.message, /=== Вложения задачи, не вошедшие в пакет ===\nНе вошли по бюджету \(2\): mid\.txt, old\.txt/);
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.3: isImage, не-UTF-8 и ошибка скачивания -> 'Пропущены как нетекстовые' и 'Не скачались', ход не падает", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test3-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const id2 = "01M7" + "0".repeat(21) + "2";
+  const id3 = "01M7" + "0".repeat(21) + "3";
+  const atts = [
+    { id: id1, name: "photo.png", createdAt: "2026-11-25T12:00:00Z", isImage: true, sizeBytes: 100 },
+    { id: id2, name: "binary.dat", createdAt: "2026-11-25T11:00:00Z", sizeBytes: 50 },
+    { id: id3, name: "broken.txt", createdAt: "2026-11-25T10:00:00Z", sizeBytes: 50 },
+  ];
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts) + ",\n" +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    '  const id = args[args.indexOf("get") + 1];\n' +
+    '  const outIdx = args.indexOf("--out");\n' +
+    '  if (id === "' + id2 + '") {\n' +
+    '    writeFileSync(args[outIdx + 1], Buffer.from([0xff, 0xfe, 0x00, 0x01]));\n' +
+    '  } else {\n' +
+    '    process.exit(1);\n' +
+    '  }\n' +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Task non-text / download failure test",
+      "",
+      "## Description",
+      "Check skipped reasons",
+      "",
+      "## Attachments",
+      ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "",
+      "## Additional instructions",
+      "No attachments named here",
+    ].join("\n");
+
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    const materials = await collectTaskAttachments(prep, [], packageOptions);
+    assert.equal(materials.length, 0);
+    assert.equal(materials.omittedOptional.length, 3);
+
+    const collected = await collectTask(prep, [], materials, packageOptions);
+    const packed = packTask(prep, collected, packageOptions);
+    assert.match(packed.message, /=== Вложения задачи, не вошедшие в пакет ===/);
+    assert.match(packed.message, /Пропущены как нетекстовые \(2\): photo\.png, binary\.dat/);
+    assert.match(packed.message, /Не скачались \(1\): broken\.txt/);
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.4: нетекстовое или нескачиваемое названо в instructions по ID или имени -> отказ хода failed", async (t) => {
+  const { collectTaskAttachments, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test4-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const id2 = "01M7" + "0".repeat(21) + "2";
+  const atts = [
+    { id: id1, name: "photo.png", createdAt: "2026-11-25T12:00:00Z", isImage: true, sizeBytes: 100 },
+    { id: id2, name: "broken.txt", createdAt: "2026-11-25T10:00:00Z", sizeBytes: 50 },
+  ];
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts) + ",\n" +
+    "  }));\n" +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+
+    // Case A: Named by name "photo.png"
+    const textA = [
+      "# PLUG-419 · Mandatory failure", "## Description", "Desc",
+      "## Attachments", ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "## Additional instructions", "Проверь photo.png перед работой",
+    ].join("\n");
+    const prepA = await prepareTask({ text: textA, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    await assert.rejects(
+      () => collectTaskAttachments(prepA, [], packageOptions),
+      /mandatory tracker attachment is not permitted text: photo\.png/,
+    );
+
+    // Case B: Named by ID
+    const textB = [
+      "# PLUG-419 · Mandatory failure", "## Description", "Desc",
+      "## Attachments", ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "## Additional instructions", `Проверь вложение ${id2} обязательно`,
+    ].join("\n");
+    const prepB = await prepareTask({ text: textB, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    await assert.rejects(
+      () => collectTaskAttachments(prepB, [], packageOptions),
+      /mandatory tracker attachment could not be downloaded: broken\.txt/,
+    );
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.5: два вложения с одинаковым именем, имя названо — обязательным считается только самое новое", async (t) => {
+  const { collectTaskAttachments, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test5-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const id2 = "01M7" + "0".repeat(21) + "2";
+  const atts = [
+    { id: id1, name: "notes.txt", createdAt: "2026-11-20T10:00:00Z", sizeBytes: 50 },
+    { id: id2, name: "notes.txt", createdAt: "2026-11-25T10:00:00Z", sizeBytes: 50 },
+  ];
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts) + ",\n" +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    '  const id = args[args.indexOf("get") + 1];\n' +
+    '  const outIdx = args.indexOf("--out");\n' +
+    '  if (id === "' + id2 + '") {\n' +
+    '    writeFileSync(args[outIdx + 1], "Newest notes content\\n");\n' +
+    '  } else {\n' +
+    '    process.exit(1); // Older notes.txt fails to download\n' +
+    '  }\n' +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Same name test", "## Description", "Desc",
+      "## Attachments", ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "## Additional instructions", "Прочитай notes.txt внимательно",
+    ].join("\n");
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    // The newer notes.txt (id2) is mandatory and succeeds.
+    // The older notes.txt (id1) is optional and its download failure does NOT throw!
+    const materials = await collectTaskAttachments(prep, [], packageOptions);
+    assert.equal(materials.length, 1);
+    assert.equal(materials[0].id, id2);
+    assert.equal(materials[0].required, true);
+    assert.equal(materials.omittedOptional.length, 1);
+    assert.equal(materials.omittedOptional[0].id, id1);
+    assert.equal(materials.omittedOptional[0].reason, "download failed");
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.6: 'Attached files: docs/x.md' и упоминание 'docs/x.md' не делают обязательным вложение трекера 'x.md'", async (t) => {
+  const { collectTaskAttachments, isAttachmentNamed, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test6-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const atts = [
+    { id: id1, name: "x.md", createdAt: "2026-11-25T10:00:00Z", sizeBytes: 50 },
+  ];
+
+  mkdirSync(join(tmp, "docs"), { recursive: true });
+  writeFileSync(join(tmp, "docs/x.md"), "repository file content\n");
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts) + ",\n" +
+    "  }));\n" +
+    "} else { process.exit(1); } // fails download\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Path vs attachment test", "## Description", "Desc",
+      "## Attachments", `- x.md · ${id1}`,
+      "## Additional instructions",
+      "Приложенные файлы (прочитай в репозитории): docs/x.md",
+      "Сверься с docs/x.md и \\x.md в коде.",
+    ].join("\n");
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+
+    // isAttachmentNamed checks
+    assert.equal(isAttachmentNamed(prep.attachmentSearchText, null, "x.md"), false);
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    // Because x.md is NOT mandatory, download failure does NOT throw!
+    const materials = await collectTaskAttachments(prep, [], packageOptions);
+    assert.equal(materials.filter((m) => m.source === "Tracker attachment").length, 0);
+    assert.equal(materials.filter((m) => m.source === "Repository attachment").length, 1);
+    assert.equal(materials.omittedOptional.length, 1);
+    assert.equal(materials.omittedOptional[0].name, "x.md");
+    assert.equal(materials.omittedOptional[0].reason, "download failed");
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.7: 12 текстовых ACP-файлов на пути задачи не дают отказа 'too many upload files'", async (t) => {
+  const { collectTaskAttachments, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test7-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const files = [];
+  const blocks = [];
+  for (let i = 1; i <= 12; i++) {
+    const p = join(tmp, `acp-${i}.txt`);
+    writeFileSync(p, `ACP file ${i} content\n`);
+    files.push(p);
+    blocks.push({ type: "localFile", path: p });
+  }
+
+  const text = "# PLUG-419 · 12 ACP files\n\n## Description\nDesc\n\n## Additional instructions\nCheck all ACP files";
+  const session = { cwd: tmp };
+  const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+  const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+
+  const packageOptions = {
+    signal: AbortSignal.timeout(5000),
+    spillDir: join(tmp, "spill"),
+    maxUploadBytes: 100_000,
+    maxUploadCount: 5, // 12 > 5: inlined files on task path must not be limited by count!
+    validateUploads: (b, opts) => {
+      // Inlined ACP files on task path pass limitCount: false
+      assert.equal(opts?.limitCount, false);
+      return { files };
+    },
+    ownedFiles: [],
+    limit: 100_000,
+  };
+
+  const materials = await collectTaskAttachments(prep, blocks, packageOptions);
+  assert.equal(materials.length, 12);
+  assert.ok(materials.every((m) => m.source === "ACP attachment" && m.required === true && m.upload === false));
+});
+
+test("Вложения задачи §4.7.8: optionalAttachmentBytes: 0 -> все необязательные перечислены в 'Не вошли по бюджету'", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test8-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const id2 = "01M7" + "0".repeat(21) + "2";
+  const atts = [
+    { id: id1, name: "a.txt", createdAt: "2026-11-25T10:00:00Z", sizeBytes: 100 },
+    { id: id2, name: "b.txt", createdAt: "2026-11-25T11:00:00Z", sizeBytes: 100 },
+  ];
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts) + ",\n" +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    "  process.exit(2);\n" +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Zero budget test", "## Description", "Desc",
+      "## Attachments", ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "## Additional instructions", "No attachments named",
+    ].join("\n");
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    prep.settings = { ...prep.settings, optionalAttachmentBytes: 0 };
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    const materials = await collectTaskAttachments(prep, [], packageOptions);
+    assert.equal(materials.length, 0);
+    assert.equal(materials.omittedOptional.length, 2);
+    assert.ok(materials.omittedOptional.every((o) => o.reason === "budget"));
+
+    const collected = await collectTask(prep, [], materials, packageOptions);
+    const packed = packTask(prep, collected, packageOptions);
+    assert.match(packed.message, /=== Вложения задачи, не вошедшие в пакет ===\nНе вошли по бюджету \(2\): b\.txt, a\.txt/);
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.9: событие task:attachments содержит только числа, без имён", async (t) => {
+  const { collectTaskAttachments, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test9-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const id2 = "01M7" + "0".repeat(21) + "2";
+  const id3 = "01M7" + "0".repeat(21) + "3";
+  const atts = [
+    { id: id1, name: "mandatory.txt", createdAt: "2026-11-25T10:00:00Z", sizeBytes: 50 },
+    { id: id2, name: "included.txt", createdAt: "2026-11-25T11:00:00Z", sizeBytes: 50 },
+    { id: id3, name: "bad.png", createdAt: "2026-11-25T12:00:00Z", isImage: true, sizeBytes: 50 },
+  ];
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts) + ",\n" +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    '  const outIdx = args.indexOf("--out");\n' +
+    '  writeFileSync(args[outIdx + 1], "Sample content\\n");\n' +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Slog test", "## Description", "Desc",
+      "## Attachments", ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "## Additional instructions", "Проверь mandatory.txt",
+    ].join("\n");
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    const materials = await collectTaskAttachments(prep, [], packageOptions);
+    assert.ok(materials.stats, "materials.stats must be defined");
+    assert.deepEqual(Object.keys(materials.stats).sort(), [
+      "includedOptional", "mandatory", "omittedBudget", "omittedDownloadFailed", "omittedNotText",
+    ]);
+    for (const [k, v] of Object.entries(materials.stats)) {
+      assert.equal(typeof v, "number", `materials.stats.${k} must be a number`);
+      assert.ok(Number.isInteger(v) && v >= 0, `materials.stats.${k} must be a non-negative integer`);
+    }
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.10: точный повтор возобновляет ход, голое 'продолжай' не вызывает bb tasks attachment get", async (t) => {
+  const repo = setup(t);
+  const text = task("Review task with tracker attachment", RU, { ref: "review", tracker: true });
+
+  // 1. Bare continue on interrupted turn uses saved package without downloading attachments
+  const first1 = fixture(t, repo, () => new Promise(() => {}));
+  const sessionId1 = await first1.newSession();
+  first1.notifyPrompt(sessionId1, text);
+  await waitFor(() => first1.requests().length >= 1);
+  first1.kill();
+  await once(first1.child, "exit");
+
+  const app1 = fixture(t, repo, readAnswer, { stateDir: first1.state });
+  await app1.loadSession(sessionId1);
+
+  const callsBeforeContinue = existsSync(first1.cliLog)
+    ? readFileSync(first1.cliLog, "utf8").split("\n").filter((l) => l.includes("tasks attachment get")).length
+    : 0;
+  assert.equal(callsBeforeContinue, 1);
+
+  const replyContinue = await app1.prompt(sessionId1, "продолжай");
+  assert.equal(replyContinue.result?.stopReason, "end_turn", JSON.stringify(replyContinue.error));
+
+  const callsAfterContinue = readFileSync(first1.cliLog, "utf8")
+    .split("\n")
+    .filter((l) => l.includes("tasks attachment get")).length;
+  assert.equal(callsAfterContinue, 1, "bare continue did not call bb tasks attachment get");
+
+  // 2. Exact repeat re-gathers materials, matches fingerprint, and resumes turn
+  const first2 = fixture(t, repo, () => new Promise(() => {}));
+  const sessionId2 = await first2.newSession();
+  first2.notifyPrompt(sessionId2, text);
+  await waitFor(() => first2.requests().length >= 1);
+  first2.kill();
+  await once(first2.child, "exit");
+
+  const app2 = fixture(t, repo, readAnswer, { stateDir: first2.state });
+  await app2.loadSession(sessionId2);
+
+  const callsBeforeRepeat = existsSync(first2.cliLog)
+    ? readFileSync(first2.cliLog, "utf8").split("\n").filter((l) => l.includes("tasks attachment get")).length
+    : 0;
+  assert.equal(callsBeforeRepeat, 1);
+
+  const replyRepeat = await app2.prompt(sessionId2, text);
+  assert.equal(replyRepeat.result?.stopReason, "end_turn", JSON.stringify(replyRepeat.error));
+
+  const callsAfterRepeat = readFileSync(first2.cliLog, "utf8")
+    .split("\n")
+    .filter((l) => l.includes("tasks attachment get")).length;
+  assert.equal(callsAfterRepeat, 2, "exact repeat re-gathered materials (called bb tasks attachment get)");
+
+  const { listSessionRecords, listTurns } = await import("../src/turn-journal.mjs");
+  const [sessRec] = listSessionRecords(first2.state);
+  const turns = listTurns(first2.state, sessRec.key);
+  assert.equal(turns.length, 1, "exact repeat resumed turn instead of starting a new turn");
+  assert.equal(turns[0].record.attempts.length, 2, "turn has two attempts recorded");
+});
+
+test("Вложения задачи §4.7.11: research-пакет из seed-1938 с вложениями карточки не меняется", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test11-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const id2 = "01M7" + "0".repeat(21) + "2";
+  const atts = [
+    { id: id1, name: "doc1.txt", createdAt: "2026-11-25T10:00:00Z", sizeBytes: 100 },
+    { id: id2, name: "doc2.txt", createdAt: "2026-11-25T11:00:00Z", sizeBytes: 100 },
+  ];
+
+  const text = [
+    "# PLUG-404 · research: seed 1938 test",
+    "",
+    "## Description",
+    "Find information on the web",
+    "",
+    "## Attachments",
+    ...atts.map((a) => `- ${a.name} · ${a.id}`),
+    "",
+    "## Additional instructions",
+    "задача без кода: не менять файлы",
+    "Search the web for information",
+  ].join("\n");
+
+  const session = { cwd: tmp, journal: { record: { research: true } } };
+  const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+  const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+  assert.equal(prep.research, true);
+
+  const packageOptions = {
+    signal: AbortSignal.timeout(5000),
+    spillDir: join(tmp, "spill"),
+    maxUploadBytes: 100_000,
+    maxUploadCount: 5,
+    validateUploads: () => ({ files: [] }),
+    ownedFiles: [],
+    limit: 100_000,
+  };
+
+  const materials = await collectTaskAttachments(prep, [], packageOptions);
+  assert.equal(materials.length, 0, "light research does not collect tracker attachments");
+  assert.equal(materials.omittedOptional.length, 0);
+
+  const collected = await collectTask(prep, [], materials, packageOptions);
+  assert.deepEqual(collected.omitted.filter((o) => o.source.includes("Tracker attachment")), []);
+
+  const packed = packTask(prep, collected, packageOptions);
+  assert.doesNotMatch(packed.message, /=== Tracker attachment/);
+  assert.doesNotMatch(packed.message, /=== Вложения задачи, не вошедшие в пакет ===/);
+  assert.doesNotMatch(packed.message, /doc1\.txt/);
+  assert.doesNotMatch(packed.message, /doc2\.txt/);
+});
+
+test("Вложения задачи §4.7.12: обязательные вложения никогда не вытесняются необязательными", async (t) => {
+  const { collectTaskAttachments, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test12-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const id2 = "01M7" + "0".repeat(21) + "2";
+  const atts = [
+    { id: id1, name: "optional.txt", createdAt: "2026-11-25T12:00:00Z", sizeBytes: 150 },
+    { id: id2, name: "mandatory.txt", createdAt: "2026-11-20T10:00:00Z", sizeBytes: 150 },
+  ];
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts) + ",\n" +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    '  const id = args[args.indexOf("get") + 1];\n' +
+    '  const outIdx = args.indexOf("--out");\n' +
+    '  writeFileSync(args[outIdx + 1], "x".repeat(150));\n' +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Budget priority test", "## Description", "Desc",
+      "## Attachments", ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "## Additional instructions", "Проверь mandatory.txt",
+    ].join("\n");
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    // Total budget is tight: only enough room for mandatory attachment (150) plus tiny headroom
+    prep.settings = { ...prep.settings, maxTotalBytes: 250, optionalAttachmentBytes: 200 };
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    const materials = await collectTaskAttachments(prep, [], packageOptions);
+    // mandatory.txt is collected
+    assert.equal(materials.length, 1);
+    assert.equal(materials[0].name, "mandatory.txt");
+    assert.equal(materials[0].required, true);
+    // optional.txt (even though newer by createdAt) was NOT allowed to displace mandatory.txt
+    assert.equal(materials.omittedOptional.length, 1);
+    assert.equal(materials.omittedOptional[0].name, "optional.txt");
+    assert.equal(materials.omittedOptional[0].reason, "budget");
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
 });
