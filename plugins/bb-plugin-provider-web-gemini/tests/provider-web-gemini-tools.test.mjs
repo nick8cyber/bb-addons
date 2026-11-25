@@ -1,4 +1,5 @@
 import test from "node:test";
+process.env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL ?? "/dev/null";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";

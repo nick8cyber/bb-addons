@@ -2004,6 +2004,7 @@ export async function runPrompt(id, sessionId, text, attachments = {}) {
               slog("task:attachments", materials.stats);
             }
             tj.turn.taskSha256 = taskInputSha256(tj.turn.inputBlocksSha256, materials, context.settings.mask);
+            tj.turn.mandatorySha256 = taskMandatorySha256(tj.turn.inputBlocksSha256, materials, context.settings.mask);
             tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
             collected = await collectTask(context, attachments.blocks, materials, packageOptions);
             packed = packTask(context, collected, packageOptions);
@@ -2940,6 +2941,24 @@ const taskInputSha256 = (inputBlocksSha256, materials, mask = (t) => t) => {
   ]));
 };
 
+const taskMandatorySha256 = (inputBlocksSha256, materials, mask = (t) => t) => {
+  const mandatory = [];
+  for (const m of materials || []) {
+    const textHash = m.maskedSha256 ?? sha256(mask(m.text));
+    if (m.required !== false) {
+      mandatory.push({
+        source: m.source,
+        idOrPath: m.id ?? m.name ?? m.at,
+        sha256: textHash,
+      });
+    }
+  }
+  return sha256(JSON.stringify([
+    inputBlocksSha256,
+    mandatory,
+  ]));
+};
+
 function taskAttachmentOptions(session, task) {
   return {
     signal: task.signal,
@@ -3003,14 +3022,14 @@ function fileRepairInstruction(context, candidate, plan) {
     "single Markdown fence. Previous response summary " + summary + "\n";
 }
 
-async function planTaskTurn({ session, sessionId, blocks, text, prepare, task }) {
+async function planTaskTurn({ session, sessionId, blocks, text, prepare, task, stateDir = STATE_DIR }) {
   const inputSha256 = sha256(JSON.stringify(normalizeInput(blocks)));
   const isContinue = blocks.every((block) => block.type === "text") && journal.isContinueText(text);
-  const saved = session.journal ?? journal.findSessionRecord(STATE_DIR, sessionId);
+  const saved = session.journal ?? journal.findSessionRecord(stateDir, sessionId);
   // PLUG-384: флаг research живёт в записи сессии — следующий ход видит
   // его в prepareTask и после рестарта провайдера, без маркера в тексте.
   if (saved) session.journal = saved;
-  const last = saved ? journal.listTurns(STATE_DIR, saved.key).at(-1) : null;
+  const last = saved ? journal.listTurns(stateDir, saved.key).at(-1) : null;
   if (last?.corrupt || (last && last.record.version !== journal.JOURNAL_VERSION)) {
     return { errorOutcome: "failed", reason: "recovery: saved turn journal is corrupt or has an unsupported version" };
   }
@@ -3030,12 +3049,13 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
     let fingerprint = inputSha256;
     let exact = false;
     if (!isContinue && candidate.taskSha256) {
+      materials = await collectTaskAttachments(context, blocks, taskAttachmentOptions(session, task));
+      fingerprint = taskInputSha256(inputSha256, materials, context.settings.mask);
       if (candidate.commit) {
-        exact = true;
-        fingerprint = candidate.taskSha256;
+        const currentMandatory = taskMandatorySha256(inputSha256, materials, context.settings.mask);
+        const candidateMandatory = candidate.mandatorySha256 ?? candidate.taskSha256;
+        exact = fingerprint === candidate.taskSha256 || currentMandatory === candidateMandatory;
       } else {
-        materials = await collectTaskAttachments(context, blocks, taskAttachmentOptions(session, task));
-        fingerprint = taskInputSha256(inputSha256, materials, context.settings.mask);
         exact = fingerprint === candidate.taskSha256;
       }
     }
@@ -3044,12 +3064,12 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
       if (candidate.mode === "write" && task.mode !== "write") {
         return { errorOutcome: "not_started", reason: "accept-edits is required to resume the saved file task" };
       }
-      const pkg = journal.loadTurnPackage(STATE_DIR, saved.key, candidate);
+      const pkg = journal.loadTurnPackage(stateDir, saved.key, candidate);
       if (!pkg.ok) {
-        journal.completeTurn(STATE_DIR, saved.key, candidate, { outcome: "failed", reason: "recovery: " + pkg.reason });
+        journal.completeTurn(stateDir, saved.key, candidate, { outcome: "failed", reason: "recovery: " + pkg.reason });
         return { errorOutcome: "failed", reason: "recovery: " + pkg.reason };
       }
-      journal.addAttempt(STATE_DIR, saved.key, candidate, fingerprint);
+      journal.addAttempt(stateDir, saved.key, candidate, fingerprint);
       session.journal = saved;
       return { kind: "resume", sessKey: saved.key, turn: candidate, pkg, exact, context };
     }
@@ -3060,13 +3080,13 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
     return { errorOutcome: "not_started", reason: "recovery: legacy task input fingerprint is incomplete; send a bare continue to resume" };
   }
   if (unfinished) {
-    journal.completeTurn(STATE_DIR, saved.key, unfinished, { outcome: "failed", reason: "superseded by a new task input" });
+    journal.completeTurn(stateDir, saved.key, unfinished, { outcome: "failed", reason: "superseded by a new task input" });
     session.convId = null;
     session.backend = null;
   }
   let entry = saved;
   if (!entry) {
-    entry = journal.createSessionRecord(STATE_DIR, {
+    entry = journal.createSessionRecord(stateDir, {
       sessionId,
       threadId: session.thread.thread.id,
       projectId: session.thread.thread.projectId,
@@ -3083,7 +3103,7 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
   session.journal = entry;
   const head = context.writeHead ?? await journal.headOf(context.root ?? context.cwd, task.signal);
   task.signal.throwIfAborted();
-  const turn = journal.createTurn(STATE_DIR, entry, {
+  const turn = journal.createTurn(stateDir, entry, {
     inputSha256,
     previousTurnNo: last?.turnNo,
     mode: task.mode,
@@ -3681,6 +3701,8 @@ if (process.argv[2] === "unlock") {
   });
   process.exit(0);
 }
+
+export { normalizeInput, planTaskTurn, taskInputSha256, taskMandatorySha256 };
 
 const isMain =
   process.argv[1] &&

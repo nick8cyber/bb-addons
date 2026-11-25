@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+process.env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL ?? "/dev/null";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";

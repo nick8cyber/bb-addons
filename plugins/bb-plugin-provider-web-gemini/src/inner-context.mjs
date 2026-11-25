@@ -377,31 +377,6 @@ const inside = (root, absolute) => {
   return file && !isAbsolute(file) && file !== ".." && !file.startsWith("../") ? file : null;
 };
 
-async function trackerFiles(context, scratch, maxBytes, signal) {
-  if (!context.key) throw new Error("tracker attachments require a task key");
-  const shown = JSON.parse(await bb(["tasks", "show", context.key, "--json"], signal));
-  if (shown.task?.key !== context.key || shown.project?.linkedBbProjectId !== context.thread.projectId ||
-      !shown.taskThreads?.some((entry) => entry.threadId === context.thread.id)) {
-    throw new Error("tracker attachment task does not match the current BB thread");
-  }
-  const output = [];
-  const seen = new Set();
-  for (const file of context.attachments) {
-    const entry = shown.attachments?.find((item) => item.id === file.id);
-    if (!entry || (Number.isFinite(entry.sizeBytes) && entry.sizeBytes > maxBytes)) throw new Error("tracker attachment unavailable or too large");
-    if (seen.has(file.id)) continue;
-    seen.add(file.id);
-    const dest = join(scratch, randomUUID());
-    try {
-      await bb(["tasks", "attachment", "get", file.id, "--out", dest], signal);
-      output.push({ name: entry.fileName ?? file.name, text: await readTextFile(dest, maxBytes, signal) });
-    } catch {
-      throw new Error("tracker attachment could not be downloaded as permitted text");
-    }
-  }
-  return output;
-}
-
 function explicitLinks(context, blocks) {
   const links = new Set(blocks.filter((block) => block.type === "resource_link" && block.uri && !block.uri.startsWith("file:")).map((block) => block.uri));
   for (const [url] of context.text.matchAll(/(?:https?|ftp):\/\/[^\s<>"'()[\]\x60]+/g)) links.add(url.replace(/[.,;]+$/, ""));
@@ -645,6 +620,9 @@ export async function collectTaskAttachments(context, blocks, options) {
 
         optionalList.sort(compareAttachmentsNewestFirst);
         let optionalBudgetRemaining = settings.optionalAttachmentBytes;
+        const taskTextBytes = context.text ? bytes(mask(context.text)) : 0;
+        const occupiedCoreBytes = (options.coreBytes ?? taskTextBytes) + (options.reserveBytes ?? 0);
+        let remainingBudget = Math.max(0, maxBytes - materialBytes - occupiedCoreBytes);
 
         for (const item of optionalList) {
           signal.throwIfAborted();
@@ -658,7 +636,7 @@ export async function collectTaskAttachments(context, blocks, options) {
             omittedNotTextCount++;
             continue;
           }
-          const effectiveBudget = Math.min(optionalBudgetRemaining, maxBytes - materialBytes);
+          const effectiveBudget = Math.min(optionalBudgetRemaining, remainingBudget);
           if (Number.isFinite(item.sizeBytes) && (item.sizeBytes > effectiveBudget || item.sizeBytes > maxUploadBytes)) {
             omittedOptional.push({ id: item.id, name: item.name, reason: "budget" });
             omittedBudgetCount++;
@@ -691,6 +669,7 @@ export async function collectTaskAttachments(context, blocks, options) {
             continue;
           }
           optionalBudgetRemaining -= size;
+          remainingBudget -= size;
           includedOptionalCount++;
           add("Tracker attachment", text, {
             name: item.name,
@@ -738,8 +717,11 @@ export async function collectTask(context, blocks, materials, options) {
   };
   const omit = (source, reason) => omitted.push({ source: mask(source), reason, revision });
 
+  const mandatoryMaterials = materials.filter((m) => m.required !== false);
+  const optionalMaterials = materials.filter((m) => m.required === false);
+
   add("Task text", context.text);
-  for (const { source, text, name, at, upload, required = true, createdAt, id } of materials) {
+  for (const { source, text, name, at, upload, required = true, createdAt, id } of mandatoryMaterials) {
     let delivery = "package";
     if (upload) {
       const { pkgName, pkgPath } = tools.writeSpillPackage(spillDir, randomUUID(), mask(text));
@@ -748,14 +730,6 @@ export async function collectTask(context, blocks, materials, options) {
       delivery = pkgName;
     }
     add(source, text, { name, at, delivery, required, createdAt, id });
-  }
-  if (!isLightResearch) {
-    for (const item of context.attachmentOmissions) {
-      omit("Tracker attachment: " + item.line, item.reason);
-    }
-    for (const item of (materials.omittedOptional ?? [])) {
-      omit("Tracker attachment: " + item.name, "optional attachment: " + item.reason);
-    }
   }
 
   const linkSourceText = isLightResearch ? buildCleanResearchPackage(context) : context.text;
@@ -793,11 +767,42 @@ export async function collectTask(context, blocks, materials, options) {
   } else if (!root) {
     omit("Git status and diff", "working directory is not a Git worktree");
   }
-  const skippedAttachmentsBlock = !isLightResearch && materials.omittedOptional?.length
-    ? buildSkippedAttachmentsBlock(materials.omittedOptional, mask)
+
+  const allOmittedOptional = [...(materials.omittedOptional ?? [])];
+  for (const item of optionalMaterials) {
+    const { source, text, name, at, upload, createdAt, id } = item;
+    const maskedText = mask(text);
+    const size = bytes(maskedText);
+    if (coreBytes + size > maxBytes) {
+      allOmittedOptional.push({ id, name, reason: "budget" });
+      continue;
+    }
+    let delivery = "package";
+    if (upload) {
+      const { pkgName, pkgPath } = tools.writeSpillPackage(spillDir, randomUUID(), maskedText);
+      options.ownedFiles.push(pkgPath);
+      materialFiles.push(pkgPath);
+      delivery = pkgName;
+    }
+    coreBytes += size;
+    const entry = { source, ...(name ? { name: mask(name) } : {}), ...(createdAt ? { createdAt } : {}), ...(id ? { id } : {}), revision: at ?? revision, required: false, included: "full", bytes: size, sha256: digest(maskedText), delivery };
+    core.push(Object.freeze({ entry: Object.freeze(entry), text: maskedText }));
+  }
+
+  if (!isLightResearch) {
+    for (const item of context.attachmentOmissions) {
+      omit("Tracker attachment: " + item.line, item.reason);
+    }
+    for (const item of allOmittedOptional) {
+      omit("Tracker attachment: " + item.name, "optional attachment: " + item.reason);
+    }
+  }
+
+  const skippedAttachmentsBlock = !isLightResearch && allOmittedOptional.length
+    ? buildSkippedAttachmentsBlock(allOmittedOptional, mask)
     : "";
   return Object.freeze({ core: Object.freeze(core), omitted: Object.freeze(omitted.map(Object.freeze)),
-    files: Object.freeze(materialFiles), reviewDiff, fileBases, skippedAttachmentsBlock });
+    files: Object.freeze(materialFiles), reviewDiff, fileBases, skippedAttachmentsBlock, allOmittedOptional });
 }
 
 export function filterServiceLines(text) {
@@ -995,6 +1000,7 @@ export function packTask(context, collected, options) {
   const supplements = [...(collected.agent?.supplements ?? [])];
   let omissions = collected.agent?.omitted ?? [];
   let dropped = 0, compact = false, summarized = false;
+  let currentCollected = collected;
   while (true) {
     const budgetNote = dropped ? [{
       source: "Fast agent", revision: context.pin?.sha ?? "working copy",
@@ -1002,23 +1008,47 @@ export function packTask(context, collected, options) {
     }] : [];
     try {
       return Object.freeze({
-        ...renderTaskPackage(context, collected, options, supplements, [...omissions, ...budgetNote], compact),
+        ...renderTaskPackage(context, currentCollected, options, supplements, [...omissions, ...budgetNote], compact),
         agentDeliveryLimited: dropped > 0 || compact,
       });
     } catch (error) {
       if (supplements.length) {
         supplements.pop();
         dropped++;
-      } else if (!compact && (omissions.length || dropped)) {
-        compact = true;
-      } else if (!summarized && omissions.length > 1) {
-        omissions = [{ source: "Fast agent", reason: "additional context incomplete; omission details exceed delivery budget" }];
-        summarized = true;
-      } else if (omissions.length || dropped) {
-        // The mandatory package can exactly fill the remaining space.
-        return Object.freeze({ ...renderTaskPackage(context, collected, options, [], []), agentDeliveryLimited: true });
       } else {
-        throw error;
+        const optionalIdx = currentCollected.core.findLastIndex(({ entry }) => entry.required === false);
+        if (optionalIdx !== -1) {
+          const removed = currentCollected.core[optionalIdx];
+          const newCore = currentCollected.core.filter((_, idx) => idx !== optionalIdx);
+          const newOmitted = [
+            ...currentCollected.omitted,
+            {
+              source: context.settings.mask("Tracker attachment: " + (removed.entry.name ?? "unnamed")),
+              reason: "optional attachment: budget",
+              revision: removed.entry.revision ?? "working copy",
+            },
+          ];
+          const omittedEntry = { id: removed.entry.id, name: removed.entry.name, reason: "budget" };
+          const allOmitted = [...(currentCollected.allOmittedOptional ?? []), omittedEntry];
+          const newSkippedBlock = buildSkippedAttachmentsBlock(allOmitted, context.settings.mask);
+          currentCollected = {
+            ...currentCollected,
+            core: Object.freeze(newCore),
+            omitted: Object.freeze(newOmitted),
+            skippedAttachmentsBlock: newSkippedBlock,
+            allOmittedOptional: allOmitted,
+          };
+        } else if (!compact && (omissions.length || dropped)) {
+          compact = true;
+        } else if (!summarized && omissions.length > 1) {
+          omissions = [{ source: "Fast agent", reason: "additional context incomplete; omission details exceed delivery budget" }];
+          summarized = true;
+        } else if (omissions.length || dropped) {
+          // The mandatory package can exactly fill the remaining space.
+          return Object.freeze({ ...renderTaskPackage(context, currentCollected, options, [], []), agentDeliveryLimited: true });
+        } else {
+          throw error;
+        }
       }
     }
   }

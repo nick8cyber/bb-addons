@@ -239,6 +239,7 @@ export function createTurn(stateDir, entry, fields) {
     deadlineAt: fields.deadlineAt ?? null,
     inputBlocksSha256: fields.inputSha256,
     taskSha256: null,
+    mandatorySha256: fields.mandatorySha256 ?? null,
     attempts: [{ n: 1, inputSha256: fields.inputSha256, at: now }],
     head: fields.head ?? null,
     pin: fields.pin ?? null,

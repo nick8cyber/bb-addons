@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+process.env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL ?? "/dev/null";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";

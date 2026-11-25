@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+process.env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL ?? "/dev/null";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
@@ -188,7 +189,8 @@ if (area === "thread" && action === "show" && arg === threadId && extra[0] === "
     attachments: [{ id: ${quoted(attachmentId)}, fileName: "tracker.md" }],
   }));
 } else if (area === "tasks" && action === "attachment" && arg === "get" && extra[0] === ${quoted(attachmentId)} && extra[1] === "--out") {
-  writeFileSync(extra[2], "Tracker input ZX12-marker\n");
+  if (process.env.FIXTURE_ATTACHMENT_FAIL === "1") { process.exitCode = 2; }
+  else { writeFileSync(extra[2], process.env.FIXTURE_ATTACHMENT_CONTENT ?? "Tracker input ZX12-marker\n"); }
 } else if (area === "thread" && action === "log" && arg === threadId && extra[0] === "--message" && extra[1] === "2") {
   console.log("Linked material ZX12-marker");
 } else process.exitCode = 2;
@@ -3154,6 +3156,23 @@ test("Вложения задачи §4.7.9: событие task:attachments с�
       assert.equal(typeof v, "number", `materials.stats.${k} must be a number`);
       assert.ok(Number.isInteger(v) && v >= 0, `materials.stats.${k} must be a non-negative integer`);
     }
+
+    const { slog } = await import("../acp-server.mjs");
+    const origStateDir = process.env.WEB_GEMINI_STATE_DIR;
+    process.env.WEB_GEMINI_STATE_DIR = tmp;
+    try {
+      slog("task:attachments", materials.stats);
+      const logContent = readFileSync(join(tmp, "acp-server.log"), "utf8");
+      assert.match(logContent, /task:attachments \{"mandatory":1,"includedOptional":1,"omittedBudget":0,"omittedNotText":1,"omittedDownloadFailed":0\}/);
+      const logLine = logContent.split("\n").find((l) => l.includes("task:attachments"));
+      assert.ok(logLine);
+      assert.doesNotMatch(logLine, /mandatory\.txt/);
+      assert.doesNotMatch(logLine, /included\.txt/);
+      assert.doesNotMatch(logLine, /bad\.png/);
+    } finally {
+      if (origStateDir !== undefined) process.env.WEB_GEMINI_STATE_DIR = origStateDir;
+      else delete process.env.WEB_GEMINI_STATE_DIR;
+    }
   } finally {
     if (oldCli !== undefined) process.env.BB_CLI = oldCli;
     else delete process.env.BB_CLI;
@@ -3217,6 +3236,28 @@ test("Вложения задачи §4.7.10: точный повтор возо
   const turns = listTurns(first2.state, sessRec.key);
   assert.equal(turns.length, 1, "exact repeat resumed turn instead of starting a new turn");
   assert.equal(turns[0].record.attempts.length, 2, "turn has two attempts recorded");
+
+  // 3. Exact repeat when an optional attachment failed to download supersedes previous turn and starts fresh turn without failing
+  const first3 = fixture(t, repo, () => new Promise(() => {}));
+  const sessionId3 = await first3.newSession();
+  first3.notifyPrompt(sessionId3, text);
+  await waitFor(() => first3.requests().length >= 1);
+  first3.kill();
+  await once(first3.child, "exit");
+
+  const app3 = fixture(t, repo, readAnswer, { stateDir: first3.state, env: { FIXTURE_ATTACHMENT_FAIL: "1" } });
+  await app3.loadSession(sessionId3);
+
+  const replyRepeat3 = await app3.prompt(sessionId3, text);
+  assert.equal(replyRepeat3.result?.stopReason, "end_turn", JSON.stringify(replyRepeat3.error));
+
+  const [sessRec3] = listSessionRecords(first3.state);
+  const turns3 = listTurns(first3.state, sessRec3.key);
+  assert.equal(turns3.length, 2, "turn was superseded and a new turn was started");
+  assert.equal(turns3[0].record.outcome, "failed");
+  assert.equal(turns3[0].record.reason, "superseded by a new task input");
+  assert.equal(turns3[1].record.turnNo, 2);
+  assert.equal(turns3[1].record.outcome, "passed");
 });
 
 test("Вложения задачи §4.7.11: research-пакет из seed-1938 с вложениями карточки не меняется", async (t) => {
@@ -3337,6 +3378,218 @@ test("Вложения задачи §4.7.12: обязательные влож�
     assert.equal(materials.omittedOptional.length, 1);
     assert.equal(materials.omittedOptional[0].name, "optional.txt");
     assert.equal(materials.omittedOptional[0].reason, "budget");
+  } finally {
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.13: ход с коммитом при изменении обязательного вложения не возвращает старый SHA, а начинает новый ход (PLUG-419)", async (t) => {
+  const { normalizeInput, planTaskTurn, taskInputSha256, taskMandatorySha256 } = await import("../acp-server.mjs");
+  const { createSessionRecord, createTurn, saveTurn } = await import("../src/turn-journal.mjs");
+  const { collectTaskAttachments, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test13-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const id2 = "01M7" + "0".repeat(21) + "2";
+  const atts = [
+    { id: id1, name: "tracker.md", createdAt: "2026-11-25T12:00:00Z", sizeBytes: 100 },
+    { id: id2, name: "notes.txt", createdAt: "2026-11-25T12:05:00Z", sizeBytes: 100 },
+  ];
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts) + ",\n" +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    '  const outIdx = args.indexOf("--out");\n' +
+    '  const attId = args[3];\n' +
+    '  const content = attId === ' + JSON.stringify(id1) + '\n' +
+    '    ? (process.env.TEST_MANDATORY_CONTENT || "Version 1 mandatory\\n")\n' +
+    '    : (process.env.TEST_OPTIONAL_CONTENT || "Version 1 optional\\n");\n' +
+    '  writeFileSync(args[outIdx + 1], content);\n' +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Commit test with named attachment",
+      "",
+      "## Description",
+      "Check mandatory attachment changes",
+      "",
+      "## Attachments",
+      ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "",
+      "## Additional instructions",
+      "Проверь tracker.md",
+    ].join("\n");
+
+    const blocks = [{ type: "text", text }];
+    const session = {
+      cwd: tmp,
+      roots: [tmp],
+      thread: { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } },
+      model: "test-model",
+      thinking: false,
+      account: "test-acc",
+    };
+    const sessionId = "sess-plug-419-commit";
+
+    const sessEntry = createSessionRecord(tmp, {
+      sessionId,
+      threadId,
+      projectId,
+      fingerprint: "wt-fp",
+      accessCeiling: "write",
+      accessMode: "write",
+      roots: [tmp],
+      model: "test-model",
+      thinking: false,
+      account: "test-acc",
+    });
+    session.journal = sessEntry;
+
+    const prepare = async (savedTurn) => {
+      const context = await prepareTask({ text, session, thread: session.thread, stateDir: tmp, signal: AbortSignal.timeout(5000), savedTurn });
+      return { ...context, writeHead: { sha: "base_sha", branch: "main" } };
+    };
+    const task = { mode: "write", signal: AbortSignal.timeout(5000), deadline: Date.now() + 60000 };
+
+    process.env.TEST_MANDATORY_CONTENT = "Version 1 mandatory\n";
+    process.env.TEST_OPTIONAL_CONTENT = "Version 1 optional\n";
+    const context1 = await prepare();
+    const packageOptions = {
+      signal: task.signal,
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+    const materials1 = await collectTaskAttachments(context1, blocks, packageOptions);
+    const inputSha256 = createHash("sha256").update(JSON.stringify(normalizeInput(blocks))).digest("hex");
+    const tSha256 = taskInputSha256(inputSha256, materials1, context1.settings.mask);
+    const mMandatorySha256 = taskMandatorySha256(inputSha256, materials1, context1.settings.mask);
+
+    const turn1 = createTurn(tmp, sessEntry, {
+      inputSha256,
+      mode: "write",
+      profile: { model: "test-model", thinking: false, account: "test-acc" },
+      deadlineAt: task.deadline,
+      budgetLimits: {},
+      head: { sha: "base_sha", branch: "main" },
+      expected: "files",
+      write: true,
+    });
+    turn1.taskSha256 = tSha256;
+    turn1.mandatorySha256 = mMandatorySha256;
+    turn1.commit = { sha: "commit_sha_12345", head: { branch: "main" } };
+    turn1.outcome = "passed";
+    saveTurn(tmp, sessEntry.key, turn1);
+
+    // 1. Repeat with UNCHANGED attachments -> replays committed turn
+    const planUnchanged = await planTaskTurn({ session, sessionId, blocks, text, prepare, task, stateDir: tmp });
+    assert.equal(planUnchanged.kind, "committed");
+    assert.equal(planUnchanged.turn.commit.sha, "commit_sha_12345");
+
+    // 2. Repeat with MODIFIED OPTIONAL attachment only -> still replays committed turn
+    process.env.TEST_OPTIONAL_CONTENT = "Version 2 modified optional\n";
+    const planOptionalModified = await planTaskTurn({ session, sessionId, blocks, text, prepare, task, stateDir: tmp });
+    assert.equal(planOptionalModified.kind, "committed");
+    assert.equal(planOptionalModified.turn.commit.sha, "commit_sha_12345");
+
+    // 3. Repeat with MODIFIED MANDATORY attachment -> starts a fresh turn (turn 2), not returning old commit SHA
+    process.env.TEST_MANDATORY_CONTENT = "Version 2 modified mandatory\n";
+    const planModified = await planTaskTurn({ session, sessionId, blocks, text, prepare, task, stateDir: tmp });
+    assert.equal(planModified.kind, "fresh");
+    assert.equal(planModified.turn.turnNo, 2);
+    assert.equal(planModified.turn.commit, undefined);
+  } finally {
+    delete process.env.TEST_MANDATORY_CONTENT;
+    delete process.env.TEST_OPTIONAL_CONTENT;
+    if (oldCli !== undefined) process.env.BB_CLI = oldCli;
+    else delete process.env.BB_CLI;
+  }
+});
+
+test("Вложения задачи §4.7.14: малый maxTotalBytes — необязательное вложение вытесняется и не роняет сборку пакета (collectTask + packTask) (PLUG-419)", async (t) => {
+  const { collectTask, collectTaskAttachments, packTask, prepareTask } = await import("../src/inner-context.mjs");
+  const tmp = mkdtempSync(join(tmpdir(), "plug-419-test14-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const id1 = "01M7" + "0".repeat(21) + "1";
+  const atts = [
+    { id: id1, name: "large-unnamed.txt", createdAt: "2026-11-25T12:00:00Z", sizeBytes: 3000 },
+  ];
+
+  const mockCli = join(tmp, "mock-bb.mjs");
+  writeFileSync(mockCli, "#!/usr/bin/env node\n" +
+    'import { writeFileSync } from "node:fs";\n' +
+    "const args = process.argv.slice(2);\n" +
+    'if (args[0] === "tasks" && args[1] === "show" && args[3] === "--json") {\n' +
+    "  console.log(JSON.stringify({\n" +
+    "    task: { key: args[2] },\n" +
+    "    project: { linkedBbProjectId: " + JSON.stringify(projectId) + " },\n" +
+    "    taskThreads: [{ threadId: " + JSON.stringify(threadId) + " }],\n" +
+    "    attachments: " + JSON.stringify(atts) + ",\n" +
+    "  }));\n" +
+    '} else if (args[0] === "tasks" && args[1] === "attachment" && args[2] === "get") {\n' +
+    '  const outIdx = args.indexOf("--out");\n' +
+    '  writeFileSync(args[outIdx + 1], "x".repeat(3000));\n' +
+    "} else { process.exit(1); }\n");
+  chmodSync(mockCli, 0o700);
+
+  const oldCli = process.env.BB_CLI;
+  process.env.BB_CLI = mockCli;
+  try {
+    const text = [
+      "# PLUG-419 · Budget test with small maxTotalBytes",
+      "",
+      "## Description",
+      "Test that core task context plus опись fits, while large optional attachment does not fail the turn.",
+      "A".repeat(1000),
+      "",
+      "## Attachments",
+      ...atts.map((a) => `- ${a.name} · ${a.id}`),
+      "",
+      "## Additional instructions",
+      "Do not name the attachment here.",
+    ].join("\n");
+
+    const session = { cwd: tmp };
+    const thread = { thread: { id: threadId, projectId }, environment: { path: tmp, id: "env-1", projectId } };
+    const prep = await prepareTask({ text, session, thread, stateDir: tmp, signal: AbortSignal.timeout(5000) });
+    // Total budget 4000: core + manifest fits (~2400), but core + 3000 exceeds 4000
+    prep.settings = { ...prep.settings, maxTotalBytes: 4000, optionalAttachmentBytes: 240_000 };
+
+    const packageOptions = {
+      signal: AbortSignal.timeout(5000),
+      spillDir: join(tmp, "spill"),
+      maxUploadBytes: 100_000,
+      maxUploadCount: 5,
+      validateUploads: () => ({ files: [] }),
+      ownedFiles: [],
+      limit: 100_000,
+    };
+
+    const materials = await collectTaskAttachments(prep, [], packageOptions);
+    const collected = await collectTask(prep, [], materials, packageOptions);
+    // Should NOT throw "mandatory task and manifest exceed delivery budget"
+    const packed = packTask(prep, collected, packageOptions);
+    assert.ok(packed, "package must be assembled");
+    assert.match(packed.message, /=== Вложения задачи, не вошедшие в пакет ===\nНе вошли по бюджету \(1\): large-unnamed\.txt/);
   } finally {
     if (oldCli !== undefined) process.env.BB_CLI = oldCli;
     else delete process.env.BB_CLI;

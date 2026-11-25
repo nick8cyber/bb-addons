@@ -18,7 +18,7 @@
     "host": "host.mjs"
   },
   "scripts": {
-    "test": "GIT_CONFIG_GLOBAL=/dev/null node --test tests/*.test.mjs",
+    "test": "node --test tests/*.test.mjs",
     "test:live": "node tests/test-driver.js"
   },
   "license": "MIT",
