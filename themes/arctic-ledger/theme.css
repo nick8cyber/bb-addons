@@ -545,3 +545,40 @@ diffs-container {
 .dark [data-testid="sidebar-footer-customize-inline"] [data-footer-placement-toggle] {
   color: #bfd0e2;
 }
+
+/* Suggestion buttons from the external next-prompt plugin (composer banner,
+ * chrome=bare): restyle the host Tailwind-utility buttons onto the theme's
+ * accent ramps instead of host foreground/border defaults. Scoped by
+ * data-bb-plugin, so it stays inert while the plugin is not installed. */
+[data-bb-plugin="next-prompt"] button.bg-foreground {
+  background-color: var(--primary);
+  color: var(--primary-foreground);
+  border-color: var(--primary);
+}
+
+[data-bb-plugin="next-prompt"] button.bg-foreground:hover {
+  background-color: color-mix(in srgb, var(--primary) 88%, black);
+}
+
+[data-bb-plugin="next-prompt"] button.border-border {
+  background-color: var(--card);
+  color: var(--secondary-foreground);
+  border-color: var(--border);
+}
+
+[data-bb-plugin="next-prompt"] button.border-border:hover,
+[data-bb-plugin="next-prompt"] button.border-border:focus-visible {
+  background-color: var(--state-hover);
+  color: var(--foreground);
+  border-color: var(--border-hairline);
+}
+
+[data-bb-plugin="next-prompt"] button.text-muted-foreground:hover {
+  background-color: var(--state-hover);
+  color: var(--foreground);
+}
+
+[data-bb-plugin="next-prompt"] button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
