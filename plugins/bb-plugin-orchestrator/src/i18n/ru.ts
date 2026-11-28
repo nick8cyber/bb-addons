@@ -1121,6 +1121,7 @@ export const RU: Record<string, string> = {
   // ── workgraph.ts / §27–§32 (r34, ADR-0032) — task work graph CLI ────
   "cli.helpEnqueueS": "Поставить задачу в очередь графа",
   "cli.helpDequeueS": "Снять задачу с очереди графа (только владелец)",
+  "cli.helpRerouteS": "Смена маршрута fix|simple → feature на месте координатором своей задачи в auto до кода (§29.9)",
   "cli.helpDeferS": "Отложить задачу (только владелец)",
   "cli.helpRejectS": "Возврат узла на доработку",
   "cli.helpResumeS": "Возобновить задачу из deferred/blocked/stalled",

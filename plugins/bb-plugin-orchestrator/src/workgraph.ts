@@ -1535,6 +1535,78 @@ export async function runDequeue(
   return { ok: true, task: res.task! };
 }
 
+/**
+ * §29.9 (PLUG-426): Смена маршрута на месте (команда reroute, CAS в SQLite, без dequeue).
+ * Повышает маршрут fix|simple → feature координатором своей задачи в auto до кода.
+ */
+export async function runReroute(
+  taskKey: string,
+  targetRoute: string,
+  reason: string,
+  callerThreadId: string | null | undefined,
+  deps: {
+    store: DelegationStore;
+    workGraphMode: WorkGraphMode;
+    now?: () => number;
+    notifyOwner?: (line: string) => Promise<unknown> | unknown;
+    log?: { warn: (msg: string) => void; info?: (msg: string) => void; error?: (msg: string) => void };
+  },
+): Promise<{ ok: boolean; task: TaskQueueRow; fromRoute: string }> {
+  // До транзакции (§29.9 п. 1):
+  // 1. Пустой --reason -> reason-required
+  if (!reason || !reason.trim() || reason.startsWith("--")) {
+    throw new OrchestratorError(
+      "reason-required",
+      "укажи причину смены маршрута: --reason <текст>",
+    );
+  }
+
+  const key = normalizeTaskKey(taskKey);
+
+  // 2. Нет записи task_queue -> task-not-found
+  const task = deps.store.getTask(key);
+  if (!task) {
+    throw new OrchestratorError(
+      "task-not-found",
+      `задача ${key} не найдена в очереди`,
+    );
+  }
+
+  // 3. Режим проекта off -> graph-disabled
+  if (deps.workGraphMode === "off") {
+    throw new OrchestratorError(
+      "graph-disabled",
+      "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+
+  const nowMs = deps.now ? deps.now() : Date.now();
+
+  const res = deps.store.rerouteTask({
+    taskKey: key,
+    targetRoute,
+    reason: reason.trim(),
+    callerThreadId: callerThreadId ?? null,
+    workGraphMode: deps.workGraphMode,
+    now: nowMs,
+  });
+
+  // §29.9 п. 5: После фиксации — одна строка владельцу без кнопок.
+  // «PLUG-414: маршрут fix → feature, координатор (§29.9): <причина>»
+  // Сбой доставки пишется в лог и действие не откатывает.
+  if (deps.notifyOwner) {
+    try {
+      await deps.notifyOwner(
+        `${key}: маршрут ${res.fromRoute} → feature, координатор (§29.9): ${reason.trim()}`,
+      );
+    } catch (e) {
+      deps.log?.warn?.(`orchestrator: сбой отправки строки владельцу при reroute: ${e}`);
+    }
+  }
+
+  return { ok: true, task: res.task, fromRoute: res.fromRoute };
+}
+
 export async function runDefer(
   taskKey: string,
   reason: string | undefined,

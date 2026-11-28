@@ -7,6 +7,7 @@ import type { Database } from "better-sqlite3";
 import { OrchestratorError } from "./errors.js";
 import type { EventHookSetting } from "./events.js";
 import { T_RU, type T } from "./i18n/index.js";
+import type { WorkGraphMode } from "./workgraph-mode.js";
 
 export const MIGRATIONS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS delegations (
@@ -4480,6 +4481,261 @@ export class DelegationStore {
         transitionId: Number(transInfo.lastInsertRowid),
       };
     })();
+  }
+
+  /**
+   * §29.9 (PLUG-426): Смена маршрута на месте командой reroute координатором
+   * своей задачи в auto до кода. Единая транзакция BEGIN IMMEDIATE с CAS по
+   * (route, node, status, created_at). Без внешних вызовов.
+   */
+  rerouteTask(input: {
+    taskKey: string;
+    targetRoute: string;
+    reason: string;
+    callerThreadId: string | null;
+    workGraphMode: WorkGraphMode;
+    now: number;
+  }): { ok: true; task: TaskQueueRow; fromRoute: string } {
+    const key = normalizeTaskKey(input.taskKey);
+
+    const runTx = this.db.transaction(() => {
+      const task = this.getTask(key);
+      if (!task) {
+        throw new OrchestratorError(
+          "task-not-found",
+          `задача ${key} не найдена в очереди`,
+        );
+      }
+
+      // а) у callerThreadId есть строка thread_roles с role = 'orchestrator' -> not-coordinator
+      if (!input.callerThreadId) {
+        throw new OrchestratorError(
+          "permission-denied",
+          "owner-only (§29.9: not-coordinator)",
+        );
+      }
+      const roleRow = this.db
+        .prepare("SELECT role FROM thread_roles WHERE thread_id = ?")
+        .get(input.callerThreadId) as { role: string } | undefined;
+      if (!roleRow || roleRow.role !== "orchestrator") {
+        throw new OrchestratorError(
+          "permission-denied",
+          "owner-only (§29.9: not-coordinator)",
+        );
+      }
+
+      // б) task_queue.coordinator_thread_id = callerThreadId -> foreign-coordinator
+      if (task.coordinator_thread_id !== input.callerThreadId) {
+        throw new OrchestratorError(
+          "permission-denied",
+          "owner-only (§29.9: foreign-coordinator)",
+        );
+      }
+
+      // в) task_queue.confirmation_mode = 'auto' -> manual-mode
+      if (task.confirmation_mode !== "auto") {
+        throw new OrchestratorError(
+          "permission-denied",
+          "owner-only (§29.9: manual-mode)",
+        );
+      }
+
+      // г) текущий route IN ('fix', 'simple'), целевой — только feature -> route-not-allowed
+      if (
+        input.targetRoute !== "feature" ||
+        (task.route !== "fix" && task.route !== "simple")
+      ) {
+        throw new OrchestratorError(
+          "permission-denied",
+          "owner-only (§29.9: route-not-allowed)",
+        );
+      }
+
+      // д) раздачи на узле code не было по всей истории ключа (включая заходы до прошлых dequeue):
+      // нет строки delegations по task_key с level IN ('complex', 'high', 'medium', 'simple') в любом статусе
+      // и нет записи task_transitions с to_node = 'code' -> code-dispatched
+      const codeDelegation = this.db
+        .prepare(
+          "SELECT 1 FROM delegations WHERE task_key = ? AND level IN ('complex', 'high', 'medium', 'simple') LIMIT 1",
+        )
+        .get(key);
+      const codeTransition = this.db
+        .prepare(
+          "SELECT 1 FROM task_transitions WHERE task_key = ? AND to_node = 'code' LIMIT 1",
+        )
+        .get(key);
+      if (codeDelegation || codeTransition) {
+        throw new OrchestratorError(
+          "permission-denied",
+          "owner-only (§29.9: code-dispatched)",
+        );
+      }
+
+      // е) по task_key нет строк releases в любом статусе и записей task_transitions с to_status = 'pr_open' -> released
+      const releaseRow = this.db
+        .prepare("SELECT 1 FROM releases WHERE task_key = ? LIMIT 1")
+        .get(key);
+      const prTransition = this.db
+        .prepare(
+          "SELECT 1 FROM task_transitions WHERE task_key = ? AND to_status = 'pr_open' LIMIT 1",
+        )
+        .get(key);
+      if (releaseRow || prTransition) {
+        throw new OrchestratorError(
+          "permission-denied",
+          "owner-only (§29.9: released)",
+        );
+      }
+
+      // ж) нет строки delegations по task_key в статусе dispatching или running -> task-busy
+      const busyDelegation = this.db
+        .prepare(
+          "SELECT 1 FROM delegations WHERE task_key = ? AND status IN ('dispatching', 'running') LIMIT 1",
+        )
+        .get(key);
+      if (busyDelegation) {
+        throw new OrchestratorError(
+          "permission-denied",
+          "owner-only (§29.9: task-busy)",
+        );
+      }
+
+      // з) в strict: node = 'start' и status IN ('queued', 'stalled'); в shadow: status NOT IN ('done', 'cancelled') -> not-at-start
+      if (input.workGraphMode === "strict") {
+        if (
+          task.node !== "start" ||
+          (task.status !== "queued" && task.status !== "stalled")
+        ) {
+          throw new OrchestratorError(
+            "permission-denied",
+            "owner-only (§29.9: not-at-start)",
+          );
+        }
+      } else {
+        if (task.status === "done" || task.status === "cancelled") {
+          throw new OrchestratorError(
+            "permission-denied",
+            "owner-only (§29.9: not-at-start)",
+          );
+        }
+      }
+
+      // 3. Действие — только SQLite: CAS по прочитанному в той же транзакции
+      const fromRoute = task.route;
+      const nowMs = input.now;
+
+      let info;
+      if (input.workGraphMode === "strict") {
+        info = this.db
+          .prepare(
+            `UPDATE task_queue SET route = 'feature', status = 'queued', updated_at = :now
+             WHERE task_key = :k AND route = :route AND node = :node AND status = :status AND created_at = :createdAt`,
+          )
+          .run({
+            k: key,
+            route: task.route,
+            node: task.node,
+            status: task.status,
+            createdAt: task.created_at,
+            now: nowMs,
+          });
+      } else {
+        info = this.db
+          .prepare(
+            `UPDATE task_queue SET route = 'feature', updated_at = :now
+             WHERE task_key = :k AND route = :route AND node = :node AND status = :status AND created_at = :createdAt`,
+          )
+          .run({
+            k: key,
+            route: task.route,
+            node: task.node,
+            status: task.status,
+            createdAt: task.created_at,
+            now: nowMs,
+          });
+      }
+
+      if (info.changes === 0) {
+        const fresh = this.getTask(key);
+        if (!fresh) {
+          throw new OrchestratorError(
+            "task-not-found",
+            `задача ${key} не найдена в очереди`,
+          );
+        }
+        if (
+          input.targetRoute !== "feature" ||
+          (fresh.route !== "fix" && fresh.route !== "simple")
+        ) {
+          throw new OrchestratorError(
+            "permission-denied",
+            "owner-only (§29.9: route-not-allowed)",
+          );
+        }
+        if (input.workGraphMode === "strict") {
+          if (
+            fresh.node !== "start" ||
+            (fresh.status !== "queued" && fresh.status !== "stalled")
+          ) {
+            throw new OrchestratorError(
+              "permission-denied",
+              "owner-only (§29.9: not-at-start)",
+            );
+          }
+        } else {
+          if (fresh.status === "done" || fresh.status === "cancelled") {
+            throw new OrchestratorError(
+              "permission-denied",
+              "owner-only (§29.9: not-at-start)",
+            );
+          }
+        }
+        throw new OrchestratorError(
+          "permission-denied",
+          "owner-only (§29.9: route-not-allowed)",
+        );
+      }
+
+      // 5. Журнал: task_transitions в той же транзакции
+      const fromNode = task.node;
+      const toNode = task.node;
+      const fromStatus = task.status;
+      const toStatus = input.workGraphMode === "strict" ? "queued" : task.status;
+      const reasonStr = `coordinator-auto:reroute:${fromRoute}→feature:${input.reason}`;
+      const payloadStr = JSON.stringify({
+        event: "coordinator_auto",
+        command: "reroute",
+        from_route: fromRoute,
+        to_route: "feature",
+        caller_thread_id: input.callerThreadId,
+      });
+
+      this.db
+        .prepare(
+          `INSERT INTO task_transitions (
+             task_key, from_node, to_node, from_status, to_status, actor, reason, payload, created_at
+           ) VALUES (?, ?, ?, ?, ?, 'coordinator:auto', ?, ?, ?)`,
+        )
+        .run(
+          key,
+          fromNode,
+          toNode,
+          fromStatus,
+          toStatus,
+          reasonStr,
+          payloadStr,
+          nowMs,
+        );
+
+      const updated = this.getTask(key)!;
+      return {
+        ok: true as const,
+        task: updated,
+        fromRoute,
+      };
+    }).immediate;
+
+    return runTx();
   }
 
   listQueuedTasks(): TaskQueueRow[] {

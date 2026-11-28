@@ -1109,6 +1109,7 @@ export const EN: Record<string, string> = {
   // ── workgraph.ts / §27–§32 (r34, ADR-0032) — task work graph CLI ────
   "cli.helpEnqueueS": "Enqueue a task into the work graph",
   "cli.helpDequeueS": "Dequeue a task from the work graph (owner-only)",
+  "cli.helpRerouteS": "Reroute task fix|simple → feature in-place by coordinator of own task in auto before code (§29.9)",
   "cli.helpDeferS": "Defer a task (owner-only)",
   "cli.helpRejectS": "Reject task node for rework",
   "cli.helpResumeS": "Resume task from deferred/blocked/stalled",

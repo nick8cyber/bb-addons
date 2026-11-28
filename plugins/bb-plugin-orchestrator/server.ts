@@ -181,6 +181,7 @@ import {
   resolveTaskProjectId,
   runApprove,
   runDequeue,
+  runReroute,
   runDefer,
   runEnqueue,
   runReject,
@@ -359,6 +360,18 @@ export const rpcContract = defineRpcContract({
       ok: z.literal(true),
       taskKey: z.string(),
       status: z.string(),
+    }),
+  },
+  reroute: {
+    input: z.object({
+      taskKey: z.string(),
+      route: z.string(),
+      reason: z.string(),
+      callerThreadId: z.string().nullable().optional(),
+    }),
+    output: z.object({
+      ok: z.literal(true),
+      task: z.any(),
     }),
   },
   taskDetails: {
@@ -3432,6 +3445,28 @@ export async function createPlugin(
         status: res.task.status,
       };
     },
+    async reroute(input) {
+      const taskKey = input.taskKey;
+      const taskPid = await resolveTaskProjectId(store, taskKey, { bbCli, log: bb.log });
+      const callerThreadId = input.callerThreadId ?? null;
+      const res = await runReroute(
+        taskKey,
+        input.route,
+        input.reason,
+        callerThreadId,
+        {
+          store,
+          workGraphMode: getWorkGraphMode(taskPid),
+          now,
+          notifyOwner: (line) => notifyOwnerLine(line),
+          log: bb.log,
+        },
+      );
+      return {
+        ok: true as const,
+        task: res.task,
+      };
+    },
     async taskDetails(input) {
       const task = store.getTask(input.taskKey);
       return { task: task ?? null };
@@ -4111,6 +4146,12 @@ export async function createPlugin(
         usage: "bb orchestrator dequeue <KEY> [--reason <reason>] [--json]",
       },
       {
+        name: "reroute",
+        summary: t("cli.helpRerouteS"),
+        usage:
+          "bb orchestrator reroute <KEY> --route feature --reason <причина> [--json]",
+      },
+      {
         name: "defer",
         summary: t("cli.helpDeferS"),
         usage: "bb orchestrator defer <KEY> --reason <reason> [--json]",
@@ -4223,6 +4264,7 @@ export async function createPlugin(
             "kb",
             "enqueue",
             "dequeue",
+            "reroute",
             "defer",
             "reject",
             "resume",
@@ -5675,6 +5717,41 @@ abandoned: ${res.reported
             : {
                 exitCode: 0,
                 stdout: `dequeued ${res.task.task_key} (status: ${res.task.status})\n`,
+              };
+        }
+
+        if (cmd === "reroute") {
+          const taskKey = positional[1];
+          if (!taskKey) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "укажи ключ задачи: bb orchestrator reroute <KEY> --route feature --reason <причина>",
+            );
+          }
+          const taskProjId =
+            (await resolveTaskProjectId(store, taskKey, { bbCli, log: bb.log })) ??
+            ctx.projectId;
+          const callerThreadId = ctx.threadId ?? process.env.BB_THREAD_ID ?? null;
+          const routeVal = flag("--route") ?? "";
+          const reasonVal = flag("--reason") ?? "";
+          const res = await runReroute(
+            taskKey,
+            routeVal,
+            reasonVal,
+            callerThreadId,
+            {
+              store,
+              workGraphMode: getWorkGraphMode(taskProjId),
+              now,
+              notifyOwner: (line) => notifyOwnerLine(line),
+              log: bb.log,
+            },
+          );
+          return json
+            ? jsonOk({ ok: true, task: res.task })
+            : {
+                exitCode: 0,
+                stdout: `rerouted ${res.task.task_key} (${res.fromRoute} → ${res.task.route}, node: ${res.task.node}, status: ${res.task.status})\n`,
               };
         }
 
