@@ -1764,7 +1764,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 
 Сначала журнал и очередь в базе, затем репетиция пути с подставными агентами, и только затем живые прогоны. Управление графом регулируется настройкой проекта `orchestrator.workGraph`:
 - **`off` (по умолчанию):** полная совместимость с r33. Очередь `task_queue` не ведётся, команды `delegate`, `merge`, `release` работают в классическом ручном режиме координатора. Наблюдатель в проектах с режимом `off` полностью отключён и не производит никаких записей в базу данных (правило абсолютного молчания, §32.2).
-- **`shadow` (пассивный режим аудита и зеркалирования, Б4):** таблицы `task_queue` и `task_transitions` ведутся, команды очереди `enqueue`, `dequeue`, `defer`, `reject`, `resume`, `approve`, `release-note`, `run-queue` функционируют. Прямые вызовы команд `delegate`, `merge`, `release` не блокируются и выполняются в штатном режиме.
+- **`shadow` (пассивный режим аудита и зеркалирования, Б4):** таблицы `task_queue` и `task_transitions` ведутся, команды очереди `enqueue`, `dequeue`, `defer`, `reject`, `resume`, `approve`, `reroute` (§29.9), `release-note`, `run-queue` функционируют. Прямые вызовы команд `delegate`, `merge`, `release` не блокируются и выполняются в штатном режиме.
   Scope зеркалирования:
   - Для задач, зарегистрированных в `task_queue`: каждое ручное действие координатора (`delegate`, `merge`, `release`) зеркалируется в `task_transitions` (с актором `shadow:coordinator` / `shadow:machine`), а конвейер графа параллельно вычисляет и протоколирует в `task_queue.payload.shadow_eval`:
     1) `would_allow: delegate` / `would_reject: invalid_node`: соответствует ли раздача координатора текущему узлу графа;
@@ -1803,7 +1803,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
        * если функциональная ветка `<branch>` отсутствует локально: создаётся чистая ветка от `origin/<mergeBaseBranch>` (`git branch <branch> origin/<mergeBaseBranch>`);
        * если ветка `<branch>` уже существует локально: если `refs/heads/<branch>` равна `origin/<mergeBaseBranch>` или является её предком (ветка создана конвейером и ещё не модифицировалась): ветка переиспользуется;
        * если ветка уже существует и содержит коммиты, не являющиеся предками `origin/<mergeBaseBranch>`: конвейер переводит задачу в статус `stalled: branch-exists: ветка <branch> уже существует и содержит коммиты; проверь состояние ветки или выполни dequeue`.
-     - Команды очереди в строгом режиме: управление задачами графа выполняется через набор команд `bb orchestrator`: `enqueue`, `dequeue`, `defer`, `reject`, `resume`, `approve`, `release-note`, `run-queue`.
+     - Команды очереди в строгом режиме: управление задачами графа выполняется через набор команд `bb orchestrator`: `enqueue`, `dequeue`, `defer`, `reject`, `resume`, `approve`, `reroute` (§29.9), `release-note`, `run-queue`.
   3) Выкладка задачи (шаг 1 [orchestrator-release](orchestrator-release.md)) допускается исключительно при условии, что задача зарегистрирована в `task_queue` и её состояние строго равно `node = 'release', status = 'running'`.
   4) Координатор освобождается от ручной диспетчеризации — задача продвигается детерминированным конвейером по машинным доказательствам.
 
