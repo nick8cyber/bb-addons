@@ -121,3 +121,82 @@ div:has(> [data-bb-plugin="usage-pro"]) {
   font-variant-numeric: tabular-nums !important;
   opacity: 0.9 !important;
 }
+
+/* PLUG-411: «Все машины» — мини-полосы у футера сайдбара (опция footerMachines).
+   Оверлей experimental_appOverlay: визуально прижат к правому краю ряда иконок
+   футера; горизонталь выставляется из JS по границе сайдбара. */
+.usage-pro-machines-strip {
+  position: fixed;
+  bottom: 8px;
+  left: -10000px;
+  transform: translateX(-100%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--background, var(--popover));
+  color: var(--foreground, var(--popover-foreground));
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm, 0 1px 2px rgb(0 0 0 / 0.08));
+}
+
+.usage-pro-machines-strip:focus-visible {
+  outline: 2px solid var(--ring, var(--sidebar-ring, #3b82f6));
+  outline-offset: 1px;
+}
+
+.usage-pro-machines-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.usage-pro-machines-item.is-offline {
+  opacity: 0.55;
+}
+
+.usage-pro-machines-item .lbl {
+  color: var(--muted-foreground);
+}
+
+.usage-pro-machines-item .mini {
+  display: block;
+  width: 26px;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--muted);
+}
+
+.usage-pro-machines-item .mini i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+}
+
+.usage-pro-machines-item .mini i.empty {
+  background: transparent;
+}
+
+.usage-pro-machines-item .pct {
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.usage-pro-machines-sep {
+  width: 1px;
+  height: 12px;
+  background: var(--border);
+}
+
+.usage-pro-machines-strip[data-fit="compact"] .usage-pro-machines-item .lbl {
+  display: none;
+}
+

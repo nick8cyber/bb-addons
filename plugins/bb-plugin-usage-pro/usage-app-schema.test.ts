@@ -11,7 +11,7 @@ const pluginDir = path.dirname(new URL(import.meta.url).pathname);
 // globalThis.__bbPluginRuntime — so we evaluate the single `var` statement
 // that declares the zod schemas with the real zod namespace bound to the
 // bundle's minified alias.
-function loadInterfaceUsageUnion(): z.ZodType {
+function loadInterfaceSchemas(): { union: z.ZodType; machine: z.ZodType } {
   const bundle = fs.readFileSync(path.join(pluginDir, "app.bundle.js"), "utf8");
   const decl = /(?:var |,)([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.discriminatedUnion\("status"/.exec(bundle);
   if (!decl) throw new Error('cannot locate discriminatedUnion("status") in app.bundle.js');
@@ -37,9 +37,17 @@ function loadInterfaceUsageUnion(): z.ZodType {
   }
   if (end < 0) throw new Error("schema var statement is not terminated in app.bundle.js");
   const statement = bundle.slice(varStart, end);
+  // The machine entry schema (PLUG-411) lives in the same var statement —
+  // it is the strictObject whose shape leads with id + displayName + a
+  // connected/disconnected status enum.
+  const machineDecl = new RegExp(
+    `,([A-Za-z_$][\\w$]*)=${zodAlias}\\.strictObject\\(\\{id:[A-Za-z_$][\\w$]*,displayName:[A-Za-z_$][\\w$]*,status:${zodAlias}\\.enum`,
+  ).exec(statement);
+  if (!machineDecl) throw new Error("cannot locate the machine entry schema in app.bundle.js");
+  const machineName = machineDecl[1];
   // eslint-disable-next-line @typescript-eslint/no-implied-eval
-  const build = new Function(zodAlias, `${statement}; return ${unionName};`);
-  return build(z) as z.ZodType;
+  const build = new Function(zodAlias, `${statement}; return { union: ${unionName}, machine: ${machineName} };`);
+  return build(z) as { union: z.ZodType; machine: z.ZodType };
 }
 
 const defOf = (schema: z.ZodType) => (schema as unknown as { _zod: { def: any } })._zod.def;
@@ -61,8 +69,13 @@ function serverUsageUnion(): z.ZodType {
   return defOf(defOf(provider).shape.usage).innerType as z.ZodType;
 }
 
+function serverMachineSchema(): z.ZodType {
+  const output = (providerUsageRpcContract as any).getUsage.output as z.ZodType;
+  return defOf(defOf(output).shape.machines).element as z.ZodType;
+}
+
 describe("PLUG-328 usage panel schema parity", () => {
-  const usageUnion = loadInterfaceUsageUnion();
+  const { union: usageUnion } = loadInterfaceSchemas();
   const okCard = {
     status: "ok",
     accountEmail: "ops@example.com",
@@ -83,5 +96,30 @@ describe("PLUG-328 usage panel schema parity", () => {
 
   it('keeps the "ok" branch key set identical to the server contract', () => {
     expect(okBranchKeys(usageUnion)).toEqual(okBranchKeys(serverUsageUnion()));
+  });
+});
+
+describe("PLUG-411 machine entry schema parity", () => {
+  const { machine } = loadInterfaceSchemas();
+  const serverMachine = serverMachineSchema();
+
+  it("keeps the machine entry key set identical to the server contract", () => {
+    expect(Object.keys(defOf(machine).shape).sort()).toEqual(
+      Object.keys(defOf(serverMachine).shape).sort(),
+    );
+  });
+
+  it("accepts a machine entry carrying server/updatedAtMs", () => {
+    const entry = {
+      id: "host-1",
+      displayName: "Primary",
+      status: "connected",
+      providers: [],
+      error: null,
+      server: true,
+      updatedAtMs: 1_700_000_000_000,
+    };
+    expect(machine.safeParse(entry).success).toBe(true);
+    expect(serverMachine.safeParse(entry).success).toBe(true);
   });
 });

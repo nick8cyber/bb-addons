@@ -842,8 +842,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     expect(snapCodexOnly.machines[0].providers.some((p: any) => p.providerId === "claude-code")).toBe(true);
   });
 
-  // Coordinator Feedback 2: AGY baseline semantics preserved across non-source hosts
-  it("Coordinator 2: AGY baseline semantics preserved across non-source hosts", async () => {
+  // Coordinator Feedback 2 (PLUG-411): agy accounts live only on the server
+  // host — attaching them to remote machines would duplicate local accounts.
+  it("Coordinator 2: AGY accounts attach strictly to primaryHostId, not remote hosts", async () => {
     const agyDir = path.join(tmpUserHome, ".bb", "plugins", "provider-agy", "bridge-data", "accounts", "user@example.com", ".gemini", "antigravity-cli");
     fs.mkdirSync(agyDir, { recursive: true });
     fs.writeFileSync(path.join(agyDir, "antigravity-oauth-token"), "mock-token");
@@ -870,7 +871,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     const host1Agy = snap.machines.find((m: any) => m.id === "host-1").providers.filter((p: any) => p.providerId === "agy");
     const host2Agy = snap.machines.find((m: any) => m.id === "host-2").providers.filter((p: any) => p.providerId === "agy");
     expect(host1Agy).toHaveLength(1);
-    expect(host2Agy).toHaveLength(1);
+    expect(host2Agy).toHaveLength(0);
   });
 
   // Coordinator Feedback 3: Pi transport failure persists warning, observedAt kept, recovery clears
@@ -1690,5 +1691,562 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
     });
     expect(argonCards(snapshot)).toHaveLength(1);
+  });
+
+  // PLUG-411: usageMachineSchema grew `server`/`updatedAtMs`; a disconnected
+  // host answers from the per-machine snapshot cache with the stale stamp.
+  it("PLUG-411: machines carry server flag and updatedAtMs; offline host serves cached providers", async () => {
+    const hosts: Host[] = [
+      { id: "host-1", name: "Primary", status: "connected" },
+      { id: "host-2", name: "Worker", status: "connected" },
+    ];
+    const h = setupHarness({
+      hosts,
+      primaryHostId: "host-1",
+      sources: [{ pluginId: "source-native", displayName: "Native" }],
+      inventories: {
+        "source-native": {
+          resources: [
+            {
+              id: "res-h1", label: "H1 Codex", providerId: "codex",
+              scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+            },
+            {
+              id: "res-h2", label: "H2 Codex", providerId: "codex",
+              scope: { kind: "host", hostId: "host-2", hostName: "Worker" },
+            },
+          ],
+        },
+      },
+      measurements: {
+        "source-native:res-h1": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 10 }] },
+        },
+        "source-native:res-h2": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 20 }] },
+        },
+      },
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    const online = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const m1 = online.machines.find((m: any) => m.id === "host-1");
+    const m2 = online.machines.find((m: any) => m.id === "host-2");
+    expect(m1.server).toBe(true);
+    expect(m2.server).toBe(false);
+    expect(m1.updatedAtMs).toBe(currentTime);
+    expect(m2.updatedAtMs).toBe(currentTime);
+    const remoteCards = m2.providers.filter((p: any) => p.providerId === "codex");
+    expect(remoteCards.length).toBeGreaterThan(0);
+
+    // Host-2 drops; the next snapshot keeps its last known providers and the
+    // stale updatedAtMs while host-1 refreshes to the new clock.
+    hosts[1].status = "disconnected";
+    currentTime += 10 * 60_000;
+
+    const offline = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const off2 = offline.machines.find((m: any) => m.id === "host-2");
+    const on1 = offline.machines.find((m: any) => m.id === "host-1");
+    expect(off2.status).toBe("disconnected");
+    expect(off2.updatedAtMs).toBe(m2.updatedAtMs);
+    expect(off2.providers.filter((p: any) => p.providerId === "codex")).toHaveLength(remoteCards.length);
+    expect(on1.status).toBe("connected");
+    expect(on1.updatedAtMs).toBe(currentTime);
+  });
+
+  // PLUG-411: providers.list is narrowed by hostId only for a single-machine
+  // request — the all-machines call needs metadata from every host.
+  it("PLUG-411: providers.list gets hostId only when exactly one host is requested", async () => {
+    const h = setupHarness({
+      hosts: [
+        { id: "host-1", name: "Primary", status: "connected" },
+        { id: "host-2", name: "Worker", status: "connected" },
+      ],
+      primaryHostId: "host-1",
+      sources: [],
+      inventories: {},
+      measurements: {},
+    });
+    const listCalls: any[] = [];
+    h.fakeHost.harness.sdk.stub("providers.list", async (args: any) => {
+      listCalls.push(args);
+      return [];
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    await h.registeredRpc.getUsage({
+      force: false, machineIds: ["host-1"], providerId: "codex", maxAgeMs: 60_000,
+    });
+    await h.registeredRpc.getUsage({
+      force: false, machineIds: ["host-1", "host-2"], providerId: "codex", maxAgeMs: 60_000,
+    });
+    await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+
+    expect(listCalls[0]).toEqual({ hostId: "host-1" });
+    expect(listCalls[1]).toEqual({});
+    expect(listCalls[2]).toEqual({});
+  });
+
+  // PLUG-411: a failing measurement on one machine leaves the other machine's
+  // cards intact — errors stay inside their own account entry.
+  it("PLUG-411: one machine's measurement error does not break other machines", async () => {
+    const h = setupHarness({
+      hosts: [
+        { id: "host-1", name: "Primary", status: "connected" },
+        { id: "host-2", name: "Worker", status: "connected" },
+      ],
+      primaryHostId: "host-1",
+      sources: [{ pluginId: "source-native", displayName: "Native" }],
+      inventories: {
+        "source-native": {
+          resources: [
+            {
+              id: "res-h1", label: "H1 Codex", providerId: "codex",
+              scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+            },
+            {
+              id: "res-h2", label: "H2 Codex", providerId: "codex",
+              scope: { kind: "host", hostId: "host-2", hostName: "Worker" },
+            },
+          ],
+        },
+      },
+      measurements: {
+        "source-native:res-h1": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 10 }] },
+        },
+        "source-native:res-h2": {
+          usage: { status: "error", message: "agent died" },
+        },
+      },
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    const snap = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const m1 = snap.machines.find((m: any) => m.id === "host-1");
+    const m2 = snap.machines.find((m: any) => m.id === "host-2");
+    expect(m1.providers.find((p: any) => p.providerId === "codex").usage.status).toBe("ok");
+    const bad = m2.providers.find((p: any) => p.providerId === "codex");
+    expect(bad.usage.status).toBe("error");
+    expect(m1.error).toBeNull();
+    expect(m2.error).toBeNull();
+  });
+
+  // PLUG-411: SWR cache hit (request within maxAgeMs without force) preserves
+  // updatedAtMs without shifting it forward to the query timestamp.
+  it("PLUG-411: SWR cache hit does not shift updatedAtMs forward", async () => {
+    const hosts: Host[] = [
+      { id: "host-1", name: "Primary", status: "connected" },
+      { id: "host-2", name: "Worker", status: "connected" },
+    ];
+    const h = setupHarness({
+      hosts,
+      primaryHostId: "host-1",
+      sources: [{ pluginId: "source-native", displayName: "Native" }],
+      inventories: {
+        "source-native": {
+          resources: [
+            {
+              id: "res-h1", label: "H1 Codex", providerId: "codex",
+              scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+            },
+          ],
+        },
+      },
+      measurements: {
+        "source-native:res-h1": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 10 }] },
+        },
+      },
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    const first = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const m1First = first.machines.find((m: any) => m.id === "host-1");
+    expect(m1First.updatedAtMs).toBe(currentTime);
+
+    // Advance clock within SWR window (maxAgeMs: 60_000)
+    currentTime += 25_000;
+    const second = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const m1Second = second.machines.find((m: any) => m.id === "host-1");
+    // Must remain the original timestamp, not currentTime + 25_000
+    expect(m1Second.updatedAtMs).toBe(m1First.updatedAtMs);
+
+    // Force refresh advances updatedAtMs
+    currentTime += 10_000;
+    const third = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: "codex", maxAgeMs: 0,
+    });
+    const m1Third = third.machines.find((m: any) => m.id === "host-1");
+    expect(m1Third.updatedAtMs).toBe(currentTime);
+  });
+
+  // PLUG-411: failed refresh returning cached ok with warning does not advance updatedAtMs
+  it("PLUG-411: failed refresh returning cached ok with warning does not advance updatedAtMs", async () => {
+    const hosts: Host[] = [
+      { id: "host-1", name: "Primary", status: "connected" },
+    ];
+    const h = setupHarness({
+      hosts,
+      primaryHostId: "host-1",
+      sources: [{ pluginId: "source-native", displayName: "Native" }],
+      inventories: {
+        "source-native": {
+          resources: [
+            {
+              id: "res-h1", label: "H1 Codex", providerId: "codex",
+              scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+            },
+          ],
+        },
+      },
+      measurements: {
+        "source-native:res-h1": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 15 }] },
+        },
+      },
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    const snap1 = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const m1 = snap1.machines.find((m: any) => m.id === "host-1");
+    expect(m1.updatedAtMs).toBe(currentTime);
+    const initialUpdatedAt = m1.updatedAtMs;
+
+    // Advance clock, make next fetch throw an error
+    currentTime += 30_000;
+    h.measurementMap.set("source-native:res-h1", () => {
+      throw new Error("network down");
+    });
+
+    const snap2 = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: "codex", maxAgeMs: 0,
+    });
+    const m1After = snap2.machines.find((m: any) => m.id === "host-1");
+    // Provider returns cached ok with warning
+    expect(m1After.providers[0].usage.status).toBe("ok");
+    expect(m1After.providers[0].warning).toContain("Usage could not be refreshed");
+    // updatedAtMs must NOT advance to currentTime (30_000 later)
+    expect(m1After.updatedAtMs).toBe(initialUpdatedAt);
+  });
+
+  // PLUG-411: temporary vanishing of resource from listResources preserves cached providers
+  // within TTL with stale warning, but evicts them after TTL.
+  it("PLUG-411: temporary disappearance of resource from listResources preserves cached providers", async () => {
+    const hosts: Host[] = [
+      { id: "host-1", name: "Primary", status: "connected" },
+    ];
+    const inventory = {
+      resources: [
+        {
+          id: "res-h1", label: "H1 Codex", providerId: "codex",
+          scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+        },
+      ],
+    };
+    const h = setupHarness({
+      hosts,
+      primaryHostId: "host-1",
+      sources: [{ pluginId: "source-native", displayName: "Native" }],
+      inventories: { "source-native": inventory },
+      measurements: {
+        "source-native:res-h1": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 15 }] },
+        },
+      },
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    const snap1 = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const m1 = snap1.machines.find((m: any) => m.id === "host-1");
+    expect(m1.providers.filter((p: any) => p.providerId === "codex")).toHaveLength(1);
+    const initialUpdatedAt = m1.updatedAtMs;
+
+    // Resource transiently disappears from listResources
+    inventory.resources = [];
+    currentTime += 70_000;
+
+    const snap2 = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: "codex", maxAgeMs: 0,
+    });
+    const m1After = snap2.machines.find((m: any) => m.id === "host-1");
+    // Cached providers and updatedAtMs are preserved within TTL, marked with warning
+    expect(m1After.providers.filter((p: any) => p.providerId === "codex")).toHaveLength(1);
+    expect(m1After.providers[0].warning).toBe("Данные устарели");
+    expect(m1After.updatedAtMs).toBe(initialUpdatedAt);
+
+    // After TTL (300_000 ms) expires, provider is evicted
+    currentTime += 300_000;
+    const snap3 = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: "codex", maxAgeMs: 0,
+    });
+    const m1Expired = snap3.machines.find((m: any) => m.id === "host-1");
+    expect(m1Expired.providers.filter((p: any) => p.providerId === "codex")).toHaveLength(0);
+  });
+
+  // PLUG-411 audit (goes 12–14 blocker): a vanished provider must be evicted by
+  // ITS OWN TTL, not by the machine snapshot's. A fresh answer from one
+  // provider keeps refreshing the machine snapshot; under the old per-snapshot
+  // TTL the stale entry of another provider was re-persisted with every cycle
+  // and lived forever.
+  it("PLUG-411: vanished provider evicted by its own TTL while another provider keeps refreshing", async () => {
+    const hosts: Host[] = [
+      { id: "host-1", name: "Primary", status: "connected" },
+    ];
+    const inventory = {
+      resources: [
+        {
+          id: "res-h1", label: "H1 Codex", providerId: "codex",
+          scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+        },
+        {
+          id: "res-h1-claude", label: "H1 Claude", providerId: "claude-code",
+          scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+        },
+      ],
+    };
+    const h = setupHarness({
+      hosts,
+      primaryHostId: "host-1",
+      sources: [{ pluginId: "source-native", displayName: "Native" }],
+      inventories: { "source-native": inventory },
+      measurements: {
+        "source-native:res-h1": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 15 }] },
+        },
+        "source-native:res-h1-claude": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 10 }] },
+        },
+      },
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    // Initial full load: both providers fresh, snapshot stamped
+    const snap1 = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 60_000,
+    });
+    const m1 = snap1.machines.find((m: any) => m.id === "host-1");
+    expect(m1.providers.map((p: any) => p.providerId).sort()).toEqual(["claude-code", "codex"]);
+    expect(m1.providers.every((p: any) => !p.warning)).toBe(true);
+
+    // Claude resource vanishes from listResources; the codex tab keeps
+    // refreshing every 120 s (popover interval), which re-saves the snapshot.
+    inventory.resources = inventory.resources.filter((r: any) => r.providerId === "codex");
+
+    currentTime += 120_000;
+    const snap2 = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: "codex", maxAgeMs: 0,
+    });
+    const m2After = snap2.machines.find((m: any) => m.id === "host-1");
+    // Within claude's own TTL (120 s < 300 s since its last fresh answer) the
+    // entry is preserved, marked stale.
+    const claude2 = m2After.providers.filter((p: any) => p.providerId === "claude-code");
+    expect(claude2).toHaveLength(1);
+    expect(claude2[0].warning).toBe("Данные устарели");
+    expect(m2After.updatedAtMs).toBe(currentTime);
+
+    // Three more codex refreshes (t0 + 480 s total): claude's own TTL has long
+    // expired even though every cycle refreshed the machine snapshot.
+    currentTime += 120_000;
+    await h.registeredRpc.getUsage({ force: true, machineIds: null, providerId: "codex", maxAgeMs: 0 });
+    currentTime += 120_000;
+    await h.registeredRpc.getUsage({ force: true, machineIds: null, providerId: "codex", maxAgeMs: 0 });
+    currentTime += 120_000;
+    const snap5 = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: "codex", maxAgeMs: 0,
+    });
+    const m1Expired = snap5.machines.find((m: any) => m.id === "host-1");
+    expect(m1Expired.providers.filter((p: any) => p.providerId === "claude-code")).toHaveLength(0);
+    // Codex itself stays fresh and unmarked across all cycles.
+    const codex5 = m1Expired.providers.filter((p: any) => p.providerId === "codex");
+    expect(codex5).toHaveLength(1);
+    expect(codex5[0].warning).toBeNull();
+    expect(m1Expired.updatedAtMs).toBe(currentTime);
+  });
+
+  // PLUG-417 (§4.1): vanished multi-account provider preserves ALL accounts in snapshot
+  it("PLUG-417: vanished multi-account provider preserves ALL accounts in snapshot", async () => {
+    const hosts: Host[] = [
+      { id: "host-1", name: "Primary", status: "connected" },
+    ];
+    const inventory = {
+      resources: [
+        {
+          id: "res-h1-codex-1", label: "H1 Codex 1", providerId: "codex",
+          scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+        },
+        {
+          id: "res-h1-codex-2", label: "H1 Codex 2", providerId: "codex",
+          scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+        },
+        {
+          id: "res-h1-claude", label: "H1 Claude", providerId: "claude-code",
+          scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+        },
+      ],
+    };
+    const h = setupHarness({
+      hosts,
+      primaryHostId: "host-1",
+      sources: [{ pluginId: "source-native", displayName: "Native" }],
+      inventories: { "source-native": inventory },
+      measurements: {
+        "source-native:res-h1-codex-1": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 15 }] },
+        },
+        "source-native:res-h1-codex-2": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 25 }] },
+        },
+        "source-native:res-h1-claude": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 10 }] },
+        },
+      },
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    // Initial load: 2 codex accounts and 1 claude account
+    const snap1 = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 60_000,
+    });
+    const m1 = snap1.machines.find((m: any) => m.id === "host-1");
+    const codex1 = m1.providers.filter((p: any) => p.providerId === "codex");
+    expect(codex1).toHaveLength(2);
+    expect(codex1.every((p: any) => !p.warning)).toBe(true);
+
+    // Both codex resources vanish from listResources; claude-code keeps refreshing
+    inventory.resources = inventory.resources.filter((r: any) => r.providerId === "claude-code");
+
+    currentTime += 120_000;
+    const snap2 = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: "claude-code", maxAgeMs: 0,
+    });
+    const m2 = snap2.machines.find((m: any) => m.id === "host-1");
+    // Crucial check: BOTH codex accounts preserved from snapshot, marked with warning
+    const codex2 = m2.providers.filter((p: any) => p.providerId === "codex");
+    expect(codex2).toHaveLength(2);
+    expect(codex2[0].warning).toBe("Данные устарели");
+    expect(codex2[1].warning).toBe("Данные устарели");
+
+    // After 300s TTL expires (t0 + 360s):
+    currentTime += 240_000;
+    const snap3 = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: "claude-code", maxAgeMs: 0,
+    });
+    const m3 = snap3.machines.find((m: any) => m.id === "host-1");
+    expect(m3.providers.filter((p: any) => p.providerId === "codex")).toHaveLength(0);
+    expect(m3.providers.filter((p: any) => p.providerId === "claude-code")).toHaveLength(1);
+  });
+
+  // PLUG-411: markDirty() (thread.idle / thread.failed) invalidates measurements
+  // but preserves machineSnapshots for offline hosts.
+  it("PLUG-411: markDirty does not evict machineSnapshots", async () => {
+    const hosts: Host[] = [
+      { id: "host-1", name: "Primary", status: "connected" },
+      { id: "host-2", name: "Worker", status: "connected" },
+    ];
+    const h = setupHarness({
+      hosts,
+      primaryHostId: "host-1",
+      sources: [{ pluginId: "source-native", displayName: "Native" }],
+      inventories: {
+        "source-native": {
+          resources: [
+            {
+              id: "res-h2", label: "H2 Codex", providerId: "codex",
+              scope: { kind: "host", hostId: "host-2", hostName: "Worker" },
+            },
+          ],
+        },
+      },
+      measurements: {
+        "source-native:res-h2": {
+          usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 40 }] },
+        },
+      },
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    const first = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const m2First = first.machines.find((m: any) => m.id === "host-2");
+    expect(m2First.updatedAtMs).toBe(currentTime);
+    expect(m2First.providers).toHaveLength(1);
+
+    // Host 2 goes offline and thread.idle emits markDirty()
+    hosts[1].status = "disconnected";
+    await h.fakeHost.harness.behavior.emitThreadEvent("thread.idle", {} as any);
+    currentTime += 120_000;
+
+    const second = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const m2Offline = second.machines.find((m: any) => m.id === "host-2");
+    expect(m2Offline.status).toBe("disconnected");
+    expect(m2Offline.updatedAtMs).toBe(m2First.updatedAtMs);
+    expect(m2Offline.providers).toHaveLength(1);
+  });
+
+  // PLUG-411: collection error does not advance updatedAtMs
+  it("PLUG-411: collection error does not advance updatedAtMs or overwrite valid snapshot", async () => {
+    const hosts: Host[] = [
+      { id: "host-1", name: "Primary", status: "connected" },
+    ];
+    let measurementVal: any = {
+      usage: { status: "ok", windows: [{ label: "Weekly limit", usedPercent: 10 }] },
+    };
+    const h = setupHarness({
+      hosts,
+      primaryHostId: "host-1",
+      sources: [{ pluginId: "source-native", displayName: "Native" }],
+      inventories: {
+        "source-native": {
+          resources: [
+            {
+              id: "res-h1", label: "H1 Codex", providerId: "codex",
+              scope: { kind: "host", hostId: "host-1", hostName: "Primary" },
+            },
+          ],
+        },
+      },
+      measurements: {
+        "source-native:res-h1": () => measurementVal,
+      },
+    });
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    const first = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
+    });
+    const m1First = first.machines.find((m: any) => m.id === "host-1");
+    expect(m1First.updatedAtMs).toBe(currentTime);
+
+    // Measurement starts failing
+    measurementVal = { usage: { status: "error", message: "gateway timeout" } };
+    currentTime += 80_000;
+
+    const second = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: "codex", maxAgeMs: 0,
+    });
+    const m1Second = second.machines.find((m: any) => m.id === "host-1");
+    // Card shows error, but updatedAtMs does NOT advance to currentTime + 80_000
+    expect(m1Second.providers[0].usage.status).toBe("error");
+    expect(m1Second.updatedAtMs).toBe(m1First.updatedAtMs);
   });
 });
