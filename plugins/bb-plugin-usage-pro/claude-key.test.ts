@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  claudeKeyContract,
   createClaudeKeyHandlers,
   readClaudeKeyState,
   type ClaudeKeyDeps,
@@ -104,7 +105,7 @@ describe("claudeKey.set", () => {
     });
     const h = createClaudeKeyHandlers(deps(run));
     await expect(h.set({ enabled: true })).rejects.toThrowError(/^claude-key switch failed$/);
-    expect(await h.status()).toEqual({ enabled: false, settingsReadable: true });
+    expect(await h.status()).toEqual({ enabled: false, settingsReadable: true, available: false });
   });
 
   it("does not leak process output or helper paths in thrown errors", async () => {
@@ -119,5 +120,32 @@ describe("claudeKey.set", () => {
     expect(err).toBeInstanceOf(Error);
     expect(JSON.stringify(err)).not.toContain("sk-ant");
     expect((err as { stderr?: string }).stderr).toBeUndefined();
+  });
+
+  it("reports available: true when switchScript exists and has execute permission", async () => {
+    await writeFile(settingsPath, JSON.stringify({ theme: "dark" }));
+    const scriptPath = join(dir, "mock-claude-key");
+    await writeFile(scriptPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const h = createClaudeKeyHandlers({ settingsPath, switchScript: scriptPath, run: vi.fn() });
+    const res = await h.status();
+    expect(res).toEqual({ enabled: false, settingsReadable: true, available: true });
+  });
+
+  it("reports available: false when switchScript is missing or non-executable", async () => {
+    await writeFile(settingsPath, JSON.stringify({ theme: "dark" }));
+    const scriptPath = join(dir, "unexec-claude-key");
+    await writeFile(scriptPath, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+    const h = createClaudeKeyHandlers({ settingsPath, switchScript: scriptPath, run: vi.fn() });
+    const res = await h.status();
+    expect(res).toEqual({ enabled: false, settingsReadable: true, available: false });
+  });
+});
+
+describe("claudeKeyContract schema (+available)", () => {
+  it("validates available boolean in claudeKey.status output schema", () => {
+    const statusSchema = claudeKeyContract["claudeKey.status"].output;
+    expect(statusSchema.safeParse({ enabled: true, settingsReadable: true, available: true }).success).toBe(true);
+    expect(statusSchema.safeParse({ enabled: true, settingsReadable: true, available: false }).success).toBe(true);
+    expect(statusSchema.safeParse({ enabled: true, settingsReadable: true }).success).toBe(false);
   });
 });

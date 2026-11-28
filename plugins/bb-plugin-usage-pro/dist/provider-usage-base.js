@@ -12947,7 +12947,9 @@ var usageMachineSchema = external_exports.strictObject({
   displayName: nonemptyStringSchema,
   status: external_exports.enum(["connected", "disconnected"]),
   providers: external_exports.array(usageProviderSchema),
-  error: external_exports.nullable(nonemptyStringSchema)
+  error: external_exports.nullable(nonemptyStringSchema),
+  server: external_exports.boolean(),
+  updatedAtMs: external_exports.nullable(external_exports.number())
 });
 var usageSnapshotSchema = external_exports.strictObject({
   machines: external_exports.array(usageMachineSchema)
@@ -15314,6 +15316,12 @@ function providerUsagePlugin(bb, options = {}) {
         label: "Скрывать Claude-модели в статистике",
         description: "Не показывать устаревшие лимиты сторонних моделей (Claude / GPT) во вкладке Google / Antigravity.",
         default: true
+      },
+      footerMachines: {
+        type: "boolean",
+        label: "Лимиты всех машин у футера",
+        description: "Показывать в футере мини-полосу каждой машины. Включайте, если в футере есть место.",
+        default: false
       }
     });
   }
@@ -16119,6 +16127,12 @@ function providerUsagePlugin(bb, options = {}) {
 
   const inventories = new Map();
   const measurements = new Map();
+  // Last successfully assembled per-host reply: providers snapshot plus the
+  // stamp the "N min ago" offline label and footer strip consume. Unlike
+  // `measurements`, this cache is not invalidated by markDirty() or by a
+  // resource briefly vanishing from listResources — a disconnected host keeps
+  // showing its last known bars until it answers again.
+  const machineSnapshots = new Map();
   const lastKnownAccountKey = new Map();
   const resourceEpoch = new Map();
   const pending = new Map();
@@ -16224,7 +16238,11 @@ function providerUsagePlugin(bb, options = {}) {
   };
 
   const readUsage = async (request) => {
-    const hostId = request.machineIds?.find((id) => !id.startsWith("source:"));
+    // Provider metadata (displayName/logoUrl/icon/signInHint) is per-host, so
+    // narrow the lookup only when a single real host was requested — a
+    // multi-machine ("all machines") request needs metadata from every host.
+    const requestedHostIds = request.machineIds === null ? null : request.machineIds.filter((id) => !id.startsWith("source:"));
+    const hostId = requestedHostIds !== null && requestedHostIds.length === 1 ? requestedHostIds[0] : void 0;
     const [hosts, sources, providers, config2] = await Promise.all([
       bb.sdk.hosts.list().then((hosts2) => hosts2.filter((host) => host.type !== "ephemeral")),
       bb.sdk.plugins.experimental_discoverRpc({ method: usageListMethod }),
@@ -16353,6 +16371,8 @@ function providerUsagePlugin(bb, options = {}) {
       }).map((resource) => ({ source, resource }))
     );
 
+    const freshSuccessHosts = new Set();
+
     for (let offset = 0; offset < selected.length; offset += 3) {
       await Promise.all(
         selected.slice(offset, offset + 3).map(async ({ source, resource }) => {
@@ -16361,8 +16381,14 @@ function providerUsagePlugin(bb, options = {}) {
           if (!request.force && cached2 && (getNow() - cached2.loadedAt < request.maxAgeMs)) {
             return;
           }
+          const prevLoadedAt = cached2?.loadedAt;
           try {
             await fetchResource(source.pluginId, resource.id, request.force);
+            const m = measurements.get(key);
+            if (m && m.value?.usage?.status === "ok" && m.warning === null && m.loadedAt !== prevLoadedAt) {
+              const hId = resource.scope.kind === "shared" ? (hosts[0]?.id ?? `source:${source.pluginId}`) : resource.scope.hostId;
+              if (hId) freshSuccessHosts.add(hId);
+            }
           } catch {
             // Handled inside fetchResource
           }
@@ -16375,14 +16401,27 @@ function providerUsagePlugin(bb, options = {}) {
 
     let piResult = null;
     if (shouldFetchCodex) {
+      const prevLoaded = codexPiCache.loadedAt;
       piResult = await fetchCodexPiUsage(request.force, request.maxAgeMs);
+      if (primaryHostId && piResult?.usage?.status === "ok" && !piResult.warning && codexPiCache.loadedAt !== prevLoaded) {
+        freshSuccessHosts.add(primaryHostId);
+      }
     } else {
       piResult = getCachedCodexPi();
     }
 
     let agyAccounts = [];
     if (shouldFetchAgy) {
+      const prevAgyLoaded = new Map();
+      for (const [k, v] of agyAccountsCache) prevAgyLoaded.set(k, v.loadedAt);
       agyAccounts = await fetchAgyAccountsUsage(request.force, request.maxAgeMs);
+      if (primaryHostId && agyAccounts.some((a) => a.usage?.status === "ok")) {
+        const hasFreshAgy = agyAccounts.some((a) => {
+          const c = agyAccountsCache.get(a.label);
+          return c && c.loadedAt !== prevAgyLoaded.get(a.label) && a.usage?.status === "ok" && !a.warning;
+        });
+        if (hasFreshAgy) freshSuccessHosts.add(primaryHostId);
+      }
     } else {
       agyAccounts = getCachedAgyAccounts();
     }
@@ -16403,7 +16442,9 @@ function providerUsagePlugin(bb, options = {}) {
       displayName: host.name,
       status: host.status,
       providers: [],
-      error: null
+      error: null,
+      server: host.id === primaryHostId,
+      updatedAtMs: null
     }));
 
     for (const source of inventories.values()) {
@@ -16416,7 +16457,9 @@ function providerUsagePlugin(bb, options = {}) {
           displayName: sourceName,
           status: "connected",
           providers: [],
-          error: `${sourceName}: ${source.error}`
+          error: `${sourceName}: ${source.error}`,
+          server: false,
+          updatedAtMs: null
         });
       } else if (hosts.length === 0 && hasShared) {
         machines.push({
@@ -16424,7 +16467,9 @@ function providerUsagePlugin(bb, options = {}) {
           displayName: sourceName,
           status: "connected",
           providers: [],
-          error: null
+          error: null,
+          server: false,
+          updatedAtMs: null
         });
       }
     }
@@ -16526,7 +16571,10 @@ function providerUsagePlugin(bb, options = {}) {
         }
       }
 
-      if (!machine.id.startsWith("source:")) {
+      // agy accounts live only on the server host — attaching them to remote
+      // machines would duplicate the server's local accounts there and skew
+      // the "freest machine" hint.
+      if (machine.id === primaryHostId) {
         try {
           const agyMeta = providers.find((p) => p.id === "agy");
           for (const acc of agyAccounts) {
@@ -16619,6 +16667,78 @@ function providerUsagePlugin(bb, options = {}) {
       machine.providers.sort(
         (a, b) => (providerOrder.get(a.providerId) ?? Number.MAX_SAFE_INTEGER) - (providerOrder.get(b.providerId) ?? Number.MAX_SAFE_INTEGER)
       );
+    }
+
+    for (const machine of machines) {
+      if (machine.id.startsWith("source:")) continue;
+      const cachedSnap = machineSnapshots.get(machine.id);
+      const inScope = request.machineIds === null || request.machineIds.includes(machine.id);
+
+      if (machine.status !== "connected") {
+        if (cachedSnap !== void 0) {
+          // Offline host answers with its last known providers so the "all
+          // machines" view can render dimmed bars and the "N min ago" label.
+          machine.providers = cachedSnap.providers;
+          machine.updatedAtMs = cachedSnap.updatedAtMs;
+        } else {
+          machine.updatedAtMs = null;
+        }
+        continue;
+      }
+
+      // Staleness is tracked per provider, not per machine snapshot: a fresh
+      // answer from one provider must not extend the lifetime of another
+      // provider that vanished from listResources.
+      const CONNECTED_CACHE_TTL_MS = 300000;
+      const stampNow = getNow();
+      const providerStamps = new Map(
+        Object.entries(cachedSnap?.providerStamps ?? {})
+      );
+      for (const provider of machine.providers) {
+        providerStamps.set(provider.providerId, stampNow);
+      }
+      if (cachedSnap !== void 0) {
+        const currentProviderIds = new Set(machine.providers.map((p) => p.providerId));
+        const evictedProviderIds = new Set();
+        const staleToAdd = [];
+        for (const prev of cachedSnap.providers) {
+          if (currentProviderIds.has(prev.providerId)) continue;
+          if (evictedProviderIds.has(prev.providerId)) continue;
+          const stampedAt = providerStamps.get(prev.providerId) ?? cachedSnap.updatedAtMs;
+          if (stampedAt === null || stampedAt === void 0 || stampNow - stampedAt > CONNECTED_CACHE_TTL_MS) {
+            // Past its own TTL — evict the entry of the vanished provider.
+            providerStamps.delete(prev.providerId);
+            evictedProviderIds.add(prev.providerId);
+            continue;
+          }
+          // Preserve providers missing from this partial/single-provider
+          // response (e.g. temporary vanishing of a resource) only within
+          // their own TTL, marked as stale for every card that shows them.
+          staleToAdd.push({
+            ...prev,
+            warning: prev.warning || "Данные устарели"
+          });
+        }
+        if (staleToAdd.length > 0) {
+          machine.providers.push(...staleToAdd);
+        }
+        machine.providers.sort(
+          (a, b) => (providerOrder.get(a.providerId) ?? Number.MAX_SAFE_INTEGER) - (providerOrder.get(b.providerId) ?? Number.MAX_SAFE_INTEGER)
+        );
+      }
+
+      const hasFreshOk = inScope && freshSuccessHosts.has(machine.id) && machine.providers.some((p) => p.usage?.status === "ok" && !p.warning);
+
+      if (hasFreshOk) {
+        machine.updatedAtMs = stampNow;
+        machineSnapshots.set(machine.id, {
+          updatedAtMs: machine.updatedAtMs,
+          providers: machine.providers,
+          providerStamps: Object.fromEntries(providerStamps)
+        });
+      } else {
+        machine.updatedAtMs = cachedSnap?.updatedAtMs ?? null;
+      }
     }
     return { machines };
   };

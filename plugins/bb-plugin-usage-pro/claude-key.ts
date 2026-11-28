@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -21,7 +22,7 @@ export const claudeKeyContract = defineRpcContract({
     experimental_description:
       "Read whether Claude Code is switched to the Anthropic Console API key: true when apiKeyHelper is present in ~/.claude/settings.json. The file is the source of truth; the helper value is never returned.",
     input: z.object({}).strict(),
-    output: statusOutputSchema,
+    output: statusOutputSchema.extend({ available: z.boolean() }),
   },
   "claudeKey.set": {
     experimental_description:
@@ -78,8 +79,14 @@ export function createClaudeKeyHandlers(deps: ClaudeKeyDeps = claudeKeyDefaults)
     return next;
   };
 
-  const status = async (): Promise<ClaudeKeyState> =>
-    enqueue(() => readClaudeKeyState(deps.settingsPath));
+  const status = () =>
+    enqueue(async () => {
+      const [state, available] = await Promise.all([
+        readClaudeKeyState(deps.settingsPath),
+        access(deps.switchScript, constants.X_OK).then(() => true, () => false),
+      ]);
+      return { ...state, available };
+    });
 
   const set = async ({ enabled }: { enabled: boolean }): Promise<ClaudeKeyState> =>
     enqueue(async () => {
