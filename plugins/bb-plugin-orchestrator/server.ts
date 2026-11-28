@@ -498,6 +498,8 @@ export interface OrchestratorDeps {
   cmd?: ReturnType<typeof createCmd>;
   /** Clock for the §2 preset-check throttle; tests inject a fake. */
   now?: () => number;
+  /** PR provider stub/counter for tests (§29.9 п.6) */
+  prProvider?: any;
 }
 
 interface PresetListEntry {
