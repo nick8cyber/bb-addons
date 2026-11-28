@@ -5,9 +5,9 @@
  * so their static imports resolve through the hook.
  */
 import { registerHooks } from "node:module";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach } from "node:test";
 
@@ -25,6 +25,24 @@ if (!process.env.ORCH_TEST_REAL_HOME) {
     process.env.GIT_CONFIG_GLOBAL = cfg;
   }
   process.env.ORCHESTRATOR_HOOKS_DIR ??= join(home, ".bb", "git-hooks");
+  // PLUG-439: ни один тест не зовёт настоящий bb (хук post-checkout из
+  // теста слал строки в живые треды через унаследованный BB_CLI). BB_CLI и
+  // первый `bb` на PATH — заглушка: exit 0, каждый вызов строкой в журнал
+  // ($ORCH_TEST_BB_LOG, по умолчанию общий журнал в изолированном HOME).
+  // Тест-файл может перенаправить журнал своим ORCH_TEST_BB_LOG.
+  process.env.ORCH_TEST_REAL_BB_CLI = process.env.BB_CLI ?? "";
+  const stubDir = join(home, ".bb-cli-stub");
+  mkdirSync(stubDir, { recursive: true });
+  const stub = join(stubDir, "bb");
+  const defaultLog = join(home, "bb-cli-calls.log");
+  writeFileSync(
+    stub,
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> "\${ORCH_TEST_BB_LOG:-${defaultLog}}"\nexit 0\n`,
+    { mode: 0o755 },
+  );
+  process.env.BB_CLI = stub;
+  process.env.ORCH_TEST_BB_STUB = stub;
+  process.env.PATH = `${stubDir}${delimiter}${process.env.PATH ?? ""}`;
   process.on("exit", () => {
     try {
       rmSync(home, { recursive: true, force: true });

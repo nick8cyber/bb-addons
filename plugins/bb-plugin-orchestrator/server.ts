@@ -1995,8 +1995,18 @@ export async function createPlugin(
     threadId: string,
     copy: string,
     branch: string,
-  ): Promise<{ delivered: boolean; line: string; targets: string[]; duplicate?: boolean }> => {
+  ): Promise<{ delivered: boolean; line: string; targets: string[]; duplicate?: boolean; reason?: string }> => {
     const line = `тред ${threadId} переключил копию ${copy} на ${branch}`;
+    // §24 п.3 (PLUG-439): тред-источник не существует в BB (тест, чужой
+    // BB_THREAD_ID) — строка не доставляется никому.
+    let thr: Awaited<ReturnType<typeof bb.sdk.threads.get>>;
+    try {
+      thr = await bb.sdk.threads.get({ threadId });
+    } catch (e) {
+      const reason = `тред-источник ${threadId} не найден в BB: ${describeError(e)}`;
+      bb.log.warn(`orchestrator: checkout-notice не доставлена: ${reason}`);
+      return { delivered: false, line, targets: [], reason };
+    }
     const key = `${threadId}|${copy}|${branch}`;
     const seen = checkoutNoticeSeen.get(key);
     if (seen !== undefined && Date.now() - seen < 60_000) {
@@ -2011,12 +2021,7 @@ export async function createPlugin(
     }
     const del = store.byThreadId(threadId);
     if (del?.coordinator_thread_id) callers.add(del.coordinator_thread_id);
-    try {
-      const thr = await bb.sdk.threads.get({ threadId });
-      if (thr.parentThreadId) callers.add(thr.parentThreadId);
-    } catch {
-      /* тред не найден — вызвавший неизвестен */
-    }
+    if (thr.parentThreadId) callers.add(thr.parentThreadId);
     callers.delete(threadId);
     const ownerThread = await resolveAlertThreadId().catch(() => undefined);
     const targets = [...new Set([...(ownerThread ? [ownerThread] : []), ...callers])].filter(

@@ -1482,3 +1482,59 @@ test("§31.9: CLI delegate forwards --kind, --base-sha, and --head-sha", async (
   assert.ok(attach.repo);
   assert.deepEqual(attach.specPaths, ["docs/specs/feat.md"]);
 });
+
+test("§24 п.3 (PLUG-439): checkout-notice — тред-источник не найден в BB → строка не уходит никому", async () => {
+  const sent: string[] = [];
+  const host = await hostWith({}, fakeCli().cli, {
+    threads: {
+      get: async () => {
+        throw new Error("thread not found");
+      },
+      send: async (input: { threadId: string }) => {
+        sent.push(input.threadId);
+        return {};
+      },
+    },
+  } as never);
+  const res = await host.harness.runCli(
+    ["checkout-notice", "--copy", "/tmp/copy", "--branch", "feature", "--json"],
+    { threadId: "thr_ghost" },
+  );
+  const body = JSON.parse(res.stdout) as {
+    ok: boolean;
+    data?: { delivered: boolean; targets: string[]; reason?: string };
+    delivered?: boolean;
+    targets?: string[];
+    reason?: string;
+  };
+  const out = body.data ?? body;
+  assert.equal(out.delivered, false);
+  assert.deepEqual(out.targets, []);
+  assert.match(out.reason ?? "", /thr_ghost не найден в BB/);
+  assert.deepEqual(sent, []);
+  const txt = await host.harness.runCli(
+    ["checkout-notice", "--copy", "/tmp/copy2", "--branch", "feature"],
+    { threadId: "thr_ghost" },
+  );
+  assert.equal(txt.exitCode, 1);
+  assert.deepEqual(sent, []);
+});
+
+test("§24 п.3 (PLUG-439): checkout-notice — тред существует → строка вызвавшему (родителю)", async () => {
+  const sent: string[] = [];
+  const host = await hostWith({}, fakeCli().cli, {
+    threads: {
+      get: async () => ({ id: "thr_src", parentThreadId: "thr_parent" }),
+      send: async (input: { threadId: string }) => {
+        sent.push(input.threadId);
+        return {};
+      },
+    },
+  } as never);
+  const res = await host.harness.runCli(
+    ["checkout-notice", "--copy", "/tmp/copy", "--branch", "feature"],
+    { threadId: "thr_src" },
+  );
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(sent, ["thr_parent"]);
+});

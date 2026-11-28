@@ -13,13 +13,15 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
+  rmSync,
   realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import Database from "better-sqlite3";
 import { makeTempDir } from "./helpers/temp.js";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
@@ -90,9 +92,25 @@ function initRepo(repo: string, branch = "main"): void {
   });
 }
 
-/** Isolated environment: own global git config with our hooks installed. */
+// PLUG-439: настоящий bb не вызывается ни разу. Всё, что прошло мимо
+// заглушки hookEnv (BB_CLI и `bb` на PATH из register-hooks.ts), пишется
+// в журнал файла FILE_BB_LOG — тест-сторож в конце файла требует его
+// пустым. Каталог не через makeTempDir: тот чистится после каждого теста.
+const FILE_BB_DIR = mkdtempSync(join(tmpdir(), "orch-boundaries-bb-"));
+const FILE_BB_LOG = join(FILE_BB_DIR, "untracked-bb-calls");
+process.env.ORCH_TEST_BB_LOG = FILE_BB_LOG;
+process.on("exit", () => rmSync(FILE_BB_DIR, { recursive: true, force: true }));
+/** Every BB_CLI handed out by hookEnv — the guard checks each is a stub. */
+const HOOK_ENV_BB: string[] = [];
+
+/** Isolated environment: own global git config with our hooks installed,
+ * BB_CLI = заглушка в tmp (exit 0, каждый вызов строкой в `bbCalls`). */
 async function hookEnv(prefix: string) {
   const tmp = makeTempDir(prefix);
+  const bbCli = join(tmp, "fake-bb");
+  const bbCalls = join(tmp, "bb-calls");
+  writeFileSync(bbCli, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${bbCalls}'\nexit 0\n`, { mode: 0o755 });
+  HOOK_ENV_BB.push(bbCli);
   const hooksDir = join(tmp, "git-hooks");
   const gcfg = join(tmp, "gitconfig");
   writeFileSync(gcfg, "");
@@ -103,9 +121,9 @@ async function hookEnv(prefix: string) {
   } finally {
     process.env.GIT_CONFIG_GLOBAL = prev;
   }
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: gcfg } as NodeJS.ProcessEnv;
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: gcfg, BB_CLI: bbCli } as NodeJS.ProcessEnv;
   delete env.BB_THREAD_ID;
-  return { tmp, hooksDir, gcfg, env };
+  return { tmp, hooksDir, gcfg, env, bbCli, bbCalls };
 }
 
 function initDb(dbPath: string): { db: InstanceType<typeof Database>; store: DelegationStore } {
@@ -514,17 +532,14 @@ test("§24 п.2 (аудит р.3 п.3): база роли не читается 
 // ────────────────────────────────────────────────────────────────────────
 
 test("§24.1 п.6: post-checkout из треда с ролью в чужой копии → один вызов checkout-notice", async () => {
-  const { tmp, store, env, db, bbDb } = await roleEnv("orch-postco-");
+  const { tmp, store, env, db, bbDb, bbCalls: calls } = await roleEnv("orch-postco-");
   store.setThreadRole("thr_coord", "orchestrator", "owner");
   db.close();
   initBbDb(bbDb, [], []);
-  const calls = join(tmp, "bb-calls");
-  const fakeBb = join(tmp, "fake-bb");
-  writeFileSync(fakeBb, `#!/bin/sh\necho "$@" >> ${calls}\n`);
-  chmodSync(fakeBb, 0o755);
   const repo = join(tmp, "owner-copy");
   initRepo(repo);
-  const e = { ...env, BB_THREAD_ID: "thr_coord", BB_CLI: fakeBb };
+  // BB_CLI — заглушка hookEnv, без своей подмены (PLUG-439)
+  const e = { ...env, BB_THREAD_ID: "thr_coord" };
   assert.equal(git(repo, ["checkout", "-q", "-b", "feature"], e).status, 0);
   const lines = readFileSync(calls, "utf8").trim().split("\n");
   assert.equal(lines.length, 1);
@@ -1090,4 +1105,24 @@ test("тест-страж: глобальный core.hooksPath реальной 
   assert.notEqual(process.env.HOME, REAL_HOME, "HOME тестов изолирован");
   assert.notEqual(homedir(), REAL_HOME);
   assert.equal(realGlobalHooksPath(), REAL_BEFORE);
+});
+
+test("тест-страж (PLUG-439): за прогон файла настоящий bb не вызван ни разу", () => {
+  const realBb = process.env.ORCH_TEST_REAL_BB_CLI ?? "";
+  const stub = process.env.ORCH_TEST_BB_STUB ?? "";
+  assert.ok(stub, "register-hooks.ts поставил заглушку bb");
+  assert.equal(process.env.BB_CLI, stub, "BB_CLI процесса тестов — заглушка");
+  if (realBb) assert.notEqual(process.env.BB_CLI, realBb);
+  // `bb` по PATH (хук без BB_CLI) — тоже заглушка, не настоящий bb
+  const which = spawnSync("sh", ["-c", "command -v bb"], { encoding: "utf8", env: process.env });
+  assert.equal(which.stdout.trim(), stub);
+  // каждая среда hookEnv отдала хукам свою заглушку
+  assert.ok(HOOK_ENV_BB.length > 0);
+  for (const b of HOOK_ENV_BB) {
+    assert.notEqual(b, realBb);
+    assert.match(b, /\/fake-bb$/);
+  }
+  // ни один вызов не прошёл мимо заглушки hookEnv
+  const untracked = existsSync(FILE_BB_LOG) ? readFileSync(FILE_BB_LOG, "utf8").trim() : "";
+  assert.equal(untracked, "", `вызовы bb мимо заглушки hookEnv:\n${untracked}`);
 });
