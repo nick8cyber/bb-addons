@@ -1,8 +1,8 @@
 ---
 title: Orchestrator — граф задачи и очередь кодом (Work Graphs)
 status: approved
-updated: 2026-11-24
-revision: 34.11 (r34.11 / PLUG-403 — трекер следует за фактом, §32.7; r34.10 — действия по закрытым записям §32.5.4 п. 3, одна строка task-not-enqueued; r34.9 / PLUG-400 — уровень high, §32.6; r34.8 / PLUG-398 — наблюдатель-сверка shadow §32.5, ADR-0041; r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
+updated: 2026-11-28
+revision: 34.12 (r34.12 / PLUG-426 — смена маршрута на месте командой reroute, §29.9, ADR-0032; r34.11 / PLUG-403 — трекер следует за фактом, §32.7; r34.10 — действия по закрытым записям §32.5.4 п. 3, одна строка task-not-enqueued; r34.9 / PLUG-400 — уровень high, §32.6; r34.8 / PLUG-398 — наблюдатель-сверка shadow §32.5, ADR-0041; r34.7 / PLUG-389 — единая проверка «спека до кода» (§31.9, ADR-0032), флаг specBeforeCode в политике и проекте, приоритет разрешения и согласование с кодом; r34.6 — вынос раздела графа задач в отдельный документ спеки по замечанию 7 архитектора, PLUG-315, ADR-0037, PLUG-361)
 ---
 
 # Граф задачи и очередь кодом (Work Graphs)
@@ -331,6 +331,27 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 5. **Защита от занижения маршрута без ломки автономности (Б3):**
    - Задачи `fix`, `simple`, `docs`, поставленные агентом (получающие режим `auto` по умолчанию маршрута или из `orchestrator.approvalMode`), выполняются полностью автономно до завершения задачи (`done`) без блокирующей ручной паузы на старте (сохраняя принцип «поставил задачу, конвейер работает до сдачи/релиза»).
    - Защита обеспечивается **машинной проверкой соблюдения границ маршрута при сдаче кода (§31.7, Б3, r34.2)**: если исполнитель на маршруте `fix` или `simple` затронул спецификации (пути `orchestrator.routeLimits.specPaths`), миграции/схемы БД (`migrationPaths`), публичные интерфейсы/CLI (`apiPaths`) или превысил лимиты нетто-диффа без тестов (`maxFiles`, `maxLines`, по умолчанию >3 файлов, >150 строк), сдача кода автоматически бракуется машиной, и задача переводится на маршрут `feature` в узел `design` (перепроектирование архитектором), исключая незаметное протаскивание архитектурных правок под видом простых задач.
+
+### 29.9 Смена маршрута на месте: `reroute` (PLUG-426)
+
+Случай PLUG-414: задача встала как `fix` без договора, гейт §31.9 законно отказал, а сменить маршрут мог только владелец (`dequeue` + `enqueue`). `reroute` меняет маршрут на более строгий одной записью SQLite, без разрушающих операций. Правило §29 п.4 (`dequeue`, `enqueue`, `approve`, `--acceptance`, `--mode` — только владелец) и строка `dequeue` §28.1 не меняются.
+
+1. **Вход:** `bb orchestrator reroute <KEY> --route feature --reason "<текст>" [--json]` и RPC `reroute` с тем же обработчиком (`taskKey`, `route`, `reason`, `callerThreadId`; у CLI `callerThreadId` = `BB_THREAD_ID`). Инструментом агента не выдаётся; навык `orchestrator-coordinator` получает строку о команде. До транзакции: пустой `--reason` → `reason-required`, нет записи `task_queue` → `task-not-found`, режим проекта `off` → `graph-disabled`.
+2. **Условия** — по порядку, в одной транзакции `BEGIN IMMEDIATE`; первое невыполненное даёт код отказа:
+   - а) у `callerThreadId` есть строка `thread_roles` с `role = 'orchestrator'` (запасной критерий §3 без строки `thread_roles`, роль в промпте и вызов без `BB_THREAD_ID` не в счёт, §13.2) → `not-coordinator`;
+   - б) `task_queue.coordinator_thread_id = callerThreadId` → `foreign-coordinator`;
+   - в) `task_queue.confirmation_mode = 'auto'` → `manual-mode`;
+   - г) текущий `route IN ('fix', 'simple')`, целевой — только `feature` (маршрут только строже: гейты добавляются, не снимаются) → `route-not-allowed`;
+   - д) **раздачи на узле `code` не было** по всей истории ключа (включая заходы до прошлых `dequeue`): нет строки `delegations` по `task_key` с `level IN ('complex', 'high', 'medium', 'simple')` в любом статусе (в том числе `cancelled`, `failed`, `reissued`) и нет записи `task_transitions` с `to_node = 'code'` → `code-dispatched`. Раздачи уровней `spec`, `research`, `architect` и ревью не считаются;
+   - е) по `task_key` нет строк `releases` в любом статусе и записей `task_transitions` с `to_status = 'pr_open'` → `released`;
+   - ж) нет строки `delegations` по `task_key` в статусе `dispatching` или `running` → `task-busy` (координатор сначала делает обычный `cancel`, §6);
+   - з) в `strict`: `node = 'start'` и `status IN ('queued', 'stalled')`; в `shadow`: `status NOT IN ('done', 'cancelled')` → `not-at-start`. Задачу в `blocked`/`deferred` возвращает только владелец (§29 п.4).
+
+   Отказ: `permission-denied: owner-only (§29.9: <код>)`; задача, `task_transitions` и уведомления не меняются.
+3. **Действие — только SQLite**, CAS по прочитанному в той же транзакции (§27.1 п.2): `UPDATE task_queue SET route = 'feature', updated_at = :now` (в `strict` ещё `status = 'queued'`) `WHERE task_key = :k AND route = :route AND node = :node AND status = :status AND created_at = :createdAt`. `branch`, `level`, `created_at`, `confirmation_mode`, артефакты, счётчики и `payload` не меняются; в `shadow` узел и статус не трогаются (зеркало идёт за фактом, §32.5). Изменено 0 строк — откат и отказ по перечитанному состоянию (второй параллельный `reroute` получает `route-not-allowed`).
+4. **Без внешних действий:** команда не вызывает Git (`cmdRunner`), `threads.stop`, `prProvider`, `origin` и `run-queue`. Дальше задачу ведёт `run-queue` по §28 штатным путём `feature` в `auto`: `start → design → spec → spec_review → code` с гейтом §31.9.
+5. **Журнал:** в той же транзакции строка `task_transitions`: `from_node = to_node = node`, `from_status`/`to_status` — фактические, `actor = 'coordinator:auto'`, `reason = 'coordinator-auto:reroute:<fix|simple>→feature:<причина>'`, `payload` = `{event: "coordinator_auto", command: "reroute", from_route, to_route, caller_thread_id}`. После фиксации — одна строка владельцу без кнопок (не `PluginInteractionRequest`): «PLUG-414: маршрут fix → feature, координатор (§29.9): <причина>». Сбой доставки пишется в лог и действие не откатывает.
+6. **Приёмка** (настоящие CLI и RPC, §19.7): успех в `strict` (`start/queued`, `route = 'feature'`) и в `shadow` (узел и статус прежние); каждый код отказа п.1–п.2 — отдельным тестом без изменений задачи, журнала и уведомлений; повтор на `feature` → `route-not-allowed`; из двух параллельных `reroute` проходит ровно один; подставные `cmdRunner`, `threads.stop`, `prProvider` — 0 вызовов; после `reroute` PLUG-414 проходит гейт §31.9 штатным путём `feature` без владельца.
 
 ## 30. Ревизия 34: роль и уровень `architect`
 
